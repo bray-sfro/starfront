@@ -1,0 +1,11 @@
+# Core
+fastapi>=0.110
+uvicorn[standard]>=0.27
+numpy>=1.24
+
+# The application window (Edge WebView2 on Windows).  Only needed for the
+# desktop window; `python run.py --browser` runs without it.
+pywebview>=5.0
+
+# Windows only, for ASCOM Platform (COM) drivers
+pywin32>=306 ; sys_platform == "win32"

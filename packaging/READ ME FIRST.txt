@@ -1,0 +1,44 @@
+Starfront
+=========
+
+Telescope control and collaborative imaging for Windows.
+
+Install
+-------
+1. Unzip this folder anywhere you like - e.g. C:\Starfront.
+   Keep everything together; the program looks beside itself for its files.
+2. Double-click  Starfront.exe.
+   Windows may say it protected your PC the first time: More info -> Run anyway.
+3. The window opens on its own. Your settings, targets and plans live in
+   C:\Users\<you>\Starfront, so replacing this folder with a newer one never
+   loses them.
+
+Coming from N.I.N.A.?
+---------------------
+Equipment... -> Import from N.I.N.A.  reads the profile you last used and
+brings across your optics, camera, filters and offsets, focus and dither
+settings, ASTAP, and which driver is in which slot. It shows everything before
+it writes anything.
+
+Joining the collaboration
+-------------------------
+Collab tab -> Join with Discord. One button: it signs you in with Discord and
+enrols this telescope. You need to be a member of the Discord server.
+
+You will also want
+------------------
+- The ASCOM Platform (ascom-standards.org) and your drivers - as for N.I.N.A.
+- ASTAP (hnsky.org/astap.htm) with a star database, for plate solving.
+- PHD2 (openphdguiding.org), for guiding.
+- Microsoft Edge WebView2 - already on Windows 10/11; if the window does not
+  open, install it from microsoft.com/edge/webview2.
+
+If something goes wrong
+-----------------------
+The log is  C:\Users\<you>\Starfront\logs\astrocontrol.log.
+"Starfront Console.exe" runs the same program with a console, so a window that
+will not open says why:   "Starfront Console.exe" --browser   opens it in your
+browser instead.
+
+The full manual is README.md in the _internal folder, and is the same text as
+the project's README.

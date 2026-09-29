@@ -1,0 +1,2971 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Starfront</title>
+<link rel="icon" href="starfront.png?v=1" type="image/png">
+<!-- The ?v= stamps exist to break a browser cache that has already decided an
+     older copy is still fresh. Bump them if a released build ever needs to
+     invalidate a client that has not revalidated. -->
+<link rel="stylesheet" href="style.css?v=50">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <img class="brand-mark" src="starfront.png?v=1" alt="" width="20" height="20">
+    <span>Starfront</span>
+  </div>
+  <nav class="maintabs">
+    <button class="tab active" data-tab="image">Image</button>
+    <button class="tab" data-tab="sky">Planetarium</button>
+    <button class="tab" data-tab="planner">Planner</button>
+    <button class="tab" data-tab="plan">Plan</button>
+    <button class="tab" data-tab="calibrate">Calibrate</button>
+    <button class="tab" data-tab="collab">Collab</button>
+    <!-- The two survey tabs are complete and stay in the build, but they are
+         not part of the first release: a sweep of the twilight sky is a
+         different program from an evening on one target, and showing both makes
+         the window look like it needs a manual. `astro.tabs.surveys` in local
+         storage brings them back for development. -->
+    <button class="tab" data-tab="survey" data-optional="surveys" hidden>Survey</button>
+    <button class="tab" data-tab="allsky" data-optional="surveys" hidden>All-Sky</button>
+  </nav>
+
+  <button class="btn small" id="btnEquipment">Equipment…</button>
+  <button class="btn small" id="btnSettings">Site &amp; Optics…</button>
+  <button class="btn small wizard-btn" id="btnFirstLight"
+          title="A walk-through from an empty program to a night of imaging">First light…</button>
+  <!-- Which telescope the panels below are driving. Hidden while there is only
+       one, so a single-scope rig never sees a control it does not need. -->
+  <div id="rigSwitch" class="rig-switch" hidden></div>
+  <div id="devicePills" class="pills"></div>
+
+  <div class="topbar-right">
+    <div class="panel-toggles">
+      <button class="btn small ghost" data-panel-toggle="observatory" title="Weather, roof and power">Observatory</button>
+      <button class="btn small ghost" data-panel-toggle="piercam" title="Live view of the telescope">Pier cam</button>
+      <button class="btn small ghost" data-panel-toggle="stretch" title="Display stretch">Stretch</button>
+      <button class="btn small ghost" data-panel-toggle="session" title="This session's captures">Session</button>
+      <button class="btn small ghost" data-panel-toggle="run" title="Focus curve and sub statistics">Run</button>
+      <button class="btn small ghost" data-panel-toggle="log" title="Event log">Log</button>
+    </div>
+    <span id="clock" class="mono muted"></span>
+    <span id="linkState" class="link-state offline">offline</span>
+  </div>
+</header>
+
+<!-- ------------------------------------------------ what the rig is doing -->
+<!-- One line, always in the same place, that answers "why is nothing
+     happening?" without opening a panel or reading the log. It is driven from
+     the live device state as well as the sequencer, so it says "slewing" for a
+     slew started by hand just as readily as for one inside a run. -->
+<div id="activityBar" class="activity" hidden>
+  <span class="activity-icon" id="activityIcon">●</span>
+  <b class="activity-verb" id="activityVerb">—</b>
+  <span class="activity-detail" id="activityDetail"></span>
+  <span class="spacer"></span>
+  <span class="mono small muted" id="activityElapsed"></span>
+</div>
+
+<!-- ------------------------------------------------ sequence banner -->
+<!-- Whether the rig is working, and how far through, without hunting for it.
+     Hidden entirely when no sequence is running so it costs nothing. -->
+<div id="seqBanner" class="seq-banner" hidden>
+  <span class="seq-dot"></span>
+  <div class="seq-headline">
+    <b id="seqTargetName">—</b>
+    <span class="muted" id="seqStage">—</span>
+  </div>
+  <div class="seq-bars">
+    <div class="seq-bar-row">
+      <span class="seq-bar-label" id="seqFrameLabel">frame</span>
+      <div class="seq-bar"><div class="seq-bar-fill" id="seqFrameFill"></div></div>
+      <span class="mono seq-bar-value" id="seqFrameValue">—</span>
+    </div>
+    <div class="seq-bar-row">
+      <span class="seq-bar-label">target</span>
+      <div class="seq-bar"><div class="seq-bar-fill alt" id="seqTargetFill"></div></div>
+      <span class="mono seq-bar-value" id="seqTargetValue">—</span>
+    </div>
+  </div>
+  <div class="seq-facts">
+    <div class="readout"><span>Filter</span><b id="seqFilter">—</b></div>
+    <div class="readout"><span>Guiding</span><b id="seqGuide">—</b></div>
+    <div class="readout"><span>Elapsed</span><b id="seqElapsed">—</b></div>
+  </div>
+  <div class="row gap">
+    <button class="btn small" id="seqBannerPause">Pause</button>
+    <button class="btn small danger" id="seqBannerStop">Stop</button>
+  </div>
+</div>
+
+<!-- Recovery gets its own line rather than a word in the banner: something has
+     gone wrong and is being put right, and that is worth interrupting the
+     display for. It disappears again the moment the run is back to normal. -->
+<div id="recoveryBar" class="recovery-bar" hidden>
+  <span class="recovery-mark">⟳</span>
+  <b id="recoveryKind">Recovering</b>
+  <span id="recoveryReason"></span>
+  <span class="spacer"></span>
+  <span class="mono small" id="recoveryCount"></span>
+</div>
+
+<!-- Everything that is quietly wrong, most serious first. The strip shows
+     the worst one and a count; clicking it opens the whole list with what
+     to do about each. Entries clear themselves when the condition goes. -->
+<div id="warningsBar" class="warnings-bar" hidden>
+  <button class="warnings-head" id="warningsHead" type="button">
+    <span class="warnings-mark" id="warningsMark">!</span>
+    <b id="warningsTitle">—</b>
+    <span class="muted" id="warningsDetail"></span>
+    <span class="spacer"></span>
+    <span class="mono small" id="warningsCount"></span>
+  </button>
+  <div class="warnings-list" id="warningsList" hidden></div>
+</div>
+
+<main class="layout">
+
+  <!-- ------------------------------------------------ control -->
+  <aside class="column column-left">
+
+    <!-- Which of the device panels below are on screen. The night is mostly
+         spent looking at frames, not at a d-pad, so everything but the camera
+         starts folded away and is one click from coming back. -->
+    <div class="control-toggles" id="controlToggles">
+      <button class="btn small ghost" data-device-toggle="focuser" title="Focuser">Focuser</button>
+      <button class="btn small ghost" data-device-toggle="rotator" title="Rotator">Rotator</button>
+      <button class="btn small ghost" data-device-toggle="mount" title="Mount">Mount</button>
+      <button class="btn small ghost" data-device-toggle="guider" title="Guiding">Guiding</button>
+    </div>
+
+    <section class="panel" id="panel-camera">
+      <h2>Camera <span class="tag" data-role="cam-name">—</span></h2>
+
+      <!-- The two things a night is actually driven with. Everything else about
+           taking a frame is one disclosure below. -->
+      <div class="grid-2">
+        <label>Exposure (s)
+          <input type="number" id="exposure" value="5" min="0" max="3600" step="0.1">
+        </label>
+        <label>Type
+          <select id="frameType">
+            <option value="light">Light</option>
+            <option value="dark">Dark</option>
+            <option value="bias">Bias</option>
+            <option value="flat">Flat</option>
+            <option value="darkflat">Dark Flat</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="row gap">
+        <button class="btn primary flex" id="btnCapture">Capture</button>
+        <button class="btn" id="btnLoop">Loop</button>
+        <button class="btn danger" id="btnAbort" disabled>Abort</button>
+      </div>
+      <div class="row gap">
+        <button class="btn flex" id="btnAutofocus">Autofocus</button>
+        <button class="btn ghost" id="btnAutofocusAll" hidden
+                title="Sweep every telescope's focuser at the same time">All</button>
+        <button class="btn danger" id="btnAutofocusAbort" hidden
+                title="Stop the sweep and put the focuser back">Abort</button>
+      </div>
+
+      <div class="progress"><div class="progress-fill" id="expProgress"></div></div>
+      <div class="row between small mono muted">
+        <span id="expState">idle</span>
+        <span id="expCounter"></span>
+      </div>
+
+      <div id="filterButtons" class="filter-grid muted-empty">Not connected</div>
+
+      <!-- A one-line readout of the things worth glancing at while frames come
+           in, so the panels they belong to can stay shut. -->
+      <div class="readout-row compact">
+        <div class="readout"><span>Sensor</span><b id="ccdTemp">—</b></div>
+        <div class="readout"><span>Focus</span><b id="focPosMini">—</b></div>
+        <div class="readout"><span>Guide RMS</span><b id="guiRmsMini">—</b></div>
+      </div>
+
+      <details class="fold" id="foldCameraSetup">
+        <summary>Frame settings</summary>
+        <div class="grid-2">
+          <label>Binning
+            <select id="binning"><option>1</option><option>2</option><option>3</option><option>4</option></select>
+          </label>
+          <label>Gain <span class="muted mono" id="gainValue"></span>
+            <input type="range" id="gain" min="0" max="500" step="1" value="120">
+          </label>
+          <label>Offset <span class="muted mono" id="offsetValue"></span>
+            <input type="range" id="offset" min="0" max="255" step="1" value="30">
+          </label>
+        </div>
+        <p class="small muted">
+          Gain and offset a sequence should start from live in
+          <b>Equipment → Camera</b>; these drive the frame you take by hand now.
+        </p>
+      </details>
+
+      <details class="fold" id="foldCooling">
+        <summary>Cooling</summary>
+        <div class="readout-row">
+          <div class="readout"><span>Sensor</span><b id="ccdTempFull">—</b></div>
+          <div class="readout"><span>Setpoint</span><b id="ccdSetpoint">—</b></div>
+          <div class="readout"><span>Power</span><b id="coolerPower">—</b></div>
+        </div>
+        <div class="meter"><div class="meter-fill" id="coolerMeter"></div></div>
+        <div class="row gap">
+          <input type="number" id="setpointInput" value="-10" min="-50" max="30" step="0.5">
+          <button class="btn small" id="btnSetpoint">Set</button>
+          <button class="btn small" id="btnCooler">Cooler on</button>
+        </div>
+      </details>
+
+      <details class="fold" id="foldSaving">
+        <summary>Saving</summary>
+        <label class="inline"><input type="checkbox" id="chkSave" checked> Save frames to disk</label>
+        <label>Folder
+          <div class="row gap">
+            <input type="text" id="saveDir" spellcheck="false" placeholder="capture folder">
+            <button class="btn small" id="btnBrowseDir">Browse…</button>
+          </div>
+        </label>
+        <label>Target name
+          <div class="row gap">
+            <input type="text" id="targetName" spellcheck="false" placeholder="e.g. M31">
+            <button class="btn small" id="btnSetTarget">Set</button>
+          </div>
+        </label>
+        <div class="small muted mono" id="filePreview">—</div>
+      </details>
+    </section>
+
+    <section class="panel" id="panel-focuser" data-device-panel="focuser" hidden>
+      <h2>Focuser <span class="tag" data-role="foc-name">—</span></h2>
+      <div class="readout-row">
+        <div class="readout"><span>Position</span><b id="focPos">—</b></div>
+        <div class="readout"><span>Target</span><b id="focTarget">—</b></div>
+        <div class="readout"><span>Temp</span><b id="focTemp">—</b></div>
+      </div>
+      <div class="stepper">
+        <button class="btn small" data-focus-step="-1000">−1000</button>
+        <button class="btn small" data-focus-step="-100">−100</button>
+        <button class="btn small" data-focus-step="-10">−10</button>
+        <button class="btn small" data-focus-step="10">+10</button>
+        <button class="btn small" data-focus-step="100">+100</button>
+        <button class="btn small" data-focus-step="1000">+1000</button>
+      </div>
+      <div class="row gap">
+        <input type="number" id="focTargetInput" placeholder="absolute position" step="1">
+        <button class="btn small" id="btnFocMove">Go</button>
+        <button class="btn small danger" id="btnFocHalt">Halt</button>
+      </div>
+      <p class="small muted">
+        Autofocus is on the Camera panel, where the rest of taking a frame is.
+      </p>
+    </section>
+
+    <section class="panel" id="panel-rotator" data-device-panel="rotator" hidden>
+      <h2>Rotator <span class="tag" data-role="rot-name">—</span></h2>
+      <div class="readout-row">
+        <div class="readout"><span>Sky angle</span><b id="rotPos">—</b></div>
+        <div class="readout"><span>Mechanical</span><b id="rotMech">—</b></div>
+        <div class="readout"><span>State</span><b id="rotState">—</b></div>
+      </div>
+      <div class="stepper">
+        <button class="btn small" data-rotate-step="-45">−45</button>
+        <button class="btn small" data-rotate-step="-10">−10</button>
+        <button class="btn small" data-rotate-step="-1">−1</button>
+        <button class="btn small" data-rotate-step="1">+1</button>
+        <button class="btn small" data-rotate-step="10">+10</button>
+        <button class="btn small" data-rotate-step="45">+45</button>
+      </div>
+      <div class="row gap">
+        <input type="number" id="rotTargetInput" placeholder="position angle °" step="0.1" min="0" max="359.9">
+        <button class="btn small" id="btnRotMove">Go</button>
+        <button class="btn small danger" id="btnRotHalt">Halt</button>
+      </div>
+      <div class="row gap">
+        <button class="btn small ghost flex" id="btnRotSync" title="Tell the rotator its true sky angle, from the last plate solve">Sync from solve</button>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-mount" data-device-panel="mount" hidden>
+      <h2>Mount <span class="tag" data-role="mnt-name">—</span></h2>
+      <div class="readout-row">
+        <div class="readout"><span>RA</span><b id="mntRa">—</b></div>
+        <div class="readout"><span>Dec</span><b id="mntDec">—</b></div>
+      </div>
+      <div class="readout-row">
+        <div class="readout"><span>Alt</span><b id="mntAlt">—</b></div>
+        <div class="readout"><span>Az</span><b id="mntAz">—</b></div>
+        <div class="readout"><span>LST</span><b id="mntLst">—</b></div>
+      </div>
+
+      <div class="dpad">
+        <button class="btn pad" data-jog="north" style="grid-area:n">N</button>
+        <button class="btn pad" data-jog="west" style="grid-area:w">W</button>
+        <button class="btn pad danger" id="btnMountStop" style="grid-area:c">STOP</button>
+        <button class="btn pad" data-jog="east" style="grid-area:e">E</button>
+        <button class="btn pad" data-jog="south" style="grid-area:s">S</button>
+      </div>
+      <label class="small">Slew rate
+        <select id="jogRate">
+          <option value="0.004">Guide (0.004 °/s)</option>
+          <option value="0.05">Slow (0.05 °/s)</option>
+          <option value="0.5" selected>Medium (0.5 °/s)</option>
+          <option value="2">Fast (2 °/s)</option>
+        </select>
+      </label>
+
+      <div class="grid-2">
+        <label>Target RA (h)<input type="number" id="targetRa" step="0.0001" min="0" max="23.9999" value="20.5"></label>
+        <label>Target Dec (°)<input type="number" id="targetDec" step="0.001" min="-90" max="90" value="38"></label>
+      </div>
+      <div class="row gap">
+        <button class="btn primary small" id="btnSlew">Slew</button>
+        <button class="btn small" id="btnSync">Sync</button>
+        <button class="btn small danger" id="btnAbortSlew">Abort</button>
+      </div>
+      <div class="row gap">
+        <button class="btn small" id="btnTracking">Tracking</button>
+        <button class="btn small" id="btnPark">Park</button>
+        <button class="btn small" id="btnUnpark">Unpark</button>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-guider" data-device-panel="guider" hidden>
+      <h2>Guiding <span class="tag" data-role="gui-name">—</span></h2>
+      <div class="readout-row">
+        <div class="readout"><span>State</span><b id="guiState">—</b></div>
+        <div class="readout"><span>RMS</span><b id="guiRms">—</b></div>
+      </div>
+      <div class="readout-row">
+        <div class="readout"><span>RA</span><b id="guiRmsRa">—</b></div>
+        <div class="readout"><span>Dec</span><b id="guiRmsDec">—</b></div>
+        <div class="readout"><span>SNR</span><b id="guiSnr">—</b></div>
+      </div>
+      <div class="row gap">
+        <button class="btn small primary" id="btnGuide">Guide</button>
+        <button class="btn small danger" id="btnGuideStop">Stop</button>
+        <button class="btn small" id="btnDither">Dither</button>
+      </div>
+      <div class="grid-2">
+        <label>Dither (px)<input type="number" id="ditherPixels" value="3" min="0.1" max="100" step="0.1"></label>
+        <label>Settle (px / s)
+          <div class="row gap">
+            <input type="number" id="settlePixels" value="1.5" min="0.1" max="50" step="0.1">
+            <input type="number" id="settleTime" value="8" min="0" max="600" step="1">
+          </div>
+        </label>
+      </div>
+      <label class="inline"><input type="checkbox" id="chkRaOnly"> Dither RA only</label>
+    </section>
+
+  </aside>
+
+  <!-- ------------------------------------------------ viewer / planetarium -->
+  <section class="column column-center">
+
+    <!-- ---------------------------------------------- image tab -->
+    <div class="tab-panel" data-panel="image">
+      <div class="viewer-toolbar">
+        <span class="viewer-title" id="viewerTitle">No image</span>
+        <span class="spacer"></span>
+        <button class="btn small" id="btnFit">Fit</button>
+        <button class="btn small" id="btnActual">1:1</button>
+        <button class="btn small" id="btnZoomOut">−</button>
+        <span class="mono small" id="zoomLabel">—</span>
+        <button class="btn small" id="btnZoomIn">+</button>
+        <label class="inline"><input type="checkbox" id="chkCrosshair"> Crosshair</label>
+        <a class="btn small ghost" id="btnDownload" download>Save FITS</a>
+      </div>
+
+      <div class="canvas-wrap" id="canvasWrap">
+        <canvas id="view"></canvas>
+        <div class="viewer-empty" id="viewerEmpty">
+          <p>Connect the camera and take an exposure.</p>
+          <p class="muted small">Open <b>Equipment…</b> to connect your gear.</p>
+        </div>
+        <div class="loading-badge" id="viewerLoading" hidden>rendering…</div>
+      </div>
+
+      <!-- One thumbnail per telescope, so a triple-RASA night can be watched
+           from one window instead of three. Hidden on a single scope. -->
+      <div class="rig-views" id="rigViews" hidden></div>
+
+      <div class="viewer-status mono small">
+        <span id="cursorReadout">—</span>
+        <span class="spacer"></span>
+        <span id="frameInfo"></span>
+      </div>
+    </div>
+
+    <!-- ---------------------------------------------- planetarium tab -->
+    <div class="tab-panel" data-panel="sky" hidden>
+      <div class="viewer-toolbar sky-toolbar">
+        <div class="sky-search">
+          <input type="text" id="skySearch" spellcheck="false" autocomplete="off"
+                 placeholder="Find an object — M31, NGC 7000, Andromeda…">
+          <div class="sky-results" id="skyResults" hidden></div>
+        </div>
+        <span class="spacer"></span>
+        <button class="btn small" id="btnSkyZoomOut" title="Wider field">−</button>
+        <span class="mono small muted" id="skyFov">60°</span>
+        <button class="btn small" id="btnSkyZoomIn" title="Narrower field">+</button>
+        <button class="btn small" id="btnSkyFrame" title="Zoom to the camera's field">Frame</button>
+        <button class="btn small" id="btnSkyCatalog" title="Browse the catalog">Catalog</button>
+        <button class="btn small" id="btnSkyScope" title="Centre on the mount">Find scope</button>
+      </div>
+
+      <div class="sky-wrap" id="skyWrap">
+        <div class="sky-stage">
+          <canvas id="skyChart"></canvas>
+
+          <div class="sky-hud mono" id="skyHud">
+            <div id="skyHudSite">site not set</div>
+            <div id="skyHudCursor">—</div>
+          </div>
+
+          <div class="sky-loading" id="skyLoading">
+            <div class="spinner"></div>
+            <p class="muted small">Loading star catalogue…</p>
+          </div>
+          <div class="sky-loading" id="skyOffline" hidden>
+            <p>The star chart could not be drawn.</p>
+            <p class="mono small sky-offline-detail" id="skyOfflineDetail"></p>
+            <button class="btn small" id="btnSkyRetry">Try again</button>
+          </div>
+
+          <div class="sky-menu" id="skyMenu" hidden></div>
+        </div>
+
+        <aside class="sky-catalog" id="skyCatalog" hidden>
+          <div class="sky-catalog-head">
+            <input type="text" id="skyCatalogFilter" spellcheck="false" placeholder="Filter…">
+            <select id="skyCatalogSort">
+              <option value="name">By name</option>
+              <option value="altitude">By altitude</option>
+              <option value="magnitude">By magnitude</option>
+            </select>
+          </div>
+          <label class="inline"><input type="checkbox" id="chkSkyVisibleOnly" checked> Above horizon only</label>
+          <div class="sky-catalog-list" id="skyCatalogList"></div>
+        </aside>
+      </div>
+
+      <div class="viewer-status mono small sky-status">
+        <span id="skyTarget">no selection</span>
+        <span class="spacer"></span>
+        <span class="muted" title="Milky Way backdrop from the ESO/S. Brunier 360° panorama, CC BY 4.0">Milky Way: ESO/S. Brunier</span>
+        <span id="skyScopeReadout">mount not connected</span>
+      </div>
+
+      <div class="viewer-toolbar sky-options">
+        <label class="inline"><input type="checkbox" id="chkSkyHorizon" checked> Horizon</label>
+        <label class="inline"><input type="checkbox" id="chkSkyGrid"> Alt/Az grid</label>
+        <label class="inline"><input type="checkbox" id="chkSkyEqGrid"> RA/Dec grid</label>
+        <label class="inline"><input type="checkbox" id="chkSkyMeridian" checked> Meridian</label>
+        <label class="inline"><input type="checkbox" id="chkSkyLabels" checked> Star names</label>
+        <label class="inline"><input type="checkbox" id="chkSkyDeepSky" checked> Deep sky</label>
+        <label class="inline"><input type="checkbox" id="chkSkySolar" checked> Sun, Moon &amp; planets</label>
+        <label class="inline"><input type="checkbox" id="chkSkyScope" checked> Telescope</label>
+        <label class="inline"><input type="checkbox" id="chkSkyFov" checked> Camera FOV</label>
+        <label class="inline" title="Where the other telescopes in the collaboration are pointing, as they last checked in"><input type="checkbox" id="chkSkyOthers" checked> Other telescopes</label>
+        <span class="spacer"></span>
+        <span class="mono small muted" id="skyTimeLabel">now</span>
+        <button class="btn small" data-sky-time="-3600">−1h</button>
+        <button class="btn small" data-sky-time="-600">−10m</button>
+        <button class="btn small" id="btnSkyNow">Now</button>
+        <button class="btn small" data-sky-time="600">+10m</button>
+        <button class="btn small" data-sky-time="3600">+1h</button>
+      </div>
+    </div>
+
+    <!-- ---------------------------------------------- planner tab -->
+    <div class="tab-panel" data-panel="planner" hidden>
+      <div class="viewer-toolbar sky-toolbar">
+        <div class="sky-search">
+          <input type="text" id="planSearch" spellcheck="false" autocomplete="off"
+                 placeholder="Frame an object — M31, NGC 7000, Veil…">
+          <div class="sky-results" id="planResults" hidden></div>
+        </div>
+        <select id="planSurvey" title="Survey"></select>
+        <label class="inline compact">Field
+          <input type="number" id="planFov" value="3" min="0.05" max="90" step="0.1"
+                 title="How much sky the picture covers, in degrees">
+          <span class="muted">°</span>
+        </label>
+        <button class="btn small" id="btnPlanLoad">Load</button>
+        <!-- Frame against one of your own frames rather than a survey cutout:
+             the field at your focal length, through your filters, with your
+             gradients and your star shapes. -->
+        <button class="btn small" id="btnPlanFits"
+                title="Open a FITS frame and frame against it">Open FITS…</button>
+        <button class="btn small ghost" id="btnPlanFitsClear" hidden
+                title="Go back to the survey picture">Survey</button>
+        <span class="spacer"></span>
+        <button class="btn small" id="btnPlanTargets"
+                title="Targets, collaborations, and tonight's plan">Plan the night</button>
+      </div>
+
+      <div class="reference-bar" id="planReferenceBar" hidden>
+        <b id="planReferenceName">—</b>
+        <span class="mono small" id="planReferenceDetail"></span>
+        <span class="spacer"></span>
+        <button class="btn small ghost" id="btnPlanReferenceGoto"
+                title="Put the framing back on the middle of this frame">Centre on it</button>
+      </div>
+
+      <!-- The bounding rectangle a collaboration gets defined by. Drawn here
+           rather than typed into a form: it is a shape on the sky, and the only
+           honest way to choose one is to see what is inside it. -->
+      <div class="reference-bar" id="planRegionBar" hidden>
+        <b>Collab region</b>
+        <span class="mono small" id="planRegionText">drag a rectangle on the picture</span>
+        <span class="spacer"></span>
+        <button class="btn small ghost" id="btnPlanRegionClear">Clear</button>
+        <button class="btn primary small" id="btnPlanRegionUse" disabled>
+          Use for a collaboration</button>
+      </div>
+
+      <div class="sky-wrap" id="planWrap">
+        <div class="sky-stage planner-stage">
+          <canvas id="planCanvas"></canvas>
+
+          <div class="sky-hud mono" id="planHud">
+            <div id="planHudField">no framing yet</div>
+            <div id="planHudCursor">—</div>
+          </div>
+
+          <div class="sky-loading" id="planEmpty">
+            <p>Search for an object above, or send one here from the Planetarium.</p>
+            <p class="muted small">
+              The survey picture shows what is really there; the rectangle shows
+              what your camera will get.
+            </p>
+          </div>
+          <div class="sky-loading" id="planLoading" hidden>
+            <div class="spinner"></div>
+            <p class="muted small">Fetching survey image…</p>
+          </div>
+          <div class="sky-loading" id="planFailed" hidden>
+            <p>Could not fetch the survey image.</p>
+            <p class="mono small sky-offline-detail" id="planFailedDetail"></p>
+            <button class="btn small" id="btnPlanRetry">Try again</button>
+          </div>
+        </div>
+
+        <!-- Everything you could shoot, and what you have chosen to shoot
+             tonight, side by side. One surface: a collaboration chunk is a
+             target like any other and gets planned the same way, rather than
+             being arranged somewhere else behind this tab's back. -->
+        <aside class="sky-catalog planner-targets" id="planTargets" hidden>
+          <div class="dock-section">
+            <h3 class="row gap">Targets <span class="tag" id="planTargetCount">0</span>
+              <span class="spacer"></span>
+              <button class="btn small ghost danger" id="btnClearTargets"
+                      title="Empty the target list. What has been collected on them is kept.">Clear all</button></h3>
+            <div class="sky-catalog-list dock-list" id="planTargetList"></div>
+          </div>
+
+          <div class="dock-section dock-tonight">
+            <h3>Tonight <span class="tag" id="planTonightCount">0</span>
+              <span class="mono small muted" id="planTonightUsed"></span>
+            </h3>
+            <div class="dock-list dock-drop" id="planTonightList"></div>
+            <p class="small muted">
+              Drag a target or a collaboration chunk in here, then give it the
+              hours you want it to have. Times are pinned: auto-arrange works
+              around them rather than over them.
+            </p>
+          </div>
+        </aside>
+      </div>
+
+      <div class="viewer-status mono small">
+        <span id="planReadout">—</span>
+        <span class="spacer"></span>
+        <span id="planCoverage"></span>
+      </div>
+
+      <div class="viewer-toolbar planner-options">
+        <label class="inline compact">Angle
+          <input type="range" id="planRotation" min="0" max="359" step="1" value="0">
+          <input type="number" id="planRotationValue" min="0" max="359" step="0.1" value="0">
+          <span class="muted">°</span>
+        </label>
+        <button class="btn small" id="btnPlanMatchRotator" title="Use the rotator's current angle">Match rotator</button>
+        <button class="btn small" id="btnPlanMatchCamera"
+                title="Use the camera angle the last plate solve measured">Match camera</button>
+
+        <span class="divider"></span>
+
+        <label class="inline compact">Mosaic
+          <input type="number" id="planRows" value="1" min="1" max="20" step="1" title="rows">
+          <span class="muted">×</span>
+          <input type="number" id="planCols" value="1" min="1" max="20" step="1" title="columns">
+        </label>
+        <label class="inline compact">Overlap
+          <input type="number" id="planOverlap" value="10" min="0" max="80" step="1">
+          <span class="muted">%</span>
+        </label>
+        <select id="planAlign" title="What the camera angle does across the grid">
+          <option value="aligned">Rotator follows grid</option>
+          <option value="fixed">Rotator locked</option>
+        </select>
+
+        <span class="spacer"></span>
+        <button class="btn small" id="btnPlanRegion"
+                title="Drag out the patch of sky a collaboration should cover">
+          Draw a collab region</button>
+        <button class="btn small" id="btnPlanGoto" title="Slew and rotate the rig to this framing">Go to framing</button>
+        <button class="btn primary small" id="btnPlanSave">Save as target</button>
+      </div>
+    </div>
+
+    <!-- ---------------------------------------------- imaging plan tab -->
+    <!-- ------------------------------------------- solar system survey -->
+    <div class="tab-panel" data-panel="survey" hidden>
+      <div class="viewer-toolbar sky-toolbar">
+        <select id="svMode" title="Which of the two surveys this sweep is">
+          <option value="comet">Twilight comet sweep</option>
+          <option value="deep">Deep NEA survey</option>
+        </select>
+        <label class="inline compact">Night of
+          <input type="date" id="svDate">
+        </label>
+        <button class="btn small" id="btnSvTonight">Tonight</button>
+        <select id="svSide" title="Which side of the Sun to sweep">
+          <option value="morning">Morning sweep</option>
+          <option value="evening">Evening sweep</option>
+          <option value="both">Both</option>
+        </select>
+        <button class="btn small primary" id="btnSvOptimise"
+                title="Set everything from tonight's geometry">Best for tonight</button>
+        <button class="btn small" id="btnSvPlan">Plan sweep</button>
+        <span class="spacer"></span>
+        <span class="mono small" id="svWindowLabel">—</span>
+      </div>
+
+      <!-- What the optimiser decided and why, so the settings below are not a
+           black box. -->
+      <div class="survey-advice" id="svAdvice" hidden></div>
+
+      <!-- The single number that says whether tonight is worth running: how
+           close to the Sun the twilight can actually reach. -->
+      <div class="survey-viability" id="svViability">
+        <span class="muted small">viability</span>
+        <span class="mono small" id="svViabilityText">—</span>
+        <span class="spacer"></span>
+        <button class="btn small ghost" id="btnSvSeason">Year view</button>
+      </div>
+
+      <div class="survey-season" id="svSeasonWrap" hidden>
+        <canvas id="svSeason"></canvas>
+        <div class="small muted" id="svSeasonNote">
+          Which mornings and evenings the comet zone is reachable at all. On the
+          flat months it is not a scheduling problem — the zone is below the
+          horizon.
+        </div>
+      </div>
+
+      <div class="survey-layout">
+        <div class="survey-chart-wrap">
+          <div class="survey-chart-bar">
+            <select id="svShowWindow" title="Which twilight to draw" hidden></select>
+            <label class="inline compact" title="Draw the whole grid, not just the fields that fit tonight">
+              <input type="checkbox" id="svShowGrid" checked> Show grid
+            </label>
+            <span class="spacer"></span>
+            <span class="mono small muted" id="svZoomLabel">1.0×</span>
+            <button class="btn small ghost" id="btnSvZoomOut" title="Zoom out">−</button>
+            <button class="btn small ghost" id="btnSvZoomIn" title="Zoom in">+</button>
+            <button class="btn small ghost" id="btnSvZoomReset"
+                    title="Back to the whole sky">Reset</button>
+          </div>
+          <canvas id="svChart" title="Wheel to zoom, drag to pan"></canvas>
+          <div class="survey-scrub">
+            <span class="mono small" id="svClock">—</span>
+            <input type="range" id="svTime" min="0" max="100" value="0" step="1"
+                   title="Step through the twilight window">
+            <span class="mono small muted" id="svSunAlt">—</span>
+          </div>
+        </div>
+
+        <aside class="survey-controls">
+          <h3>Survey region <span class="muted small">Sun-relative</span></h3>
+          <div class="grid-2">
+            <label>Elongation from (°)
+              <input type="number" id="svElongMin" step="1" min="0" max="180" value="30">
+            </label>
+            <label>to (°)
+              <input type="number" id="svElongMax" step="1" min="0" max="180" value="60">
+            </label>
+            <label>Ecliptic latitude ± (°)
+              <input type="number" id="svBeta" step="1" min="1" max="90" value="30">
+            </label>
+            <label>Panel overlap (%)
+              <input type="number" id="svOverlap" step="1" min="0" max="50" value="8">
+            </label>
+          </div>
+          <p class="small muted">
+            Stored against the Sun, not the sky. The Sun moves a degree a day, so
+            a sweep saved as RA and Dec is stale within the week; this one is
+            transformed afresh for whatever date you plan it for.
+          </p>
+
+          <h3>When</h3>
+          <div class="grid-2">
+            <label>Start at Sun (°)
+              <input type="number" id="svSunHigh" step="1" min="-30" max="0" value="-8">
+            </label>
+            <label>End at Sun (°)
+              <input type="number" id="svSunLow" step="1" min="-30" max="0" value="-18">
+            </label>
+          </div>
+
+          <h3>Observability</h3>
+          <div class="grid-2">
+            <label>Minimum altitude (°)
+              <input type="number" id="svMinAlt" step="1" min="0" max="80" value="20">
+            </label>
+            <label>Moon avoidance (°)
+              <input type="number" id="svMoon" step="5" min="0" max="180" value="40">
+            </label>
+            <label>Avoid galactic plane (°)
+              <input type="number" id="svGalactic" step="1" min="0" max="90" value="10">
+            </label>
+            <label>Skip if shot within (nights)
+              <input type="number" id="svRevisit" step="1" min="0" max="60" value="5">
+            </label>
+          </div>
+          <label class="inline"><input type="checkbox" id="svMoonScale" checked>
+            Scale Moon avoidance with its phase</label>
+          <p class="small muted" id="svAltNote"></p>
+
+          <h3>Acquisition <span class="muted small">synthetic tracking</span></h3>
+          <div class="grid-2">
+            <label>Exposure (s)
+              <input type="number" id="svExposure" step="1" min="1" max="600" value="30">
+            </label>
+            <label>Exposures per field
+              <input type="number" id="svCount" step="1" min="1" max="500" value="36">
+            </label>
+            <label>Binning
+              <select id="svBinning">
+                <option value="1">1 × 1</option>
+                <option value="2" selected>2 × 2</option>
+                <option value="3">3 × 3</option>
+                <option value="4">4 × 4</option>
+              </select>
+            </label>
+            <label>Dither (px)
+              <input type="number" id="svDitherPixels" step="0.5" min="0.5" max="50" value="3">
+            </label>
+          </div>
+          <label class="inline"><input type="checkbox" id="svDither" checked>
+            Dither between subs</label>
+          <p class="small muted" id="svAcqNote"></p>
+
+          <h3>Result</h3>
+          <div class="readout-row">
+            <div class="readout"><span>Fields</span><b id="svFields">—</b></div>
+            <div class="readout"><span>Per field</span><b id="svPerField">—</b></div>
+            <div class="readout"><span>Window fits</span><b id="svCapacity">—</b></div>
+          </div>
+          <div class="small mono muted" id="svSummary">not planned yet</div>
+          <div class="survey-warn" id="svWarn" hidden></div>
+
+          <div class="row gap">
+            <input type="text" id="svName" spellcheck="false" placeholder="Sweep name">
+            <select id="svPosition" title="Where in the night's plan it goes">
+              <option value="end">Append</option>
+              <option value="start">Prepend</option>
+            </select>
+            <button class="btn small primary" id="btnSvSave" disabled>Save to plan</button>
+          </div>
+
+          <h3>Coverage <span class="muted small" id="svCoverageCount">0 cells</span></h3>
+          <p class="small muted">
+            Kept in the Sun's frame: "have I shot this?" is a question about the
+            Sun's neighbourhood, and that is a different piece of sky every night.
+            Ticked off automatically as the sequence shoots each field.
+          </p>
+          <button class="btn small ghost danger" id="btnSvClearCoverage">
+            Clear coverage history</button>
+        </aside>
+      </div>
+
+      <div class="survey-table" id="svTable"></div>
+    </div>
+
+    <div class="tab-panel" data-panel="plan" hidden>
+      <div class="viewer-toolbar sky-toolbar">
+        <input type="text" id="schedName" class="plan-name" spellcheck="false"
+               placeholder="Plan name">
+        <!-- No date: the plan is always for tonight, worked out afresh every
+             time it is looked at. The Earth goes round and the sky with it, so
+             a plan pinned to a date is one that is quietly wrong from the
+             following evening. -->
+        <select id="schedSequence" title="Saved sequences"></select>
+        <button class="btn small" id="btnSeqLoad"
+                title="Replace the plan with this saved sequence">Load</button>
+        <button class="btn small" id="btnSeqSave"
+                title="Keep this plan under a name, to bring back another night">Save as…</button>
+        <button class="btn small ghost danger" id="btnSeqDelete">Delete</button>
+        <button class="btn small" id="btnSchedArrange"
+                title="Order the night, give every target a slot, and fill the slots">Auto-arrange</button>
+        <label class="inline compact" id="planChooseWrap"
+               title="Also choose the filters, sub length and frame counts, from the Moon, what each target already has, and its goal">
+          <input type="checkbox" id="planChooseExposures" checked> pick exposures
+        </label>
+        <span class="spacer"></span>
+        <select id="schedAddTarget" title="Add a saved target to the plan"></select>
+        <button class="btn small" id="btnSchedAdd">Add to plan</button>
+      </div>
+
+      <div class="plan-night mono small" id="schedNight">—</div>
+
+      <!-- The whole night in one picture: where the Moon is, every target's
+           curve together, and a lane along the foot showing which of them the
+           telescope is actually on and where the gaps are. -->
+      <div class="night-view" id="nightView">
+        <canvas id="nightGraph" class="night-graph"></canvas>
+        <div class="night-legend" id="nightLegend"></div>
+        <!-- What Auto-arrange chose, and why. An allocation that turns up
+             without a reason is one you have to check by hand, which is most
+             of the work it was meant to save. -->
+        <div class="arrange-report" id="arrangeReport" hidden></div>
+      </div>
+
+      <div class="viewer-toolbar sequence-bar">
+        <span class="seq-dot" id="seqDot"></span>
+        <span class="mono small" id="seqState">idle</span>
+        <span class="spacer"></span>
+        <button class="btn small go" id="btnSeqStart">Run sequence</button>
+        <!-- Night after night, unattended: each night opens at dusk with the
+             mount homed and the cover open, and ends with the mount homed and
+             parked, the cover and roof shut and the cameras warm. -->
+        <button class="btn small loop" id="btnSeqLoop"
+                title="Run the plan tonight and every night after: home, unpark and open at dusk; home, park, close and warm at dawn"><span class="loop-icon" aria-hidden="true">&#x21bb;</span>Run on loop</button>
+        <button class="btn small" id="btnSeqPause" disabled>Pause</button>
+        <button class="btn small" id="btnSeqSkip" disabled>Skip target</button>
+        <button class="btn small danger" id="btnSeqStop" disabled>Stop</button>
+        <!-- Stop ends the run and leaves the rig where it is. This puts the
+             observatory to bed: park, close the cover, warm the cameras. It is
+             deliberately available whether or not a sequence is running,
+             because "something is wrong, shut it down" is not a thing that only
+             happens mid-plan. -->
+        <button class="btn small danger" id="btnSeqAbort"
+                title="Stop, park the mount, close the flat panel and warm the cameras">
+          Abort &amp; park</button>
+      </div>
+
+      <div class="plan-list" id="schedList">
+        <p class="muted small">Loading…</p>
+      </div>
+
+      <div class="viewer-status mono small">
+        <span id="schedSummary">—</span>
+        <span class="spacer"></span>
+        <span class="muted" id="schedSaved">saved automatically</span>
+      </div>
+    </div>
+
+    <!-- ------------------------------------------------ all-sky survey -->
+    <div class="tab-panel" data-panel="allsky" hidden>
+      <div class="viewer-toolbar sky-toolbar">
+        <select id="asSurvey" title="Which all-sky survey"></select>
+        <button class="btn small" id="btnAsNew">New survey…</button>
+        <button class="btn small" id="btnAsToPlan"
+                title="Put it in tonight's plan and give it a slot">Add to plan</button>
+        <span class="spacer"></span>
+        <label class="inline compact" title="Stars, constellations and the deep-sky catalogue">
+          <input type="checkbox" id="asShowSky" checked> Sky
+        </label>
+        <label class="inline compact" title="Draw tonight's fields over the grid">
+          <input type="checkbox" id="asShowTonight" checked> Tonight
+        </label>
+        <label class="inline compact"
+               title="Leave out sky that never rises high enough here; off, it is drawn dimmed">
+          <input type="checkbox" id="asShowReach"> Hide out of reach
+        </label>
+        <button class="btn small" id="btnAsFrameTonight"
+                title="Zoom to the part of the sky being shot tonight">Find tonight</button>
+        <span class="mono small muted" id="asZoomLabel">1.0×</span>
+        <button class="btn small ghost" id="btnAsZoomOut" title="Zoom out">−</button>
+        <button class="btn small ghost" id="btnAsZoomIn" title="Zoom in">+</button>
+        <button class="btn small ghost" id="btnAsZoomReset" title="Back to the whole sky">Reset</button>
+        <button class="btn small ghost danger" id="btnAsDelete">Delete</button>
+      </div>
+
+      <div class="as-progress" id="asProgress">
+        <div class="as-bar"><div class="as-bar-fill" id="asBarFill"></div></div>
+        <div class="as-stats" id="asStats">—</div>
+      </div>
+      <div class="survey-warn" id="asAngleWarning" hidden></div>
+
+      <div class="survey-layout">
+        <div class="survey-chart-wrap">
+          <canvas id="asChart"
+                  title="Wheel to zoom, drag to pan, click a field for its detail"></canvas>
+          <div class="as-legend">
+            <span><i class="as-swatch as-none"></i> not started</span>
+            <span><i class="as-swatch as-part"></i> part done</span>
+            <span><i class="as-swatch as-full"></i> complete</span>
+            <span><i class="as-swatch as-out"></i> out of reach</span>
+            <span><i class="as-swatch as-tonight"></i> tonight, in order</span>
+            <span><i class="as-swatch as-moon"></i> Moon</span>
+            <span class="mono small muted" id="asDrawn">—</span>
+            <span class="spacer"></span>
+            <span class="mono small muted" id="asHover">—</span>
+          </div>
+          <p class="small muted as-note">
+            RA runs right to left, as it does on a star chart, so the
+            constellations are the right way round. The grey lines join each
+            constellation's bright stars to their nearest neighbours — they are
+            not the traditional figures, which the star catalogue does not
+            carry, but they put the patterns where you can find them.
+          </p>
+          <div class="as-field" id="asField" hidden></div>
+        </div>
+
+        <aside class="survey-controls">
+          <h3>Per field</h3>
+          <p class="small muted">
+            What every field in the survey is to be shot with. A field counts as
+            done when it has this many frames of each — from any telescope, so
+            three scopes on the mount finish a field in a third of the time.
+          </p>
+          <div class="cal-sets" id="asGoal"></div>
+          <div class="row gap">
+            <select id="asAddFilter"></select>
+            <button class="btn small" id="btnAsAddFilter">Add a filter</button>
+            <span class="spacer"></span>
+            <button class="btn small primary" id="btnAsSaveGoal">Save</button>
+          </div>
+          <div class="small mono muted" id="asGoalNote">—</div>
+
+          <h3>Tonight</h3>
+          <div class="readout-row">
+            <div class="readout"><span>Fields</span><b id="asTonightCount">—</b></div>
+            <div class="readout"><span>Flips</span><b id="asTonightFlips">—</b></div>
+            <div class="readout"><span>Median airmass</span><b id="asTonightAir">—</b></div>
+          </div>
+          <div class="readout-row">
+            <div class="readout" title="How far the mount moves between one field and the next">
+              <span>Slew per field</span><b id="asTonightSlew">—</b></div>
+            <div class="readout"><span>Slew all night</span><b id="asTonightSlewAll">—</b></div>
+          </div>
+          <div class="readout-row">
+            <div class="readout" title="Separate patches of sky tonight's fields fall into. One is what you want.">
+              <span>Patches</span><b id="asTonightPatches">—</b></div>
+            <div class="readout" title="How many steps land on a field touching the last one">
+              <span>Joined up</span><b id="asTonightJoined">—</b></div>
+          </div>
+          <div class="small mono muted" id="asTonightNote">—</div>
+          <div class="as-tonight-list" id="asTonightList"></div>
+
+          <h3>How it chooses</h3>
+          <div class="grid-2">
+            <label>Minimum altitude (°)
+              <input type="number" id="asMinAlt" step="1" min="0" max="85" value="40">
+            </label>
+            <label>Good enough above (°)
+              <input type="number" id="asQualityAlt" step="1" min="20" max="90" value="70">
+            </label>
+            <label>Furthest past meridian (h)
+              <input type="number" id="asMaxHa" step="0.5" min="0.25" max="12" value="3">
+            </label>
+            <label>Moon avoidance (°)
+              <input type="number" id="asMoon" step="5" min="0" max="180" value="30">
+            </label>
+            <label title="How hard it works to shoot the field next door rather than the best one anywhere">
+              Prefer neighbours
+              <input type="number" id="asSlew" step="0.5" min="0" max="20" value="2">
+            </label>
+            <label title="The longest one visit to a field may last. 0 shoots the whole goal in one go.">
+              Minutes per visit
+              <input type="number" id="asVisit" step="1" min="0" max="600" value="10">
+            </label>
+            <label title="How strongly a part-finished field is preferred over an untouched one">
+              Finish what is started
+              <input type="number" id="asFinish" step="5" min="0" max="200" value="25">
+            </label>
+          </div>
+          <p class="small muted" id="asVisitNote">—</p>
+          <label class="inline"><input type="checkbox" id="asFlips" checked>
+            Never shoot before the meridian (no flips)</label>
+          <label class="inline"><input type="checkbox" id="asMoonScale" checked>
+            Scale Moon avoidance with its phase</label>
+          <div class="row gap">
+            <span class="spacer"></span>
+            <button class="btn small" id="btnAsSaveSettings">Save</button>
+          </div>
+          <p class="small muted">
+            Fields are only ever shot <b>after</b> they cross the meridian. That
+            one rule catches each field within minutes of its transit — the
+            highest it ever gets from here — and keeps the mount on one side of
+            the pier all night, so a German equatorial never flips. Above
+            <b>good enough</b> the extra altitude buys nothing (70° is airmass
+            1.06), so the survey spreads across a band of declination instead of
+            grinding away at the zenith for a year.
+          </p>
+        </aside>
+      </div>
+    </div>
+
+    <!-- ------------------------------------------------ calibrate -->
+    <div class="tab-panel" data-panel="calibrate" hidden>
+      <div class="viewer-toolbar sky-toolbar">
+        <select id="calRecipe" title="A saved set of calibration frames"></select>
+        <button class="btn small" id="btnCalNew" title="Start an empty recipe">New</button>
+        <button class="btn small" id="btnCalSuggest"
+                title="Build one from what is connected right now">Suggest</button>
+        <button class="btn small" id="btnCalSave">Save recipe</button>
+        <button class="btn small ghost danger" id="btnCalDelete">Delete</button>
+        <span class="spacer"></span>
+        <select id="calScope" title="Which telescope to shoot on"></select>
+        <button class="btn small" id="btnCalToPlan"
+                title="Run it as a task in tonight's plan instead">Add to plan</button>
+        <button class="btn small primary" id="btnCalRun">Run now</button>
+        <button class="btn small danger" id="btnCalAbort" disabled>Abort</button>
+      </div>
+
+      <div class="cal-progress" id="calProgress" hidden>
+        <span class="seq-dot"></span>
+        <div class="seq-headline">
+          <b id="calRunName">—</b>
+          <span class="muted" id="calRunStage">—</span>
+        </div>
+        <div class="seq-bars">
+          <div class="seq-bar-row">
+            <span class="seq-bar-label">set</span>
+            <div class="seq-bar"><div class="seq-bar-fill" id="calSetFill"></div></div>
+            <span class="mono seq-bar-value" id="calSetValue">—</span>
+          </div>
+          <div class="seq-bar-row">
+            <span class="seq-bar-label">frame</span>
+            <div class="seq-bar"><div class="seq-bar-fill" id="calFrameFill"></div></div>
+            <span class="mono seq-bar-value" id="calFrameValue">—</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="survey-layout">
+        <div class="survey-chart-wrap">
+          <div class="row gap">
+            <input type="text" id="calName" class="plan-name" spellcheck="false"
+                   placeholder="Recipe name">
+            <span class="spacer"></span>
+            <span class="mono small muted" id="calEstimate">—</span>
+          </div>
+
+          <div class="cal-sets" id="calSets">
+            <p class="muted small">Loading…</p>
+          </div>
+
+          <div class="row gap">
+            <select id="calAddType">
+              <option value="bias">Bias</option>
+              <option value="dark" selected>Dark</option>
+              <option value="flat">Flat</option>
+              <option value="darkflat">Dark for the flats</option>
+            </select>
+            <button class="btn small" id="btnCalAddSet">Add a set</button>
+            <span class="spacer"></span>
+            <button class="btn small" id="btnCalAllFilters"
+                    title="One line of flats covering every filter in the wheel">
+              Flats for every filter</button>
+          </div>
+          <p class="small muted">
+            <b>Suggest</b> builds the set a night needs: bias frames, a dark at
+            every exposure your filters are shot at (the defaults under
+            Equipment → Default exposure per filter), and a flat through every
+            filter. Flats always measure their own exposure — what reaches the
+            sensor depends on the panel, the filter and the optics, and a sky
+            flat re-measures every frame — so there is nothing to type for one.
+          </p>
+
+          <p class="small muted">
+            Every telescope shoots the set at the same time and each gets its own
+            master, tagged with its own name. Flats have to work that way — the
+            dust and the vignetting are the telescope's, not the mount's — and a
+            telescope's flats are only ever given back to that telescope.
+          </p>
+
+          <h3>Last run</h3>
+          <div class="cal-results" id="calResults">
+            <p class="muted small">Nothing has been shot yet this session.</p>
+          </div>
+        </div>
+
+        <aside class="survey-controls">
+          <!-- The one question this tab has to answer at a glance: is there a
+               valid, current set of masters for what tonight will shoot? Each
+               thing the night needs is a row, and each row is one of three
+               words, because those are the three things a person can do. -->
+          <h3>Calibration masters <span class="tag" data-role="rig-scope">—</span></h3>
+          <div class="cal-coverage" id="calCoverage">
+            <div class="cal-coverage-head" id="calCoverageHead">—</div>
+            <div class="cal-coverage-rows" id="calCoverageRows"></div>
+          </div>
+
+          <h3>Library <span class="tag" id="calLibraryCount">—</span></h3>
+          <!-- The folder itself is set in Equipment, beside the capture root,
+               so there is one field for it rather than two that can disagree. -->
+          <div class="row gap">
+            <span class="mono small grow" id="calLibraryDir">—</span>
+            <button class="btn small ghost" id="btnCalLibraryDir"
+                    title="Set the folder in Equipment">Change…</button>
+          </div>
+          <p class="small muted" id="calLibraryNote">—</p>
+          <div class="row gap">
+            <button class="btn small" id="btnCalImport"
+                    title="Bring in a master built in PixInsight, Siril or anything else — FITS or XISF">
+              Add a master file…</button>
+          </div>
+
+          <div class="cal-masters" id="calMasters"></div>
+
+          <h3>Applying them to lights</h3>
+          <label>Calibrate automatically
+            <select id="calApplyTo">
+              <option value="survey">Survey frames only</option>
+              <option value="all">Every light frame</option>
+              <option value="off">Never</option>
+            </select>
+          </label>
+          <p class="small muted">
+            The raw frame is always kept. A calibrated copy is written beside it
+            in a <b>calibrated</b> subfolder, with the masters it used named in
+            its header.
+          </p>
+
+          <h3>What counts as a match</h3>
+          <div class="grid-2">
+            <label>Temperature within (°C)
+              <input type="number" id="calMatchTemp" step="0.5" min="0" max="50" value="2">
+            </label>
+            <label>Exposure within (%)
+              <input type="number" id="calMatchExp" step="1" min="0" max="100" value="5">
+            </label>
+            <label>Flats good for (days)
+              <input type="number" id="calFlatAge" step="1" min="0" max="3650" value="30">
+            </label>
+            <label>Darks good for (days)
+              <input type="number" id="calDarkAge" step="1" min="0" max="3650" value="180">
+            </label>
+          </div>
+
+          <h3>Building masters</h3>
+          <div class="grid-2">
+            <label>Combine by
+              <select id="calStackMethod">
+                <option value="sigma">Sigma-clipped mean</option>
+                <option value="median">Median</option>
+                <option value="mean">Mean</option>
+              </select>
+            </label>
+            <label>Clip at (Ïƒ)
+              <input type="number" id="calSigma" step="0.5" min="0.5" max="10" value="3">
+            </label>
+            <label>Flats aim for (ADU)
+              <input type="number" id="calFlatAdu" step="500" min="100" max="65000" value="25000">
+            </label>
+            <label>Panel brightness (%)
+              <input type="number" id="calPanelBrightness" step="5" min="0" max="100" value="50">
+            </label>
+            <label>Never dim below (%)
+              <input type="number" id="calFlatMinBright" step="1" min="1" max="100" value="5">
+            </label>
+            <label>Shortest flat (s)
+              <input type="number" id="calFlatMinExp" step="0.000001" min="0.000001"
+                     max="600" value="0.000032">
+            </label>
+            <label>Longest flat (s)
+              <input type="number" id="calFlatMaxExp" step="1" min="0.01" max="600" value="30">
+            </label>
+          </div>
+          <label class="inline"><input type="checkbox" id="calAutoBright" checked>
+            Set the panel brightness automatically</label>
+          <p class="small muted">
+            With this on, <b>panel brightness</b> is only the first guess: each
+            filter gets the brightness and exposure that put it on target
+            together. Searching the exposure alone cannot work for luminance —
+            it passes several times the light of any narrowband filter, so a
+            panel set for Ha saturates L before the shutter can close. A set
+            that names its own brightness keeps it.
+          </p>
+          <p class="small muted">
+            The shortest flat is the one that matters on a fast telescope: a
+            RASA under a daylit sky is at the target level in a fraction of a
+            millisecond, and a floor set any higher just reports that the sky is
+            too bright. Take it down to whatever your camera's own minimum is —
+            32&nbsp;µs (0.000032&nbsp;s) on most CMOS.
+          </p>
+          <label class="inline"><input type="checkbox" id="calKeepSubs" checked>
+            Keep the individual frames after stacking</label>
+
+          <h3>Sky flats</h3>
+          <div class="grid-2">
+            <label>Point at
+              <select id="calSkyPointing">
+                <option value="zenith">The zenith</option>
+                <option value="antisolar">Opposite the Sun</option>
+              </select>
+            </label>
+            <label>Altitude (°)
+              <input type="number" id="calSkyAltitude" step="1" min="30" max="90" value="80">
+            </label>
+            <label>Move between frames (′)
+              <input type="number" id="calSkyDither" step="0.5" min="0" max="60" value="2">
+            </label>
+            <label>Keep frames within (%)
+              <input type="number" id="calSkyAccept" step="5" min="2" max="90" value="40">
+            </label>
+            <label>Off the meridian (°)
+              <input type="number" id="calSkyMeridian" step="1" min="0" max="45" value="0">
+            </label>
+          </div>
+          <label class="inline"><input type="checkbox" id="calSkyTracking">
+            Keep tracking during the flats</label>
+          <div class="small mono" id="calFlatSpot">—</div>
+          <p class="small muted">
+            Tracking is off by default: nothing in a flat has to stay still, and
+            a mount that is not tracking never crosses the meridian, so the
+            zenith is fine on any mount. <b>Off the meridian</b> only matters if
+            you turn tracking back on, when a German equatorial parked at the
+            zenith could flip half way through and leave the second half of the
+            frames rotated against the first.
+          </p>
+          <p class="small muted">
+            The telescope is moved a little between every frame, so the stars
+            land somewhere different each time and the stack combines them out.
+            Twilight changes by a factor of two every few minutes, so every
+            frame sets the exposure for the next one and anything that lands
+            too far off is thrown away. The set ends when it has what it was
+            asked for, or when the sky leaves the range the camera can follow.
+          </p>
+
+          <h3>The light path</h3>
+          <label class="inline"><input type="checkbox" id="calAutoCover" checked>
+            Open the cover before any light frame</label>
+          <p class="small muted">
+            Calibration shuts the cover for the darks and lights the panel for
+            the flats. With this on, the next frame that needs sky — a sub, a
+            focus exposure, a plate solve, or Capture on the Image tab — puts
+            the panel out and opens the cover itself, and waits for it. Turn it
+            off if you open the telescope by hand.
+          </p>
+
+          <div class="row gap">
+            <span class="spacer"></span>
+            <button class="btn small primary" id="btnCalSaveSettings">Save settings</button>
+          </div>
+
+          <h3>Right now <span class="tag" data-role="rig-scope">—</span></h3>
+          <div class="small mono" id="calMatchNow">—</div>
+        </aside>
+      </div>
+    </div>
+
+    <!-- --------------------------------------- bringing in a master file -->
+    <dialog id="calImportDialog" class="modal">
+      <form method="dialog" class="modal-head">
+        <h2>Add a master file</h2>
+        <span class="spacer"></span>
+        <button class="btn small ghost" value="close">Close</button>
+      </form>
+      <div class="modal-body">
+        <p class="small muted">
+          A master built somewhere else — PixInsight, Siril, N.I.N.A. — as
+          FITS or XISF. It is copied into the library as a 16-bit FITS master
+          with its details in the header; the original is not touched.
+        </p>
+        <div class="row gap">
+          <input type="text" id="calImportPath" class="grow" spellcheck="false"
+                 placeholder="C:\…\master_dark_300s.xisf">
+          <button class="btn small" id="btnCalImportBrowse">Browse…</button>
+          <button class="btn small" id="btnCalImportRead">Read it</button>
+        </div>
+        <p class="small mono muted" id="calImportFound">—</p>
+        <div class="grid-2">
+          <label>What it is
+            <select id="calImportType">
+              <option value="">— say what it is —</option>
+              <option value="bias">Bias</option>
+              <option value="dark">Dark</option>
+              <option value="flat">Flat</option>
+              <option value="darkflat">Dark for the flats</option>
+            </select>
+          </label>
+          <label>Filter (flats)
+            <input type="text" id="calImportFilter" maxlength="24" spellcheck="false"
+                   placeholder="L, R, H…">
+          </label>
+          <label>Exposure (s)
+            <input type="number" id="calImportExposure" step="0.001" min="0" max="3600">
+          </label>
+          <label>Sensor temperature (°C)
+            <input type="number" id="calImportTemp" step="0.5" min="-60" max="60"
+                   placeholder="unknown">
+          </label>
+          <label>Gain
+            <input type="number" id="calImportGain" step="1" min="0" placeholder="unknown">
+          </label>
+          <label>Offset
+            <input type="number" id="calImportOffset" step="1" min="0" placeholder="unknown">
+          </label>
+          <label>Binning
+            <select id="calImportBin">
+              <option value="1">1 × 1</option>
+              <option value="2">2 × 2</option>
+              <option value="3">3 × 3</option>
+              <option value="4">4 × 4</option>
+            </select>
+          </label>
+          <label>Telescope (flats)
+            <input type="text" id="calImportScope" maxlength="60" spellcheck="false">
+          </label>
+        </div>
+        <p class="small muted">
+          What the file's header says is filled in; correct anything it got
+          wrong. A dark needs its exposure and temperature to be matched to
+          the lights; a flat needs its filter and, with more than one
+          telescope, whose it is.
+        </p>
+        <div class="row gap">
+          <span class="spacer"></span>
+          <button class="btn small primary" id="btnCalImportGo">Add to the library</button>
+        </div>
+      </div>
+    </dialog>
+
+    <!-- ------------------------------------------------------------ collab -->
+    <!-- Two things, and deliberately only two: start a collaboration, and take
+         part in one. Everything else that used to live here - enrolling
+         telescopes by hand, dealing chunks out, a ledger with override buttons -
+         was machinery showing through. The server deals the sky out by itself
+         and the progress bars say how it is going, so none of it had to be on
+         screen. -->
+    <div class="tab-panel" data-panel="collab" hidden>
+
+      <div class="viewer-toolbar sky-toolbar">
+        <b>Collaborations</b>
+        <span class="pill" id="colServerPill"><span class="dot"></span><span
+              id="colServerText">not configured</span></span>
+        <!-- Who is about: telescopes checked in lately, and the people
+             behind them. Refreshed with every poll. -->
+        <span class="col-online mono small" id="colOnline" title="Telescopes that have checked in within the last 25 minutes">—</span>
+        <span class="spacer"></span>
+        <label class="inline small" title="Let the others see where this telescope points and what it is shooting. Never your location.">
+          <input type="checkbox" id="colShare" checked> Share my position</label>
+        <button class="btn small" id="btnColRefresh">Refresh</button>
+      </div>
+
+      <div class="collab-page">
+
+        <!-- Joining: one button. Sign in with Discord and this telescope is
+             enrolled behind it. Everything else about the connection lives
+             under Advanced and almost nobody opens it. -->
+        <div class="plan-box col-join" id="colJoinBox">
+          <div class="row gap">
+            <div class="grow">
+              <b id="colWhoName">Not joined yet</b>
+              <div class="small muted" id="colWhoNote">
+                One button: sign in with Discord and this telescope is
+                enrolled. You need to be a member of the Discord server.
+              </div>
+            </div>
+            <button class="btn primary" id="btnColLogin">Join with Discord</button>
+            <button class="btn small ghost" id="btnColLogout" hidden>Sign out</button>
+          </div>
+        </div>
+
+        <!-- ------------------------------------------------- 1. start one -->
+        <details class="fold" id="colStartFold">
+          <summary>Start a collaboration</summary>
+          <div class="plan-box">
+            <div class="row gap">
+              <label class="inline"><input type="radio" name="colShape"
+                     id="colShapeOne" value="one" checked> One target</label>
+              <label class="inline"><input type="radio" name="colShape"
+                     id="colShapeMosaic" value="mosaic"> A mosaic</label>
+            </div>
+
+            <div class="col-region" id="colRegionBox">
+              <div class="grow">
+                <b id="colRegionText">Nothing chosen yet</b>
+                <div class="small muted" id="colRegionHint">
+                  Pick one of your targets, or draw a rectangle in the Planner.
+                </div>
+              </div>
+              <select id="colTargetPick" title="One of your saved targets"></select>
+              <button class="btn small" id="btnColFrame">
+                Frame it in the Planner</button>
+              <button class="btn small" id="btnColDraw" hidden>
+                Draw it in the Planner</button>
+            </div>
+
+            <div class="grid-2">
+              <label>Name
+                <input type="text" id="colPName" spellcheck="false"
+                       placeholder="Cygnus wide mosaic">
+              </label>
+              <label>What it is for
+                <input type="text" id="colPNotes" spellcheck="false"
+                       placeholder="optional">
+              </label>
+            </div>
+
+            <h4>Filters, and how deep to go</h4>
+            <p class="small muted">
+              Hours wanted at every point of the sky it covers. A 3 nm Ha and a
+              7 nm Ha are not the same data, so say which you will take.
+            </p>
+            <div id="colPFilters"></div>
+            <button class="btn small" id="btnColAddFilter">Add a filter</button>
+
+            <details class="fold">
+              <summary>What you will accept</summary>
+              <p class="small muted">
+                Blank means no limit. Star size and guiding are in arcseconds,
+                not pixels: that is the only unit meaning the same thing on two
+                telescopes.
+              </p>
+              <div class="grid-2">
+                <label>Shortest focal length (mm)
+                  <input type="number" id="colRMinFocal" step="10" min="0">
+                </label>
+                <label>Longest focal length (mm)
+                  <input type="number" id="colRMaxFocal" step="10" min="0">
+                </label>
+                <label>Stars no worse than (")
+                  <input type="number" id="colRMaxHfr" step="0.1" min="0">
+                </label>
+                <label id="colRMinFramesBox" title="A telescope stacks its own frames before anything is blended, and three subs on a panel do not stack. A night is never cut into visits shorter than this in any filter.">Fewest frames per panel a night
+                  <input type="number" id="colRMinFrames" step="1" min="1" placeholder="10">
+                </label>
+                <label>Guiding no worse than (")
+                  <input type="number" id="colRMaxRms" step="0.05" min="0">
+                </label>
+                <label>Shortest sub (s)
+                  <input type="number" id="colRMinExp" step="10" min="0">
+                </label>
+                <label>Longest sub (s)
+                  <input type="number" id="colRMaxExp" step="10" min="0">
+                </label>
+                <label>Moon at most (% lit)
+                  <input type="number" id="colRMoonIll" step="5" min="0" max="100">
+                </label>
+                <label>Moon at least (degrees away)
+                  <input type="number" id="colRMoonSep" step="5" min="0" max="180">
+                </label>
+                <label title="Nobody shoots it lower than this. Every rig's own observatory floor still applies on top.">Altitude at least (degrees)
+                  <input type="number" id="colRMinAlt" step="5" min="0" max="85">
+                </label>
+              </div>
+              <label class="inline"><input type="checkbox" id="colRCalibrated">
+                Only calibrated frames count</label>
+              <div class="row gap" style="margin-top: 6px">
+                <label class="inline"><input type="checkbox" id="colRColour" checked>
+                  One-shot colour cameras may take part</label>
+                <label class="inline">— only with the Moon under
+                  <input type="number" id="colRColourMoon" step="5" min="0" max="100"
+                         style="width: 64px" placeholder="any"> % lit</label>
+              </div>
+              <p class="small muted">
+                A colour camera shoots broadband RGB whatever is in front of it,
+                so it has nothing to give a narrowband project and nothing usable
+                on a bright night. To take its data, list a filter named
+                <b>RGB</b> above.
+              </p>
+            </details>
+
+            <div class="row gap" style="margin-top: 10px">
+              <span class="spacer"></span>
+              <button class="btn small primary" id="btnColCreate">
+                Start it</button>
+            </div>
+          </div>
+        </details>
+
+        <!-- ------------------------------------------------ 2. take part -->
+        <h3 class="collab-heading">Active collaborations
+          <span class="tag" id="colOpenCount">0</span></h3>
+        <div id="colBrowse">
+          <p class="small muted">Set a server above, then refresh.</p>
+        </div>
+
+        <div id="colTask"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ------------------------------------------------ analysis -->
+  <aside class="column column-right">
+
+    <section class="panel" id="panel-stretch" data-toggle-panel="stretch" hidden>
+      <h2>Display Stretch</h2>
+      <label class="inline"><input type="checkbox" id="chkAuto" checked> Auto stretch</label>
+      <label class="inline"><input type="checkbox" id="chkInvert"> Invert</label>
+      <label class="small">Black <span class="mono muted" id="blackValue"></span>
+        <input type="range" id="black" min="0" max="1000" value="0">
+      </label>
+      <label class="small">Midtone <span class="mono muted" id="midtoneValue"></span>
+        <input type="range" id="midtone" min="0" max="1000" value="500">
+      </label>
+      <label class="small">White <span class="mono muted" id="whiteValue"></span>
+        <input type="range" id="white" min="0" max="1000" value="1000">
+      </label>
+      <canvas id="histogram" height="90"></canvas>
+    </section>
+
+    <section class="panel" id="panel-solver" data-only-tab="sky">
+      <h2>Plate Solve <span class="tag" id="solverTag">—</span></h2>
+      <div class="row gap">
+        <button class="btn small flex" id="btnSolve">Solve</button>
+        <button class="btn small flex" id="btnSolveSync">Solve &amp; Sync</button>
+      </div>
+      <div class="row gap">
+        <button class="btn small primary flex" id="btnSolveCenter">Centre here</button>
+        <button class="btn small danger" id="btnSolveAbort" disabled>Abort</button>
+      </div>
+      <div class="small mono muted" id="solveState">idle</div>
+      <div class="readout-row">
+        <div class="readout"><span>RA</span><b id="solveRa">—</b></div>
+        <div class="readout"><span>Dec</span><b id="solveDec">—</b></div>
+      </div>
+      <div class="readout-row">
+        <div class="readout"><span>Scale</span><b id="solveScale">—</b></div>
+        <div class="readout"><span>Rotation</span><b id="solveRotation">—</b></div>
+        <div class="readout"><span>Field</span><b id="solveField">—</b></div>
+      </div>
+      <div class="row gap">
+        <button class="btn small ghost flex" id="btnSolveTarget">Send to planetarium</button>
+      </div>
+    </section>
+
+    <section class="panel" id="panel-run" data-toggle-panel="run" hidden>
+      <h2>Autofocus <span class="tag" id="focusTag">—</span></h2>
+      <canvas id="focusCurve" class="run-chart"></canvas>
+      <div class="small mono muted" id="focusDetail">no focus run yet</div>
+
+      <h3>Subs this run <span class="tag" id="frameCount">0</span></h3>
+      <canvas id="hfrChart" class="run-chart"></canvas>
+      <div class="readout-row">
+        <div class="readout"><span>HFR now</span><b id="hfrNow">—</b></div>
+        <div class="readout"><span>Drift</span><b id="hfrDrift">—</b></div>
+        <div class="readout"><span>Pointing</span><b id="pointingError">—</b></div>
+      </div>
+      <div class="small mono muted" id="runDetail">nothing captured yet</div>
+    </section>
+
+    <!-- The building rather than the telescope: what the weather is doing,
+         what is over the scope, and what is switched on. -->
+    <section class="panel" id="panel-observatory" data-toggle-panel="observatory" hidden>
+      <h2>Observatory</h2>
+
+      <div class="safety-banner" id="safetyBanner">Not watching the weather</div>
+
+      <div class="readout-row" id="domeRow" hidden>
+        <div class="readout"><span>Roof</span><b id="domeShutter">—</b></div>
+        <div class="readout"><span>Dome</span><b id="domeAz">—</b></div>
+      </div>
+      <div class="row gap" id="domeControls" hidden>
+        <button class="btn small" id="btnRoofOpen">Open roof</button>
+        <button class="btn small danger" id="btnRoofClose">Close roof</button>
+        <button class="btn small ghost" id="btnDomeSlave">Slave</button>
+      </div>
+
+      <h3 id="switchHeading" hidden>Power</h3>
+      <div class="switch-list" id="switchList" hidden></div>
+
+      <p class="small muted" id="observatoryNote">
+        Connect a safety monitor, a dome and a power box on the Equipment rows.
+      </p>
+    </section>
+
+    <!-- The camera watching the telescope. Lives beside the frames rather than
+         in a window of its own: "is the scope where it should be, and is
+         anything about to hit anything" is a question you ask while looking at
+         a sub coming in, not one you go somewhere else for. -->
+    <section class="panel" id="panel-piercam" data-toggle-panel="piercam" hidden>
+      <h2>Pier cam <span class="tag" data-role="pier-name">—</span></h2>
+      <div class="piercam-frame">
+        <img id="piercamImage" alt="Live view of the telescope" hidden>
+        <div class="piercam-empty" id="piercamEmpty">No pier camera connected</div>
+      </div>
+      <div class="readout-row">
+        <div class="readout"><span>Exposure</span><b id="piercamExposure">—</b></div>
+        <div class="readout"><span>Gain</span><b id="piercamGain">—</b></div>
+        <div class="readout"><span>Level</span><b id="piercamLevel">—</b></div>
+      </div>
+      <div class="small mono muted" id="piercamDetail">waiting for a frame</div>
+    </section>
+
+    <section class="panel grow" id="panel-session" data-toggle-panel="session" hidden>
+      <h2>Session <span class="tag" id="imageCount">0</span></h2>
+      <div id="imageList" class="image-list muted-empty">No captures yet</div>
+    </section>
+
+    <section class="panel grow" id="panel-log" data-toggle-panel="log" hidden>
+      <h2>Log</h2>
+      <div id="log" class="log"></div>
+    </section>
+
+  </aside>
+</main>
+
+<!-- ------------------------------------------------ floating focus window -->
+<!-- A focus run is something you watch, not something you go and find. This
+     rides over the image, can be dragged out of the way, and takes itself off a
+     few seconds after the sweep lands. -->
+<div id="focusFloat" class="float-window" hidden>
+  <div class="float-head" id="focusFloatHead">
+    <span class="float-title">Autofocus</span>
+    <span class="tag" id="focusFloatScope">—</span>
+    <span class="spacer"></span>
+    <button class="btn small danger" id="focusFloatAbort" hidden
+            title="Stop the sweep and put the focuser back where it started">Abort</button>
+    <button class="btn small ghost" id="focusFloatPin"
+            title="Keep this open after the run finishes">Pin</button>
+    <button class="btn small ghost" id="focusFloatClose" title="Close">✕</button>
+  </div>
+  <div class="float-body">
+    <!-- One per telescope, once there is more than one. Three RASAs sweep at
+         the same time, and watching only whichever happens to still be going
+         is no way to tell whether all three landed. -->
+    <div class="focus-tabs" id="focusFloatTabs" hidden></div>
+    <canvas id="focusFloatCurve" class="run-chart"></canvas>
+    <div class="small mono muted" id="focusFloatDetail">no focus run yet</div>
+    <div class="readout-row">
+      <div class="readout"><span>Position</span><b id="focusFloatPos">—</b></div>
+      <div class="readout"><span>HFD</span><b id="focusFloatHfd">—</b></div>
+      <div class="readout"><span>Temp</span><b id="focusFloatTemp">—</b></div>
+    </div>
+  </div>
+</div>
+
+<!-- ------------------------------------------------ equipment dialog -->
+<!-- One dialog, one subject per page. It used to be a single column four
+     screens tall, where the dithering settings were below the focuser settings
+     for no reason other than the order they were written in; now the left rail
+     says what is in here and the Save button never scrolls away. -->
+<dialog id="equipmentDialog" class="modal wide">
+  <form method="dialog" class="modal-head">
+    <h2>Equipment</h2>
+    <span class="spacer"></span>
+    <button class="btn small ghost" value="close">Close</button>
+  </form>
+
+  <div class="modal-split">
+  <nav class="pref-nav" id="equipmentNav"></nav>
+  <div class="modal-body" id="equipmentBody">
+
+    <section class="pref" data-pref="connection" data-pref-label="Connection">
+    <h3>Profile</h3>
+    <div class="row gap">
+      <select id="profileSelect" class="grow"></select>
+      <button class="btn small" id="btnProfileLoad">Load</button>
+      <button class="btn small" id="btnProfileSave">Save as…</button>
+      <button class="btn small ghost danger" id="btnProfileDelete">Delete</button>
+    </div>
+    <p class="small muted">
+      A profile remembers every telescope here, which driver each of its slots
+      connects to, and the settings around them — so a rig that comes apart in
+      the spring goes back together in one click.
+    </p>
+    <div class="row gap">
+      <button class="btn small" id="btnNinaImport">Import from N.I.N.A.…</button>
+      <span class="small muted">Your focal length, pixel size, filters and
+        their offsets, focus and dither settings, ASTAP, and which driver is
+        which — read from the N.I.N.A. profile you last used, shown before
+        anything is written.</span>
+    </div>
+
+    <h3>Telescopes</h3>
+    <div id="rigTabs" class="rig-tabs"></div>
+    <div class="row gap">
+      <button class="btn ghost small" id="btnRigAdd">Add telescope</button>
+      <button class="btn ghost small" id="btnRigRename">Rename</button>
+      <button class="btn ghost small" id="btnRigMaster">Make master</button>
+      <span class="spacer"></span>
+      <button class="btn ghost small danger" id="btnRigRemove">Remove</button>
+    </div>
+    <p class="small muted" id="rigNote">
+      The master carries the mount and the guider and decides where everything
+      points. Every other telescope is bolted to the same mount: it focuses and
+      exposes in step with the master, and never exposes while the master is
+      dithering.
+    </p>
+
+    <div id="connectList" class="connect-list"></div>
+
+    <div class="row gap">
+      <button class="btn primary small" id="btnConnectAll">Connect all</button>
+      <button class="btn small" id="btnRigConnect">This telescope</button>
+      <button class="btn ghost small" id="btnScanAlpaca">Scan Alpaca</button>
+      <button class="btn ghost small" id="btnRefreshDrivers">Refresh drivers</button>
+      <span class="spacer"></span>
+      <button class="btn ghost small danger" id="btnDisconnectAll">Disconnect all</button>
+    </div>
+    <p class="small muted">
+      <b>Connect all</b> brings up every telescope's remembered drivers — each
+      device is remembered the first time you connect it by hand. Set a row to
+      <b>— none —</b> and press Connect to leave that slot empty, so a telescope
+      with no rotator does not report one missing every night.
+    </p>
+
+    <p class="small muted" id="backendNote">
+      ASCOM drivers appear automatically. Alpaca devices need a scan. PHD2 must be
+      running with its server enabled (Tools → Enable Server).
+    </p>
+    </section>
+
+    <section class="pref" data-pref="camera" data-pref-label="Camera" hidden>
+    <h3>Camera <span class="tag" data-role="rig-scope">—</span></h3>
+    <div class="grid-2">
+      <label>Gain
+        <input type="number" id="camGain" step="1" min="0" max="100000" placeholder="leave blank to keep">
+      </label>
+      <label>Offset
+        <input type="number" id="camOffset" step="1" min="0" max="100000" placeholder="leave blank to keep">
+      </label>
+      <label>Cool to (°C)
+        <input type="number" id="camSetpoint" step="0.5" min="-60" max="40" value="-10">
+      </label>
+      <label>Within (°C)
+        <input type="number" id="camTolerance" step="0.1" min="0.1" max="20" value="1">
+      </label>
+      <label>Give up after (min)
+        <input type="number" id="camCoolTimeout" step="1" min="1" max="180" value="20">
+      </label>
+      <label>Warm at (°C/min)
+        <input type="number" id="camWarmRate" step="0.5" min="0.5" max="30" value="3">
+      </label>
+    </div>
+    <label class="inline"><input type="checkbox" id="camCoolStart" checked> Cool down when a sequence starts</label>
+    <label class="inline"><input type="checkbox" id="camWarmEnd" checked> Warm up when it finishes</label>
+    <label class="inline"><input type="checkbox" id="camWaitCooling"> Wait for temperature before the first slew</label>
+    <p class="small muted">
+      Gain and offset are applied when a sequence starts, so a night always
+      begins from the same settings. Warming is ramped rather than switched off
+      — a fast change can condense moisture onto the sensor window.
+    </p>
+    <p class="small muted">
+      The cooler comes on the moment the sequence starts either way. Leave the
+      wait off and the night gets on with homing, slewing, centring and focusing
+      while the sensor comes down, and only pauses for temperature immediately
+      before the first light frame — by which time there is usually nothing left
+      to wait for. Turn it on to hold everything still until the setpoint is
+      reached.
+    </p>
+
+    <h3>Camera angle <span class="tag" data-role="rig-scope">—</span></h3>
+    <div class="grid-2">
+      <label>Angle (°, 0 = north up)
+        <input type="number" id="opticsAngle" step="0.01" min="-360" max="360" value="0">
+      </label>
+      <label>Last measured
+        <input type="text" id="opticsAngleSolved" readonly>
+      </label>
+    </div>
+    <label class="inline"><input type="checkbox" id="opticsAngleFromSolve" checked>
+      Update it from every plate solve</label>
+    <p class="small muted">
+      The position angle the sensor actually sits at. Everything that has to
+      know what shape of sky the camera covers uses it — mosaic panels and the
+      framing rectangle. A plate solve measures it exactly, so leave the box
+      ticked and it stays right; it is left alone while a rotator is connected,
+      because there the angle is commanded per target rather than fixed by how
+      the camera sits.
+    </p>
+    </section>
+
+    <section class="pref" data-pref="filters" data-pref-label="Filters" hidden>
+    <h3>Filters <span class="tag" data-role="rig-scope">—</span></h3>
+    <p class="small muted">
+      Name the slots, in the order they are fitted in the wheel. Slot 1 here has
+      to be slot 1 in the wheel: everything downstream matches on the name, so
+      get the order wrong and the sequencer asks for Ha and moves to whatever is
+      really in that position. Leave a slot blank if it is empty.
+    </p>
+    <div class="filter-slots" id="camFilterSlots"></div>
+    <datalist id="filterNameOptions"></datalist>
+    <div class="row gap">
+      <button class="btn small ghost" id="btnFilterAdd">Add a slot</button>
+      <button class="btn small ghost" id="btnFilterFromWheel"
+              title="Take the names and the order from what the wheel reports">From wheel</button>
+      <button class="btn small ghost" id="btnFilterClear">Clear</button>
+    </div>
+    <p class="small muted" id="camFilterNote">—</p>
+
+    <label class="inline"><input type="checkbox" id="camColour">
+      One-shot colour camera</label>
+    <p class="small muted">
+      Learned from the camera's own Bayer matrix the first time it connects,
+      and kept. Tick it yourself if the camera has not been connected yet: a
+      collaboration needs to know before it lets a colour camera in.
+    </p>
+
+    <label>In the light path now
+      <select id="camFixedFilter"></select>
+    </label>
+    <p class="small muted">
+      For a telescope with no filter wheel — a RASA carries its filter in a
+      drawer at prime focus, and nothing can move it. Say which one is fitted
+      and the frames are labelled with it, the plan can allocate to it, and the
+      sequencer says so plainly if the night asks for a different one instead of
+      quietly shooting the wrong stack. Ignored while a wheel is connected,
+      because then the wheel knows.
+    </p>
+
+    <h3>Focus offsets <span class="tag" data-role="rig-scope">—</span></h3>
+    <label class="inline"><input type="checkbox" id="afUseOffsets" checked>
+      Move the focuser by a known offset when the filter changes</label>
+    <div class="offset-grid" id="filterOffsetRows">
+      <p class="small muted">Choose this telescope's filters above first.</p>
+    </div>
+    <p class="small muted">
+      Filters are not parfocal: a 3 nm Ha and a luminance filter sit a few
+      hundred steps apart on most trains. The numbers are <b>relative to each
+      other</b>, not absolute positions — pick whichever filter you usually
+      focus on, leave it at 0, and give the others how far the focuser has to
+      move from there. A filter change then costs a second instead of a sweep.
+    </p>
+
+    <h4>Measure them</h4>
+    <p class="small muted">
+      Focuses each filter in turn and works out the differences, then saves them
+      here for this telescope. Costs one sweep per filter per pass, and buys
+      every filter change afterwards.
+    </p>
+    <div class="grid-2">
+      <label>Passes
+        <input type="number" id="offPasses" step="1" min="1" max="5" value="2">
+      </label>
+      <label>Measure against
+        <select id="offReference" title="The filter everything else is compared to"></select>
+      </label>
+    </div>
+    <p class="small muted">
+      The filters are swept <b>round-robin</b> and each pass is worked out
+      against its own reading of the reference, so the temperature drift between
+      passes cancels instead of being counted as a filter difference. Two passes
+      is enough to see whether the numbers agree; the spread is shown below when
+      they do not.
+    </p>
+    <div class="row gap">
+      <button class="btn small" id="btnOffsetsRun">Measure offsets</button>
+      <button class="btn small danger" id="btnOffsetsAbort" hidden>Stop</button>
+    </div>
+    <div class="offset-progress" id="offsetsProgress" hidden></div>
+    <p class="small muted" id="offsetsNote">—</p>
+    <label>Focus through
+      <select id="afFilter" title="Which filter autofocus sweeps on"></select>
+    </label>
+    <p class="small muted">
+      Sweeping through one filter every time keeps runs comparable and keeps the
+      offsets above meaningful — and finds stars far faster than narrowband
+      does. The imaging filter goes back as soon as the sweep lands. Leave it on
+      <b>whatever is in the path</b> for a rig that carries one filter.
+    </p>
+
+    </section>
+
+    <section class="pref" data-pref="files" data-pref-label="Files" hidden>
+    <h3>Where frames are saved</h3>
+    <label>Root folder
+      <div class="row gap">
+        <input type="text" id="capRoot" spellcheck="false" placeholder="default: the captures folder beside your settings">
+        <button class="btn small" id="btnCapBrowse">Browse…</button>
+      </div>
+    </label>
+    <p class="small muted" id="capPreview">—</p>
+
+    <label>Calibration library
+      <div class="row gap">
+        <input type="text" id="calRoot" spellcheck="false"
+               placeholder="default: the calibration folder beside your settings">
+        <button class="btn small" id="btnCalRootBrowse">Browse…</button>
+      </div>
+    </label>
+    <p class="small muted" id="calRootPreview">—</p>
+    <p class="small muted">
+      Where master darks, flats and biases live, and where the Calibrate tab
+      builds them. Worth putting somewhere that gets backed up: a season of
+      darks is hours of closed-shutter time that cannot be taken again on the
+      night they turn out to be missing.
+    </p>
+    </section>
+
+    <section class="pref" data-pref="focus" data-pref-label="Autofocus" hidden>
+    <h3>Autofocus <span class="tag" data-role="rig-scope">—</span></h3>
+    <div class="grid-2">
+      <label>Step size
+        <input type="number" id="afStepSize" step="1" min="1" max="100000" value="100">
+      </label>
+      <label>Points in the sweep
+        <input type="number" id="afPoints" step="2" min="5" max="31" value="9">
+      </label>
+      <label>Exposure (s)
+        <input type="number" id="afExposure" step="0.5" min="0.1" max="120" value="6">
+      </label>
+      <label>Backlash (steps)
+        <input type="number" id="afBacklash" step="1" min="0" max="10000" value="0">
+      </label>
+      <label>Refocus every (min)
+        <input type="number" id="afInterval" step="5" min="0" max="600" value="60">
+      </label>
+      <label>Refocus on ΔT (°C)
+        <input type="number" id="afTempDelta" step="0.1" min="0" max="20" value="1">
+      </label>
+      <label>Refocus on HFR growth (%)
+        <input type="number" id="afHfrPercent" step="1" min="0" max="200" value="15">
+      </label>
+      <label>Curve fit
+        <select id="afMethod">
+          <option value="trendhyperbolic">Trend lines + hyperbola</option>
+          <option value="trendparabolic">Trend lines + parabola</option>
+          <option value="trendlines">Trend lines</option>
+          <option value="hyperbolic">Hyperbola</option>
+          <option value="parabolic">Parabola</option>
+        </select>
+      </label>
+      <label>Frames per point
+        <input type="number" id="afFrames" step="1" min="1" max="10" value="1">
+      </label>
+      <label>Attempts
+        <input type="number" id="afAttempts" step="1" min="1" max="5" value="2">
+      </label>
+      <label>Accept if HFR under (×start)
+        <input type="number" id="afMaxRatio" step="0.05" min="1" max="3" value="1.15">
+      </label>
+    </div>
+    <p class="small muted">
+      The sweep extends itself: if focus turns out to be beyond the range it
+      started with, it keeps stepping that way until both arms of the V have
+      enough points, rather than giving up. The result is only accepted if the
+      stars at the chosen position really are no worse than they started.
+    </p>
+    <label class="inline"><input type="checkbox" id="afOnStart" checked> Focus at the start of a run</label>
+    <label class="inline"><input type="checkbox" id="afOnFilter" checked> Focus on filter change</label>
+    <p class="small muted">
+      Step size is the one number that must match your focuser: the sweep should
+      span roughly twice the range over which stars visibly bloat. Too small and
+      the curve is flat; too large and it misses the minimum.
+    </p>
+    <p class="small muted">
+      <b>Backlash</b> matters more than it looks. Every position is approached
+      from the same direction so the sweep is consistent with itself, but the
+      move onto the final position has to reverse — and if the overshoot is
+      smaller than the focuser's real backlash, the confirming frame is taken
+      somewhere the sweep never measured and the run lands short. Leave it at 0
+      and five step sizes are used, which covers most focusers; if the log warns
+      that the focuser "is not going where it is told", put the real figure here.
+    </p>
+    <p class="small muted" id="afScopeNote" hidden>
+      Each telescope has its own focuser and its own sweep. These numbers belong
+      to the one selected above; when a run needs focusing they all sweep at the
+      same time, because a telescope in the middle of a sweep is deliberately out
+      of focus and nothing else on the mount can be shooting anyway.
+    </p>
+    <div class="row gap">
+      <button class="btn small" id="btnFocusNow">Focus now</button>
+      <button class="btn small ghost" id="btnFocusAll" hidden>Focus all telescopes</button>
+      <span class="small muted" id="afStatus"></span>
+    </div>
+    </section>
+
+    <section class="pref" data-pref="mount" data-pref-label="Mount" hidden>
+    <h3>Meridian flip</h3>
+    <label class="inline"><input type="checkbox" id="flipEnabled" checked>
+      Flip the mount at the meridian</label>
+    <div class="grid-2">
+      <label>Stop imaging this long before (min)
+        <input type="number" id="flipPause" step="1" min="0" max="120" value="5">
+      </label>
+      <label>Flip this long after (min)
+        <input type="number" id="flipAfter" step="1" min="0" max="120" value="2">
+      </label>
+    </div>
+    <label class="inline"><input type="checkbox" id="flipSolve" checked>
+      Plate solve and re-centre after the flip</label>
+    <p class="small muted">
+      A German equatorial cannot track through the meridian. Imaging stops
+      before the target gets there, the mount is sent back to the same
+      coordinates — which is what makes the driver flip — and the new pointing
+      is solved and synced before imaging starts again. A fork mount reports no
+      side of pier and is left alone whatever this says. Focus is checked after
+      every flip, because on most rigs it shifts across one.
+    </p>
+
+    <h3>Slewing</h3>
+    <div class="grid-2">
+      <label>Settle after a slew (s)
+        <input type="number" id="seqSettle" step="1" min="0" max="600" value="10">
+      </label>
+      <label>Give homing up after (min)
+        <input type="number" id="seqHomeTimeout" step="1" min="1" max="60" value="5">
+      </label>
+    </div>
+    <p class="small muted">
+      How long to let the mount stop ringing before a frame is taken or a plate
+      solve is attempted. A heavy rig on a light tripod wants more of this than
+      a pier does.
+    </p>
+
+    <h3>When the sequence starts</h3>
+    <label class="inline"><input type="checkbox" id="seqHomeAtStart" checked>
+      Home the mount before the first slew</label>
+    <p class="small muted">
+      A mount that has been power-cycled, hand-slewed, or left somewhere by
+      another program does not know where it is pointing, and every slew after
+      that is wrong by the same amount. Homing first costs a minute and removes
+      the whole problem. A mount that cannot home is skipped, and one that
+      refuses is reported without ending the night.
+    </p>
+
+    <h3>When the plan runs out</h3>
+    <label class="inline"><input type="checkbox" id="seqParkAtEnd">
+      Park the mount</label>
+    <label class="inline"><input type="checkbox" id="seqStopTracking">
+      Stop tracking</label>
+    <p class="small muted">
+      Both are off by default: a surprise slew in the dark is worse than a mount
+      left tracking where you put it. Turn parking on for an observatory with a
+      roof that has to come over the telescope. Guiding is always stopped at the
+      end whatever these say, and the cameras warm in the background rather than
+      holding the sequence open. <b>Run on loop</b> ignores both: on loop every
+      night ends with the cover closed, the mount homed and parked, the roof
+      shut and the cameras warm, whatever is ticked here.
+    </p>
+
+    <h3>Run on loop</h3>
+    <div class="grid-2">
+      <label>Open the night this long before dark (min)
+        <input type="number" id="seqLoopLead" step="5" min="0" max="180" value="20">
+      </label>
+    </div>
+    <p class="small muted">
+      On loop, each night opens this long before astronomical dusk so the
+      cameras cool, the mount homes and the first focus happens in twilight,
+      and the first frame is taken in the dark. A target with a start time
+      still waits for it.
+    </p>
+    </section>
+
+    <section class="pref" data-pref="safety" data-pref-label="Safety" hidden>
+    <h3>The weather</h3>
+    <p class="small muted">
+      A safety monitor aggregates cloud, rain, wind and whatever else the
+      observatory cares about into one answer. This is the only setting group in
+      the program that exists to protect the equipment rather than the data.
+    </p>
+    <label class="inline"><input type="checkbox" id="safEnabled" checked>
+      Watch the safety monitor</label>
+    <label class="inline"><input type="checkbox" id="safBlockStart" checked>
+      Refuse to start a sequence while it says unsafe</label>
+    <label class="inline"><input type="checkbox" id="safUnreachable" checked>
+      Treat a monitor that cannot be reached as unsafe</label>
+    <p class="small muted">
+      That last one matters more than it looks. A monitor that has been
+      unplugged, whose driver has thrown, or which has simply stopped answering
+      is not evidence of good weather. Turning it off is a decision to trust the
+      sky over the sensor.
+    </p>
+
+    <label>When it says unsafe
+      <select id="safOnUnsafe">
+        <option value="shutdown">Shut the observatory down — park, close, warm</option>
+        <option value="pause">Hold the run and wait for it to clear</option>
+      </select>
+    </label>
+    <p class="small muted">
+      Shut down for a roof this program controls. Hold for a dome somebody else
+      closes, where the run should pick up again in twenty minutes without a
+      slew.
+    </p>
+
+    <div class="grid-2">
+      <label>Unsafe for this long first (s)
+        <input type="number" id="safGrace" step="1" min="0" max="3600" value="15">
+      </label>
+      <label>Safe again for this long (s)
+        <input type="number" id="safResume" step="10" min="0" max="86400" value="600">
+      </label>
+    </div>
+    <p class="small muted">
+      A cloud sensor flickering unsafe for one reading is not weather. Coming
+      back is deliberately much slower: starting up into a gap in the cloud is
+      how a rig ends up opening and closing its roof all night.
+    </p>
+    </section>
+
+    <section class="pref" data-pref="notify" data-pref-label="Notifications" hidden>
+    <h3>Telling somebody who is not in the room</h3>
+    <p class="small muted">
+      A rig at a remote site fails silently by default: the sequence stops at one
+      in the morning and nobody reads the log until breakfast, by which time the
+      night and the weather have both gone.
+    </p>
+    <label class="inline"><input type="checkbox" id="notEnabled">
+      Send notifications</label>
+
+    <h3>Discord, or any webhook</h3>
+    <label>Webhook URL
+      <input type="text" id="notWebhook" spellcheck="false"
+             placeholder="https://discord.com/api/webhooks/...">
+    </label>
+    <p class="small muted">
+      <b>Discord:</b> in your server, open the channel's settings →
+      <b>Integrations</b> → <b>Webhooks</b> → <b>New Webhook</b> → <b>Copy
+      Webhook URL</b>, and paste it here. Messages arrive as coloured cards
+      with the telescope's name on them, so a club channel with several rigs
+      posting into it still reads. Press <b>Send a test message</b> to prove
+      it before a night depends on it.
+    </p>
+    <label>Message field (other services)
+      <input type="text" id="notField" spellcheck="false" value="content">
+    </label>
+    <p class="small muted">
+      Slack, Telegram, Pushover, ntfy and anything self-hosted also accept a
+      URL to POST JSON to. Only the key the message goes under varies:
+      <b>text</b> for Slack, <b>message</b> for ntfy and Pushover. Discord
+      ignores this field.
+    </p>
+
+    <h3>Mail</h3>
+    <div class="grid-2">
+      <label>SMTP host
+        <input type="text" id="notSmtpHost" spellcheck="false" placeholder="blank = off">
+      </label>
+      <label>Port
+        <input type="number" id="notSmtpPort" step="1" min="1" max="65535" value="587">
+      </label>
+      <label>Username
+        <input type="text" id="notSmtpUser" spellcheck="false">
+      </label>
+      <label>Password
+        <input type="password" id="notSmtpPassword" autocomplete="new-password">
+      </label>
+      <label>From
+        <input type="text" id="notSmtpFrom" spellcheck="false">
+      </label>
+      <label>To
+        <input type="text" id="notSmtpTo" spellcheck="false">
+      </label>
+    </div>
+    <label class="inline"><input type="checkbox" id="notStartTls" checked>
+      Use STARTTLS</label>
+
+    <h3>What is worth interrupting somebody for</h3>
+    <label class="inline"><input type="checkbox" id="notOnFailure" checked>
+      The sequence failed</label>
+    <label class="inline"><input type="checkbox" id="notOnSafety" checked>
+      The weather turned</label>
+    <label class="inline"><input type="checkbox" id="notOnGiveUp" checked>
+      Recovery gave up</label>
+    <label class="inline"><input type="checkbox" id="notOnSequenceEnd" checked>
+      The sequence finished, or the night was put to bed</label>
+    <label class="inline"><input type="checkbox" id="notOnActivity" checked>
+      What the telescope is doing: a night opening, each target starting, a
+      meridian flip, when the next night opens</label>
+    <label class="inline"><input type="checkbox" id="notOnCalibration" checked>
+      A calibration run finished, and what it built</label>
+    <label class="inline"><input type="checkbox" id="notOnWarning" checked>
+      A critical warning: black frames, a shut cover, a full disk, a camera that has hung</label>
+    <label class="inline"><input type="checkbox" id="notOnRecovery">
+      Every recovery</label>
+    <div class="grid-2">
+      <label>Failures never more often than (s)
+        <input type="number" id="notMinGap" step="10" min="0" max="3600" value="60">
+      </label>
+    </div>
+    <p class="small muted">
+      The gap only holds back failure, recovery and weather messages, so a rig
+      failing in a loop at three in the morning does not empty a phone. A
+      night's activity is a handful of messages spaced by the sky and is never
+      held back.
+    </p>
+    <div class="row gap">
+      <button class="btn small" id="btnNotifyTest">Send a test message</button>
+    </div>
+    <p class="small muted" id="notifyNote">—</p>
+    </section>
+
+    <section class="pref" data-pref="piercam" data-pref-label="Pier cam" hidden>
+    <h3>The camera watching the telescope</h3>
+    <p class="small muted">
+      Connect it on the Equipment rows like any other device — it is an ordinary
+      ASCOM or ZWO camera in a different job, so every backend already knows how
+      to drive it. The live view is the <b>Pier cam</b> button in the top bar.
+    </p>
+
+    <label class="inline"><input type="checkbox" id="pierEnabled" checked>
+      Keep a live view running</label>
+    <label class="inline"><input type="checkbox" id="pierAuto" checked>
+      Auto-exposure and auto-gain</label>
+    <p class="small muted">
+      Auto is the whole point of the slot. This camera has to cope with
+      afternoon sun, dusk, moonlight and a pitch-dark dome on the same night
+      with nobody awake to adjust it, so it meters each frame and corrects
+      towards a target brightness. Exposure moves first because it costs nothing
+      in noise; gain moves only when the exposure has run out of room.
+    </p>
+
+    <div class="grid-2">
+      <label>Aim for (% of full scale)
+        <input type="number" id="pierTarget" step="1" min="2" max="95" value="35">
+      </label>
+      <label>Leave alone within (%)
+        <input type="number" id="pierDeadband" step="1" min="0" max="50" value="8">
+      </label>
+      <label>Shortest exposure (s)
+        <input type="number" id="pierMinExposure" step="0.0005" min="0.0001" max="60" value="0.0005">
+      </label>
+      <label>Longest exposure (s)
+        <input type="number" id="pierMaxExposure" step="0.5" min="0.01" max="120" value="8">
+      </label>
+      <label>Highest gain (blank = the camera's)
+        <input type="number" id="pierMaxGain" step="1" min="0" max="100000">
+      </label>
+      <label>A frame every (s)
+        <input type="number" id="pierInterval" step="0.25" min="0.25" max="60" value="1">
+      </label>
+      <label>Send at most (px)
+        <input type="number" id="pierMaxDim" step="20" min="160" max="2000" value="720">
+      </label>
+      <label>Gamma
+        <input type="number" id="pierGamma" step="0.1" min="1" max="4" value="2.2">
+      </label>
+    </div>
+    <p class="small muted">
+      The longest exposure also sets how slow the feed can get: eight seconds
+      for one picture of a dark dome is still a live view, eighty is not. A gain
+      ceiling is worth setting — the top of an ASI's range is unusable noise,
+      and an auto-gain loop with nothing to stop it will find its way there on
+      the first properly dark night.
+    </p>
+    </section>
+
+    <section class="pref" data-pref="guiding" data-pref-label="Guiding" hidden>
+    <h3>PHD2</h3>
+    <label>Program
+      <div class="row gap">
+        <input type="text" id="phd2Path" spellcheck="false"
+               placeholder="found automatically — or give the full path to phd2.exe">
+        <button class="btn small" id="btnPhd2Browse">Browse…</button>
+      </div>
+    </label>
+    <label>Equipment profile
+      <input type="text" id="phd2Profile" spellcheck="false"
+             placeholder="leave blank to keep whichever profile PHD2 has loaded">
+    </label>
+    <label class="inline"><input type="checkbox" id="phd2AutoStart" checked>
+      Start PHD2 if it is not already running</label>
+    <label class="inline"><input type="checkbox" id="phd2ConnectEquipment" checked>
+      Connect PHD2's own camera and mount when connecting</label>
+    <label class="inline"><input type="checkbox" id="phd2AutoSelect" checked>
+      Loop and pick a guide star before guiding</label>
+    <p class="small muted" id="phd2Note">—</p>
+
+    <h3>Guiding</h3>
+    <label class="inline"><input type="checkbox" id="guideWithSequence" checked>
+      Start guiding when a sequence reaches a target</label>
+    <label>Wait for it to settle for up to (s)
+      <input type="number" id="guideSettleTimeout" step="10" min="10" max="900" value="180">
+    </label>
+    <p class="small muted">
+      Without this nothing ever tells PHD2 to guide: dithering between subs
+      checks that guiding is running and quietly does nothing when it is not, so
+      a whole night can run unguided.
+    </p>
+
+    <h3>Dithering</h3>
+    <label class="inline"><input type="checkbox" id="ditherEnabled" checked> Dither between subs</label>
+    <div class="grid-2">
+      <label>Every N frames
+        <input type="number" id="ditherEvery" step="1" min="1" max="50" value="1">
+      </label>
+      <label>Amount (px)
+        <input type="number" id="ditherAmount" step="0.5" min="0.1" max="100" value="3">
+      </label>
+      <label>Settle within (px)
+        <input type="number" id="ditherSettlePixels" step="0.1" min="0.1" max="50" value="1.5">
+      </label>
+      <label>Settle for (s)
+        <input type="number" id="ditherSettleTime" step="1" min="0" max="600" value="8">
+      </label>
+      <label>Give up after (s)
+        <input type="number" id="ditherSettleTimeout" step="5" min="5" max="600" value="60">
+      </label>
+    </div>
+    <label class="inline"><input type="checkbox" id="ditherRaOnly"> RA only (for mounts with poor Dec backlash)</label>
+    </section>
+
+    <!-- ------------------------------------------------------- recovery -->
+    <section class="pref" data-pref="recovery" data-pref-label="Recovery" hidden>
+    <h3>When something goes wrong</h3>
+    <label class="inline"><input type="checkbox" id="recEnabled" checked>
+      Try to put the run right rather than stopping it</label>
+    <p class="small muted">
+      The things that go wrong at three in the morning are not exotic: the guide
+      star goes behind a cloud, the mount drifts until the object is halfway out
+      of frame, a camera misses a download. Each is noticed between frames,
+      named on screen while it is being fixed, and retried a bounded number of
+      times — the bound being the important half, because a rig that needs
+      rescuing every five minutes has a fault that another retry will not mend.
+    </p>
+
+    <h3>The guide star</h3>
+    <label class="inline"><input type="checkbox" id="recGuiding" checked>
+      Re-acquire the guide star when it is lost</label>
+    <div class="grid-2">
+      <label>Wait for it to come back (s)
+        <input type="number" id="recGuideGrace" step="5" min="0" max="600" value="25">
+      </label>
+      <label>Restart attempts
+        <input type="number" id="recGuideAttempts" step="1" min="0" max="20" value="3">
+      </label>
+      <label>Recalibrate after N attempts
+        <input type="number" id="recRecalAfter" step="1" min="0" max="20" value="2">
+      </label>
+    </div>
+    <p class="small muted">
+      PHD2 usually finds the star again itself within an exposure or two, so the
+      wait is not politeness — a cloud is over before a re-acquisition would
+      have finished. After that the guider is stopped, given a fresh star and
+      restarted; the later attempts recalibrate as well, which is slow and is
+      the only thing that fixes a mount that has been nudged by hand. If none of
+      it works the night carries on unguided and says so loudly, because an
+      unguided sub of a bright target is still a sub.
+    </p>
+    <label class="inline"><input type="checkbox" id="recDiscardLost">
+      Move frames taken without a guide lock into a <code>suspect</code> folder</label>
+    <p class="small muted">
+      Nothing is ever deleted. Frames taken while the guider had no lock are
+      always flagged on the sub chart; this also moves them out of the way so
+      they are not stacked by accident.
+    </p>
+
+    <h3>The pointing</h3>
+    <label class="inline"><input type="checkbox" id="recPointing" checked>
+      Slew back and re-centre when the target drifts</label>
+    <div class="grid-2">
+      <label>Re-centre beyond (arcmin)
+        <input type="number" id="recRecentre" step="1" min="1" max="600" value="10">
+      </label>
+      <label>Attempts
+        <input type="number" id="recRecentreAttempts" step="1" min="0" max="10" value="2">
+      </label>
+    </div>
+    <p class="small muted">
+      Measured by the pointing check on the Monitoring page, so that has to be
+      switched on for this to have anything to act on. The warning threshold
+      there is for things worth knowing about; this one is for a target on its
+      way out of the frame.
+    </p>
+
+    <h3>The camera</h3>
+    <div class="grid-2">
+      <label>Retry a failed frame
+        <input type="number" id="recFrameRetries" step="1" min="0" max="20" value="3">
+      </label>
+      <label>Wait between tries (s)
+        <input type="number" id="recFrameWait" step="5" min="0" max="600" value="20">
+      </label>
+    </div>
+    <label class="inline"><input type="checkbox" id="recReconnect" checked>
+      Disconnect and reconnect a camera that keeps failing</label>
+    <p class="small muted">
+      A camera that misses one download is fine; one that has fallen off the USB
+      bus is not, and asking again is the only thing that tells them apart. Only
+      the telescope that failed is retried, so a working camera never shoots the
+      same slot twice.
+    </p>
+
+    <h3>Giving up</h3>
+    <div class="grid-2">
+      <label>Rescues allowed per target
+        <input type="number" id="recMaxPerTarget" step="1" min="0" max="100" value="8">
+      </label>
+      <label>Wait between attempts (s)
+        <input type="number" id="recCooldown" step="5" min="0" max="3600" value="30">
+      </label>
+      <label>Then
+        <select id="recOnGiveUp">
+          <option value="next">Move on to the next target</option>
+          <option value="stop">Stop the sequence</option>
+          <option value="park">Stop the sequence and park the mount</option>
+        </select>
+      </label>
+    </div>
+    <p class="small muted">
+      The budget is per target, so a night that needed three rescues on M31 is
+      still willing to rescue NGC 7000. Set it to 0 for no limit.
+    </p>
+    </section>
+
+    <section class="pref" data-pref="monitoring" data-pref-label="Monitoring" hidden>
+    <h3>Watching the run</h3>
+    <label class="inline"><input type="checkbox" id="seqMeasure" checked> Measure star size on every sub</label>
+    <div class="grid-2">
+      <label>Plate solve every N subs
+        <input type="number" id="seqSolveEvery" step="1" min="0" max="200" value="10">
+      </label>
+      <label>Warn beyond (arcmin)
+        <input type="number" id="seqPointingWarn" step="0.5" min="0.5" max="120" value="5">
+      </label>
+      <label>Warn on HFR drift (%)
+        <input type="number" id="seqFocusWarn" step="5" min="0" max="200" value="25">
+      </label>
+    </div>
+    <p class="small muted">
+      Pointing checks run in the background so they never hold up the next
+      exposure. Set the interval to 0 to switch them off. Recovery uses this
+      measurement to decide when the target has drifted far enough to go back
+      to, so leaving it off leaves that with nothing to act on.
+    </p>
+    </section>
+
+    <!-- ----------------------------------------------------- overheads -->
+    <section class="pref" data-pref="overheads" data-pref-label="Timing" hidden>
+    <h3>What the rig costs between exposures</h3>
+    <p class="small muted">
+      Every plan is arithmetic on two numbers: how long the shutter is open, and
+      everything else. The first is exact. The second used to be three typed
+      guesses, and guesses are always wrong in the same direction — nobody types
+      in the cost of the thing they forgot about. A 61-megapixel camera on USB 2
+      takes eighteen seconds to hand over a frame; a nine-point autofocus sweep
+      is four minutes, and the old arithmetic costed it at nothing at all. A
+      night planned on those guesses runs out of dark an hour early.
+    </p>
+
+    <div class="overhead-table" id="overheadTable">
+      <p class="small muted">Loading…</p>
+    </div>
+
+    <label class="inline"><input type="checkbox" id="schedUseMeasured" checked>
+      Plan on what the rig has measured, where it has measured it</label>
+    <p class="small muted">
+      Untick to go back to the typed figures in <b>Site &amp; Optics →
+      Planning</b>, which stay there untouched either way.
+    </p>
+
+    <h3>Calibrate</h3>
+    <p class="small muted">
+      The rig times itself as it works — every download, every filter change,
+      every slew and every focus run — so after one night it knows. This does
+      the same on purpose, in about the time one autofocus sweep takes: a few
+      short frames for the download, the wheel back and forth for a filter
+      change, and one sweep.
+    </p>
+    <p class="small muted">
+      <b>One sweep is enough for every filter.</b> What gets measured is the
+      cost per sweep point of moving the focuser and measuring the stars, which
+      does not depend on the filter or the sub length — the exposures are
+      arithmetic. So a nine-point sweep at six seconds and a fifteen-point sweep
+      at twenty are both predicted from the same pair of numbers.
+    </p>
+    <p class="small muted">
+      Slew time is <i>not</i> measured here: how long a slew takes depends
+      entirely on how far it is, and a made-up slew would measure a made-up
+      distance. That one is learned from the real slews a sequence makes.
+    </p>
+    <div class="row gap">
+      <button class="btn primary small" id="btnCalibrateOverheads">Calibrate overhead</button>
+      <label class="inline compact"><input type="checkbox" id="calOverheadFocus" checked>
+        include a focus sweep</label>
+      <span class="spacer"></span>
+      <button class="btn ghost small danger" id="btnClearOverheads"
+              title="Forget every measurement and go back to the typed figures">Forget</button>
+    </div>
+    <p class="small muted" id="overheadStatus">—</p>
+    </section>
+
+  </div>
+  </div>
+
+  <!-- Outside the scrolling body on purpose: a Save button you have to go and
+       find is one that gets forgotten. -->
+  <div class="modal-foot">
+    <span class="small muted" id="equipmentSaveNote">Settings apply to the selected telescope where they belong to one.</span>
+    <span class="spacer"></span>
+    <button class="btn primary small" id="btnSaveEquipment">Save settings</button>
+  </div>
+</dialog>
+
+<!-- ------------------------------------------------ new all-sky survey -->
+<dialog id="allskyDialog" class="modal">
+  <form method="dialog" class="modal-head">
+    <h2>New all-sky survey</h2>
+    <span class="spacer"></span>
+    <button class="btn small ghost" value="close">Close</button>
+  </form>
+
+  <div class="modal-body">
+    <label>Name
+      <input type="text" id="asNewName" spellcheck="false" placeholder="e.g. Northern all-sky">
+    </label>
+
+    <h3>The grid</h3>
+    <div class="grid-2">
+      <label>Declination from (°)
+        <input type="number" id="asNewDecMin" step="1" min="-90" max="90" value="-30">
+      </label>
+      <label>to (°)
+        <input type="number" id="asNewDecMax" step="1" min="-90" max="90" value="90">
+      </label>
+      <label>Overlap at the equator (%)
+        <input type="number" id="asNewOverlap" step="1" min="0" max="60" value="20">
+      </label>
+      <label>Field of view
+        <input type="text" id="asNewField" readonly>
+      </label>
+    </div>
+    <p class="small muted">
+      The overlap grows towards the poles on its own. A field covers more
+      degrees of right ascension the nearer the pole it sits, so the spacing is
+      worked out from the edge of the field nearest the equator — which makes
+      the number above a floor that holds everywhere, rather than an average
+      with gaps under it. Using one spacing for the whole sky would shoot the
+      polar rings many times over for no more coverage.
+    </p>
+    <p class="small muted">
+      The field size is the smallest of the telescopes on the mount: it is the
+      only one all of them can deliver, so the grid holds whichever scope a
+      field ends up being shot on.
+    </p>
+
+    <h3>Per field</h3>
+    <div class="cal-sets" id="asNewGoal"></div>
+    <div class="row gap">
+      <select id="asNewAddFilter"></select>
+      <button class="btn small" id="btnAsNewAddFilter">Add a filter</button>
+    </div>
+
+    <h3>What that comes to</h3>
+    <div class="as-preview mono small" id="asPreview">—</div>
+
+    <div class="row gap">
+      <span class="spacer"></span>
+      <button class="btn small" id="btnAsPreview">Work it out</button>
+      <button class="btn primary small" id="btnAsCreate">Create survey</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- ------------------------------------------------ device setup dialog -->
+<dialog id="deviceSetupDialog" class="modal">
+  <form method="dialog" class="modal-head">
+    <h2 id="devSetupTitle">Device setup</h2>
+    <span class="spacer"></span>
+    <button class="btn small ghost" value="close">Close</button>
+  </form>
+
+  <div class="modal-body">
+    <label>Driver ID
+      <input type="text" id="devSetupId" spellcheck="false"
+             placeholder="e.g. ASCOM.ASICamera2.Camera">
+    </label>
+    <p class="small muted">
+      The ProgID this telescope opens. Some drivers register one per device —
+      <span class="mono">ASCOM.Foo.Camera</span>,
+      <span class="mono">ASCOM.Foo_2.Camera</span> — and if yours does, giving
+      each telescope its own here is the whole job. You can type one that is not
+      in the dropdown.
+    </p>
+
+    <div class="row gap">
+      <button class="btn small" id="btnDevSetupOpen">Driver's setup window…</button>
+      <button class="btn small ghost" id="btnDevSetupRead">Read its settings</button>
+    </div>
+    <p class="small muted">
+      The driver's own window opens on a thread of its own, so the rest of the
+      program keeps running behind it. The device has to be disconnected first —
+      a driver will not take its settings while it is in use.
+    </p>
+
+    <h3>Settings this telescope pins</h3>
+    <div id="devSetupValues" class="dev-settings muted-empty">
+      Press <b>Read its settings</b> to see what the driver keeps for this ID.
+    </div>
+    <p class="small muted">
+      These are the driver's own settings, not ours. Tick the one that names the
+      device — a serial number, a camera index, whatever this driver calls it —
+      and it is written into the driver in the moment before this telescope
+      connects. That is how several telescopes share a single driver: each one
+      says which device it means on its way up.
+    </p>
+    <p class="small warn-text" id="devSetupNote" hidden></p>
+
+    <div class="row gap">
+      <span class="spacer"></span>
+      <button class="btn primary small" id="btnDevSetupSave">Save</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- ------------------------------------------------ site & optics dialog -->
+<dialog id="settingsDialog" class="modal wide">
+  <form method="dialog" class="modal-head">
+    <h2>Site &amp; Optics</h2>
+    <span class="spacer"></span>
+    <button class="btn small ghost" value="close">Close</button>
+  </form>
+
+  <div class="modal-split">
+  <nav class="pref-nav" id="settingsNav"></nav>
+  <div class="modal-body" id="settingsBody">
+    <section class="pref" data-pref="site" data-pref-label="Site">
+    <h3>Observing site</h3>
+    <label class="inline">
+      <input type="checkbox" id="chkSiteFromMount" checked> Use the location the mount reports
+    </label>
+    <div class="grid-2">
+      <label>Latitude (° N)
+        <input type="number" id="siteLatitude" step="0.000001" min="-90" max="90" placeholder="e.g. 31.9">
+      </label>
+      <label>Longitude (° E)
+        <input type="number" id="siteLongitude" step="0.000001" min="-180" max="180" placeholder="e.g. -99.1">
+      </label>
+      <label>Elevation (m)
+        <input type="number" id="siteElevation" step="1" min="-500" max="9000" value="0">
+      </label>
+    </div>
+    <p class="small muted" id="siteNote">
+      Longitude is degrees east of Greenwich, so the Americas are negative. The
+      planetarium needs this to draw the horizon, the meridian and the alt/az grid.
+    </p>
+
+    <h3>Horizon</h3>
+    <div class="grid-2">
+      <label>Minimum elevation for captures (°)
+        <input type="number" id="schedMinAltitude" step="1" min="0" max="85" value="30">
+      </label>
+    </div>
+    <p class="small muted" id="schedMinAltitudeNote">
+      How low the telescope is willing to shoot. Below this the air is thick
+      enough that the frame is rarely worth keeping, so a target is only given a
+      window while it is above the line, and the sequencer stops a target that
+      sinks below it mid-run rather than filling the disk with murk. Raise it if
+      trees or a neighbour's roof take the bottom of your sky.
+    </p>
+    </section>
+
+    <section class="pref" data-pref="optics" data-pref-label="Optics" hidden>
+    <h3>Optics</h3>
+    <div class="grid-2">
+      <label>Focal length (mm)
+        <input type="number" id="opticsFocalLength" step="1" min="1" max="50000" placeholder="e.g. 530">
+      </label>
+      <!-- The camera angle lives in Equipment, next to the camera it belongs
+           to, so there is one field for it rather than two that can disagree. -->
+      <label>Camera angle (°)
+        <div class="row gap">
+          <span class="mono grow" id="opticsAngleHere">—</span>
+          <button class="btn small ghost" id="btnOpticsAngle"
+                  title="Set it in Equipment">Change…</button>
+        </div>
+      </label>
+    </div>
+    <div class="grid-2">
+      <label>Sensor width (px)
+        <input type="number" id="opticsSensorWidth" step="1" min="1" max="60000" placeholder="e.g. 6248">
+      </label>
+      <label>Sensor height (px)
+        <input type="number" id="opticsSensorHeight" step="1" min="1" max="60000" placeholder="e.g. 4176">
+      </label>
+      <label>Pixel size (µm)
+        <input type="number" id="opticsPixelSize" step="0.01" min="0.1" max="100" placeholder="e.g. 3.76">
+      </label>
+    </div>
+    <p class="small muted" id="opticsNote">
+      Focal length sizes the field-of-view rectangle and gives the plate solver
+      its scale hint. Rotation is the camera angle, 0 = north up. The sensor is
+      read from the camera when one is connected — fill it in here so you can
+      plan framings with the rig switched off.
+    </p>
+
+    <h3>Usable field</h3>
+    <div class="grid-2">
+      <label>Usable width (°)
+        <input type="number" id="opticsUsableWidth" step="0.01" min="0" max="90"
+               placeholder="whole sensor">
+      </label>
+      <label>Usable height (°)
+        <input type="number" id="opticsUsableHeight" step="0.01" min="0" max="90"
+               placeholder="whole sensor">
+      </label>
+    </div>
+    <p class="small muted">
+      What the optics actually correct, where that is smaller than the sensor —
+      a RASA 8's 22 mm image circle does not reach the corners of an APS-C chip.
+      Mosaic panels are laid out on this rather than on the full frame, so the
+      seams are covered by glass that works. Leave both blank for a train that
+      illuminates the whole sensor.
+    </p>
+    </section>
+
+    <section class="pref" data-pref="solver" data-pref-label="Plate solver" hidden>
+    <h3>Plate solver</h3>
+    <label>ASTAP executable
+      <input type="text" id="solverPath" spellcheck="false" placeholder="found automatically">
+    </label>
+    <div class="grid-2">
+      <label>Search radius (°)
+        <input type="number" id="solverRadius" step="1" min="1" max="180" value="15">
+      </label>
+      <label>Downsample
+        <select id="solverDownsample">
+          <option value="0">Auto</option>
+          <option value="1">1 (none)</option>
+          <option value="2">2</option>
+          <option value="3">3</option>
+          <option value="4">4</option>
+        </select>
+      </label>
+      <label>Centring exposure (s)
+        <input type="number" id="solverExposure" step="0.5" min="0.1" max="600" value="5">
+      </label>
+      <label>Centre within (arcmin)
+        <input type="number" id="solverTolerance" step="0.1" min="0.1" max="120" value="1">
+      </label>
+      <label>Centring attempts
+        <input type="number" id="solverAttempts" step="1" min="1" max="10" value="3">
+      </label>
+      <label>Solve timeout (s)
+        <input type="number" id="solverTimeout" step="5" min="5" max="1800" value="120">
+      </label>
+    </div>
+    <div class="grid-2">
+      <label>Stars to use
+        <input type="number" id="solverMaxStars" step="10" min="10" max="10000" value="500">
+      </label>
+    </div>
+    <p class="small muted" id="solverNote">—</p>
+    <p class="small muted">
+      Centring takes a frame, solves it, slews by whatever the solve says is
+      wrong, and does it again until the field centre is inside the tolerance or
+      the attempts run out. A tight tolerance on a mount with backlash spends
+      the attempts and lands no closer, so a wide field is usually better served
+      by one arcminute than by ten arcseconds.
+    </p>
+
+    <h3>astrometry.net</h3>
+    <label class="inline"><input type="checkbox" id="astrometryEnabled" checked>
+      Fall back to astrometry.net when ASTAP cannot solve a frame</label>
+    <label>API key
+      <input type="password" id="astrometryKey" spellcheck="false"
+             autocomplete="off" placeholder="from your profile at nova.astrometry.net">
+    </label>
+    <div class="grid-2">
+      <label>Give up after (min)
+        <input type="number" id="astrometryTimeout" step="1" min="1" max="60" value="10">
+      </label>
+    </div>
+    <label>Service
+      <input type="text" id="astrometryUrl" spellcheck="false"
+             placeholder="https://nova.astrometry.net/api/">
+    </label>
+    <p class="small muted">
+      Only ever used for a FITS frame opened as a framing reference in the
+      Planner, never during a run: it needs the network and takes anywhere from
+      twenty seconds to several minutes, which is fine for a planning question
+      in the afternoon and useless at the telescope.
+    </p>
+    <p class="small muted">
+      It earns its place on frames from somewhere else. A file off another rig
+      — or a phone lens, or an old scan — can be at a scale this machine has no
+      ASTAP index files for, and solving that blind is exactly what the service
+      is built for. Your own frames almost never reach it: anything written
+      after a plate solve already carries the answer in its header. Point
+      <b>Service</b> at your own installation if you run one.
+    </p>
+    </section>
+
+    <section class="pref" data-pref="planning" data-pref-label="Planning" hidden>
+    <h3>How long things take</h3>
+    <div class="grid-2">
+      <label>Between subs (s)
+        <input type="number" id="schedPerFrame" step="1" min="0" max="600" value="15">
+      </label>
+      <label>Filter change (s)
+        <input type="number" id="schedFilterChange" step="1" min="0" max="600" value="20">
+      </label>
+      <label>Per mosaic panel (s)
+        <input type="number" id="schedPerPanel" step="5" min="0" max="3600" value="90">
+      </label>
+    </div>
+    <p class="small muted">
+      What the planner adds to the shutter time when it works out whether a
+      night's plan fits: download and dither between subs, the wheel moving, and
+      the slew, settle and plate solve each mosaic panel costs. These do not
+      drive the rig — they only decide whether the plan says the night fits, so
+      set them to what your gear really takes and the budget stays honest.
+    </p>
+
+    <h3>What Auto-arrange chooses</h3>
+    <label class="inline"><input type="checkbox" id="apChoose" checked>
+      Pick the filters, sub length and frame counts as well as the times</label>
+    <p class="small muted">
+      From three things, all of which a person weighs up by hand every clear
+      night: the Moon, what the target already has in the bank, and its goal.
+      Everything it writes lands on the plan where you can see and change it
+      before the night starts — it decides nothing at the telescope.
+    </p>
+
+    <h4>Default exposure per filter</h4>
+    <div class="offset-grid" id="apFilterExposures">
+      <p class="small muted">Choose this telescope's filters in Equipment first.</p>
+    </div>
+    <p class="small muted">
+      Seconds per sub under a dark sky, and the number Auto-arrange reaches for
+      first. These are starting points for a night, not limits — what actually
+      gets shot is whatever is sitting on the plan when the sequence starts, and
+      every one of these lands there where it can be changed.
+    </p>
+
+    <div class="grid-2">
+      <label>Luminance fallback (s)
+        <input type="number" id="apLum" step="10" min="1" max="3600" value="120">
+      </label>
+      <label>Colour fallback (s)
+        <input type="number" id="apBroad" step="10" min="1" max="3600" value="180">
+      </label>
+      <label>Narrowband fallback (s)
+        <input type="number" id="apNarrow" step="30" min="1" max="3600" value="600">
+      </label>
+      <label>Shortest it will go (s)
+        <input type="number" id="apMinExposure" step="5" min="1" max="600" value="30">
+      </label>
+    </div>
+    <p class="small muted">
+      The fallbacks are for a filter with no entry above — something unusual in
+      the wheel still gets a sensible length rather than a default that suits
+      nothing.
+    </p>
+
+    <div class="grid-2">
+      <label>Narrowband above (% lit)
+        <input type="number" id="apNarrowAbove" step="5" min="0" max="100" value="40">
+      </label>
+      <label>Far enough from the Moon (°)
+        <input type="number" id="apMoonSafe" step="5" min="0" max="180" value="90">
+      </label>
+      <label>Fewest frames per filter
+        <input type="number" id="apMinFrames" step="1" min="1" max="50" value="3">
+      </label>
+    </div>
+    <label class="inline"><input type="checkbox" id="apShorten" checked>
+      Shorten broadband subs under a bright Moon</label>
+    <p class="small muted">
+      A bright Moon does not stop a night, it changes what the night is for.
+      Narrowband barely notices it — a 3 nm filter throws away almost all of the
+      scattered sunlight along with almost all of the sky — so above the lit
+      fraction here a target moves onto whatever narrowband it carries. One that
+      carries none gets shorter broadband subs instead: a bright sky fills the
+      well sooner, and the answer to that is more shorter frames rather than
+      fewer longer ones. Past the distance here the Moon's glow has fallen off
+      enough that broadband is fine at any phase.
+    </p>
+    </section>
+
+  </div>
+  </div>
+
+  <div class="modal-foot">
+    <span class="small muted">These describe the observatory, so every telescope shares them.</span>
+    <span class="spacer"></span>
+    <button class="btn primary small" id="btnSaveSettings">Save</button>
+  </div>
+</dialog>
+
+<!-- ------------------------------------------------ ask dialog
+     WebView2 answers window.confirm and window.prompt itself, immediately and
+     with the default, so a native confirmation never reaches the operator. Any
+     question that matters is asked here instead. -->
+<dialog id="ninaDialog" class="modal">
+  <form method="dialog" class="modal-head">
+    <h2>Import from N.I.N.A.</h2>
+    <span class="spacer"></span>
+    <button class="btn small ghost" value="close">Close</button>
+  </form>
+  <div class="modal-body">
+    <div class="row gap">
+      <label class="grow">Profile
+        <select id="ninaProfile"></select>
+      </label>
+    </div>
+    <p class="small muted" id="ninaNote">Reading…</p>
+    <div id="ninaPreview" class="nina-preview"></div>
+    <div class="row gap" style="margin-top: 10px">
+      <span class="small muted" id="ninaSummary"></span>
+      <span class="spacer"></span>
+      <button class="btn small primary" id="btnNinaApply" disabled>Import</button>
+    </div>
+  </div>
+</dialog>
+
+<!-- ---------------------------------------------- first light walk-through -->
+<dialog id="wizardDialog" class="modal wizard">
+  <form method="dialog" class="modal-head">
+    <h2>First light</h2>
+    <span class="wizard-where small muted" id="wizWhere"></span>
+    <span class="spacer"></span>
+    <button class="btn small ghost" value="close" title="Come back any time from the First light button">Later</button>
+  </form>
+  <div class="modal-body">
+    <div class="wizard-steps" id="wizSteps"></div>
+    <h3 id="wizTitle"></h3>
+    <div id="wizBody" class="wizard-body"></div>
+    <div class="wizard-state" id="wizState"></div>
+    <div class="row gap wizard-actions" id="wizActions"></div>
+    <div class="row gap wizard-nav">
+      <button class="btn small ghost" id="wizBack">Back</button>
+      <label class="inline small muted"><input type="checkbox" id="wizNoMore">
+        Don’t open this on its own again</label>
+      <span class="spacer"></span>
+      <button class="btn small ghost" id="wizSkip">Skip this step</button>
+      <button class="btn small primary" id="wizNext">Next</button>
+    </div>
+  </div>
+</dialog>
+
+<dialog id="askDialog" class="modal ask">
+  <form method="dialog" class="modal-head">
+    <h2 id="askTitle">Confirm</h2>
+  </form>
+  <div class="modal-body">
+    <p id="askMessage"></p>
+    <label id="askInputRow" hidden>
+      <input type="text" id="askInput" spellcheck="false">
+    </label>
+    <div class="row gap">
+      <span class="spacer"></span>
+      <button class="btn small" id="askCancel">Cancel</button>
+      <button class="btn primary small" id="askConfirm">OK</button>
+    </div>
+  </div>
+</dialog>
+
+<div id="toasts" class="toasts"></div>
+
+<script src="app.js?v=50"></script>
+<script src="sky.js?v=50"></script>
+<script src="planner.js?v=50"></script>
+<script src="plan.js?v=50"></script>
+<script src="surveytab.js?v=50"></script>
+<script src="calibrate.js?v=50"></script>
+<script src="collab.js?v=50"></script>
+<script src="allsky.js?v=50"></script>
+<script src="wizard.js?v=50"></script>
+</body>
+</html>

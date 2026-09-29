@@ -1,0 +1,25 @@
+[Unit]
+Description=Starfront collaboration server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=astrocollab
+Group=astrocollab
+WorkingDirectory=/opt/astrocollab
+Environment=ASTROCOLLAB_DATA=/var/lib/astrocollab
+# Loopback only: Caddy in front of it does TLS and is what the world talks to.
+ExecStart=/opt/astrocollab/venv/bin/python server/run.py --host 127.0.0.1 --port 8800
+Restart=always
+RestartSec=3
+# The admin token and the Discord secret live in /var/lib/astrocollab and
+# nowhere else; the program folder is read-only to the service.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/astrocollab
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.check-tmp/
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Build output: the folder people run and the zips they download.
+packaging/build/
+packaging/dist/
+*.zip
+
+# Anything an observatory produces or is told: settings, targets, plans,
+# the calibration library, logs, frames. None of it belongs in the code.
+*.log
+*.fits
+*.fit
+*.xisf
+*.db
+*.sqlite
+*.sqlite3
+discord.env
+settings.json
+targets.json
+plan.json
+calibration.json
+equipment.json
+
+# Scratch that lives beside the project but is not part of it.
+rockwood_planetarium*.py
+run-test.log

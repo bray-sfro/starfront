@@ -1,0 +1,2074 @@
+/* Starfront - dark, low-glare palette suitable for use at the telescope. */
+
+:root {
+  --bg: #0a0c11;
+  --panel: #12151c;
+  --panel-2: #171b24;
+  --line: #232936;
+  --text: #dde3ee;
+  --muted: #7b8698;
+  --accent: #7ee7a5;          /* Starfront mint */
+  --accent-dim: #1f5a3c;
+  --accent-edge: #2f7a50;
+  --accent-text: #dcf5e6;
+  --good: #4bb87a;
+  --warn: #d9a03d;
+  --bad: #d9503d;
+  --blue: #5b8dd9;
+  --radius: 7px;
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+/* The `hidden` attribute is only `display: none` in the user-agent stylesheet,
+   so any class of ours that sets `display` silently defeats it — an element
+   with `hidden` stays on screen while `element.hidden` reads true. That is how
+   the planetarium's error panel came to sit permanently over a chart that was
+   drawing perfectly underneath. Settle it once, for every element. */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  overflow: hidden;
+}
+
+.mono { font-family: var(--mono); }
+.muted { color: var(--muted); }
+.small { font-size: 12px; }
+.spacer { flex: 1; }
+
+/* ---------------------------------------------------------------- topbar */
+/* The window is a column: the bar, whichever strips are showing under it,
+   and the tabs taking the rest. On a narrow window the bar wraps onto two
+   lines rather than piling its pills on top of the tabs, and the strips push
+   the tabs up rather than off the bottom of the window. */
+body { display: flex; flex-direction: column; }
+body > .activity, body > .seq-banner, body > .recovery-bar, body > .warnings-bar { flex-shrink: 0; }
+
+.topbar {
+  min-height: 46px;
+  flex-shrink: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 16px;
+  padding: 4px 14px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+}
+
+.brand-mark {
+  width: 20px; height: 20px;
+  border-radius: 50%;
+  display: block;
+  box-shadow: 0 0 10px rgba(126, 231, 165, 0.35);
+}
+
+.pills { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 9px;
+  font-size: 11.5px;
+  border: 1px solid var(--line);
+  border-radius: 100px;
+  background: var(--panel-2);
+  color: var(--muted);
+}
+.pill .dot { width: 7px; height: 7px; border-radius: 50%; background: #47506180; }
+.pill.on { color: var(--text); border-color: #2c5d43; }
+.pill.on .dot { background: var(--good); box-shadow: 0 0 7px var(--good); }
+.pill.busy { border-color: #6b5324; }
+.pill.busy .dot { background: var(--warn); animation: blink 1s infinite; }
+
+@keyframes blink { 50% { opacity: 0.25; } }
+
+.topbar-right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+
+.link-state {
+  font-size: 11px; padding: 2px 8px; border-radius: 100px;
+  border: 1px solid var(--line); color: var(--muted);
+}
+.link-state.online { color: var(--good); border-color: #2c5d43; }
+.link-state.offline { color: var(--bad); border-color: #5d2c2c; }
+
+/* ---------------------------------------------------------------- layout */
+.layout {
+  display: grid;
+  grid-template-columns: 330px minmax(0, 1fr) 320px;
+  gap: 10px;
+  padding: 10px;
+  flex: 1;
+  min-height: 0;
+}
+
+.column { min-height: 0; display: flex; flex-direction: column; gap: 10px; }
+.column-left, .column-right { overflow-y: auto; scrollbar-width: thin; }
+.column-center { overflow: hidden; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 11px 12px 13px;
+}
+.panel.grow { flex: 1; min-height: 120px; display: flex; flex-direction: column; }
+
+.panel h2 {
+  margin: 0 0 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.9px;
+  text-transform: uppercase;
+  color: var(--muted);
+  display: flex; align-items: center; gap: 8px;
+}
+.panel h3 {
+  margin: 14px 0 8px;
+  font-size: 10.5px; letter-spacing: 0.9px; text-transform: uppercase;
+  color: var(--muted); font-weight: 600;
+}
+
+.tag {
+  font-size: 10.5px; font-weight: 400; letter-spacing: 0;
+  text-transform: none; color: var(--muted);
+  padding: 1px 7px; border: 1px solid var(--line); border-radius: 100px;
+  max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* ---------------------------------------------------------------- forms */
+label { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 8px; }
+label.inline {
+  display: inline-flex; align-items: center; gap: 6px;
+  margin-right: 12px; color: var(--text); font-size: 12px;
+}
+
+input[type="number"], input[type="text"], select {
+  width: 100%;
+  margin-top: 3px;
+  padding: 5px 7px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--text);
+  font: inherit;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+input:focus, select:focus { outline: none; border-color: var(--accent-dim); }
+
+input[type="range"] {
+  width: 100%; margin-top: 5px; height: 3px; -webkit-appearance: none; appearance: none;
+  background: var(--line); border-radius: 3px;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 13px; height: 13px; border-radius: 50%;
+  background: var(--text); border: 2px solid var(--panel); cursor: pointer;
+}
+input[type="checkbox"] { accent-color: var(--accent); }
+
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 10px; }
+.row { display: flex; align-items: center; }
+.row.gap { gap: 6px; margin-bottom: 8px; }
+.row.between { justify-content: space-between; }
+.row.gap input[type="number"] { margin-top: 0; }
+
+/* ---------------------------------------------------------------- buttons */
+.btn {
+  padding: 6px 11px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  color: var(--text);
+  font: inherit; font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+  text-decoration: none;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.btn:hover:not(:disabled) { background: #1e2430; border-color: #333d4f; }
+.btn:disabled { opacity: 0.38; cursor: not-allowed; }
+.btn.small { padding: 4px 9px; font-size: 11.5px; }
+.btn.primary { background: var(--accent-dim); border-color: var(--accent-edge); color: var(--accent-text); }
+.btn.primary:hover:not(:disabled) { background: var(--accent-edge); }
+.btn.danger { color: #eda296; border-color: #4a2721; }
+.btn.danger:hover:not(:disabled) { background: #3a1d18; }
+.btn.ghost { background: transparent; }
+/* The two ways a night starts: green for tonight, blue for every night. */
+.btn.go { background: #235a3b; border-color: #2f7a50; color: #dcf5e6; }
+.btn.go:hover:not(:disabled) { background: #2f7a50; }
+.btn.loop { background: #274670; border-color: #365f96; color: #dde9fa; }
+.btn.loop:hover:not(:disabled) { background: #365f96; }
+.btn.loop .loop-icon { display: inline-block; margin-right: 5px; font-size: 13px; line-height: 1; }
+.btn.active { background: var(--accent-dim); border-color: var(--accent-edge); color: var(--accent-text); }
+.btn.flex { flex: 1; }
+
+/* ---------------------------------------------------------------- readouts */
+.readout-row { display: flex; gap: 6px; margin-bottom: 9px; }
+.readout {
+  flex: 1;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 5px 7px;
+  min-width: 0;
+}
+.readout span { display: block; font-size: 10px; color: var(--muted); letter-spacing: 0.5px; }
+.readout b {
+  display: block; font-family: var(--mono); font-size: 13px; font-weight: 500;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.readout b.alert { color: var(--warn); }
+
+.progress {
+  height: 4px; background: var(--panel-2); border-radius: 3px;
+  overflow: hidden; margin: 4px 0 5px;
+}
+.progress-fill { height: 100%; width: 0; background: var(--accent); transition: width 0.25s linear; }
+
+.meter { height: 4px; background: var(--panel-2); border-radius: 3px; overflow: hidden; margin-bottom: 9px; }
+.meter-fill { height: 100%; width: 0; background: var(--blue); transition: width 0.4s; }
+
+/* ---------------------------------------------------------------- equipment */
+/* ------------------------------------------------- solar system survey tab */
+
+.survey-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 12px;
+  padding: 10px 12px;
+  min-height: 0;
+  flex: 1;
+}
+.survey-chart-wrap { display: flex; flex-direction: column; min-height: 0; }
+#svChart {
+  flex: 1; width: 100%; min-height: 320px; display: block;
+  border: 1px solid var(--line); border-radius: 6px;
+}
+.survey-scrub {
+  display: flex; align-items: center; gap: 10px; padding: 8px 2px 0;
+}
+.survey-scrub input[type="range"] { flex: 1; margin: 0; }
+
+.survey-controls {
+  overflow-y: auto;
+  padding-right: 4px;
+  border-left: 1px solid var(--line);
+  padding-left: 12px;
+}
+.survey-controls h3 { margin-top: 14px; }
+.survey-controls h3:first-child { margin-top: 0; }
+
+/* Said loudly, because every one of these costs discoveries. */
+.survey-warn {
+  margin-top: 8px; padding: 8px 10px;
+  font-size: 11.5px; line-height: 1.5;
+  border: 1px solid var(--warn); border-radius: 5px;
+  background: rgba(232, 176, 84, 0.10); color: var(--warn);
+}
+
+/* The viability line: the one number that says whether tonight is worth it. */
+.survey-viability {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 14px; margin: 0 12px;
+  border: 1px solid var(--line); border-radius: 5px;
+  background: var(--panel-2);
+}
+.survey-viability.good { border-color: var(--good); }
+.survey-viability.poor { border-color: var(--warn); }
+
+/* What the optimiser decided, and why. */
+.survey-advice {
+  margin: 0 12px; padding: 9px 12px;
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 11.5px; line-height: 1.5;
+  border: 1px solid var(--good); border-radius: 5px;
+  background: rgba(75, 184, 122, 0.08);
+}
+.survey-advice b { font-size: 12.5px; }
+.survey-advice .muted { color: var(--muted); }
+
+.survey-season { padding: 8px 12px 0; }
+#svSeason { width: 100%; height: 92px; display: block; }
+
+.survey-chart-bar {
+  display: flex; align-items: center; gap: 6px; padding-bottom: 6px;
+}
+.survey-chart-bar select { width: auto; margin-top: 0; }
+.survey-chart-bar .btn { padding: 2px 9px; }
+#svChart { cursor: grab; }
+
+table.survey-fields tr.survey-group td {
+  font-size: 10px; letter-spacing: 0.6px; text-transform: uppercase;
+  color: var(--muted); padding-top: 10px; border-bottom: 1px solid var(--line);
+}
+
+.survey-table { padding: 0 12px 12px; overflow-x: auto; }
+table.survey-fields { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+table.survey-fields th {
+  text-align: left; font-size: 10px; letter-spacing: 0.5px;
+  text-transform: uppercase; color: var(--muted);
+  padding: 4px 8px; border-bottom: 1px solid var(--line);
+}
+table.survey-fields td { padding: 3px 8px; border-bottom: 1px solid var(--panel-2); }
+table.survey-fields tr:hover td { background: var(--panel-2); }
+
+@media (max-width: 1100px) {
+  .survey-layout { grid-template-columns: 1fr; }
+  .survey-controls { border-left: none; padding-left: 0; }
+}
+
+/* ------------------------------------------------------- activity indicator */
+/* One line, always in the same place, that says what the rig is doing. It reads
+   the same whether a sequence is driving or a hand is: "why has nothing moved
+   for two minutes" is the question it exists to answer. */
+
+.activity {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-2);
+  font-size: 12.5px;
+}
+.activity-icon { font-size: 13px; line-height: 1; }
+.activity-verb { letter-spacing: 0.2px; }
+.activity-detail { color: var(--muted); min-width: 0; }
+/* Working on something that takes a moment. */
+.activity.busy { background: linear-gradient(90deg, rgba(91, 141, 217, 0.16), transparent 55%); }
+.activity.busy .activity-icon { color: var(--blue); animation: activity-pulse 1.6s infinite; }
+/* The shutter is open — the one state where waiting is the point. */
+.activity.live { background: linear-gradient(90deg, rgba(75, 184, 122, 0.14), transparent 55%); }
+.activity.live .activity-icon { color: var(--good); }
+.activity.idle .activity-icon { color: var(--muted); }
+/* Something has gone wrong and is being put right. */
+.activity.alert { background: linear-gradient(90deg, rgba(232, 176, 84, 0.2), transparent 55%); }
+.activity.alert .activity-icon { color: var(--warn); animation: activity-pulse 1.1s infinite; }
+@keyframes activity-pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) {
+  .activity .activity-icon { animation: none; }
+}
+
+/* Recovery gets a line of its own: it is not a stage of the run, it is the run
+   being put back on its feet, and it should be impossible to miss. */
+.recovery-bar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 16px;
+  border-bottom: 1px solid var(--warn);
+  background: rgba(232, 176, 84, 0.14);
+  color: var(--text);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.recovery-bar:hover { background: rgba(232, 176, 84, 0.2); }
+.recovery-mark { color: var(--warn); animation: activity-spin 1.8s linear infinite; }
+@keyframes activity-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) {
+  .recovery-mark { animation: none; }
+}
+
+/* ------------------------------------------------------ left column chrome */
+/* Which device panels are on screen. Off by default: a night is spent looking
+   at frames, and a d-pad that is not being used is in the way. */
+.control-toggles { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 2px; }
+.control-toggles .btn { flex: 1; min-width: 68px; }
+.control-toggles .btn.active {
+  background: var(--panel-2);
+  border-color: #333d4f;
+  color: var(--text);
+}
+
+/* Settings that belong to taking a frame but are not touched every frame. */
+.fold { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 6px; }
+.fold > summary {
+  cursor: pointer;
+  list-style: none;
+  color: var(--muted);
+  font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase;
+  padding: 3px 0;
+}
+.fold > summary::-webkit-details-marker { display: none; }
+.fold > summary::before { content: '▸ '; }
+.fold[open] > summary::before { content: '▾ '; }
+.fold > summary:hover { color: var(--text); }
+.readout-row.compact { margin-top: 8px; }
+
+/* ---------------------------------------------------------- sequence banner */
+/* The one thing you should be able to read from across the room: is it working,
+   and how far through is it. */
+
+.seq-banner {
+  display: grid;
+  grid-template-columns: auto minmax(160px, 1fr) minmax(220px, 2fr) auto auto;
+  align-items: center;
+  gap: 16px;
+  padding: 9px 16px;
+  background: linear-gradient(90deg, rgba(75, 184, 122, 0.13), transparent 60%);
+  border-bottom: 1px solid var(--line);
+}
+.seq-banner.paused {
+  background: linear-gradient(90deg, rgba(232, 176, 84, 0.16), transparent 60%);
+}
+
+/* A pulse that says "still alive" at a glance. */
+.seq-dot {
+  width: 11px; height: 11px; border-radius: 50%;
+  background: var(--good);
+  box-shadow: 0 0 0 0 rgba(75, 184, 122, 0.6);
+  animation: seq-pulse 2s infinite;
+}
+.seq-banner.paused .seq-dot { background: var(--warn); animation: none; }
+@keyframes seq-pulse {
+  70% { box-shadow: 0 0 0 9px rgba(75, 184, 122, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(75, 184, 122, 0); }
+}
+/* Anyone who would rather not have a blinking light. */
+@media (prefers-reduced-motion: reduce) {
+  .seq-dot { animation: none; }
+}
+
+.seq-headline { min-width: 0; }
+.seq-headline b { font-size: 14px; display: block; }
+.seq-headline .muted { font-size: 11.5px; }
+
+.seq-bars { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.seq-bar-row { display: flex; align-items: center; gap: 8px; }
+.seq-bar-label {
+  font-size: 10px; color: var(--muted); width: 42px; text-align: right;
+  text-transform: uppercase; letter-spacing: 0.5px;
+}
+.seq-bar {
+  flex: 1; height: 9px; min-width: 0;
+  background: var(--panel-2); border-radius: 5px; overflow: hidden;
+}
+.seq-bar-fill {
+  height: 100%; width: 0; background: var(--good);
+  transition: width 0.35s linear;
+}
+.seq-bar-fill.alt { background: #5b8dd9; }
+.seq-bar-value { font-size: 11px; color: var(--muted); min-width: 96px; }
+
+.seq-facts { display: flex; gap: 18px; }
+.seq-facts .readout { min-width: 62px; }
+
+@media (max-width: 1100px) {
+  .seq-banner { grid-template-columns: auto 1fr auto; }
+  .seq-bars { grid-column: 1 / -1; }
+  .seq-facts { display: none; }
+}
+
+/* -------------------------------------------------------- floating window */
+/* The autofocus curve while it is being measured. It floats over the image
+   because that is where you are already looking, and it is draggable because
+   the one thing it must never do is sit on top of the star you are judging. */
+
+.float-window {
+  position: fixed;
+  z-index: 60;
+  /* Big enough to actually read a focus curve on, and draggable by its bar and
+     resizable from its corner when it is not. */
+  width: 640px;
+  height: 480px;
+  min-width: 360px;
+  min-height: 280px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 90px);
+  resize: both;
+  display: flex;
+  flex-direction: column;
+  top: 88px; right: 26px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+}
+.float-window.dragging { opacity: 0.92; user-select: none; }
+/* Fading out says "this is finishing on its own" rather than vanishing. */
+.float-window.leaving { transition: opacity 0.6s ease; opacity: 0; }
+
+.float-head {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 8px 6px 11px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--line);
+  cursor: move;
+}
+.float-title {
+  font-size: 11px; font-weight: 600;
+  letter-spacing: 0.6px; text-transform: uppercase;
+}
+.float-head .btn { padding: 2px 7px; font-size: 10.5px; }
+/* The chart takes whatever height the window is given, so dragging the corner
+   makes the curve bigger rather than adding empty space around it. */
+.float-body {
+  padding: 10px 12px 12px;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.float-body .run-chart { width: 100%; flex: 1; min-height: 150px; display: block; }
+.float-body .readout-row { margin-top: 10px; flex: none; }
+/* The detail line carries the fits on a second line, so newlines must show. */
+.float-body #focusFloatDetail {
+  margin-top: 8px; flex: none; white-space: pre-line; line-height: 1.5;
+}
+
+/* ------------------------------------------------------------ telescopes */
+/* The switcher in the topbar and the tab strip in the Equipment dialog. Both
+   only appear once there is a second telescope, so a single-scope rig never
+   sees them. */
+
+.rig-switch { display: flex; gap: 4px; }
+.rig-switch .btn { padding: 3px 9px; font-size: 11px; }
+
+.rig-tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 8px; }
+.rig-tab { padding: 5px 11px; font-size: 11.5px; }
+/* The master carries the mount, so it is worth telling apart at a glance. */
+.rig-tab.master::before {
+  content: '★'; margin-right: 5px; color: var(--muted); font-size: 10px;
+}
+.rig-tab.active.master::before { color: inherit; }
+/* A telescope with no allocation of its own is following the master's. */
+.rig-tab.mirrored:not(.active) { border-style: dashed; }
+.grow { flex: 1 1 auto; min-width: 0; }
+
+.connect-list { display: flex; flex-direction: column; gap: 7px; margin-bottom: 10px; }
+
+.connect-row {
+  display: grid;
+  grid-template-columns: 74px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 6px;
+}
+.connect-row .btn.icon { min-width: 0; padding: 4px 7px; font-size: 12px; }
+.connect-row > label { margin: 0; font-size: 11px; color: var(--muted); }
+.connect-row select,
+.connect-row input[type="text"] { margin-top: 0; font-size: 11px; padding: 4px 5px; }
+.connect-row .btn { padding: 4px 8px; font-size: 11px; min-width: 74px; }
+
+/* ---------------------------------------------------------------- filters */
+.filter-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 5px; }
+.filter-grid .btn { padding: 7px 2px; font-size: 11.5px; }
+
+/* ---------------------------------------------------------------- focuser */
+.stepper { display: grid; grid-template-columns: repeat(6, 1fr); gap: 4px; margin-bottom: 8px; }
+.stepper .btn { padding: 5px 0; font-size: 11px; }
+
+/* ---------------------------------------------------------------- mount */
+.dpad {
+  display: grid;
+  grid-template-areas: ". n ." "w c e" ". s .";
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  margin-bottom: 9px;
+}
+.btn.pad { padding: 9px 0; font-size: 12px; font-weight: 600; }
+.btn.pad:active { background: var(--accent-dim); }
+
+/* ---------------------------------------------------------------- viewer */
+.viewer-toolbar {
+  display: flex; align-items: center; gap: 7px;
+  padding: 7px 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.viewer-title {
+  font-family: var(--mono); font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 46%;
+}
+
+.canvas-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  background:
+    linear-gradient(var(--panel) 0 0) padding-box,
+    repeating-conic-gradient(#0d1016 0% 25%, #0a0c11 0% 50%) 0 0/18px 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+  cursor: crosshair;
+}
+.canvas-wrap canvas { display: block; width: 100%; height: 100%; }
+.canvas-wrap.panning { cursor: grabbing; }
+
+.viewer-empty {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 4px; color: var(--muted); text-align: center; pointer-events: none;
+}
+
+.loading-badge {
+  position: absolute; top: 10px; right: 12px;
+  padding: 3px 9px; font-size: 11px;
+  background: rgba(10, 12, 17, 0.85);
+  border: 1px solid var(--line); border-radius: 100px; color: var(--muted);
+}
+
+/* The per-telescope strip under the main view. */
+.rig-views {
+  display: flex; gap: 8px; flex-wrap: wrap;
+  margin: 8px 0 0;
+}
+.rig-view {
+  flex: 1 1 150px; max-width: 260px;
+  display: flex; flex-direction: column; gap: 3px;
+  padding: 6px; text-align: left; font: inherit; cursor: pointer;
+  background: var(--panel);
+  border: 1px solid var(--line); border-radius: var(--radius);
+  color: var(--text);
+}
+.rig-view:hover { border-color: var(--accent-dim); }
+.rig-view.active { border-color: var(--accent-edge); background: var(--panel-2); }
+.rig-view.faulted { border-color: var(--bad); }
+/* These carry a display of their own, which would otherwise beat [hidden]. */
+.rig-views[hidden], .rig-view-empty[hidden], .rig-view-shot img[hidden] {
+  display: none;
+}
+.rig-view-shot {
+  position: relative; display: block;
+  aspect-ratio: 3 / 2; overflow: hidden;
+  background: #06080c; border-radius: 4px;
+}
+.rig-view-shot img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.rig-view-empty {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; color: var(--muted);
+}
+.rig-view-name { font-size: 11.5px; font-weight: 600; }
+.rig-view-meta { font-size: 10.5px; color: var(--muted); }
+
+.viewer-status {
+  display: flex; gap: 12px;
+  padding: 6px 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--muted);
+}
+
+/* ---------------------------------------------------------------- analysis */
+#histogram { width: 100%; height: 90px; margin-top: 8px; display: block; }
+
+.image-list { flex: 1; overflow-y: auto; margin: -2px -4px; padding: 2px 4px; scrollbar-width: thin; }
+.image-row {
+  display: grid; grid-template-columns: 1fr auto;
+  gap: 2px 8px;
+  padding: 5px 7px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.image-row:hover { background: var(--panel-2); }
+.image-row.active { background: #12201a; border-color: var(--accent-dim); }
+.image-row .name {
+  font-family: var(--mono); font-size: 11px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.image-row .meta { grid-column: 1 / -1; font-size: 10.5px; color: var(--muted); }
+.image-row .time { font-size: 10.5px; color: var(--muted); font-family: var(--mono); }
+
+.log { flex: 1; overflow-y: auto; font-family: var(--mono); font-size: 11px; scrollbar-width: thin; }
+.log-line { padding: 2px 0; display: flex; gap: 8px; border-bottom: 1px solid #171b2480; }
+.log-line time { color: #5c6577; flex-shrink: 0; }
+.log-line.success span { color: var(--good); }
+.log-line.warn span { color: var(--warn); }
+.log-line.error span { color: var(--bad); }
+
+.muted-empty { color: var(--muted); font-size: 12px; }
+
+/* ---------------------------------------------------------------- toasts */
+.toasts {
+  position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%);
+  display: flex; flex-direction: column; gap: 8px; align-items: center;
+  z-index: 50; pointer-events: none;
+}
+.toast {
+  padding: 8px 15px;
+  background: #1b2029;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--accent);
+  border-radius: 5px;
+  font-size: 12.5px;
+  box-shadow: 0 8px 26px rgba(0, 0, 0, 0.55);
+  animation: rise 0.18s ease-out;
+}
+.toast.error { border-left-color: var(--bad); }
+.toast.success { border-left-color: var(--good); }
+
+@keyframes rise { from { opacity: 0; transform: translateY(8px); } }
+
+@media (max-width: 1280px) {
+  .layout { grid-template-columns: 300px minmax(0, 1fr) 280px; }
+}
+
+/* ---------------------------------------------------------------- dialog */
+.modal {
+  width: min(560px, 92vw);
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--panel);
+  color: var(--text);
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.7);
+}
+.modal::backdrop { background: rgba(4, 6, 10, 0.66); }
+.modal-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-2);
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+.modal-head h2 { margin: 0; font-size: 13px; letter-spacing: 0.4px; text-transform: uppercase; }
+.modal-body { padding: 14px; }
+.modal-body .row.gap { margin-bottom: 0; }
+#backendNote { margin: 12px 0 0; line-height: 1.5; }
+
+/* ------------------------------------------------- paged settings dialog */
+/* One subject per page, a rail that says what is in here, and a Save button
+   that never scrolls away — the three things a four-screen column lacked. */
+.modal.wide { width: min(860px, 96vw); }
+.modal-split { display: grid; grid-template-columns: 172px minmax(0, 1fr); }
+.pref-nav {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 10px 8px;
+  border-right: 1px solid var(--line);
+  background: var(--panel-2);
+}
+.pref-tab {
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit; font-size: 12px; text-align: left;
+  cursor: pointer;
+}
+.pref-tab:hover { color: var(--text); }
+.pref-tab.active {
+  background: var(--panel);
+  border-color: var(--line);
+  color: var(--text);
+}
+.modal-split .modal-body {
+  max-height: min(70vh, 640px);
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.pref[hidden] { display: none; }
+.pref > h3:first-child { margin-top: 0; }
+.modal-foot {
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--line);
+  background: var(--panel-2);
+  border-radius: 0 0 var(--radius) var(--radius);
+}
+
+/* The FITS frame being framed against, and what the solve made of it. */
+.reference-bar {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--blue);
+  border-radius: 5px;
+  background: var(--panel);
+  font-size: 12px;
+}
+.reference-bar[hidden] { display: none; }
+.reference-bar .mono { color: var(--muted); font-size: 11px; }
+
+/* What the rig has timed itself at. The sample count sits next to the figure
+   because one download says almost nothing and forty says a great deal. */
+.overhead-table { margin: 8px 0 12px; }
+.overhead-row {
+  display: grid; grid-template-columns: 1.4fr 70px 1.1fr 1.6fr;
+  gap: 10px; align-items: baseline;
+  padding: 4px 0;
+  border-bottom: 1px solid #1a1f2a;
+  font-size: 11.5px;
+}
+.overhead-row:last-child { border-bottom: none; }
+.overhead-row .value { text-align: right; color: var(--good); }
+.overhead-row.assumed .value { color: var(--muted); }
+.overhead-row.total { margin-top: 4px; border-top: 1px solid var(--line); }
+.overhead-row.total .value { color: var(--blue); }
+@media (max-width: 720px) {
+  .overhead-row { grid-template-columns: 1fr auto; }
+  .overhead-row .when { display: none; }
+}
+
+/* Focus offsets: a short two-column list, one row per filter. */
+.offset-grid { display: flex; flex-direction: column; gap: 4px; margin: 6px 0 8px; }
+.offset-row {
+  display: grid; grid-template-columns: 1fr 110px;
+  align-items: center; gap: 8px;
+  margin: 0;
+}
+.offset-name { font-size: 12px; }
+.offset-row input { margin: 0; }
+
+/* Saving switched off is easy to forget about; keep it visible. */
+#panel-camera.not-saving #filePreview { color: var(--warn); }
+#panel-camera.not-saving h3 + label .row,
+#panel-camera.not-saving #saveDir { opacity: 0.55; }
+
+#filePreview { margin-top: 2px; word-break: break-all; }
+
+.btn.disabled { opacity: 0.38; pointer-events: none; }
+
+.topbar #btnEquipment { margin-left: 4px; }
+
+/* ---------------------------------------------------------------- tabs */
+.maintabs {
+  display: flex; gap: 3px;
+  padding: 3px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.panel-toggles { display: flex; gap: 4px; }
+.panel-toggles .btn.active { background: var(--panel-2); border-color: #333d4f; color: var(--text); }
+
+/* The right column earns its space only when something is in it. */
+.layout.no-right { grid-template-columns: 330px minmax(0, 1fr); }
+.layout.no-right .column-right { display: none; }
+
+/* The device panels are for the tab where frames come in. On the planning tabs
+   they are 330px of camera controls nobody is using, taken off a night plan
+   that wants every pixel it can get — at 1400px wide the plan was getting less
+   width than either column beside it. */
+.layout.no-left { grid-template-columns: minmax(0, 1fr) 320px; }
+.layout.no-left .column-left { display: none; }
+.layout.no-left.no-right { grid-template-columns: minmax(0, 1fr); }
+
+.tab {
+  padding: 5px 16px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: var(--muted);
+  font: inherit; font-size: 12px;
+  cursor: pointer;
+}
+.tab:hover { color: var(--text); }
+.tab.active { background: var(--panel-2); border-color: var(--line); color: var(--text); }
+
+.tab-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 10px; }
+.tab-panel[hidden] { display: none; }
+
+/* ---------------------------------------------------------------- planetarium */
+.sky-toolbar { gap: 8px; flex-shrink: 0; }
+.sky-toolbar select { width: auto; margin-top: 0; }
+
+.sky-search { position: relative; flex: 1; min-width: 160px; max-width: 420px; }
+.sky-search input { margin-top: 0; }
+
+.sky-results {
+  position: absolute; top: calc(100% + 4px); left: 0; right: 0;
+  max-height: 320px; overflow-y: auto; scrollbar-width: thin;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.6);
+  z-index: 30;
+}
+.sky-result {
+  display: grid; grid-template-columns: 1fr auto;
+  gap: 1px 8px;
+  padding: 6px 9px;
+  cursor: pointer;
+  border-bottom: 1px solid #232936a0;
+}
+.sky-result:last-child { border-bottom: none; }
+.sky-result:hover, .sky-result.active { background: #1d2431; }
+.sky-result .id { font-family: var(--mono); font-size: 12px; }
+.sky-result .alt { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.sky-result .meta { grid-column: 1 / -1; font-size: 10.5px; color: var(--muted); }
+.sky-result.below .alt { color: var(--bad); }
+
+.sky-wrap {
+  flex: 1;
+  /* The toolbars above and below are fixed height, so on a short window flex
+     would otherwise squeeze the sky itself down to nothing. */
+  min-height: 240px;
+  display: flex; gap: 10px;
+}
+
+.sky-stage {
+  position: relative;
+  flex: 1; min-width: 0;
+  background: #040610;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+#skyChart { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; }
+.sky-stage.panning #skyChart { cursor: grabbing; }
+
+.sky-hud {
+  position: absolute; left: 10px; bottom: 10px;
+  padding: 6px 10px;
+  font-size: 11px; line-height: 1.7;
+  color: #8fa6c4;
+  background: rgba(5, 8, 20, 0.8);
+  border: 1px solid #1e2a4a;
+  border-radius: 5px;
+  pointer-events: none;
+  z-index: 8;
+}
+
+.sky-loading {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 12px; text-align: center; padding: 20px;
+  background: #00000a;
+  z-index: 10;
+}
+.sky-loading p { margin: 0; max-width: 460px; }
+.sky-offline-detail { color: var(--warn); word-break: break-word; }
+.spinner {
+  width: 42px; height: 42px;
+  border: 3px solid #1a2a4a; border-top-color: #4a70c0;
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Right-click menu on the sky, the way a planetarium does it. */
+.sky-menu {
+  position: absolute;
+  min-width: 210px;
+  padding: 4px;
+  background: var(--panel-2);
+  border: 1px solid #333d4f;
+  border-radius: 6px;
+  box-shadow: 0 16px 44px rgba(0, 0, 0, 0.7);
+  z-index: 40;
+}
+.sky-menu-title {
+  padding: 6px 9px 7px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 4px;
+}
+.sky-menu-title b { display: block; font-size: 12px; }
+.sky-menu-title span { display: block; font-family: var(--mono); font-size: 10.5px; color: var(--muted); }
+.sky-menu button {
+  display: block; width: 100%;
+  padding: 6px 9px;
+  background: transparent; border: none; border-radius: 4px;
+  color: var(--text); font: inherit; font-size: 12px; text-align: left;
+  cursor: pointer;
+}
+.sky-menu button:hover:not(:disabled) { background: #2a3242; }
+.sky-menu button:disabled { opacity: 0.35; cursor: not-allowed; }
+.sky-menu button.danger { color: #eda296; }
+.sky-menu hr { border: none; border-top: 1px solid var(--line); margin: 4px 0; }
+
+.sky-catalog {
+  width: 246px; flex-shrink: 0;
+  display: flex; flex-direction: column; gap: 7px;
+  padding: 9px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.sky-catalog[hidden] { display: none; }
+.sky-catalog-head { display: flex; gap: 6px; }
+.sky-catalog-head input, .sky-catalog-head select { margin-top: 0; font-size: 11px; }
+.sky-catalog-head select { width: auto; }
+.sky-catalog-list { flex: 1; overflow-y: auto; scrollbar-width: thin; margin: 0 -4px; padding: 0 4px; }
+
+.sky-object {
+  display: grid; grid-template-columns: 1fr auto;
+  gap: 1px 8px;
+  padding: 5px 7px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.sky-object:hover { background: var(--panel-2); }
+.sky-object.active { background: #12201a; border-color: var(--accent-dim); }
+.sky-object .id { font-family: var(--mono); font-size: 11.5px; }
+.sky-object .alt { font-family: var(--mono); font-size: 10.5px; color: var(--good); }
+.sky-object.below .alt { color: #6c7686; }
+.sky-object .meta {
+  grid-column: 1 / -1; font-size: 10.5px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.sky-options { gap: 4px; flex-wrap: wrap; flex-shrink: 0; }
+.sky-options label.inline { margin-right: 4px; font-size: 11.5px; }
+.sky-status { flex-shrink: 0; }
+
+/* ---------------------------------------------------------------- solver */
+#panel-solver .readout b { font-size: 12px; }
+#solveState { margin: 2px 0 9px; }
+#solveState.working { color: var(--warn); }
+#solveState.failed { color: var(--bad); }
+#solveState.solved { color: var(--good); }
+#solverTag.ready { color: var(--good); border-color: #2c5d43; }
+#solverTag.missing { color: var(--bad); border-color: #5d2c2c; }
+
+/* ---------------------------------------------------------------- settings */
+#planCoverage.seam-warning { color: var(--warn); font-weight: 600; }
+
+/* ---------------------------------------------------------------- plan */
+.plan-name { width: 190px; margin-top: 0; }
+.sky-toolbar #schedAddTarget { max-width: 260px; margin-top: 0; }
+
+.plan-night {
+  padding: 7px 11px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
+/* The Plan tab scrolls as one page.
+ *
+ * It used to scroll only the list of targets, inside a pane a few boxes tall,
+ * with the night graph and the toolbars pinned above it — which meant the one
+ * picture of the whole night was the thing you could never scroll to while
+ * reading the targets it describes. Now the whole tab moves together, and the
+ * only thing held in place is the row with Run and Stop on it. */
+.tab-panel[data-panel="plan"] { overflow-y: auto; scrollbar-width: thin; }
+.tab-panel[data-panel="plan"] > * { flex-shrink: 0; }
+.sequence-bar { position: sticky; top: 0; z-index: 3; }
+
+.plan-list {
+  flex: none; min-height: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(430px, 1fr));
+  gap: 10px;
+  align-content: start;
+}
+.plan-list > p { grid-column: 1 / -1; }
+
+/* An expanded target takes the whole row. Collapsed, the boxes tile two or
+   three across and the plan reads at a glance, which is the point of them being
+   small; opened, it is carrying a framing preview, this target's settings and a
+   seven-column table of every night it has ever run, and half a row is not
+   enough for any of that. */
+.plan-list > .plan-box.expanded { grid-column: 1 / -1; }
+
+.plan-box {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 12px 12px;
+}
+.plan-head {
+  display: grid; grid-template-columns: 1fr auto auto;
+  gap: 1px 8px; align-items: center; margin-bottom: 8px;
+}
+.plan-head .name { font-size: 13px; font-weight: 600; }
+.plan-head .kind {
+  grid-row: 2; grid-column: 1;
+  font-size: 10.5px; letter-spacing: 0.4px; text-transform: uppercase;
+  color: var(--muted);
+}
+.plan-head .remove { grid-row: 1 / span 2; grid-column: 3; }
+
+/* Where the run has got to, on the plan rather than only in the banner: which
+   of tonight's targets are behind it, which one it is on, and what is left. */
+.run-badge {
+  grid-row: 1 / span 2; grid-column: 2;
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 10.5px; letter-spacing: 0.4px; text-transform: uppercase;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.run-badge.running { border-color: var(--good); color: var(--good); }
+.run-badge.done { border-color: #2c5c41; color: #5e8f74; }
+.run-badge.next { border-color: var(--blue); color: var(--blue); }
+.run-badge.paused, .run-badge.alert { border-color: var(--warn); color: var(--warn); }
+.run-badge.skipped { border-style: dashed; }
+.plan-box.run-skipped { opacity: 0.55; }
+.plan-box.run-skipped .plan-total { color: var(--muted); }
+.plan-box.run-done { opacity: 0.62; }
+.plan-box.run-alert { border-color: var(--warn); }
+
+/* The total collected, in the heading: the number the plan is scanned for. */
+.plan-head .name { display: flex; align-items: baseline; gap: 7px; }
+.plan-total {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--good);
+  font-weight: 600;
+}
+.plan-total.none { color: var(--muted); font-weight: 400; }
+.plan-total.met { color: var(--blue); }
+
+.expand-hint { margin-left: auto; font-size: 10.5px; opacity: 0.65; }
+.plan-integration { display: flex; align-items: baseline; gap: 6px; }
+.plan-box.expanded { border-color: #33405a; }
+
+/* ------------------------------------------------ the expanded detail */
+/* The framing and this target's own settings share the top row; the night
+   report gets a row to itself underneath.
+
+   It used to be the middle of three columns, which gave a seven-column table
+   about a third of an already-narrow box — so the nights it exists to show
+   were behind a horizontal scrollbar, which is to say invisible. It is the
+   widest thing in here, so it gets the width. */
+.plan-detail {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  display: grid; gap: 14px;
+  grid-template-columns: minmax(260px, 3fr) minmax(240px, 2fr);
+}
+.plan-detail[hidden] { display: none; }
+.plan-report { grid-column: 1 / -1; }
+@media (max-width: 1100px) {
+  .plan-detail { grid-template-columns: minmax(0, 1fr); }
+}
+.plan-detail h4 {
+  margin: 0 0 7px;
+  font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase;
+  color: var(--muted);
+}
+/* A season on one target is a lot of nights, and the plan below it still has to
+   be reachable — so the table scrolls in its own box past about a dozen, with
+   the headings pinned so a row halfway down still says what its columns are. */
+.plan-report { min-width: 0; }
+.plan-report .night-scroll {
+  max-height: 340px; overflow-y: auto; overflow-x: auto;
+  scrollbar-width: thin;
+  border: 1px solid var(--line); border-radius: 5px;
+}
+.plan-report .night-scroll .night-table { margin: 0 8px; width: calc(100% - 16px); }
+.plan-report .night-scroll thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--panel);
+}
+
+/* The framing this target was saved with, over a picture of the real sky. */
+.plan-framing { min-width: 0; }
+.framing-stage {
+  position: relative;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  overflow: hidden;
+  background: #05070d;
+}
+.framing-canvas { width: 100%; display: block; }
+/* A mosaic's panels are clickable, which has to look like it. */
+.framing-canvas.pickable { cursor: pointer; }
+
+/* Which panels a re-shoot will cover, under the picture and in the heading. */
+.panel-pick {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 6px; min-height: 24px;
+}
+.panel-pick .picked { color: var(--accent); font-weight: 600; }
+.plan-head .kind.picked-panels { color: var(--accent); font-weight: 600; }
+.framing-status {
+  position: absolute; inset: auto 6px 6px 6px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  background: rgba(10, 12, 17, 0.8);
+  text-align: center;
+}
+.framing-status[hidden] { display: none; }
+
+/* First light: the walk-through. */
+.modal.wizard { width: min(640px, 94vw); }
+.wizard-btn.in-progress { border-color: var(--good); color: var(--good); }
+.wizard-where { margin-left: 10px; }
+.wizard-steps { display: flex; gap: 6px; margin-bottom: 12px; flex-wrap: wrap; }
+.wizard-dot {
+  width: 26px; height: 26px; border-radius: 50%;
+  border: 1px solid var(--line); background: var(--panel-2); color: var(--muted);
+  font: inherit; font-size: 11px; cursor: pointer;
+}
+.wizard-dot.done { border-color: #2c5d43; color: var(--good); }
+.wizard-dot.current { border-color: var(--accent); color: var(--text); background: var(--panel); }
+.modal.wizard h3 { margin: 4px 0 8px; font-size: 16px; }
+.wizard-body p { margin: 0 0 10px; line-height: 1.55; color: var(--text); }
+.wizard-state {
+  margin: 8px 0 12px; padding: 7px 10px; border-radius: 4px; font-size: 12.5px;
+  border-left: 3px solid var(--muted); background: var(--panel-2); color: var(--muted);
+}
+.wizard-state.done { border-left-color: var(--good); color: var(--good); }
+.wizard-state.waiting { border-left-color: var(--warn); }
+.wizard-state[hidden] { display: none; }
+.wizard-actions { margin-bottom: 14px; }
+.wizard-nav { border-top: 1px solid var(--line); padding-top: 10px; }
+
+/* The N.I.N.A. importer's plan: what changes, from what, and from where. */
+.nina-preview { max-height: 60vh; overflow-y: auto; }
+.nina-block { margin: 8px 0 12px; }
+.nina-block.off .nina-rows { opacity: 0.35; }
+.nina-head { font-weight: 600; }
+.nina-rows {
+  display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) 16px minmax(0, 1fr) minmax(0, 1.4fr);
+  gap: 3px 10px; align-items: baseline; margin-top: 4px; font-size: 12px;
+}
+.nina-rows > .nina-row > span { min-width: 0; overflow-wrap: anywhere; }
+.nina-row { display: contents; }
+.nina-row.same .nina-key, .nina-row.same .nina-now, .nina-row.same .nina-new,
+.nina-row.same .nina-arrow { color: var(--muted); }
+.nina-row .nina-new { color: var(--good); }
+.nina-row.same .nina-new { color: var(--muted); }
+.nina-row .nina-arrow { color: var(--muted); text-align: center; }
+.nina-block.left-out ul { margin: 4px 0 0 16px; padding: 0; }
+
+/* What the colours on the framing mean. */
+.framing-legend {
+  display: flex; flex-wrap: wrap; gap: 4px 14px;
+  margin: 6px 0 2px; color: var(--muted);
+}
+.framing-legend .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.framing-legend .sw {
+  display: inline-block; width: 18px; height: 12px; border-radius: 2px;
+  box-sizing: border-box; border: 1.5px solid;
+}
+.framing-legend .sw-green { background: rgba(75, 184, 122, 0.30); border-color: #4bb87a; }
+.framing-legend .sw-red { background: rgba(217, 79, 61, 0.28); border-color: #d94f3d; }
+.framing-legend .sw-blue { background: transparent; border-color: rgba(91, 141, 217, 0.95); }
+.framing-legend .sw-ring { background: rgba(255, 244, 180, 0.18); border-color: #fff4b4;
+  box-shadow: 0 0 6px rgba(255, 244, 180, 0.8); }
+.framing-legend .sw-dash { background: rgba(126, 231, 165, 0.09);
+  border: 1.5px dashed rgba(126, 231, 165, 0.95); }
+
+.night-table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+.night-table th {
+  text-align: left; font-weight: 500; color: var(--muted);
+  padding: 3px 8px 5px 0;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+.night-table td { padding: 4px 8px 4px 0; border-bottom: 1px solid #1a1f2a; }
+.night-table .num { text-align: right; padding-right: 12px; }
+.night-table th.num { text-align: right; }
+.night-table tbody tr:hover { background: var(--panel-2); }
+.night-table .night { color: var(--text); white-space: nowrap; }
+.night-table .filters { color: var(--muted); }
+.night-table .trouble { color: var(--muted); white-space: nowrap; }
+.night-table .trouble.warn { color: var(--warn); }
+
+.plan-options .opt {
+  display: grid; grid-template-columns: 1fr 96px;
+  align-items: center; gap: 8px; margin-bottom: 5px;
+}
+.plan-options .opt > span { font-size: 11.5px; }
+.plan-options .opt input, .plan-options .opt select { margin: 0; }
+.plan-options .opt select { grid-column: 1 / span 2; }
+.plan-options label.inline { margin-bottom: 4px; }
+/* Leaving a target out is the one setting here that stops frames happening, so
+   it does not sit flush with the ones that only adjust them. */
+.plan-options .opt-skip { display: block; margin-bottom: 9px; }
+.plan-options .opt-skip:has(input:checked) { color: var(--warn); }
+.plan-options .opt-hints { margin-top: 8px; }
+.plan-options .opt-hints p { margin: 0 0 5px; line-height: 1.45; }
+
+/* ------------------------------------------------ the composite night */
+/* The whole night in one picture: the Moon, every target's curve, and a lane
+   along the foot saying what the telescope is on and where the gaps are. */
+.night-view {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 8px 10px 9px;
+}
+.night-graph { width: 100%; height: 230px; display: block; }
+@media (max-width: 1100px) {
+  .night-graph { height: 190px; }
+}
+.night-legend {
+  display: flex; flex-wrap: wrap; gap: 4px 14px;
+  margin-top: 7px;
+  font-size: 11px;
+}
+.night-key { display: inline-flex; align-items: center; gap: 5px; color: var(--text); }
+.night-key i {
+  width: 11px; height: 3px; border-radius: 2px; display: inline-block;
+}
+.night-key.skipped { color: var(--muted); text-decoration: line-through; }
+.night-key.skipped i { opacity: 0.35; }
+.night-key.moon { color: #d7d2bc; }
+.night-key .moon-swatch {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: rgba(232, 226, 196, 0.5);
+  border: 1px solid rgba(232, 226, 196, 0.7);
+}
+.night-key.usage { margin-left: auto; color: var(--muted); font-family: var(--mono); }
+.night-key.usage.poor { color: var(--warn); }
+
+/* What Auto-arrange chose, and why. */
+.arrange-report {
+  margin-top: 9px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  font-size: 11.5px;
+}
+.arrange-head {
+  display: flex; align-items: center; gap: 8px;
+  margin-bottom: 6px;
+}
+.arrange-head .sky { color: var(--muted); }
+.arrange-row {
+  display: grid; grid-template-columns: minmax(120px, 1.2fr) minmax(150px, 1.4fr) 3fr;
+  gap: 10px; align-items: baseline;
+  padding: 3px 0;
+  border-bottom: 1px solid #1a1f2a;
+}
+.arrange-row:last-child { border-bottom: none; }
+.arrange-row .what { color: var(--good); font-size: 11px; }
+.arrange-row.empty .what { color: var(--muted); }
+.arrange-row .why { font-size: 10.5px; line-height: 1.4; }
+@media (max-width: 1100px) {
+  .arrange-row { grid-template-columns: minmax(0, 1fr); gap: 1px; }
+}
+
+/* Whose decision a slot was: yours, or the arranger's. */
+.slot-source {
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 10px; letter-spacing: 0.3px; text-transform: uppercase;
+  color: var(--muted);
+}
+.slot-source.pinned { border-color: var(--accent-dim); color: #9ad9b6; }
+
+/* How the night walks the plan. */
+.plan-order-bar { gap: 14px; flex-wrap: wrap; }
+.plan-order-bar select { min-width: 210px; }
+.plan-order-bar input[type="number"] { width: 68px; }
+
+.plan-graph {
+  width: 100%; height: 120px; display: block;
+  border: 1px solid var(--line); border-radius: 5px;
+  background: #0b0e15;
+}
+.plan-window { margin: 7px 0 0; color: var(--muted); }
+.plan-window.unusable { color: var(--bad); }
+.plan-order { margin-top: 5px; color: var(--muted); }
+.plan-order .warn { color: var(--warn); }
+
+.plan-filters { margin-top: 9px; }
+.plan-filter-grid {
+  display: grid;
+  grid-template-columns: 1fr 74px 74px 46px 62px;
+  gap: 4px 7px;
+  align-items: center;
+  font-size: 11.5px;
+}
+.plan-filter-grid > span { font-size: 10px; letter-spacing: 0.4px; }
+.plan-filter-grid input { margin-top: 0; padding: 3px 5px; font-size: 11.5px; }
+/* A count that exactly fills the night is the thing you were aiming at, so it
+   reads as a full tank rather than a fault. Only a count that will actually be
+   trimmed gets a warning colour, and amber rather than red — nothing is broken,
+   a number is about to be rounded down. */
+.plan-filter-grid input.at-limit { border-color: #2c5c41; color: var(--good); }
+.plan-filter-grid input.over { border-color: var(--warn); color: var(--warn); }
+.plan-filter-name { font-size: 12px !important; color: var(--text) !important; }
+
+.plan-bar {
+  height: 5px; margin-top: 10px;
+  background: var(--panel-2); border-radius: 3px; overflow: hidden;
+}
+.plan-bar-fill { height: 100%; width: 0; background: var(--good); transition: width 0.2s; }
+.plan-bar.full .plan-bar-fill { background: var(--warn); }
+.plan-bar-text { margin-top: 4px; color: var(--muted); }
+#schedSummary.over-committed { color: var(--warn); font-weight: 600; }
+
+/* ------------------------------------------------------------- sequencer */
+.sequence-bar { gap: 8px; flex-shrink: 0; }
+.seq-dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: #47506180; flex-shrink: 0;
+}
+.seq-dot.running { background: var(--good); box-shadow: 0 0 8px var(--good); }
+.seq-dot.paused { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+.seq-dot.error { background: var(--bad); box-shadow: 0 0 8px var(--bad); }
+#seqState { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.plan-box { cursor: default; }
+.plan-box.dragging { opacity: 0.4; }
+.plan-box.drop-before { box-shadow: 0 -3px 0 var(--accent); }
+.plan-box.drop-after { box-shadow: 0 3px 0 var(--accent); }
+.plan-box.active { border-color: var(--good); box-shadow: 0 0 0 1px #2c5d4380; }
+
+.plan-head .name { display: flex; align-items: center; gap: 7px; }
+.plan-head .grip { color: #4a5364; cursor: grab; font-size: 13px; letter-spacing: -1px; }
+.plan-box.dragging .grip { cursor: grabbing; }
+
+.plan-graph { cursor: crosshair; }
+.plan-slot {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 6px; color: var(--accent);
+}
+.plan-slot .muted { color: var(--muted); }
+.plan-slot .btn { padding: 1px 7px; font-size: 10.5px; }
+.plan-integration { margin-top: 6px; }
+.plan-integration .done { color: var(--good); font-weight: 600; }
+.plan-integration .meta { font-size: 10.5px; }
+.warn-text { color: var(--warn); }
+
+/* One tab per telescope while they all sweep at once. */
+.focus-tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 6px; }
+.focus-tabs[hidden] { display: none; }
+.focus-tab {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; flex-direction: column; gap: 1px;
+  padding: 4px 8px; text-align: left; font: inherit; cursor: pointer;
+  background: var(--panel-2); color: var(--muted);
+  border: 1px solid var(--line); border-radius: 5px;
+}
+.focus-tab:hover { border-color: var(--accent-dim); }
+.focus-tab.active { border-color: var(--accent-edge); background: var(--panel); color: var(--text); }
+.focus-tab-name {
+  font-size: 11px; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.focus-tab-state { font-size: 10px; }
+/* Still sweeping: a pulsing dot, so a finished one is obvious at a glance. */
+.focus-tab.running .focus-tab-state::before {
+  content: '●'; margin-right: 4px; color: var(--warn);
+  animation: blink 1s infinite;
+}
+.focus-tab.failed { border-color: #5d2c2c; }
+.focus-tab.failed .focus-tab-state { color: var(--bad); }
+
+/* A driver's own settings, as it keeps them. */
+.dev-settings { display: flex; flex-direction: column; gap: 4px; margin: 5px 0 6px; }
+.dev-setting {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) minmax(0, 1.2fr);
+  align-items: center; gap: 7px; margin: 0;
+}
+.dev-setting .dev-setting-name {
+  font-size: 11.5px; color: var(--muted);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* The ones that read like they name a device, sorted up and picked out. */
+.dev-setting.likely .dev-setting-name { color: var(--text); font-weight: 600; }
+.dev-setting input[type="text"] { margin-top: 0; font-size: 11px; padding: 4px 5px; }
+
+/* What the offset run has measured so far, per filter and per pass. The raw
+   per-pass numbers, because two passes ninety steps apart are two guesses and
+   seeing the pair is the only way to know that. */
+.offset-progress {
+  font-family: var(--mono); font-size: 11px; line-height: 1.7;
+  background: #0b0e15; border: 1px solid var(--line); border-radius: 5px;
+  padding: 7px 9px; margin: 6px 0;
+  max-height: 180px; overflow-y: auto; scrollbar-width: thin;
+}
+
+/* The filters in the wheel's slot order. Numbered, because the number is the
+   whole point: it is the slot the name lands on. */
+.filter-slots { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 8px; }
+.filter-slots.muted-empty {
+  display: block; color: var(--muted); font-size: 11.5px; padding: 6px 0;
+}
+.filter-slot {
+  display: flex; align-items: center; gap: 2px;
+  padding: 3px 4px 3px 3px;
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 5px;
+}
+.filter-slot .slot-number {
+  font-family: var(--mono); font-size: 10px; color: var(--muted);
+  background: #0b0e15; border-radius: 3px;
+  padding: 3px 5px; margin-right: 3px;
+}
+.filter-slot .slot-name-input {
+  width: 92px; margin: 0;
+  font-size: 11.5px; font-weight: 600;
+  padding: 3px 6px;
+}
+.filter-slot .slot-name-input::placeholder { font-weight: 400; }
+.filter-slot .btn.icon {
+  padding: 2px 5px; font-size: 10px; line-height: 1; min-width: 0;
+}
+.filter-slot .btn.icon:disabled { opacity: 0.25; }
+
+.run-chart {
+  width: 100%; height: 92px; display: block;
+  border: 1px solid var(--line); border-radius: 5px;
+  background: #0b0e15; margin-bottom: 6px;
+}
+
+/* The weather, said plainly and large. This is the one line in the program that
+   decides whether any of the rest should be happening. */
+/* The warnings strip under the top bar. Its colour is the worst thing on it. */
+.warnings-bar {
+  margin: 0 12px 6px; border-radius: var(--radius);
+  border: 1px solid var(--line); background: var(--panel);
+}
+.warnings-bar.critical { border-color: #93382c; background: #241110; }
+.warnings-bar.warning { border-color: #6d5a1f; background: #231d0f; }
+.warnings-bar.notice { border-color: #2b4570; background: #10182a; }
+.warnings-head {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 7px 12px; background: transparent; border: none; color: var(--text);
+  font: inherit; text-align: left; cursor: pointer;
+}
+.warnings-head .muted { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.warnings-mark {
+  width: 18px; height: 18px; border-radius: 50%; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-weight: 700; font-size: 12px;
+}
+.warnings-bar.critical .warnings-mark { background: #d9503d; color: #fff; }
+.warnings-bar.warning .warnings-mark { background: var(--warn); color: #201700; }
+.warnings-bar.notice .warnings-mark { background: var(--blue); color: #fff; }
+.warnings-list { border-top: 1px solid var(--line); padding: 4px 8px 8px; }
+.warning-row { padding: 6px 6px 6px 10px; border-left: 3px solid var(--muted); margin-top: 4px; }
+.warning-row.critical { border-left-color: #d9503d; }
+.warning-row.warning { border-left-color: var(--warn); }
+.warning-row.notice { border-left-color: var(--blue); }
+.warning-row.seen { opacity: 0.55; }
+.warning-row-head { display: flex; align-items: center; gap: 10px; }
+.warning-row .small { margin-top: 2px; line-height: 1.45; }
+.warning-fix { color: var(--good); }
+
+.safety-banner {
+  padding: 9px 11px; margin-bottom: 10px;
+  border: 1px solid var(--line); border-radius: 5px;
+  font-size: 12.5px; font-weight: 600; text-align: center;
+  background: var(--panel-2); color: var(--muted);
+}
+.safety-banner.safe { background: #10251a; border-color: #2c5d43; color: var(--good); }
+.safety-banner.unsafe { background: #2a1210; border-color: #93382c; color: #ffb4a8; }
+.safety-banner.pending { background: #2a2310; border-color: #6d5a1f; color: var(--warn); }
+.safety-banner.unknown { background: var(--panel-2); color: var(--muted); }
+
+/* Switched outlets: a power box is a list of names and buttons. */
+.switch-list { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+.switch-row {
+  display: grid; grid-template-columns: 1fr auto;
+  align-items: center; gap: 8px;
+}
+.switch-row .switch-name {
+  font-size: 11.5px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.switch-row .btn { min-width: 54px; }
+.switch-row input { width: 76px; }
+
+/* The pier camera's live view. The box keeps its height whatever the camera's
+   aspect turns out to be, so the panel below it does not jump about every time
+   a frame of a different size arrives. */
+.piercam-frame {
+  position: relative;
+  display: flex; align-items: center; justify-content: center;
+  min-height: 150px;
+  border: 1px solid var(--line); border-radius: 5px;
+  background: #0b0e15; overflow: hidden; margin-bottom: 8px;
+}
+.piercam-frame img {
+  display: block; width: 100%; height: auto;
+  /* A pier cam is usually a long way from being square to the telescope, so a
+     tall frame is cropped rather than allowed to push the readouts off screen. */
+  max-height: 420px; object-fit: contain;
+}
+.piercam-empty {
+  padding: 24px 12px; text-align: center;
+  color: var(--muted); font-size: 12px;
+}
+.piercam-frame img:not([hidden]) + .piercam-empty { display: none; }
+#panel-run .readout b { font-size: 12px; }
+#focusDetail, #runDetail { margin-bottom: 2px; }
+#focusTag.ready { color: var(--good); border-color: #2c5d43; }
+#equipmentDialog { width: min(620px, 94vw); }
+#equipmentDialog .modal-body { max-height: 80vh; overflow-y: auto; scrollbar-width: thin; }
+#equipmentDialog h3 {
+  margin: 16px 0 8px;
+  font-size: 10.5px; letter-spacing: 0.9px; text-transform: uppercase;
+  color: var(--muted); font-weight: 600;
+  border-top: 1px solid var(--line); padding-top: 12px;
+}
+
+.modal.ask { width: min(420px, 92vw); }
+.modal.ask .modal-head { border-bottom: none; padding-bottom: 0; background: var(--panel); }
+.modal.ask #askMessage { margin: 0 0 12px; line-height: 1.5; }
+.modal.ask #askInputRow { margin-bottom: 12px; }
+.modal.ask .row.gap { margin-bottom: 0; }
+
+#settingsDialog { width: min(620px, 94vw); }
+#settingsDialog .modal-body { max-height: 78vh; overflow-y: auto; scrollbar-width: thin; }
+#settingsDialog h3 {
+  margin: 16px 0 8px;
+  font-size: 10.5px; letter-spacing: 0.9px; text-transform: uppercase;
+  color: var(--muted); font-weight: 600;
+}
+#settingsDialog h3:first-child { margin-top: 0; }
+#settingsDialog p.small { margin: 2px 0 0; line-height: 1.5; }
+#solverNote.missing { color: var(--warn); }
+
+/* ---------------------------------------------------------------- planner */
+.planner-stage { background: #05070d; }
+#planCanvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: grab; }
+.planner-stage.dragging #planCanvas { cursor: grabbing; }
+
+.planner-options { gap: 8px; flex-wrap: wrap; flex-shrink: 0; }
+.planner-options .divider {
+  width: 1px; height: 20px; background: var(--line); margin: 0 4px;
+}
+
+label.inline.compact { gap: 5px; margin-right: 2px; color: var(--muted); }
+label.inline.compact input[type="number"] { width: 62px; margin-top: 0; }
+label.inline.compact input[type="range"] { width: 150px; margin-top: 0; }
+.sky-toolbar label.inline.compact input[type="number"] { width: 68px; }
+
+.planner-targets { width: 262px; }
+.planner-targets h3 {
+  margin: 0 0 4px;
+  font-size: 10.5px; letter-spacing: 0.9px; text-transform: uppercase;
+  color: var(--muted); font-weight: 600;
+  display: flex; align-items: center; gap: 7px;
+}
+.planner-targets p.small { margin: 0; line-height: 1.45; }
+
+.target-row {
+  display: grid; grid-template-columns: 1fr auto;
+  gap: 2px 8px;
+  padding: 6px 7px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.target-row:hover { background: var(--panel-2); }
+.target-row.active { background: #12201a; border-color: var(--accent-dim); }
+.target-row .name { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.target-row .kind {
+  font-size: 10px; letter-spacing: 0.4px; text-transform: uppercase; color: var(--muted);
+}
+.target-row .meta {
+  grid-column: 1 / -1; font-family: var(--mono); font-size: 10.5px; color: var(--muted);
+}
+.target-row .actions { grid-column: 1 / -1; display: flex; gap: 5px; margin-top: 4px; }
+.target-row .actions .btn { padding: 2px 7px; font-size: 10.5px; }
+
+/* ------------------------------------------------------------- calibrate */
+/* The tab borrows the survey's two-column frame; what goes in the left column
+   is a list rather than a chart, so it scrolls instead of stretching. */
+[data-panel="calibrate"] .survey-chart-wrap {
+  overflow-y: auto;
+  padding-right: 6px;
+  gap: 8px;
+}
+
+.cal-progress {
+  display: flex; align-items: center; gap: 12px;
+  margin: 0 12px; padding: 8px 12px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.cal-sets { display: flex; flex-direction: column; gap: 6px; }
+
+.cal-set {
+  display: flex; align-items: flex-end; flex-wrap: wrap; gap: 8px;
+  padding: 8px 10px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.cal-set .spacer { flex: 1; }
+.cal-set .btn { padding: 2px 8px; font-size: 10.5px; }
+
+.cal-field { display: flex; flex-direction: column; gap: 2px; margin: 0; }
+.cal-field > span { font-size: 10px; letter-spacing: 0.3px; color: var(--muted); }
+.cal-field input, .cal-field select { width: 84px; }
+
+/* The type is the thing to find when scanning the list, so it is a chip and
+   each sort has its own colour. */
+.cal-set-kind {
+  align-self: center;
+  min-width: 92px; padding: 3px 8px;
+  font-size: 10.5px; letter-spacing: 0.4px; text-transform: uppercase;
+  text-align: center; border-radius: 4px;
+  border: 1px solid var(--line); background: var(--panel-2); color: var(--muted);
+}
+.cal-set-kind.cal-bias { color: #9aa8bd; border-color: #333c4d; }
+.cal-set-kind.cal-dark { color: var(--blue); border-color: #2b4570; }
+.cal-set-kind.cal-flat { color: var(--warn); border-color: #6b5220; }
+.cal-set-kind.cal-darkflat { color: #b08bd0; border-color: #4b3a5e; }
+
+.cal-note { align-self: center; }
+
+.cal-results { display: flex; flex-direction: column; gap: 4px; }
+.cal-result {
+  display: flex; flex-direction: column; gap: 1px;
+  padding: 6px 10px;
+  border-left: 2px solid var(--good); background: var(--panel);
+  border-radius: 0 5px 5px 0;
+}
+.cal-result.failed { border-left-color: var(--bad); }
+
+.cal-masters {
+  display: flex; flex-direction: column; gap: 4px;
+  max-height: 260px; overflow-y: auto;
+  margin-top: 6px;
+}
+.cal-master {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 7px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 5px;
+}
+.cal-master .cal-set-kind { min-width: 66px; padding: 2px 5px; font-size: 9.5px; }
+.cal-master-what { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.cal-master-what b { font-family: var(--mono); font-size: 11.5px; }
+.cal-master .btn { padding: 1px 7px; }
+
+/* Is there a valid, current set of masters for tonight? One row per thing
+   the night needs, in one of three colours. */
+.cal-coverage { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.cal-coverage-head {
+  padding: 7px 10px; border-radius: 5px; font-size: 12.5px; font-weight: 600;
+  border-left: 3px solid var(--muted); background: var(--panel-2); color: var(--text);
+}
+.cal-coverage-head.ok { border-left-color: var(--good); color: var(--good); }
+.cal-coverage-head.stale { border-left-color: var(--warn); color: var(--warn); }
+.cal-coverage-head.missing { border-left-color: var(--bad); color: #eda296; }
+.cal-coverage-rows { display: flex; flex-direction: column; gap: 2px; }
+.cal-coverage-row {
+  display: grid; grid-template-columns: 96px 1fr; gap: 8px; align-items: baseline;
+  padding: 3px 8px; font-size: 11.5px; font-family: var(--mono);
+  border-radius: 4px; background: var(--panel);
+}
+.cal-coverage-row .state { font-weight: 600; letter-spacing: 0.3px; text-transform: uppercase; font-size: 10px; }
+.cal-coverage-row.ok .state { color: var(--good); }
+.cal-coverage-row.stale .state { color: var(--warn); }
+.cal-coverage-row.missing .state { color: #eda296; }
+.cal-coverage-row .why { color: var(--muted); font-family: inherit; font-size: 10.5px; }
+#calImportDialog { width: min(640px, 94vw); }
+
+/* Whether the library covers what is being shot right now. Green and red
+   because on a night that has already started this is the whole question. */
+.cal-match-ok { color: var(--good); }
+.cal-match-no { color: var(--warn); }
+#calMatchNow { display: flex; flex-direction: column; gap: 3px; font-size: 11px; }
+
+/* ---------------------------------------------------------------- all-sky */
+[data-panel="allsky"] .survey-chart-wrap { position: relative; min-height: 0; }
+#asChart {
+  flex: 1; width: 100%; min-height: 300px; display: block;
+  border: 1px solid var(--line); border-radius: 6px;
+  cursor: crosshair;
+}
+
+.as-progress {
+  display: flex; align-items: center; gap: 12px;
+  margin: 0 12px; padding: 7px 12px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.as-bar {
+  flex: 0 0 180px; height: 8px; border-radius: 4px;
+  background: #232936; overflow: hidden;
+}
+.as-bar-fill { height: 100%; background: var(--good); transition: width 0.3s; }
+.as-stats { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+
+.as-legend {
+  display: flex; align-items: center; gap: 12px;
+  padding: 7px 2px 0; font-size: 11px; color: var(--muted);
+}
+.as-legend .spacer { flex: 1; }
+.as-swatch {
+  display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+  margin-right: 4px; vertical-align: -1px;
+}
+/* These have to be the colours the canvas actually paints, or the legend is
+   telling a story about a different chart. */
+.as-swatch.as-none { background: #3f4d6b; }
+.as-swatch.as-part { background: linear-gradient(90deg, #705629, #d9a03d); }
+.as-swatch.as-full { background: var(--good); }
+.as-swatch.as-out { background: #2e3441; border: 1px solid var(--line); }
+.as-swatch.as-tonight { background: transparent; border: 1.5px solid var(--accent); }
+.as-swatch.as-moon { background: var(--warn); border-radius: 50%; }
+.as-note { margin: 4px 2px 0; line-height: 1.5; }
+#asChart { cursor: grab; }
+#asChart:active { cursor: grabbing; }
+
+/* Rides over the map rather than pushing it about, so clicking around the
+   grid does not make the thing you are clicking on move. */
+.as-field {
+  position: absolute; right: 14px; top: 14px; z-index: 5;
+  max-width: 340px; padding: 9px 11px;
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: var(--radius); box-shadow: 0 8px 24px #0008;
+}
+.as-field-head { font-weight: 600; font-size: 12px; padding-right: 22px; }
+.as-field-body { margin-top: 5px; white-space: pre-wrap; color: var(--muted); }
+.as-field-close { position: absolute; top: 5px; right: 5px; padding: 0 6px; }
+
+.as-tonight-list {
+  display: flex; flex-direction: column; gap: 2px;
+  max-height: 260px; overflow-y: auto; margin-top: 6px;
+}
+.as-tonight-row {
+  display: grid; grid-template-columns: 1fr auto auto; gap: 8px;
+  padding: 3px 6px; border-radius: 4px; font-size: 11px; cursor: pointer;
+}
+.as-tonight-row:hover { background: var(--panel-2); }
+
+.as-preview {
+  padding: 9px 11px; white-space: pre-wrap; line-height: 1.6;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); color: var(--text);
+}
+
+.plan-allsky { border-left: 2px solid var(--accent); }
+.plan-calibration { border-left: 2px solid var(--blue); }
+.plan-cal-sets {
+  display: flex; flex-direction: column; gap: 2px;
+  margin: 7px 0 0; color: var(--text);
+}
+.plan-calibration .plan-slot input[type="time"] { width: 96px; }
+
+/* ------------------------------------------------------------------ collab */
+/* Two halves of one conversation: this telescope taking part, and the machinery
+   of running one. Deliberately a reading layout rather than a cockpit - nothing
+   on this tab drives a camera, and the tables are the point. */
+
+.collab-page {
+  padding: 12px;
+  display: flex; flex-direction: column; gap: 12px;
+  max-width: 1100px;
+  overflow-y: auto;
+}
+.collab-page h3 {
+  margin: 14px 0 6px;
+  font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase;
+  color: var(--muted);
+}
+.collab-page h4 {
+  margin: 12px 0 4px;
+  font-size: 11.5px; color: var(--text); font-weight: 600;
+}
+.collab-page .night-table { margin-bottom: 6px; }
+
+.col-task {
+  margin-top: 10px; padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+/* The pre-flight check. The whole value of it is that a refusal is legible at a
+   glance, so a failed check is coloured and a merely-unknown one is not. */
+.col-checks { list-style: none; margin: 8px 0; padding: 0; font-size: 11.5px; }
+.col-check { padding: 2px 0; color: var(--muted); }
+.col-check b { display: inline-block; width: 14px; }
+.col-ok b { color: var(--good); }
+.col-no { color: var(--text); }
+.col-no b { color: var(--bad); }
+.col-unknown b { color: var(--warn); }
+
+.col-project {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 6px 8px;
+  border: 1px solid var(--line); border-radius: 5px;
+  margin-bottom: 4px;
+  cursor: pointer;
+}
+.col-project:hover { border-color: #33405a; }
+.col-project.active { border-color: var(--good); box-shadow: 0 0 0 1px #2c5d4380; }
+.col-project .mono { margin-left: auto; }
+
+/* A rejected night stays visible. A night that was thrown away is exactly the
+   thing somebody needs to see, and to be able to overrule. */
+.col-rejected td { opacity: 0.6; }
+.col-rejected td:nth-child(6) { color: var(--bad); opacity: 1; }
+
+.col-filter-name {
+  display: inline-block; min-width: 58px;
+  font-weight: 600; font-size: 11.5px;
+}
+/* The region being drawn in the Planner, and shown in the Collab form. */
+.planner-stage.drawing-region,
+.planner-stage.drawing-region canvas { cursor: crosshair; }
+
+.col-region {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 11px;
+  border: 1px dashed var(--line); border-radius: 5px;
+  margin-bottom: 8px;
+}
+.col-region.picked { border-style: solid; border-color: #2c5d43; }
+.col-region.picked b { color: var(--good); font-family: var(--mono); }
+.collab-tag { margin-left: 6px; color: var(--good); border-color: #2c5d43; }
+/* What a target will really get through tonight, as against what was asked for.
+   On the closed box, because that is the box people look at. */
+.plan-tonight {
+  margin-top: 8px;
+  padding: 6px 9px;
+  border-left: 2px solid var(--good);
+  background: var(--panel-2);
+  border-radius: 0 4px 4px 0;
+  line-height: 1.5;
+}
+.plan-tonight b { color: var(--good); margin-right: 6px; }
+.plan-tonight.none { border-left-color: var(--warn); }
+.plan-tonight.none b { color: var(--warn); }
+.col-stale {
+  margin: 8px 0;
+  padding: 7px 9px;
+  border-left: 2px solid var(--warn);
+  background: var(--panel-2);
+  border-radius: 0 4px 4px 0;
+}
+.col-stale b { color: var(--warn); }
+.col-stale .btn { margin: 5px 0; }
+/* ------------------------------------------------- the planner's night dock */
+/* Everything shootable, and what has been chosen for tonight, on one surface.
+   A collaboration chunk is a target like any other and gets planned the same
+   way; arranging it somewhere else behind this tab's back was the mistake. */
+
+/* Wider than the planetarium's catalogue: this one carries three lists and a
+   pair of time boxes rather than a column of names. */
+.planner-targets { width: 300px; display: flex; flex-direction: column; gap: 10px; }
+.dock-section { display: flex; flex-direction: column; min-height: 0; }
+.dock-section h3 { display: flex; align-items: center; gap: 7px; }
+.dock-section h3 .btn { margin-left: auto; }
+.dock-list { overflow-y: auto; min-height: 44px; }
+.dock-tonight { flex: 1 1 auto; border-top: 1px solid var(--line); padding-top: 6px; }
+
+.target-row[draggable="true"] { cursor: grab; }
+.target-row.dragging { opacity: 0.45; }
+.target-row.planned { border-left: 2px solid var(--good); }
+
+.collab-row .kind { color: var(--accent); }
+.collab-row.joined .kind { color: var(--good); }
+.collab-row.unfit { opacity: 0.72; }
+
+.dock-drop {
+  border: 1px dashed var(--line);
+  border-radius: 5px;
+  padding: 5px;
+}
+.dock-drop.over { border-color: var(--good); background: #122019; }
+.dock-empty { margin: 10px 4px; }
+
+/* Two lines, not one. The dock is a 262px column and a name beside two time
+   boxes does not fit in it - laid out in a row, the name was pushed out of
+   sight behind a horizontal scrollbar, which is the one thing on the row that
+   has to be readable. */
+.tonight-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 4px 6px;
+  padding: 6px 7px;
+  border: 1px solid var(--line); border-radius: 5px;
+  margin-bottom: 4px;
+  background: var(--panel);
+}
+.tonight-row .name {
+  grid-column: 1; grid-row: 1;
+  font-size: 12px;
+  display: flex; align-items: center; gap: 6px;
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tonight-row .remove { grid-column: 2; grid-row: 1; padding: 2px 7px; font-size: 10.5px; }
+.tonight-row .times {
+  grid-column: 1 / -1; grid-row: 2;
+  display: flex; align-items: center; gap: 4px; flex-wrap: wrap;
+}
+.tonight-row .times input {
+  width: 84px; margin: 0;
+  font-size: 11px; padding: 2px 4px;
+}
+/* --------------------------------------------- a collaboration in the plan */
+/* The chunk is not yours to expose: the sub lengths and the split between
+   filters belong to the project, and are shown rather than offered. What is
+   yours is how long the telescope is theirs for. */
+
+.collab-spec {
+  border: 1px solid var(--line); border-radius: 5px;
+  padding: 7px 9px; margin-bottom: 8px;
+  background: var(--panel-2);
+}
+.collab-spec-head { margin-bottom: 5px; }
+.plan-filter-grid.collab-grid span { align-self: center; }
+.collab-hours { margin: 0 0 4px; }
+.collab-hours input { width: 78px; margin: 0; }
+
+.collab-depth { margin-top: 10px; }
+.collab-depth h4 { margin: 0 0 5px; font-size: 11.5px; }
+.depth-grid {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 4px 8px;
+  align-items: center;
+  margin-top: 5px;
+}
+.depth-grid .meter { min-width: 60px; }
+.meter.met .meter-fill { background: var(--good); }
+
+/* Who is about: the count in the toolbar and the line on each card. */
+.col-online { color: var(--good); margin-left: 6px; }
+.col-online:empty { display: none; }
+.col-people { color: var(--muted); margin-top: 2px; }
+
+/* Browsing what is open, on the Collab tab: where a collaboration is chosen.
+   What it then does on a given night is settled in the Planner. */
+.col-open {
+  padding: 8px 10px;
+  border: 1px solid var(--line); border-radius: 5px;
+  margin-bottom: 6px;
+  display: flex; gap: 12px; align-items: flex-start;
+}
+/* The patch of sky, at a glance, beside the words. */
+.col-open .col-sky {
+  width: 180px; height: 120px; flex-shrink: 0;
+  border-radius: 4px; background: #05070d;
+  border: 1px solid var(--line);
+}
+.col-open .col-open-body { flex: 1; min-width: 0; }
+@media (max-width: 640px) {
+  .col-open { flex-direction: column; }
+  .col-open .col-sky { width: 100%; height: auto; aspect-ratio: 3 / 2; }
+}
+.col-open.joined { border-color: #2c5d43; }
+.col-open p.small { margin: 4px 0; }
+.col-open .depth-grid { margin-top: 6px; }
+
+/* A chunk's framing, on the closed box rather than behind a double-click. */
+.plan-framing.framing-inline { margin-top: 10px; }
+.plan-framing.framing-inline h4 { margin-top: 0; }
+/* Bandpass beside each filter slot. Narrow, because most filters have none. */
+.slot-nm-input { width: 58px; margin: 0; font-size: 11px; padding: 3px 5px; }
+/* The Collab tab, after it was cut down to two things. */
+.collab-heading {
+  margin: 6px 0 8px;
+  font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase;
+  color: var(--muted);
+  display: flex; align-items: center; gap: 7px;
+}
+.col-open .btn { flex-shrink: 0; }
+.col-offered { border-color: var(--accent-dim); margin-top: 10px; }
+.collab-page > .fold { margin-top: 0; }
+
+/* Joining: one box, one button. Green once it is done. */
+.col-join { border-left: 3px solid var(--warn); }
+.col-join.joined { border-left-color: var(--good); }
+.col-join .btn.primary { white-space: nowrap; }
+.collab-share { margin: 0 0 8px; }
+.collab-share b { color: var(--good); margin-right: 6px; }
