@@ -804,6 +804,21 @@
     renderSets();
   }
 
+  /** The library alone, after its folder may have moved. Leaves the recipe
+      and this tab's own settings form as they are, edits and all. */
+  async function refreshLibrary() {
+    let payload;
+    try {
+      payload = await app.api('/api/calibration');
+    } catch (error) {
+      return;
+    }
+    cal.loaded = payload;
+    renderLibrary(payload);
+    loadMatch();
+    loadCoverage();
+  }
+
   function bind() {
     $('calRecipe').addEventListener('change', async () => {
       const id = $('calRecipe').value;
@@ -933,6 +948,13 @@
     // The library is worth knowing about before the tab is opened: it decides
     // whether tonight's frames get calibrated at all.
     load();
+    // A new library folder chosen in Settings shows here straight away.
+    let libraryDir = null;
+    app.onSettings((settings) => {
+      const dir = (settings.calibration || {}).libraryDirectory || '';
+      if (dir !== libraryDir && cal.loaded) refreshLibrary();
+      libraryDir = dir;
+    });
   }
 
   document.addEventListener('DOMContentLoaded', init);

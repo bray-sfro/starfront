@@ -85,6 +85,10 @@ const state = {
    status socket, so it subscribes here rather than opening a second one. */
 const statusListeners = [];
 
+/* Tabs that show a setting of their own - the calibration library's folder -
+   hear about a save here, rather than holding what they read at startup. */
+const settingsListeners = [];
+
 /* pywebview injects this bridge when we run as a desktop window; in a plain
    browser it is absent and Browse… falls back to `pickPath`. */
 const nativeApi = () => (window.pywebview && window.pywebview.api) || null;
@@ -2868,6 +2872,9 @@ async function loadSettings() {
   }
   fillSettingsForm(state.settings);
   fillEquipmentForm(state.settings);
+  for (const listener of settingsListeners) {
+    try { listener(state.settings); } catch (error) { reportBrokenScript('Settings listener', error); }
+  }
   return state.settings;
 }
 
@@ -4874,6 +4881,8 @@ window.astro = {
   /** Re-render everything from the status already held. */
   refresh: () => { if (state.status) applyStatus(state.status); },
   onStatus: (listener) => statusListeners.push(listener),
+  /** Called with the settings each time they are (re)loaded, after a save too. */
+  onSettings: (listener) => settingsListeners.push(listener),
 };
 
 function init() {
