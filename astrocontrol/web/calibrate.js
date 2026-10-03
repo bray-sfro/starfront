@@ -804,6 +804,21 @@
     renderSets();
   }
 
+  /** The library alone, after its folder may have moved. Leaves the recipe
+      and this tab's own settings form as they are, edits and all. */
+  async function refreshLibrary() {
+    let payload;
+    try {
+      payload = await app.api('/api/calibration');
+    } catch (error) {
+      return;
+    }
+    cal.loaded = payload;
+    renderLibrary(payload);
+    loadMatch();
+    loadCoverage();
+  }
+
   function bind() {
     $('calRecipe').addEventListener('change', async () => {
       const id = $('calRecipe').value;
@@ -879,14 +894,10 @@
     $('btnCalImportRead').addEventListener('click', readImport);
     $('btnCalImportGo').addEventListener('click', doImport);
     $('btnCalImportBrowse').addEventListener('click', async () => {
-      const native = (window.pywebview && window.pywebview.api) || null;
-      if (!native || !native.pick_master) {
-        $('calImportPath').focus();
-        app.toast('Type the full path to the file here', 'info');
-        return;
-      }
       try {
-        const chosen = await native.pick_master($('calImportPath').value || '');
+        const chosen = await app.choosePath('pick_master', {
+          title: 'Import a master frame', start: $('calImportPath').value || '',
+          files: ['.fit', '.fits', '.fts', '.xisf'] });
         if (chosen) { $('calImportPath').value = chosen; readImport(); }
       } catch (error) { app.toast(String(error), 'error'); }
     });
@@ -937,6 +948,13 @@
     // The library is worth knowing about before the tab is opened: it decides
     // whether tonight's frames get calibrated at all.
     load();
+    // A new library folder chosen in Settings shows here straight away.
+    let libraryDir = null;
+    app.onSettings((settings) => {
+      const dir = (settings.calibration || {}).libraryDirectory || '';
+      if (dir !== libraryDir && cal.loaded) refreshLibrary();
+      libraryDir = dir;
+    });
   }
 
   document.addEventListener('DOMContentLoaded', init);

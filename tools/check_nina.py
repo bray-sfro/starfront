@@ -182,6 +182,20 @@ case("a choice of sections writes only those, and no drivers",
      list(part["settings"]) == ["guiding"] and part["devices"] == []
      and config2.get("optics", "focalLength") is None)
 
+# A plugin that keeps control characters in its settings (Sequencer Powerups'
+# DockableExprs) leaves references like &#x1; in the file. N.I.N.A. reads them
+# back; a conforming XML parser refuses the whole profile, which used to look
+# like there being no profile at all.
+plugged = Path(tempfile.mkdtemp())
+(plugged / "abc.profile").write_text(PROFILE.replace(
+    "</Profile>",
+    '<PluginSettings><Value>max_cycles&#x1;Numeric&#x1;None&#x0;is_powered&#1;</Value>'
+    "</PluginSettings></Profile>"), encoding="utf-8")
+found = ninaimport.profiles(plugged)
+case("a profile carrying control characters from a plugin is still found",
+     len(found) == 1, str(found))
+case("...and still read", ninaimport.read(plugged / "abc.profile")["settings"] != {})
+
 print()
 print(f"{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

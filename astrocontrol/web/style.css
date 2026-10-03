@@ -1611,6 +1611,28 @@ table.survey-fields tr:hover td { background: var(--panel-2); }
 .modal.ask #askInputRow { margin-bottom: 12px; }
 .modal.ask .row.gap { margin-bottom: 0; }
 
+/* Browse… in a browser: a folder at a time from the capture PC. */
+.modal.pick { width: min(520px, 94vw); }
+.modal.pick #pickPath { flex: 1; min-width: 0; }
+.pick-list {
+  list-style: none; margin: 10px 0 8px; padding: 4px 0;
+  height: min(46vh, 340px); overflow-y: auto; scrollbar-width: thin;
+  border: 1px solid var(--line); border-radius: var(--radius); background: var(--bg);
+}
+.pick-list li {
+  display: flex; align-items: center; gap: 8px;
+  padding: 5px 10px; cursor: pointer; user-select: none;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.pick-list li:hover { background: var(--panel-2); }
+.pick-list li.selected { background: var(--accent-dim); color: var(--accent-text); }
+.pick-list li .pick-icon { width: 14px; flex: none; color: var(--muted); text-align: center; }
+.pick-list li.dir .pick-icon { color: var(--warn); }
+.pick-list li.empty { color: var(--muted); cursor: default; }
+.pick-list li.empty:hover { background: none; }
+#pickNote:empty { display: none; }
+#pickNote { margin: 0 0 8px; }
+
 #settingsDialog { width: min(620px, 94vw); }
 #settingsDialog .modal-body { max-height: 78vh; overflow-y: auto; scrollbar-width: thin; }
 #settingsDialog h3 {
