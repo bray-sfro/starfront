@@ -20,7 +20,9 @@ with the reason, rather than mapped to the nearest thing and quietly wrong.
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
@@ -46,6 +48,24 @@ class NinaError(RuntimeError):
     pass
 
 
+log = logging.getLogger("astrocontrol.ninaimport")
+
+#: A character reference to something XML 1.0 forbids: the C0 controls other
+#: than tab, newline and return.  .NET's serialiser writes these without
+#: complaint and reads them back the same way, so a plugin that keeps a
+#: control-character-delimited string in its settings (Sequencer Powerups'
+#: `DockableExprs` does) leaves a profile N.I.N.A. is happy with and every
+#: conforming XML parser rejects outright.
+_ILLEGAL_REF = re.compile(
+    r"&#(?:x0*(?:[0-8bBcC]|1[0-9a-fA-F]|[eE]|[fF])|0*(?:[0-8]|1[124-9]|2[0-9]|3[01]));")
+
+
+def _parse(path: Path) -> ET.Element:
+    """A profile's root element, read the way N.I.N.A. reads it."""
+    text = path.read_text(encoding="utf-8-sig")
+    return ET.fromstring(_ILLEGAL_REF.sub("", text))
+
+
 # ---------------------------------------------------------------------------
 # Finding and reading profiles
 # ---------------------------------------------------------------------------
@@ -58,8 +78,9 @@ def profiles(folder: Path | None = None) -> list[dict[str, Any]]:
         return found
     for path in folder.glob("*.profile"):
         try:
-            root = ET.parse(path).getroot()
-        except (ET.ParseError, OSError):
+            root = _parse(path)
+        except (ET.ParseError, OSError, UnicodeDecodeError) as exc:
+            log.warning("N.I.N.A. profile %s could not be read: %s", path.name, exc)
             continue
         used = _text(root, "p:LastUsed") or ""
         found.append({
@@ -109,8 +130,8 @@ def read(path: Path | str) -> dict[str, Any]:
     """
     path = Path(path)
     try:
-        root = ET.parse(path).getroot()
-    except (ET.ParseError, OSError) as exc:
+        root = _parse(path)
+    except (ET.ParseError, OSError, UnicodeDecodeError) as exc:
         raise NinaError(f"{path.name} could not be read: {exc}") from exc
 
     settings: dict[str, dict[str, Any]] = {}
