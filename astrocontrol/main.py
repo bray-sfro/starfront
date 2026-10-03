@@ -22,6 +22,7 @@ from . import (allsky, astro, autoplan, calibrating, calibration, catalog,
                collabadmin, collabclient, filteroffsets, framing, logs, notify,
                overheads,
                piercam, plans, safety, schedule, solarsystem, survey)
+from . import browse
 from . import collab
 from . import filters
 from . import ninaimport
@@ -5775,6 +5776,23 @@ def _nina_profile_path(profile_id: str) -> Path:
         if row["id"] == profile_id:
             return Path(row["path"])
     raise HTTPException(status_code=404, detail="no such N.I.N.A. profile")
+
+
+@app.get("/api/browse")
+def browse_folder(path: str = Query("", max_length=1024),
+                  files: str | None = Query(None, max_length=200)) -> dict[str, Any]:
+    """One folder on this machine, for the browser's stand-in folder dialog.
+
+    `files` is a comma-separated list of extensions to include (`.fits,.fit`),
+    `*` for every file, or absent for folders only.
+    """
+    extensions = None if files is None else [
+        e.strip() if e.strip() == "*" or e.strip().startswith(".") else "." + e.strip()
+        for e in files.split(",") if e.strip()]
+    try:
+        return browse.listing(path, extensions)
+    except browse.BrowseError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/nina/profiles")

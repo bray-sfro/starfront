@@ -86,7 +86,7 @@ const state = {
 const statusListeners = [];
 
 /* pywebview injects this bridge when we run as a desktop window; in a plain
-   browser it is absent and the folder has to be typed. */
+   browser it is absent and Browse… falls back to `pickPath`. */
 const nativeApi = () => (window.pywebview && window.pywebview.api) || null;
 
 /* ------------------------------------------------------------------ api */
@@ -232,6 +232,144 @@ function bindAsk() {
   // Escape closes a <dialog> without any button being pressed.
   $('askDialog').addEventListener('close', () => {
     if (askResolve) closeAsk($('askInputRow').hidden ? false : null);
+  });
+}
+
+/* --------------------------------------------------------------- browsing */
+
+/* Browse… in a plain browser. The desktop window has Windows' own dialog; a
+   browser's file chooser hides the path and lives on whatever device the page
+   is open on, while the folder that matters is on the capture PC. So the
+   server lists that machine's folders and this walks them. */
+
+const pick = { resolve: null, files: null, path: null, parent: null, selected: null };
+
+function closePick(value) {
+  const dialog = $('pickDialog');
+  if (dialog.open) dialog.close();
+  const resolve = pick.resolve;
+  pick.resolve = null;
+  if (resolve) resolve(value);
+}
+
+function pickRow(kind, name, onPick, onOpen) {
+  const row = document.createElement('li');
+  row.className = kind;
+  row.setAttribute('role', 'option');
+  const icon = document.createElement('span');
+  icon.className = 'pick-icon';
+  icon.textContent = kind === 'file' ? '·' : (kind === 'drive' ? '◆' : '▸');
+  const label = document.createElement('span');
+  label.textContent = name;
+  row.append(icon, label);
+  row.title = name;
+  row.addEventListener('click', () => onPick(row));
+  if (onOpen) row.addEventListener('dblclick', onOpen);
+  return row;
+}
+
+function updatePickConfirm() {
+  const button = $('pickConfirm');
+  if (pick.files) {
+    button.textContent = 'Open';
+    button.disabled = !pick.selected;
+  } else {
+    button.textContent = 'Use this folder';
+    button.disabled = !pick.path;
+  }
+}
+
+async function showPickFolder(path) {
+  const query = new URLSearchParams({ path: path || '' });
+  if (pick.files) query.set('files', pick.files.join(','));
+  let listing;
+  try {
+    listing = await api(`/api/browse?${query}`);
+  } catch (error) {
+    $('pickNote').textContent = error.message;
+    return;
+  }
+  pick.path = listing.path;
+  pick.parent = listing.parent;
+  pick.selected = null;
+  $('pickPath').value = listing.path || '';
+  $('pickPath').placeholder = listing.path ? '' : 'This PC';
+  $('pickUp').disabled = !listing.parent;
+  $('pickNote').textContent = listing.truncated
+    ? 'Only the first entries are shown; type the rest of the path to go further.' : '';
+
+  const list = $('pickList');
+  list.replaceChildren();
+  const select = (row, full) => {
+    list.querySelectorAll('.selected').forEach((other) => other.classList.remove('selected'));
+    row.classList.add('selected');
+    pick.selected = full;
+    updatePickConfirm();
+  };
+  const join = (name) => (listing.path ? listing.path.replace(/[\\/]$/, '')
+    + (listing.path.includes('/') && !listing.path.includes('\\') ? '/' : '\\') + name : name);
+
+  for (const name of listing.dirs) {
+    const full = join(name);
+    // One click opens a folder; there is nothing to select inside the drive list.
+    list.append(pickRow(listing.path ? 'dir' : 'drive', name, () => showPickFolder(full)));
+  }
+  for (const name of listing.files) {
+    const full = join(name);
+    list.append(pickRow('file', name, (row) => select(row, full),
+      () => closePick(full)));
+  }
+  if (!list.children.length) {
+    const empty = document.createElement('li');
+    empty.className = 'empty';
+    empty.textContent = pick.files ? 'No matching files or folders here' : 'No folders here';
+    list.append(empty);
+  }
+  list.scrollTop = 0;
+  updatePickConfirm();
+}
+
+/** Choose a path on the capture PC from inside the page.
+
+    `files`: extensions to offer (`['.fits', '.fit']`, or `['*']`), or absent
+    to choose a folder. Resolves to the full path, or null if cancelled. */
+function pickPath({ title = 'Choose a folder', start = '', files = null } = {}) {
+  if (pick.resolve) closePick(null);
+  pick.files = files;
+  $('pickTitle').textContent = title;
+  $('pickNote').textContent = '';
+  $('pickList').replaceChildren();
+  $('pickDialog').showModal();
+  showPickFolder(start);
+  return new Promise((resolve) => { pick.resolve = resolve; });
+}
+
+/** Browse…: Windows' dialog in the desktop window, the page's own in a browser.
+    `nativeMethod` names the desktop bridge call (`pick_folder`, `pick_file`…). */
+async function choosePath(nativeMethod, options = {}) {
+  const native = nativeApi();
+  if (native && native[nativeMethod]) return native[nativeMethod](options.start || '');
+  return pickPath(options);
+}
+
+function bindPick() {
+  $('pickUp').addEventListener('click', (event) => {
+    event.preventDefault();
+    if (pick.parent) showPickFolder(pick.parent);
+  });
+  $('pickPath').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); showPickFolder($('pickPath').value); }
+  });
+  $('pickCancel').addEventListener('click', (event) => {
+    event.preventDefault();
+    closePick(null);
+  });
+  $('pickConfirm').addEventListener('click', (event) => {
+    event.preventDefault();
+    closePick(pick.files ? pick.selected : pick.path);
+  });
+  $('pickDialog').addEventListener('close', () => {
+    if (pick.resolve) closePick(null);
   });
 }
 
@@ -4421,10 +4559,9 @@ function bindControls() {
     pushOutput({ directory: $('saveDir').value }).catch(() => {});
   });
   $('btnBrowseDir').addEventListener('click', async () => {
-    const api = nativeApi();
-    if (!api) { $('saveDir').focus(); toast('Type the folder path here', 'info'); return; }
     try {
-      const chosen = await api.pick_folder($('saveDir').value || '');
+      const chosen = await choosePath('pick_folder',
+        { title: 'Save frames to', start: $('saveDir').value || '' });
       if (chosen) {
         $('saveDir').value = chosen;
         await pushOutput({ directory: chosen });
@@ -4577,22 +4714,16 @@ function bindControls() {
   });
   $('capRoot').addEventListener('input', updateCapturePreview);
   $('btnPhd2Browse').addEventListener('click', async () => {
-    const native = nativeApi();
-    if (!native || !native.pick_file) {
-      $('phd2Path').focus();
-      toast('Type the full path to phd2.exe here', 'info');
-      return;
-    }
     try {
-      const chosen = await native.pick_file($('phd2Path').value || '');
+      const chosen = await choosePath('pick_file',
+        { title: 'Find phd2.exe', start: $('phd2Path').value || '', files: ['.exe'] });
       if (chosen) { $('phd2Path').value = chosen; refreshPhd2Note(); }
     } catch (error) { toast(String(error), 'error'); }
   });
   $('btnCapBrowse').addEventListener('click', async () => {
-    const native = nativeApi();
-    if (!native) { $('capRoot').focus(); toast('Type the folder path here', 'info'); return; }
     try {
-      const chosen = await native.pick_folder($('capRoot').value || '');
+      const chosen = await choosePath('pick_folder',
+        { title: 'Where frames are saved', start: $('capRoot').value || '' });
       if (chosen) { $('capRoot').value = chosen; updateCapturePreview(); }
     } catch (error) { toast(String(error), 'error'); }
   });
@@ -4655,10 +4786,9 @@ function bindControls() {
   }
   $('calRoot').addEventListener('input', updateCalibrationPreview);
   $('btnCalRootBrowse').addEventListener('click', async () => {
-    const native = nativeApi();
-    if (!native) { $('calRoot').focus(); toast('Type the folder path here', 'info'); return; }
     try {
-      const chosen = await native.pick_folder($('calRoot').value || '');
+      const chosen = await choosePath('pick_folder',
+        { title: 'Calibration library', start: $('calRoot').value || '' });
       if (chosen) { $('calRoot').value = chosen; updateCalibrationPreview(); }
     } catch (error) { toast(String(error), 'error'); }
   });
@@ -4729,6 +4859,8 @@ window.astro = {
   toast,
   confirmAction,
   askForText,
+  /** Browse…: the native dialog in the window, the page's own in a browser. */
+  choosePath,
   fmtHours,
   fmtDegrees,
   showTab,
@@ -4750,6 +4882,7 @@ function init() {
   bindFocusFloatDrag();
   buildConnectRows();
   bindAsk();
+  bindPick();
   bindControls();
   initViewer();
   applyOptionalTabs();

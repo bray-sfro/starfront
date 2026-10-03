@@ -747,23 +747,16 @@
    * points, how wide it is and which way up it was shot — the rectangle lands
    * on the real sky rather than on the pixels. */
   async function openFits() {
-    const native = (window.pywebview && window.pywebview.api) || null;
+    // In a browser this walks the capture PC's folders rather than the
+    // device the page is open on: the server reads the frame, not the page,
+    // which is also why this works from a tablet.
     let path = '';
-    if (native && native.pick_fits) {
-      try {
-        path = await native.pick_fits(plan.lastFitsDir || '');
-      } catch (error) { app.toast(String(error), 'error'); return; }
-      if (!path) return;
-    } else {
-      // In a browser there is no file chooser that yields a path the server can
-      // open, so the path is typed. The server reads it, not the page — which
-      // is also why this works from a tablet: the file is on the capture PC.
-      path = await app.askForText(
-        'Full path to a FITS frame on the capture PC',
-        plan.lastFitsPath || '',
-        { title: 'Open FITS', confirmLabel: 'Open' });
-      if (!path) return;
-    }
+    try {
+      path = await app.choosePath('pick_fits', {
+        title: 'Open FITS', start: plan.lastFitsDir || '',
+        files: ['.fit', '.fits', '.fts'] });
+    } catch (error) { app.toast(String(error), 'error'); return; }
+    if (!path) return;
 
     plan.lastFitsPath = path;
     plan.lastFitsDir = path.replace(/[\\/][^\\/]*$/, '');

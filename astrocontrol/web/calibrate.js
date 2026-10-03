@@ -879,14 +879,10 @@
     $('btnCalImportRead').addEventListener('click', readImport);
     $('btnCalImportGo').addEventListener('click', doImport);
     $('btnCalImportBrowse').addEventListener('click', async () => {
-      const native = (window.pywebview && window.pywebview.api) || null;
-      if (!native || !native.pick_master) {
-        $('calImportPath').focus();
-        app.toast('Type the full path to the file here', 'info');
-        return;
-      }
       try {
-        const chosen = await native.pick_master($('calImportPath').value || '');
+        const chosen = await app.choosePath('pick_master', {
+          title: 'Import a master frame', start: $('calImportPath').value || '',
+          files: ['.fit', '.fits', '.fts', '.xisf'] });
         if (chosen) { $('calImportPath').value = chosen; readImport(); }
       } catch (error) { app.toast(String(error), 'error'); }
     });

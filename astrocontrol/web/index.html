@@ -8,7 +8,7 @@
 <!-- The ?v= stamps exist to break a browser cache that has already decided an
      older copy is still fresh. Bump them if a released build ever needs to
      invalidate a client that has not revalidated. -->
-<link rel="stylesheet" href="style.css?v=50">
+<link rel="stylesheet" href="style.css?v=51">
 </head>
 <body>
 
@@ -2956,14 +2956,37 @@
   </div>
 </dialog>
 
+<!-- Browse… in a browser: the capture PC's folders, listed by the server. The
+     desktop window uses Windows' own dialog instead. -->
+<dialog id="pickDialog" class="modal pick">
+  <form method="dialog" class="modal-head">
+    <h2 id="pickTitle">Choose a folder</h2>
+  </form>
+  <div class="modal-body">
+    <div class="row gap">
+      <button class="btn small" id="pickUp" title="Up one folder">↑</button>
+      <input type="text" id="pickPath" class="mono" spellcheck="false"
+             title="Type a path and press Enter to go there">
+    </div>
+    <ul id="pickList" class="pick-list" role="listbox"></ul>
+    <p class="small muted" id="pickNote"></p>
+    <div class="row gap">
+      <span class="small muted" id="pickWhere">On the capture PC</span>
+      <span class="spacer"></span>
+      <button class="btn small" id="pickCancel">Cancel</button>
+      <button class="btn primary small" id="pickConfirm">Use this folder</button>
+    </div>
+  </div>
+</dialog>
+
 <div id="toasts" class="toasts"></div>
 
-<script src="app.js?v=50"></script>
+<script src="app.js?v=51"></script>
 <script src="sky.js?v=50"></script>
-<script src="planner.js?v=50"></script>
+<script src="planner.js?v=51"></script>
 <script src="plan.js?v=50"></script>
 <script src="surveytab.js?v=50"></script>
-<script src="calibrate.js?v=50"></script>
+<script src="calibrate.js?v=51"></script>
 <script src="collab.js?v=50"></script>
 <script src="allsky.js?v=50"></script>
 <script src="wizard.js?v=50"></script>
