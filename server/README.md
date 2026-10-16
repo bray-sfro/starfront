@@ -230,6 +230,59 @@ path in `ReadWritePaths` in the service file.) The server always leaves two
 gigabytes free and refuses uploads beyond that, telling the person to tell
 the coordinator.
 
+## The live stack
+
+A light that arrives while a collaboration is collecting files is registered
+and folded into a shared stack. The upload itself only writes the file; a
+single background worker does the rest, so a slow frame never holds up the
+next one. The stack is one picture per filter, on a canvas fixed from the
+project's region and the scales of the telescopes that have joined. Later
+frames are star-matched onto it, resampled, debayered when the header names
+a Bayer pattern, weighed by noise, exposure and star size, and rejected
+pixel by pixel once a pixel has been seen enough times to have an opinion.
+
+Anybody can watch it. `/watch` lists the collaborations that are collecting,
+and `/watch/<project id>` is the picture: a stretched preview, who
+contributed, and how many frames. The page is a one-way view. It has no
+sign-in, no token, and nowhere to send a file. The same picture is pushed
+on `/api/v1/watch/<project id>/events` as the stack changes.
+
+The stack is a folder of arrays under the data directory (`stacks/` beside
+the database). Restarting the server reopens it and finishes anything that
+was queued. The frames themselves stay in the files folder; the stack does
+not keep a second copy of every sub.
+
+**What it does not do.** It does not calibrate. Flats, darks and bias are
+stored and left alone — a live stack of uncalibrated lights is a picture of
+the night, not a finished integration. It does not plate-solve against a
+catalogue. The first frame's own header is the absolute sky, and everything
+after is matched to the stars already in the stack; a first frame whose
+rotation keyword is a few degrees off makes a sharp stack that is a few
+degrees off the truth. XISF is stored and not stacked. A Bayer frame with
+no pattern in the header is stacked as mono, chequerboard and all.
+
+### Try it on this machine
+
+```bash
+python tools/check_collab_stack.py
+```
+
+That starts a server on a free port, invents two telescopes that do not
+match (focal length, pixel scale, sensor, rotation, exposure) plus a colour
+camera, uploads synthetic star fields through the same call a telescope
+uses, and checks that the stack is one picture, that the public page moved,
+and that the page does not reveal a token or an upload address. It prints
+`PASS`/`FAIL` and writes a before/after pair of previews.
+
+To leave the viewer open in a browser afterwards:
+
+```bash
+python tools/check_collab_stack.py --serve
+```
+
+The last lines are the address. Open it, leave the command running, and
+Ctrl+C when you are done. Nothing here touches a deployed server.
+
 ## What is deliberately not here yet
 
 - **A drawn depth map.** The depth map exists at the resolution of each rig's
@@ -237,13 +290,15 @@ the coordinator.
 
 ## Driving it
 
-There is no web interface here, and there is not going to be one. The
-coordinator's screen is the **Collab** tab in Starfront, which holds both
-credentials and makes these calls on the operator's behalf — so a token that can
-rewrite every project on the server is never in a page, in devtools, or in any
-extension that asks for it.
+There is no coordinator's web interface here, and there is not going to be
+one. The coordinator's screen is the **Collab** tab in Starfront, which holds
+both credentials and makes these calls on the operator's behalf — so a token
+that can rewrite every project on the server is never in a page, in devtools,
+or in any extension that asks for it. The one public page is `/watch`, and it
+only shows the live stack.
 
 `python tools/check_server.py` exercises the whole protocol over real HTTP
 against a real server on a real port. `python tools/check_coordinator.py`
 covers the tiling arithmetic and tries each credential against the other's
-endpoints.
+endpoints. `python tools/check_collab_stack.py` stacks synthetic frames from
+mismatched telescopes and opens the watch page; `--serve` leaves that page up.

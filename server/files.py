@@ -124,7 +124,8 @@ class Files:
                  person: Callable[[str], dict[str, Any] | None],
                  owns_project: Callable[[dict[str, Any], dict[str, Any]], bool],
                  owners: list[str], public_url: str,
-                 new_login_code: Callable[[], str]) -> None:
+                 new_login_code: Callable[[], str],
+                 on_light: Callable[[dict[str, Any]], None] | None = None) -> None:
         self.app = app
         self.store = store
         self.folder = Path(folder)
@@ -133,6 +134,10 @@ class Files:
         self.owners = list(owners)
         self.public_url = public_url.rstrip("/")
         self.new_login_code = new_login_code
+        # Told when a new light is on disk. It must only queue work: the
+        # upload is already done, and stacking the frame here would make
+        # the next byte wait on a plate solution.
+        self.on_light = on_light
         self.folder.mkdir(parents=True, exist_ok=True)
         self._routes()
 
@@ -359,7 +364,24 @@ class Files:
             label = telescope.strip() or str(who.get("telescope") or "")
             row = self.store.add_file(secrets.token_hex(8), project_id, who["id"],
                                       clean, written, label[:60], what)
-            return {"file": self._row(row, {}), "already": False}
+            body = {"file": self._row(row, {}), "already": False}
+            if what == "light" and self.on_light is not None:
+                try:
+                    self.on_light({
+                        "project": project_id,
+                        "user": who["id"],
+                        "name": clean,
+                        "path": str(final),
+                        "bytes": written,
+                        "telescope": label[:60],
+                        "uploader": str(who.get("name") or "")[:60],
+                    })
+                    body["stacking"] = "queued"
+                except Exception:
+                    # The file is in. A stack that could not be told about
+                    # it is reported, and the upload still stands.
+                    body["stacking"] = "skipped"
+            return body
 
         @app.get("/api/v1/projects/{project_id}/files/{user_id}/{kind}/{name}")
         def download(project_id: str, user_id: str, kind: str, name: str, request: Request):
