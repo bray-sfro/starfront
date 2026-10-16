@@ -42,6 +42,7 @@ import astrocontrol                                              # noqa: E402
 from astrocontrol import catalog, collab, filters                # noqa: E402
 from astrocontrol.config import data_root                        # noqa: E402
 from server import auth                                          # noqa: E402
+from server.community import CommunityStacker                    # noqa: E402
 from server.files import COOKIE, COOKIE_SECONDS, Files           # noqa: E402
 from server.store import Store                                   # noqa: E402
 
@@ -2135,8 +2136,13 @@ def sky_file(name: str):
 # page and the rules are in server/files.py.
 
 FILES_DIR = Path(auth.setting("FILES") or DATA / "files")
+# The live stack watches the files folder and only ever reads from it.
+# Built before the routes, so a light can be queued the moment it lands.
+community = CommunityStacker(store, DATA / "stacks", files_root=FILES_DIR)
 files = Files(app, store, FILES_DIR, _person, owns_project, DISCORD.owners,
-              DISCORD.public_url, auth.new_login_code)
+              DISCORD.public_url, auth.new_login_code, on_light=community.offer)
+community.attach(app)
+community.start()
 
 
 # ---------------------------------------------------------------------------
@@ -2151,6 +2157,9 @@ def health() -> dict[str, Any]:
             "files": files.stats(),
             # Which build is running, so an update can be checked from outside.
             "version": astrocontrol.__version__,
+            # Lights that arrive while a collaboration is collecting them are
+            # registered and stacked in the background. /watch shows it.
+            "communityStack": True,
             "adminConfigured": bool(ADMIN_TOKEN),
             "discord": DISCORD.configured(),
             "roleRequired": False,
