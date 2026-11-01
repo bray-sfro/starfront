@@ -58,13 +58,18 @@ The target name in your file pattern is the project's name, with `panel <n>`
 added on a mosaic, so your files sort by project and panel, and each FITS
 header carries `STARFRNT` (the project) and `SFPANEL`.
 
-6. **Live stacking (optional, off by default).** A coordinator can link a
-   collaboration to a [Rapid Stacker Collab](https://collab.astro.ekeservices.com)
-   project by pasting its join code into the start or edit form. Turn on
-   *Live stacking* under Options > Plugins > Starfront and sign in to Rapid
-   Stacker Collab there (a code to approve in the browser, as with Discord).
-   At the next check-in the telescope joins the stacking project of every
-   linked collaboration it is on, and from then on each light the container
+6. **Live stacking (optional, off by default).** A collaboration's lights can
+   be stacked as they land. The Starfront server makes the stacking project
+   from the collaboration itself, on its coordinator's hub or on
+   [Rapid Stacker Collab](https://collab.astro.ekeservices.com) once the
+   coordinator has linked their Collab account in the Starfront program's
+   Collab tab. Nobody makes a second project or pastes a join code, and each
+   card says where the collaboration is stacked (and, while the project is
+   still being set up or could not be, says that). Turn on *Live stacking*
+   under Options > Plugins > Starfront and sign in to Rapid Stacker Collab
+   there (a code to approve in the browser, as with Discord). At the next
+   check-in the telescope joins the stacking project of every stacked
+   collaboration it is on, and from then on each light the container
    saves for it is sent there as it lands: a copy with your location taken
    out, never your file itself. The Starfront panel shows what is waiting
    and going. A light pointed well away from the stacking project's field is

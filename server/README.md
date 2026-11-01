@@ -261,31 +261,38 @@ path in `ReadWritePaths` in the service file.) The server always leaves two
 gigabytes free and refuses uploads beyond that, telling the person to tell
 the coordinator.
 
-## Live stacking: the join code
+## Live stacking: where a collaboration is stacked
 
-A collaboration can name the [Rapid Stacker Collab](https://collab.astro.ekeservices.com)
-project that stacks its lights as they land, by carrying that project's join
-code. The coordinator sets it with `stackingJoinCode` on
-`POST /api/v1/projects` or `PUT /api/v1/projects/{id}` (blank clears it; a
-`PUT` without the field leaves it alone). Both forms that start and edit a
-collaboration have a box for it, the Starfront program's Collab tab and the
-N.I.N.A. plugin's panel, and both send it on an edit only when it was changed:
-a collaboration started on the coordinator token has no owner, so a form may
-have loaded it blank, and sending that back would clear it.
+A collaboration's lights can be stacked as they land, on the owner's
+**hub** or on [Rapid Stacker Collab](https://collab.astro.ekeservices.com)'s
+**cloud**. Either way this server makes the stacking project from the
+collaboration and keeps it in step (T706): nobody makes a second project or
+pastes a join code. The next section covers the hub; the cloud is at the end of
+it. A new collaboration that says nothing about stacking is stacked on the
+owner's hub when they have one, else on the cloud when their Collab account is
+linked, else not at all.
 
-The code is a credential: whoever holds it can join the stacking project and
-send frames to it. So:
+`GET /api/v1/agent/projects` tells each telescope where a collaboration is
+stacked in its `stacking` object (`backend`, the hub's name and address,
+`managed` for a cloud project this server made), and whether it can be
+joined yet in `stacking.state`:
 
-- it is stored canonical, `XXXX-XXXX-XXXX`, whatever spacing or case it was
-  pasted with, and one that cannot be a code (twelve characters of 2-9 and
-  A-Z without I, L and O) is refused with 400;
-- `GET /api/v1/agent/projects` hands `stackingJoinCode` only to telescopes
-  with a task on the collaboration and to the telescopes of its owner; every
-  telescope gets `stackingLinked`, a yes or no.
+- `ready`: a telescope on it can join (the hub grant, or the cloud join code, is
+  in the listing);
+- `pending`: the cloud project is still being made;
+- `failed`: making or updating it failed and is being retried (an expired Collab
+  link, say). The owner's own telescopes also get the reason in
+  `stacking.problem`, so an owner who uses only N.I.N.A. hears of it too;
+  nobody else does, as it can name the owner's Collab account;
+- blank: not stacked.
 
-Nothing else on this server is involved: the frames go from the telescope
-straight to Rapid Stacker Collab, and the ledger and reports are as before.
-`tools/check_server.py` has the cases.
+The cloud join code and the hub grant are credentials, so they go only to
+telescopes on the collaboration and to the owner's own. A pasted code is no
+longer taken (400). A collaboration from before T706 that carries one keeps it,
+read-only, and reads as an old cloud binding (`managed: false`). For 1.0.0.33
+plugins the listing still carries `stackingJoinCode` and `stackingLinked`
+(yes when there is a cloud code), which are unchanged. `tools/check_server.py`
+has the cases.
 
 ## Live stacking: hubs and the front door
 

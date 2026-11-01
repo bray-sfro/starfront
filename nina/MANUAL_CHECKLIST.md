@@ -51,11 +51,24 @@ the top of your copy.
 
 ## C. Linking a collaboration and joining
 
-- [ ] On the panel, *Start a collaboration* (or *Edit* one of yours): paste a stacking project's join code in any
-  case and spacing. *Expected:* saved; *Edit* again shows it as `XXXX-XXXX-XXXX`. A code with a `1`, `0`, `I`,
-  `L` or `O`, or the wrong length, is refused with the message under the form.
-- [ ] On a second telescope that has not joined the collaboration, open its card. *Expected:* *Live-stacked on Rapid
-  Stacker Collab* but no code anywhere; join it and refresh: the code is now given.
+The stacking project is made by the Starfront server from the collaboration (T706); nothing is pasted. For the
+cloud, the coordinator first links their Rapid Stacker Collab account once in the Starfront program's Collab tab
+(*Live stacking*, an API token with *Manage projects*); for a hub, they own or are listed on a registered hub.
+
+- [ ] With the account linked and no hub, *Start a collaboration* on the panel. *Expected:* the form has no join code
+  box; the collaboration's project appears among *My projects* on the Rapid Stacker Collab website with the
+  collaboration's name and filters, and the card says *Live-stacked on Rapid Stacker Collab*.
+- [ ] Unlink the account in the Collab tab, then start another. *Expected:* not stacked (no line on its card). Link
+  it again, but stop the Collab service (or point the link at a dead address in a test setup) and start one more.
+  *Expected:* the owner's card says *…could not be set up yet:* with the reason; another telescope's card says *the
+  owner's Starfront Collab tab says why*; the log says `… is not ready on Rapid Stacker Collab yet (failed…)` once,
+  not at every check-in. Bring the service back: within the retry wait the card goes to the normal line.
+- [ ] *Edit* an old collaboration that was given a pasted code before T706. *Expected:* the code shows read-only as
+  `XXXX-XXXX-XXXX` and still works; a different code is refused with the message under the form.
+- [ ] As the owner of a registered hub, start a collaboration. *Expected:* the card says *Live-stacked on the hub
+  <its name>*, with no Rapid Stacker Collab sign-in needed.
+- [ ] On a second telescope that has not joined a cloud collaboration, open its card. *Expected:* *Live-stacked on
+  Rapid Stacker Collab* but no code anywhere; join it and refresh: the code is now given.
 - [ ] With the switch on and signed in, wait for a check-in (or sign in again, which checks in). *Expected:* the log
   has `Starfront stacking: filters for …` and `… -> … (joined): Joined …`; *Linked collaborations* shows it with the
   filter mapping; `stacking\links.json` has the link; the card says *Joined …*.

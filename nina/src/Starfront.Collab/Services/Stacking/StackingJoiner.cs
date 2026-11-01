@@ -30,6 +30,8 @@ namespace Starfront.Collab.Services.Stacking {
         private FilterNormalizer normalizer;
         private readonly HubJoiner hub;
         private readonly Func<IApiClient> cloud;
+        /// <summary>The state last logged for each collaboration that could not be joined yet, so the log says it once, not at every check-in.</summary>
+        private readonly Dictionary<string, string> notReadyLogged = new();
 
         /// <param name="cloud">The cloud client itself: the cloud rig is made there whatever the default backend is.</param>
         /// <param name="forLink">The client a hub link talks through (its own base and grant); the router when omitted.</param>
@@ -88,7 +90,20 @@ namespace Starfront.Collab.Services.Stacking {
                     }
                     // Cloud links need the person signed in to Rapid Stacker Collab.
                     if (cloudRefused || route == JoinRoute.CloudNeedsSignIn) continue;
-                    if (string.IsNullOrWhiteSpace(listing.StackingJoinCode)) continue;
+                    if (string.IsNullOrWhiteSpace(listing.StackingJoinCode)) {
+                        // A project the server is still making, or failed to make,
+                        // has no code yet. Say so once: this was a silent skip.
+                        var binding = listing.EffectiveStacking();
+                        if (binding.Managed && binding.State is "pending" or "failed") {
+                            if (!notReadyLogged.TryGetValue(listing.Id, out var said) || said != binding.State) {
+                                notReadyLogged[listing.Id] = binding.State;
+                                var why = string.IsNullOrWhiteSpace(binding.Problem) ? "" : $": {binding.Problem}";
+                                Logger.Info($"Starfront stacking: {listing.Name} is not ready on Rapid Stacker Collab yet ({binding.State}{why})");
+                            }
+                        }
+                        continue;
+                    }
+                    notReadyLogged.Remove(listing.Id);
                     if (!JoinCodes.TryNormalize(listing.StackingJoinCode, out var code) || code.Length == 0) {
                         Logger.Warning($"Starfront stacking: {listing.Name} carries a join code that cannot be one ({listing.StackingJoinCode}); ignored");
                         continue;

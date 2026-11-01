@@ -1184,25 +1184,52 @@ def activity(agent: dict[str, Any] = Depends(agent_from),
 
 
 def _stacking_listing(project: dict[str, Any], binding: dict[str, str],
-                      agent: dict[str, Any], entitled: bool) -> dict[str, Any]:
+                      agent: dict[str, Any], entitled: bool, owns: bool = False) -> dict[str, Any]:
     """The `stacking` object of the project listing.
 
     `grant` (and `visibility`, the stack project's, for the Edit form) is the
     hub's bearer for this telescope, so it is held to the rule the join code
     is: only telescopes on the collaboration, and the owner's own, get one.
     Everyone else is told where it is stacked and nothing more.
+
+    `state` says whether a telescope can join yet: `ready`, `pending` (the
+    project is still being made) or `failed` (making it failed and is being
+    retried), blank when the collaboration is not stacked. Why: while the
+    server was still making a cloud project, or after Collab refused it (an
+    expired link, say), the listing carried an empty join code and the plugin
+    skipped the collaboration without a word; only the owner's desktop Edit
+    form said why, so an owner who uses only N.I.N.A. never found out.
+    `problem` is that reason, for the owner's own telescopes only: it can
+    name the owner's Collab account, which is nobody else's business.
     """
     out = {"backend": binding["backend"], "hubId": "", "hubName": "", "hubLanUrl": "",
            "apiBase": binding["apiBase"], "collabProjectId": "", "grant": "",
-           "visibility": "", "managed": _is_managed(binding)}
-    if binding["backend"] != "hub":
-        if _is_managed(binding) and entitled:
+           "visibility": "", "managed": _is_managed(binding),
+           "state": "", "problem": ""}
+    if binding["backend"] == "cloud":
+        if not _is_managed(binding):
+            out["state"] = "ready" if binding["joinCode"] else ""
+            return out
+        if entitled:
             out["visibility"] = binding["visibility"] or "unlisted"
+        if CLOUD.join_code(project["id"]):
+            out["state"] = "ready"
+        else:
+            seen = CLOUD.owner_view(project["id"]) or {}
+            out["state"] = "failed" if seen.get("state") in ("failed", "needs_owner") else "pending"
+            if owns and out["state"] == "failed":
+                out["problem"] = str(seen.get("error") or "")
+        return out
+    if binding["backend"] != "hub":
         return out
     hub = store.hub(binding["hubId"])
     row = store.stack_project_of(project["id"])
     if hub is None or row is None or row["doc"].get("status") in ("closed", "deleted"):
+        # Binding mints the stacking project at once, so this is a hub that
+        # has since been removed: it cannot be joined until the owner rebinds.
+        out["state"] = "failed"
         return out
+    out["state"] = "ready"
     person_id = str(agent.get("owner_id") or "")
     person = store.user(person_id) if person_id else None
     out.update({
@@ -1278,7 +1305,7 @@ def open_projects(agent: dict[str, Any] = Depends(agent_from)) -> dict[str, Any]
             # gets a telescope on this collaboration into that stack.
             "stackingLinked": bool(stacking_code),
             "stackingJoinCode": stacking_code if entitled else "",
-            "stacking": _stacking_listing(project, binding, agent, entitled),
+            "stacking": _stacking_listing(project, binding, agent, entitled, owns),
             "compatibility": collab.compatibility(profile, wants),
             "joined": project["id"] in mine,
             # What everyone together has collected, so somebody choosing where

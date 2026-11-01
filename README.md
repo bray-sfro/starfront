@@ -1969,26 +1969,41 @@ Releases live in `server/nina_plugin/`; `nina/README.md` says how one is made.
 Releasing here rather than through the central manifest repository means a
 fix reaches everybody the moment it is deployed, with no review queue.
 
-**Live stacking.** A collaboration can carry the join code of a
-[Rapid Stacker Collab](https://collab.astro.ekeservices.com) project, and a
-plugin with *Live stacking* turned on sends every light the container saves
-for it to that project as it lands, where a worker folds it into the
-per-filter stacks. The decisions behind it:
+**Live stacking.** A collaboration can be stacked by
+[Rapid Stacker Collab](https://collab.astro.ekeservices.com), on its cloud or
+on a hub, and a plugin with *Live stacking* turned on sends every light the
+container saves for it to that stacking project as it lands, where a worker
+folds it into the per-filter stacks. The server makes the stacking project from
+the collaboration and keeps it in step; nobody makes a second one or pastes a
+code (*The stacking project flows down from the collaboration*, below, T706).
+The decisions behind it:
 
 - **The code lives on the Starfront project, not in each telescope.** Pasting
   it into every plugin by hand would be forgotten on half of them. It is a
   credential, not a label: whoever holds it can join the stacking project, so
-  the server stores it canonical, refuses one that cannot be real, and hands
-  it only to telescopes on the collaboration and to the owner's own (the
-  owner's program fills its Edit form from that listing, and an owner who
-  could not see the code would save it away blank). Everyone else is told
-  only that the lights are stacked.
+  the server hands it only to telescopes on the collaboration and to the
+  owner's own (the owner's program fills its Edit form from that listing, and
+  an owner who could not see the code would save it away blank). Everyone else
+  is told only where the lights are stacked. Before T706 the coordinator made
+  the project on the Collab website and pasted its code here; such a code is
+  still stored canonical and keeps working, read-only, and a pasted one is no
+  longer taken.
+- **The listing says whether a telescope can join yet** (`stacking.state`:
+  `ready`, `pending`, `failed`, with the reason in `stacking.problem` for the
+  owner's own telescopes only). While the server was still making a cloud
+  project, or after Collab refused it (an expired account link, say), the
+  code was simply missing and the plugin skipped the collaboration without a
+  word; only the owner's desktop Edit form said why, so an owner who used only
+  N.I.N.A. never found out. The plugin's card now says where it is stacked and
+  how that stands.
 - **Where it is stacked is a `stacking` block, and the join code is its
   `cloud` case.** `POST`/`PUT /api/v1/projects` take `stacking: {backend:
-  "cloud"|"hub"|"", joinCode, apiBase, hubId, visibility?}`. `cloud` needs a
-  join code (checked as above) and is also written to `stackingJoinCode`, so
-  1.0.0.33 plugins, which know only that field, keep working; an old payload
-  with only the code reads as `cloud`. `hub` needs a hub the caller owns or is
+  "cloud"|"hub"|"", apiBase, hubId, visibility?}`. `cloud` is the project the
+  server makes through the Collab API once the owner's account is linked; its
+  code lives with that project, not in the payload, and reaches telescopes as
+  the listing's `stackingJoinCode`, so 1.0.0.33 plugins, which know only that
+  field, keep working. An old payload with only a pasted code reads as
+  `cloud`, and that code is still written to `stackingJoinCode`. `hub` needs a hub the caller owns or is
   listed on (`allowedCoordinators`), else 403, the answer for any action that is
   not theirs, the same for a hub that does not exist. Binding mints the
   stacking project the hub will serve (`prj_` and 20 lower-case Crockford

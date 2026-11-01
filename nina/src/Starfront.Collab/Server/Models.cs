@@ -133,6 +133,10 @@ namespace Starfront.Collab.Server {
         [JsonProperty("grant")] public string Grant { get; set; } = "";
         /// <summary>A cloud project the Starfront server made from the collaboration and keeps in step (T706); false for an old pasted join code.</summary>
         [JsonProperty("managed")] public bool Managed { get; set; }
+        /// <summary>"ready" (a telescope on it can join), "pending" (the cloud project is still being made), "failed" (making it failed and is retried), or blank (not stacked, or a server that predates it). Shown, never routed on.</summary>
+        [JsonProperty("state")] public string State { get; set; } = "";
+        /// <summary>Why it failed; only the owner's own telescopes are told, blank for everyone else.</summary>
+        [JsonProperty("problem")] public string Problem { get; set; } = "";
         /// <summary>The join code of a cloud project; not sent by the server inside the binding, filled in for old servers.</summary>
         [JsonIgnore] public string JoinCode { get; set; } = "";
     }

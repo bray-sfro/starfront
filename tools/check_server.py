@@ -2193,7 +2193,7 @@ case("a telescope on the collaboration is handed the code",
 _, browse = call("GET", "/api/v1/agent/projects", token=AGENT_TOKEN)
 listing = next(p for p in browse["projects"] if p["id"] == FILES_PROJECT)
 case("a collaboration without one says so", listing["stackingLinked"] is False
-     and listing["stackingJoinCode"] == "")
+     and listing["stackingJoinCode"] == "" and listing["stacking"]["state"] == "")
 
 status, changed = call("PUT", f"/api/v1/projects/{STACKED}", {"notes": "still stacked"}, token=BOB2)
 case("an edit that leaves the code out leaves it alone",
@@ -2562,6 +2562,9 @@ case("the listing keeps stackingLinked and stackingJoinCode and says cloud in th
      listing["stackingLinked"] is True and listing["stackingJoinCode"] == "H4RT-92BK-WNPC"
      and listing["stacking"]["backend"] == "cloud" and listing["stacking"]["grant"] == ""
      and listing["stacking"]["collabProjectId"] == "", str(listing["stacking"]))
+case("...an old pasted code is ready to join, and not one this server made",
+     listing["stacking"]["state"] == "ready" and listing["stacking"]["managed"] is False
+     and listing["stacking"]["problem"] == "", str(listing["stacking"]))
 
 # Bind to a hub: as its owner, then as a listed coordinator, then as someone else.
 status, made = call("POST", "/api/v1/projects", {
@@ -4891,6 +4894,9 @@ case("an edit the stacking project has no field for does not trouble the hub", s
 
 # -- 3. /stack/api cannot change a project
 OWNER_FLOW_GRANT = project_in_listing(OWNER_RIG, FLOW)["stacking"]["grant"]
+case("a hub-bound collaboration is listed ready to join, with no problem to report",
+     project_in_listing(OWNER_RIG, FLOW)["stacking"]["state"] == "ready"
+     and project_in_listing(OWNER_RIG, FLOW)["stacking"]["problem"] == "")
 status, joined = front("POST", f"/projects/{FLOW_ID}/join", {
     "display_name": "Bob Flow", "accepted_terms_version": "2026-10-13-draft"}, token=OWNER_FLOW_GRANT)
 case("(setup) the owner's telescope joins the stacking project with its grant", status == 200, f"{status} {joined}")
@@ -4932,8 +4938,10 @@ case("...and what it may change touches only its own row",
 # -- 4. the cloud, through the Collab API
 import subprocess as _sp2                                         # noqa: E402
 RSC_DIR = None
-for candidate in ([Path(os.environ["RSC_DIR"])] if os.environ.get("RSC_DIR") else []) + [
-        ROOT.parent / "Rust" / "rapid-stacker-collab", ROOT.parent.parent / "Rust" / "rapid-stacker-collab"]:
+# RSC_DIR, when set, is the only place looked (set it to an empty folder to run
+# the cloud path against the stand-in below even with a checkout beside this one).
+for candidate in ([Path(os.environ["RSC_DIR"])] if os.environ.get("RSC_DIR") else [
+        ROOT.parent / "Rust" / "rapid-stacker-collab", ROOT.parent.parent / "Rust" / "rapid-stacker-collab"]):
     if (candidate / "backend" / "local" / "server.mjs").is_file():
         RSC_DIR = candidate
         break
@@ -4950,14 +4958,142 @@ if RSC_DIR is not None:
             RSC = found.group(1)
         else:
             reason = (STACK_PROC.stderr.read() or "").strip().splitlines()
-            print("SKIP  the cloud path: Rapid Stacker Collab's local stack did not start ("
+            print("NOTE  the cloud path: Rapid Stacker Collab's local stack did not start ("
                   + (next((l for l in reason if l.startswith("Error")), reason[-1] if reason else "no output"))[:160]
                   + "); set RSC_DIR to a checkout with backend/node_modules and no lambdas/*/node_modules")
             STACK_PROC = None
     else:
-        print("SKIP  the cloud path: node is not installed")
+        print("NOTE  the cloud path: node is not installed")
 else:
-    print("SKIP  the cloud path: no rapid-stacker-collab checkout beside this repository (set RSC_DIR)")
+    print("NOTE  the cloud path: no rapid-stacker-collab checkout (in RSC_DIR, or beside this repository)")
+
+
+# A stand-in for Rapid Stacker Collab's API, for where its local stack cannot
+# run. Why: that stack is a private repository run with node, so CI (which
+# checks out only this one) printed SKIP for the whole cloud path and never ran
+# it; a change that broke making the Collab project from a collaboration would
+# have gone green. The stand-in answers exactly the calls server/stack/cloud.py
+# makes, with the contract's shapes and codes (docs/api/openapi.yaml 1.30.1:
+# MeResponse, CreateProjectRequest and UpdateProjectRequest refuse unknown
+# fields, draft->open<->paused, a token may not delete or restore). The real
+# stack is still preferred when it is at hand, and then this is not started.
+from http.server import BaseHTTPRequestHandler as _BHRH, ThreadingHTTPServer as _THS  # noqa: E402
+
+_FAKE_CREATE = {"slug", "name", "target_name", "description", "visibility", "licence", "palette", "filters",
+                "grid", "rotation_from_first_light", "policy", "notify", "owner_display_name", "owner_country"}
+_FAKE_UPDATE = {"name", "target_name", "description", "visibility", "licence", "palette", "filters", "grid",
+                "rotation_from_first_light", "policy", "notify", "status", "reprepare_rejected"}
+_FAKE_MOVES = {("draft", "open"), ("open", "paused"), ("paused", "open"), ("open", "closed"),
+               ("paused", "closed")}
+
+
+class _FakeCollab:
+    def __init__(self):
+        self.tokens, self.projects, self.lock = {}, {}, threading.Lock()
+
+    def mint(self, name, scopes):
+        token = "rscu_" + os.urandom(32).hex()
+        self.tokens[token] = {"user_id": _uuid.uuid4().hex, "name": name, "scopes": list(scopes)}
+        return token
+
+    def find(self, key):
+        return self.projects.get(key) or next((p for p in self.projects.values() if p["slug"] == key), None)
+
+    def code(self):
+        letters = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+        raw = "".join(letters[b % len(letters)] for b in os.urandom(12))
+        return f"{raw[:4]}-{raw[4:8]}-{raw[8:]}"
+
+    def answer(self, method, path, who, body):
+        """(status, body) for one call; `who` is the token's user or None."""
+        def err(status, code, message=""):
+            return status, {"ok": False, "code": code, "message": message or code}
+        if who is None:
+            return err(401, "unauthorized")
+        if path == "/auth/me" and method == "GET":
+            return 200, {"ok": True, "auth": "token", "scopes": who["scopes"], "expires_at": "2027-11-01T00:00:00Z",
+                         "user": {"user_id": who["user_id"], "name": who["name"]}}
+        if "projects:manage" not in who["scopes"] and method != "GET":
+            return err(403, "token_scope")
+        if path == "/projects" and method == "POST":
+            if set(body) - _FAKE_CREATE or not {"slug", "name", "filters", "owner_display_name"} <= set(body):
+                return err(400, "validation_failed")
+            if any(p["slug"] == body["slug"] for p in self.projects.values()):
+                return err(409, "slug_taken")
+            pid = "prj_" + _uuid.uuid4().hex[:20]
+            project = {k: v for k, v in body.items() if k not in ("owner_display_name", "owner_country")}
+            project.update(project_id=pid, status="draft", join_code=self.code(), owner=who["user_id"],
+                           visibility=body.get("visibility", "unlisted"))
+            self.projects[pid] = project
+            return 201, {"ok": True, "project": self.view(project, who)}
+        parts = path.strip("/").split("/")
+        if len(parts) < 2 or parts[0] != "projects":
+            return err(404, "not_found")
+        project = self.find(parts[1])
+        if project is None:
+            return err(404, "not_found")
+        if len(parts) == 3 and parts[2] in ("delete", "restore") and method == "POST":
+            return err(401, "session_required", "Only a signed-in browser may do this.")
+        if len(parts) != 2:
+            return err(404, "not_found")
+        if method == "GET":
+            return 200, {"ok": True, "project": self.view(project, who)}
+        if method != "PUT":
+            return err(405, "method_not_allowed")
+        if project["owner"] != who["user_id"]:
+            return err(403, "forbidden")
+        if set(body) - _FAKE_UPDATE:
+            return err(400, "validation_failed")
+        if "status" in body and body["status"] != project["status"] and \
+                (project["status"], body["status"]) not in _FAKE_MOVES:
+            return err(409, "invalid_transition")
+        project.update(body)
+        return 200, {"ok": True, "project": self.view(project, who)}
+
+    def view(self, project, who):
+        out = {k: v for k, v in project.items() if k != "owner"}
+        out["my_membership"] = {"role": "owner"} if project["owner"] == who["user_id"] else None
+        if project["owner"] != who["user_id"]:
+            out.pop("join_code", None)
+        return out
+
+
+FAKE_COLLAB, FAKE_SERVER = None, None
+if not RSC:
+    FAKE_COLLAB = _FakeCollab()
+
+    class _FakeHandler(_BHRH):
+        def log_message(self, *args):
+            pass
+
+        def _serve(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+            except ValueError:
+                body = None
+            auth = self.headers.get("Authorization") or ""
+            who = FAKE_COLLAB.tokens.get(auth[7:]) if auth.startswith("Bearer ") else None
+            path = self.path.split("?")[0]
+            if not path.startswith("/api/") or not isinstance(body, dict):
+                status, out = 400, {"ok": False, "code": "invalid_request", "message": "bad request"}
+            else:
+                with FAKE_COLLAB.lock:
+                    status, out = FAKE_COLLAB.answer(self.command, path[4:], who, body)
+            data = json.dumps(out).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        do_GET = do_POST = do_PUT = do_DELETE = _serve
+
+    FAKE_SERVER = _THS(("127.0.0.1", 0), _FakeHandler)
+    threading.Thread(target=FAKE_SERVER.serve_forever, daemon=True).start()
+    RSC = f"http://127.0.0.1:{FAKE_SERVER.server_address[1]}"
+    print("NOTE  the cloud path runs against the stand-in for Rapid Stacker Collab's API "
+          "(this check's _FakeCollab), not its local stack")
 
 
 def rsc(method, path, body=None, token=None, cookie=None):
@@ -4976,6 +5112,8 @@ def rsc(method, path, body=None, token=None, cookie=None):
 
 
 def collab_account(name, email, scopes):
+    if FAKE_COLLAB is not None:
+        return FAKE_COLLAB.mint(name, scopes)
     rsc("POST", "/auth/register", {"name": name, "email": email, "password": "correct horse battery staple"})
     mail = json.loads(urllib.request.urlopen(f"{RSC}/_local/mail?to={email}", timeout=10).read())
     link = next(l for m in mail["messages"] for l in m["links"] if "verify-email" in l)
@@ -5124,8 +5262,41 @@ if RSC:
     call("PUT", "/api/v1/stacking/cloud", {"token": CTOKEN, "apiBase": RSC + "/api"}, token=DAVE)
     case("...and linking again catches up at once", cloud_row(CF)["doc"]["state"] == "ok"
          and remote(pid_before).get("description") == "unlinked")
-    STACK_PROC.stdin.close()
-    STACK_PROC.wait(10)
+    # Whether a telescope can join yet. Why: while the project was being made,
+    # or after Collab refused it, the listing carried an empty code and the
+    # plugin skipped the collaboration in silence; only the owner's desktop
+    # Edit form said why. Now the listing says so, with the reason for the
+    # owner's own telescopes only.
+    server_app.store._run("UPDATE stack_cloud_links SET api_base = ? WHERE person = '1005'",
+                          f"http://127.0.0.1:{free_port()}/api")
+    status, made = call("POST", "/api/v1/projects", {
+        "name": "Cloud Waiting", "region": REGION, "requirements": {"filters": {"Ha": 3.0}}}, token=DAVE)
+    CW = made["project"]["id"]
+    mine_w, other_w = project_in_listing(DAVE_RIG, CW), project_in_listing(AGENT_TOKEN, CW)
+    case("a cloud project that could not be made is listed as failed, with no code to join",
+         status == 200 and mine_w["stacking"]["state"] == "failed" and mine_w["stackingJoinCode"] == ""
+         and mine_w["stackingLinked"] is False and other_w["stacking"]["state"] == "failed",
+         str(mine_w["stacking"]))
+    case("...the owner's telescope is told why, and nobody else's is",
+         "could not be reached" in mine_w["stacking"]["problem"] and other_w["stacking"]["problem"] == "",
+         f"{mine_w['stacking']['problem']!r} / {other_w['stacking']['problem']!r}")
+    server_app.store._run("UPDATE stack_cloud SET doc = json_set(doc, '$.state', 'pending') WHERE sf_project = ?", CW)
+    mine_w = project_in_listing(DAVE_RIG, CW)
+    case("...one still being made is listed as pending, with no reason to give",
+         mine_w["stacking"]["state"] == "pending" and mine_w["stacking"]["problem"] == "", str(mine_w["stacking"]))
+    server_app.store._run("UPDATE stack_cloud_links SET api_base = ? WHERE person = '1005'", good_base)
+    server_app.CLOUD.sweep(time.time() + 3600)
+    mine_w = project_in_listing(DAVE_RIG, CW)
+    case("...and once it is made it is ready, with the code, and stackingLinked as before",
+         mine_w["stacking"]["state"] == "ready" and mine_w["stacking"]["problem"] == ""
+         and mine_w["stackingJoinCode"] == cloud_row(CW)["join_code"] != "" and mine_w["stackingLinked"] is True,
+         str(mine_w["stacking"]))
+
+    if STACK_PROC is not None:
+        STACK_PROC.stdin.close()
+        STACK_PROC.wait(10)
+    if FAKE_SERVER is not None:
+        FAKE_SERVER.shutdown()
 
 print()
 print(f"{sum(results)}/{len(results)} passed")

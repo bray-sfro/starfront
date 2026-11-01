@@ -33,5 +33,6 @@
     <Compile Include="../../src/Starfront.Collab/Services/Stacking/StackingLibrary.cs" Link="Linked/StackingLibrary.cs" />
     <Compile Include="../../src/Starfront.Collab/Services/Stacking/HubBackend.cs" Link="Linked/HubBackend.cs" />
     <Compile Include="../../src/Starfront.Collab/Services/Stacking/StackingTargets.cs" Link="Linked/StackingTargets.cs" />
+    <Compile Include="../../src/Starfront.Collab/Services/Stacking/StackingLine.cs" Link="Linked/StackingLine.cs" />
   </ItemGroup>
 </Project>

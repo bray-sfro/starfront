@@ -61,7 +61,7 @@ Then:
 
 1. Open `http://127.0.0.1:8787` and register an account.
 2. Nothing is e-mailed. The verification link is captured at `http://127.0.0.1:8787/_local/mail?to=<your address>`.
-3. Create a project. Its join code is what goes on the Starfront collaboration's form.
+3. Do not create a project there: the Starfront server makes it from the collaboration (since T706). Instead open the Dashboard, and under *API tokens* create a token named Starfront with *Manage projects* and *Read projects* ticked. Copy it (it starts `rscu_` and is shown once). Section 5 links it.
 
 | Option | Meaning |
 |---|---|
@@ -123,8 +123,8 @@ Then:
 
 1. Start the Starfront server with `server/run_local.py` (section 1) and the Collab stack (section 2).
 2. Open the tunnel from Windows (section 3) and point the plugin at both servers (section 4).
-3. On the Collab website, register, verify, and create a project. Copy its join code.
-4. In N.I.N.A., sign in to Starfront (Continue as ncedelliott), start a collaboration on the Starfront panel, and paste the join code into its form.
+3. On the Collab website, register, verify, and create an API token with *Manage projects* (section 2, step 3). In the Starfront program's Collab tab, signed in to the local Starfront server, open *Live stacking* > *Rapid Stacker Collab account*, set *Service address* to `http://127.0.0.1:8787/api`, paste the token and press *Link*. This is done once; nobody creates a project or pastes a join code.
+4. In N.I.N.A., sign in to Starfront (Continue as ncedelliott) and start a collaboration on the Starfront panel. The server makes its project on the Collab stack by itself (it shows among *My projects* on the Collab website), and the card says *Live-stacked on Rapid Stacker Collab*.
 5. Turn on *Live stacking*, sign in to Rapid Stacker Collab, and wait for a check-in (or sign in again, which checks in). *Linked collaborations* should show *Joined*.
 6. Put the *Starfront collaboration* container in a sequence and run it for a few frames. The panel's *Live stacking* block should count them as waiting, then sent.
 7. With the worker running, the project's page on the Collab website shows the stack growing.

@@ -17,6 +17,7 @@ using NINA.WPF.Base.Interfaces.ViewModel;
 using NINA.WPF.Base.ViewModel;
 using Starfront.Collab.Server;
 using Starfront.Collab.Services;
+using Starfront.Collab.Services.Stacking;
 using Starfront.Collab.Sky;
 
 namespace Starfront.Collab.Ui {
@@ -159,12 +160,8 @@ namespace Starfront.Collab.Ui {
         /// <summary>Whether the lights are stacked as they land, and how this telescope stands with that stack; blank when they are not.</summary>
         public string StackingText {
             get {
-                if (!Listing.StackingLinked) return "";
-                const string stacked = "Live-stacked on Rapid Stacker Collab";
-                if (!Runtime.Ready || !Runtime.Settings.StackingEnabled) return stacked + "; turn on Live stacking in the options to send yours.";
-                var link = Runtime.Stacking.Links.Lookup(Listing.Id);
-                if (link != null) return $"{stacked}: {link.Describe()}.";
-                return Joined ? stacked + "; joining at the next check-in." : stacked + ".";
+                var enabled = Runtime.Ready && Runtime.Settings.StackingEnabled;
+                return StackingLine.Describe(Listing, enabled, enabled ? Runtime.Stacking.Links.Lookup(Listing.Id) : null, Joined);
             }
         }
 
