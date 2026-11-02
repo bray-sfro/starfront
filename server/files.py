@@ -187,6 +187,16 @@ class Files:
     def path_of(self, project_id: str, user_id: str, name: str, kind: str = "light") -> Path:
         return self.folder / project_id / user_id / KIND_FOLDERS[kind] / name
 
+    def quota_of(self, project: dict[str, Any]) -> int:
+        """The most this collaboration may hold: its own `fileQuotaGB` if
+        the coordinator set one (0 = takes no files at all), else the
+        server-wide default."""
+        own = (project.get("payload") or {}).get("fileQuotaGB")
+        try:
+            return PROJECT_QUOTA if own is None else max(0, int(float(own) * 1024 ** 3))
+        except (TypeError, ValueError):
+            return PROJECT_QUOTA
+
     def collecting(self, project: dict[str, Any]) -> bool:
         return bool((project.get("payload") or {}).get("collectFiles"))
 
@@ -258,14 +268,20 @@ class Files:
             who = self.who(request)
             listed = []
             for project in self.store.projects():
-                if project.get("status") != "open":
-                    continue
+                closed = project.get("status") != "open"
                 owned = who is not None and self.owns_project(who, project)
-                if not self.collecting(project) and not owned:
-                    continue
                 totals = self.store.file_totals(project["id"])
                 mine = (self.store.file_totals_of(project["id"], who["id"])
                         if who is not None else {"count": 0, "bytes": 0})
+                if closed:
+                    # A closed collaboration takes nothing new, but what it
+                    # collected stays downloadable: by its owner, and by each
+                    # uploader for their own files.
+                    if not totals["count"] or not (owned or mine["count"]):
+                        continue
+                elif not self.collecting(project) and not owned:
+                    continue
+                quota = self.quota_of(project)
                 listed.append({
                     "id": project["id"], "name": project["name"],
                     "coordinator": project.get("coordinator") or "",
@@ -275,8 +291,8 @@ class Files:
                     "files": totals["count"], "bytes": totals["bytes"],
                     "kinds": self.store.file_kinds(project["id"]),
                     "myFiles": mine["count"], "myBytes": mine["bytes"],
-                    "owned": owned, "quota": PROJECT_QUOTA,
-                    "full": totals["bytes"] >= PROJECT_QUOTA,
+                    "owned": owned, "quota": quota, "closed": closed,
+                    "full": totals["bytes"] >= quota,
                 })
             return {
                 "signedIn": who is not None,
@@ -350,10 +366,14 @@ class Files:
                 return {"file": self._row(existing, {}), "already": True}
             held = int(self.store.file_totals(project_id)["bytes"])
             replacing = int(existing["bytes"]) if existing is not None else 0
-            if held - replacing + length > PROJECT_QUOTA:
+            quota = self.quota_of(project)
+            if quota == 0:
+                raise HTTPException(status_code=409,
+                                    detail="this collaboration is not taking files")
+            if held - replacing + length > quota:
                 raise HTTPException(status_code=507,
                                     detail=f"this collaboration is at its storage limit "
-                                           f"({PROJECT_QUOTA // 1024 ** 3} GB); "
+                                           f"({quota / 1024 ** 3:g} GB); "
                                            "tell the coordinator")
             if self.stats()["free"] - length < KEEP_FREE:
                 raise HTTPException(status_code=507,
@@ -581,7 +601,7 @@ _PAGE = r"""<!doctype html>
     for (const p of info.projects) {
       const o = document.createElement('option');
       o.value = p.id;
-      o.textContent = `${p.name} — ${p.coordinator || 'no coordinator'} · ${p.files ? kindSummary(p.kinds) : 'nothing yet'}, ${mb(p.bytes)}` + (p.collecting ? '' : ' (not collecting; yours)') + (p.full ? ' (storage limit reached)' : '');
+      o.textContent = `${p.name} — ${p.coordinator || 'no coordinator'} · ${p.files ? kindSummary(p.kinds) : 'nothing yet'}, ${mb(p.bytes)}` + (p.collecting ? '' : ' (not collecting; yours)') + (p.closed ? ' (closed: download only)' : (p.full ? ' (storage limit reached)' : ''));
       select.appendChild(o);
     }
     $('none').hidden = info.projects.length > 0;
