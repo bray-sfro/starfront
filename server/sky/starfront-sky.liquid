@@ -1,0 +1,50 @@
+{% comment %}
+  Starfront sky - where the observatory's telescopes are pointing tonight.
+
+  Two ways to use this on a Shopify site:
+
+  1. As a section: save this file as sections/starfront-sky.liquid in the
+     theme, then add "Starfront sky" to any page from the theme editor and
+     set the options there.
+
+  2. As a Custom Liquid block: paste just the two lines between the
+     "paste from here" and "to here" marks into a Custom Liquid section.
+
+  The chart itself is served by the collaboration server, so it updates
+  without the theme being touched. It asks the server for public, read-only
+  data and stores nothing in the visitor's browser.
+{% endcomment %}
+
+{%- liquid
+  assign server = section.settings.server | default: 'https://collab.starfront.space'
+  assign hours = section.settings.hours | default: 14
+  assign refresh = section.settings.refresh | default: 60
+  assign lat = section.settings.lat | default: 31.9
+  assign lon = section.settings.lon | default: -99.1
+  assign title = section.settings.title
+-%}
+
+<div class="page-width" style="padding: {{ section.settings.padding | default: 24 }}px 0;">
+  {%- comment -%} paste from here {%- endcomment -%}
+  <div data-starfront-sky data-server="{{ server }}" data-hours="{{ hours }}" data-refresh="{{ refresh }}" data-lat="{{ lat }}" data-lon="{{ lon }}" data-title="{{ title | escape }}"></div>
+  <script src="{{ server }}/sky/widget.js" async></script>
+  {%- comment -%} to here {%- endcomment -%}
+</div>
+
+{% schema %}
+{
+  "name": "Starfront sky",
+  "tag": "section",
+  "class": "section",
+  "settings": [
+    { "type": "text", "id": "title", "label": "Heading", "default": "Tonight at Starfront" },
+    { "type": "text", "id": "server", "label": "Starfront server", "default": "https://collab.starfront.space" },
+    { "type": "range", "id": "hours", "label": "Hours of track to show", "min": 0, "max": 24, "step": 1, "default": 14 },
+    { "type": "range", "id": "refresh", "label": "Refresh every (seconds)", "min": 15, "max": 600, "step": 15, "default": 60 },
+    { "type": "text", "id": "lat", "label": "Observatory latitude (degrees north)", "default": "31.9" },
+    { "type": "text", "id": "lon", "label": "Observatory longitude (degrees east; west is negative)", "default": "-99.1" },
+    { "type": "range", "id": "padding", "label": "Space above and below (px)", "min": 0, "max": 80, "step": 4, "default": 24 }
+  ],
+  "presets": [ { "name": "Starfront sky" } ]
+}
+{% endschema %}

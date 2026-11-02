@@ -1,0 +1,8 @@
+# Caddy in front of the collaboration server: HTTPS from Let's Encrypt,
+# renewed on its own, and everything proxied to the service on loopback.
+# The install script replaces COLLAB_HOSTS with your hostname - and, while
+# telescopes still point at an older address, that one too.
+COLLAB_HOSTS {
+    encode gzip
+    reverse_proxy 127.0.0.1:8800
+}
