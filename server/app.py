@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import math
 import os
 import re
@@ -43,9 +44,30 @@ from astrocontrol import catalog, collab, filters                # noqa: E402
 from astrocontrol.config import data_root                        # noqa: E402
 from server import auth                                          # noqa: E402
 from server.files import COOKIE, COOKIE_SECONDS, Files           # noqa: E402
+from server.ratelimit import Limiter, client_address           # noqa: E402
 from server.store import Store                                   # noqa: E402
 
-app = FastAPI(title="Starfront collaboration server", version="0.1.0")
+# No public API map: /docs, /redoc and /openapi.json are off in production.
+# STARFRONT_DOCS=1 turns them back on for a local test server.
+_DOCS = os.environ.get("STARFRONT_DOCS", "") == "1"
+app = FastAPI(title="Starfront collaboration server", version="0.1.0",
+              docs_url="/docs" if _DOCS else None,
+              redoc_url="/redoc" if _DOCS else None,
+              openapi_url="/openapi.json" if _DOCS else None)
+
+limiter = Limiter()
+
+
+@app.middleware("http")
+async def _rate_limit(request: Request, call_next):
+    allowed, wait = limiter.allow(request.method, request.url.path,
+                                  client_address(request))
+    if not allowed:
+        return JSONResponse(status_code=429,
+                            content={"detail": "too many requests; try again shortly"},
+                            headers={"Retry-After": str(int(wait))})
+    return await call_next(request)
+
 
 # Beside everything else the rig keeps, and through the same function, so a
 # machine that still has its folder under the old name is not left with its
@@ -584,11 +606,10 @@ def project_depth(project_id: str,
     project = store.project(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="no such project")
-    grid = _depth_grid(project_id, project.get("payload") or {})
-    if grid is None:
+    answer = _depth_cached(project_id, project)
+    if answer is None:
         raise HTTPException(status_code=409, detail="this project has no region to map")
-    return {"project": project_id, "name": project["name"], **grid,
-            "progress": _progress(project_id, project.get("payload") or {})}
+    return answer
 
 
 @app.get("/api/v1/agent/projects/{project_id}/people")
@@ -815,6 +836,50 @@ def _figures(project_id: str, payload: dict[str, Any]
     with _figures_lock:
         _figures_cache[project_id] = (stamp, collected, progress)
     return collected, progress
+
+
+_depth_cache: dict[str, tuple[Any, dict[str, Any] | None]] = {}
+_depth_lock = threading.Lock()
+
+
+def _depth_stamp(project_id: str, project: dict[str, Any]) -> Any:
+    """What the depth map is made of: the contributions (how many, how many
+    accepted, the latest arrival and the latest verdict change) and the
+    project's region, goals and kind. Any change to one of them is a new map."""
+    payload = project.get("payload") or {}
+    row = store._one(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(accepted), 0) AS a,"
+        " COALESCE(MAX(received), 0) AS r, COALESCE(SUM(seconds), 0) AS s,"
+        " COALESCE(SUM(CASE WHEN accepted THEN seconds * (rowid % 9973 + 1) ELSE 0 END), 0) AS k"
+        " FROM contributions WHERE project = ?", project_id) or {}
+    return (int(row.get("n") or 0), int(row.get("a") or 0),
+            float(row.get("r") or 0.0), float(row.get("s") or 0.0),
+            float(row.get("k") or 0.0), str(project.get("name") or ""),
+            json.dumps({"goals": payload.get("goals"), "region": payload.get("region"),
+                        "kind": payload.get("kind")}, sort_keys=True, default=str))
+
+
+def _depth_cached(project_id: str, project: dict[str, Any]) -> dict[str, Any] | None:
+    """The depth map answer, built once per change of what it is made of.
+
+    Every telescope with the Plan tab open asks for this, and building it
+    walks every accepted frame's footprint over the whole grid; on a
+    one-CPU server that is the CPU. So it is kept until a contribution
+    lands, a verdict changes or the project's region or goals move.
+    """
+    stamp = _depth_stamp(project_id, project)
+    with _depth_lock:
+        held = _depth_cache.get(project_id)
+        if held is not None and held[0] == stamp:
+            return held[1]
+    payload = project.get("payload") or {}
+    grid = _depth_grid(project_id, payload)
+    answer = None if grid is None else {
+        "project": project_id, "name": project["name"], **grid,
+        "progress": _progress(project_id, payload)}
+    with _depth_lock:
+        _depth_cache[project_id] = (stamp, answer)
+    return answer
 
 
 def _goals(goals: dict[str, float]) -> dict[str, float]:
@@ -1563,10 +1628,19 @@ def report(body: ReportRequest,
     for raw in body.contributions:
         entry = collab.Contribution.read({**raw, "agent": agent["id"]})
         task = store.task(entry.task) if entry.task else None
-        if task is not None and task["agent"] != agent["id"]:
+        # Hours count only against a task this telescope was dealt, in the
+        # project it names; seconds are self-reported, so a report with no
+        # task behind it could pad anybody's project.
+        if task is None:
+            raise HTTPException(status_code=403,
+                                detail="a report must name a task dealt to this telescope")
+        if task["agent"] != agent["id"]:
             raise HTTPException(status_code=403,
                                 detail="that task belongs to another agent")
-        if task is not None and not entry.project:
+        if entry.project and entry.project != task["project"]:
+            raise HTTPException(status_code=403,
+                                detail="that task is in a different project")
+        if not entry.project:
             entry.project = task["project"]
 
         project = store.project(entry.project) if entry.project else None
@@ -1730,10 +1804,25 @@ def redeal_project(project_id: str,
     return {"project": project_id, "forgotten": forgotten}
 
 
+def _optional_person(authorization: str) -> dict[str, Any] | None:
+    """Who is asking, if they are signed in at all; nobody otherwise."""
+    return _person(_bearer(authorization))
+
+
+def _public_project(project: dict[str, Any]) -> dict[str, Any]:
+    """A project as anyone on the internet may see it: what it is and how
+    far along, without whose Discord account started it."""
+    return {k: v for k, v in project.items() if k != "owner_id"}
+
+
 @app.get("/api/v1/projects")
-def list_projects() -> dict[str, Any]:
-    """Open to anyone: browsing is how people find a collab to join."""
-    return {"projects": store.projects()}
+def list_projects(authorization: str = Header(default="")) -> dict[str, Any]:
+    """Open to anyone: browsing is how people find a collab to join.
+    Anonymous callers do not get the owners' Discord ids."""
+    rows = store.projects()
+    if _optional_person(authorization) is None:
+        rows = [_public_project(p) for p in rows]
+    return {"projects": rows}
 
 
 @app.get("/api/v1/lookup")
@@ -1765,12 +1854,40 @@ def lookup_object(name: str = Query(default="", max_length=80),
 
 
 @app.get("/api/v1/projects/{project_id}")
-def read_project(project_id: str) -> dict[str, Any]:
+def read_project(project_id: str,
+                 authorization: str = Header(default="")) -> dict[str, Any]:
+    """One project. Signed-in people get every task and contribution;
+    anonymous callers get a summary only - no telescope ids, Discord ids or
+    per-night sky figures (Bortle, guiding RMS, HFR, footprints)."""
     project = store.project(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="no such project")
-    return {"project": project, "tasks": store.tasks_in(project_id),
-            "contributions": store.contributions(project_id)}
+    if _optional_person(authorization) is not None:
+        return {"project": project, "tasks": store.tasks_in(project_id),
+                "contributions": store.contributions(project_id)}
+    rows = store.contributions(project_id)
+    collected, progress = _figures(project_id, project.get("payload") or {})
+    return {"project": _public_project(project), "tasks": [], "contributions": [],
+            "summary": True,
+            "telescopes": len({r.get("agent") for r in rows}),
+            "nights": len(rows),
+            "acceptedHours": round(sum(float(r.get("seconds") or 0.0)
+                                       for r in rows if r.get("accepted")) / 3600.0, 2),
+            "collected": collected, "progress": progress}
+
+
+def _may_offer_to(who: dict[str, Any], project_id: str, agent: dict[str, Any]) -> bool:
+    """A task may go to a telescope the caller owns, or one that already
+    joined (holds or held a task in) or contributed to this project. The
+    server owner may offer to any telescope."""
+    if who.get("admin"):
+        return True
+    owner = str(agent.get("owner_id") or "")
+    if owner and owner == who.get("id"):
+        return True
+    if any(t.get("agent") == agent["id"] for t in store.tasks_in(project_id)):
+        return True
+    return bool(store.contributions(project_id, agent["id"]))
 
 
 @app.post("/api/v1/projects/{project_id}/tasks")
@@ -1778,8 +1895,15 @@ def create_task(project_id: str, body: TaskRequest,
                 who: dict[str, Any] = Depends(person_from)) -> dict[str, Any]:
     """Delegate a chunk of sky to one telescope."""
     project = _require_project_owner(who, project_id)
-    if store.agent(body.agent) is None:
+    target = store.agent(body.agent)
+    if target is None:
         raise HTTPException(status_code=404, detail="no such agent")
+    if not _may_offer_to(who, project_id, target):
+        # Any member may start a project, and telescope ids are not secret,
+        # so without this anybody could push work onto a stranger's rig.
+        raise HTTPException(status_code=403,
+                            detail="that telescope has not joined this collaboration "
+                                   "and is not yours")
 
     task = collab.Task(
         id=collab.new_id(), project=project_id, projectName=project["name"],
@@ -2162,7 +2286,14 @@ def health() -> dict[str, Any]:
             "download": (_latest_setup() or {}).get("version")}
 
 
+_log = logging.getLogger("starfront.server")
+
+
 @app.exception_handler(Exception)
-async def _unhandled(_request, exc: Exception) -> JSONResponse:
+async def _unhandled(request, exc: Exception) -> JSONResponse:
+    # The details go to the journal, not to whoever asked.
+    reference = secrets.token_hex(4)
+    _log.error("unhandled error %s on %s %s", reference, request.method,
+               request.url.path, exc_info=exc)
     return JSONResponse(status_code=500,
-                        content={"detail": f"{type(exc).__name__}: {exc}"})
+                        content={"detail": f"internal server error (ref {reference})"})

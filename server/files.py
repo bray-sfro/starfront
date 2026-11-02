@@ -25,6 +25,7 @@ the server on its own.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -46,6 +47,16 @@ ALLOWED = (".fits", ".fit", ".fts", ".fz", ".xisf")
 MAX_BYTES = 4 * 1024 ** 3
 #: Room left on the disk, always. The database lives on the same disk.
 KEEP_FREE = 2 * 1024 ** 3
+#: The most one collaboration may hold, unless STARFRONT_PROJECT_QUOTA_GB
+#: says otherwise. A project already past it keeps everything it has and can
+#: still be read and downloaded; it just takes no more.
+PROJECT_QUOTA = int(float(os.environ.get("STARFRONT_PROJECT_QUOTA_GB", "40")) * 1024 ** 3)
+#: Below this much free space (or this fraction of the disk) the server
+#: warns: in the journal, in /api/v1/health and on the files page to owners.
+LOW_FREE = 10 * 1024 ** 3
+LOW_FRACTION = 0.10
+_log = logging.getLogger("starfront.files")
+
 #: The cookie a browser sign-in lives in, and how long it lasts unused.
 COOKIE = "starfront_web"
 COOKIE_SECONDS = 90 * 86400
@@ -183,10 +194,18 @@ class Files:
         totals = self.store.file_totals()
         try:
             usage = shutil.disk_usage(self.folder)
-            free = int(usage.free)
+            free, size = int(usage.free), int(usage.total)
         except OSError:
-            free = 0
-        return {"count": totals["count"], "bytes": totals["bytes"], "free": free}
+            free, size = 0, 0
+        low = free < LOW_FREE or (size > 0 and free < size * LOW_FRACTION)
+        if low:
+            now = time.time()
+            if now - getattr(self, "_warned", 0.0) > 3600:
+                self._warned = now
+                _log.warning("files disk is low: %.1f GB free of %.1f GB",
+                             free / 1024 ** 3, size / 1024 ** 3)
+        return {"count": totals["count"], "bytes": totals["bytes"], "free": free,
+                "size": size, "low": low, "projectQuota": PROJECT_QUOTA}
 
     def _row(self, row: dict[str, Any], names: dict[str, str]) -> dict[str, Any]:
         user = str(row.get("user") or "")
@@ -216,6 +235,9 @@ class Files:
         @app.get("/files/signin")
         def files_signin():
             """Begin a browser sign-in that comes back here."""
+            # Old, never-finished sign-ins are swept here too, as the
+            # program's sign-in does, so the table cannot just grow.
+            self.store.sweep_logins(time.time() - 2 * 600)
             code = self.new_login_code()
             self.store.add_login(code, back="/files")
             return RedirectResponse(f"/auth/discord/start?code={code}", status_code=303)
@@ -253,7 +275,8 @@ class Files:
                     "files": totals["count"], "bytes": totals["bytes"],
                     "kinds": self.store.file_kinds(project["id"]),
                     "myFiles": mine["count"], "myBytes": mine["bytes"],
-                    "owned": owned,
+                    "owned": owned, "quota": PROJECT_QUOTA,
+                    "full": totals["bytes"] >= PROJECT_QUOTA,
                 })
             return {
                 "signedIn": who is not None,
@@ -264,6 +287,8 @@ class Files:
                 "allowed": list(ALLOWED),
                 "maxBytes": MAX_BYTES,
                 "free": self.stats()["free"],
+                # Only the owners are told the disk itself is filling up.
+                "diskLow": bool(who and who["admin"] and self.stats()["low"]),
             }
 
         @app.get("/api/v1/projects/{project_id}/files")
@@ -323,6 +348,13 @@ class Files:
             final = self.path_of(project_id, who["id"], clean, what)
             if existing is not None and int(existing["bytes"]) == length and final.is_file():
                 return {"file": self._row(existing, {}), "already": True}
+            held = int(self.store.file_totals(project_id)["bytes"])
+            replacing = int(existing["bytes"]) if existing is not None else 0
+            if held - replacing + length > PROJECT_QUOTA:
+                raise HTTPException(status_code=507,
+                                    detail=f"this collaboration is at its storage limit "
+                                           f"({PROJECT_QUOTA // 1024 ** 3} GB); "
+                                           "tell the coordinator")
             if self.stats()["free"] - length < KEEP_FREE:
                 raise HTTPException(status_code=507,
                                     detail="the server has no room left for files; "
@@ -540,12 +572,16 @@ _PAGE = r"""<!doctype html>
     $('signin').hidden = info.signedIn; $('app').hidden = !info.signedIn;
     if (!info.signedIn) return;
     $('who').textContent = info.name;
+    let warn = document.getElementById('diskwarn');
+    if (!warn) { warn = document.createElement('p'); warn.id = 'diskwarn'; warn.className = 'small'; warn.style.color = '#ff8a7a'; $('app').prepend(warn); }
+    warn.textContent = info.diskLow ? `Server disk is low: ${mb(info.free)} free. Uploads stop when it is full.` : '';
+    warn.hidden = !info.diskLow;
     const select = $('project');
     select.innerHTML = '';
     for (const p of info.projects) {
       const o = document.createElement('option');
       o.value = p.id;
-      o.textContent = `${p.name} — ${p.coordinator || 'no coordinator'} · ${p.files ? kindSummary(p.kinds) : 'nothing yet'}, ${mb(p.bytes)}` + (p.collecting ? '' : ' (not collecting; yours)');
+      o.textContent = `${p.name} — ${p.coordinator || 'no coordinator'} · ${p.files ? kindSummary(p.kinds) : 'nothing yet'}, ${mb(p.bytes)}` + (p.collecting ? '' : ' (not collecting; yours)') + (p.full ? ' (storage limit reached)' : '');
       select.appendChild(o);
     }
     $('none').hidden = info.projects.length > 0;
