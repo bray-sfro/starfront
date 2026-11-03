@@ -733,7 +733,19 @@ _PAGE = r"""<!doctype html>
   .ccard[aria-current="true"] { border-color: #7ee7a5; background: #13231a; }
   .ccard b { display: block; } .ccard .small { color: #8f9bb0; }
   .cgroup { font-size: 12px; color: #8f9bb0; text-transform: uppercase; letter-spacing: .05em; margin: 10px 0 0; }
-  #hero { margin: 10px 0 4px; }
+  #hero { margin: 10px 0 4px; position: relative; left: 50%; transform: translateX(-50%); width: min(1240px, calc(100vw - 32px)); }
+  #hero .shot { position: relative; display: block; cursor: zoom-in; }
+  #hero .shot .zoomhint { position: absolute; right: 10px; bottom: 10px; background: #0d1017cc; color: #dbe3ee; border: 1px solid #2a3344; border-radius: 8px; padding: 4px 10px; font-size: 13px; pointer-events: none; }
+  #viewer { position: fixed; inset: 0; z-index: 50; background: #000; }
+  #viewer[hidden] { display: none; }
+  #viewerStage { position: absolute; inset: 0; overflow: hidden; touch-action: none; cursor: grab; }
+  #viewerStage:active { cursor: grabbing; }
+  #viewerImg { position: absolute; left: 0; top: 0; transform-origin: 0 0; max-width: none; user-select: none; -webkit-user-select: none; -webkit-user-drag: none; -webkit-touch-callout: none; }
+  #viewerClose { position: absolute; top: 10px; right: 10px; z-index: 2; width: 44px; height: 44px; border-radius: 22px; font-size: 22px; line-height: 1; background: #1a2130dd; color: #fff; border: 1px solid #2a3344; cursor: pointer; }
+  #viewerBar { position: absolute; left: 0; right: 0; bottom: 0; z-index: 2; padding: 10px 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+               background: linear-gradient(transparent, #000d); color: #cfd8e6; font-size: 13px; pointer-events: none; }
+  #viewerBar button { pointer-events: auto; background: #1a2130dd; color: #fff; border: 1px solid #2a3344; border-radius: 8px; min-width: 40px; height: 36px; font-size: 16px; cursor: pointer; }
+  #viewerBar #viewerTools { pointer-events: auto; }
   #hero figure { margin: 0; }
   .btn.dl { padding: 3px 10px; font-size: 13px; }
   .btn.dl.locked { background: #1a2130; color: #8f9bb0; cursor: not-allowed; }
@@ -741,7 +753,7 @@ _PAGE = r"""<!doctype html>
   table.masters td, table.people td { vertical-align: middle; }
   table.masters td.dlc { white-space: nowrap; }
   tr.tot td { border-bottom: 0; }
-  #hero img { display: block; width: 100%; height: auto; max-height: 320px; object-fit: contain; border-radius: 8px; background: #000; }
+  #hero img { display: block; width: 100%; height: auto; border-radius: 8px; background: #000; }
   #hero .cap { margin: 4px 0 0; }
   .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
   details.view { scroll-margin-top: 64px; border: 1px solid #2a3344; border-radius: 10px; margin: 10px 0; background: #0f141d; }
@@ -764,7 +776,8 @@ _PAGE = r"""<!doctype html>
     .tin { padding: 8px 12px; }
     .cards { grid-template-columns: 1fr; }
     .curname { font-size: 19px; }
-    #hero img { max-height: none; }
+    #hero { width: calc(100vw - 16px); }
+    #hero img { border-radius: 6px; }
     main { padding: 16px 12px 40px; }
     select, input[type=text], #telescope { min-width: 0; width: 100%; box-sizing: border-box; }
     .zones { grid-template-columns: 1fr 1fr; gap: 8px; }
@@ -883,6 +896,16 @@ _PAGE = r"""<!doctype html>
     </div>
   </details>
 </div>
+<div id="viewer" hidden role="dialog" aria-modal="true" aria-label="Image viewer">
+  <div id="viewerStage"><img id="viewerImg" alt="" draggable="false"></div>
+  <button type="button" id="viewerClose" aria-label="Close viewer" title="Close (Esc)">✕</button>
+  <div id="viewerBar">
+    <button type="button" data-z="in" aria-label="Zoom in">+</button><button type="button" data-z="out" aria-label="Zoom out">−</button><button type="button" data-z="fit" aria-label="Fit to screen">Fit</button>
+    <span id="viewerTools"></span>
+    <span id="viewerNote"></span>
+    <span class="muted">Scroll or pinch to zoom · drag to pan · double-tap to zoom · Esc to close</span>
+  </div>
+</div>
 <script src="/releases/page.js" defer></script>
 
 <script>
@@ -936,6 +959,110 @@ _PAGE = r"""<!doctype html>
   }
   const s = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
   // The release section draws itself (/releases/page.js) and says when.
+  // -- full-screen viewer: wheel/pinch/double-tap zoom, drag to pan --------
+  // It always shows what #heroImg shows: its src first, then the image named
+  // by #heroImg's data-full (full resolution) once that has loaded. Anything
+  // that swaps #heroImg (a stars on/off toggle) should set src and data-full;
+  // the viewer follows, keeping its zoom and position.
+  const V = { open: false, s: 1, x: 0, y: 0, w0: 0, h0: 0, ptrs: new Map(), pinch: null, tap: 0, down: null };
+  const vImg = () => $('viewerImg');
+  function vApply() { vImg().style.transform = `translate(${V.x}px, ${V.y}px) scale(${V.s})`; }
+  function vClamp() {
+    const W = innerWidth, H = innerHeight, w = V.w0 * V.s, h = V.h0 * V.s;
+    V.x = w <= W ? (W - w) / 2 : Math.min(0, Math.max(W - w, V.x));
+    V.y = h <= H ? (H - h) / 2 : Math.min(0, Math.max(H - h, V.y));
+  }
+  function vFit(ratio) {
+    ratio = ratio || (V.w0 && V.h0 ? V.w0 / V.h0 : 1.5);
+    V.w0 = Math.min(innerWidth, innerHeight * ratio); V.h0 = V.w0 / ratio;
+    vImg().style.width = V.w0 + 'px'; vImg().style.height = V.h0 + 'px';
+    V.s = 1; vClamp(); vApply();
+  }
+  function vZoom(f, px, py) {
+    const s = Math.min(16, Math.max(1, V.s * f)), k = s / V.s;
+    V.x = px - (px - V.x) * k; V.y = py - (py - V.y) * k; V.s = s; vClamp(); vApply();
+  }
+  function vLoad() {
+    const hero = $('heroImg'); if (!hero) return;
+    const img = vImg(), base = hero.currentSrc || hero.src, full = hero.dataset.full || '';
+    if (img.dataset.base !== base) {
+      const first = !img.dataset.base;
+      img.dataset.base = base; img.dataset.full = ''; img.src = base;
+      if (first) vFit(hero.naturalWidth && hero.naturalHeight ? hero.naturalWidth / hero.naturalHeight : 1.5);
+    }
+    if (full && img.dataset.full !== full) {
+      img.dataset.full = full; $('viewerNote').textContent = 'Loading full resolution…';
+      const hi = new Image(); hi.decoding = 'async';
+      hi.onload = () => { if (img.dataset.full !== full) return; img.src = full; $('viewerNote').textContent = `Full resolution · ${hi.naturalWidth.toLocaleString()} × ${hi.naturalHeight.toLocaleString()} px`; };
+      hi.onerror = () => { if (img.dataset.full === full) $('viewerNote').textContent = ''; };
+      hi.src = full;
+    } else if (!full) $('viewerNote').textContent = '';
+  }
+  function viewerOpen() {
+    if (!$('heroImg')) return;
+    V.open = true; $('viewer').hidden = false; document.body.style.overflow = 'hidden';
+    delete vImg().dataset.base; vLoad(); $('viewerClose').focus();
+    document.dispatchEvent(new CustomEvent('starfront:viewer', { detail: { open: true } }));
+  }
+  function viewerClose() {
+    V.open = false; $('viewer').hidden = true; document.body.style.overflow = '';
+    const o = $('heroOpen'); if (o) o.focus();
+    document.dispatchEvent(new CustomEvent('starfront:viewer', { detail: { open: false } }));
+  }
+  window.starfrontViewer = { open: viewerOpen, close: viewerClose, zoom: (f, x, y) => vZoom(f, x == null ? innerWidth / 2 : x, y == null ? innerHeight / 2 : y), refresh: () => V.open && vLoad() };
+  (function wireViewer() {
+    const stage = $('viewerStage');
+    $('viewerClose').addEventListener('click', viewerClose);
+    document.addEventListener('keydown', (e) => {
+      if (!V.open) return;
+      if (e.key === 'Escape') viewerClose();
+      else if (e.key === '+' || e.key === '=') vZoom(1.5, innerWidth / 2, innerHeight / 2);
+      else if (e.key === '-') vZoom(1 / 1.5, innerWidth / 2, innerHeight / 2);
+      else if (e.key === '0') vFit();
+    });
+    $('viewerBar').addEventListener('click', (e) => {
+      const z = e.target && e.target.dataset ? e.target.dataset.z : '';
+      if (z === 'in') vZoom(1.6, innerWidth / 2, innerHeight / 2);
+      else if (z === 'out') vZoom(1 / 1.6, innerWidth / 2, innerHeight / 2);
+      else if (z === 'fit') vFit();
+    });
+    stage.addEventListener('wheel', (e) => { e.preventDefault(); vZoom(Math.exp(-e.deltaY * (e.deltaMode ? 0.05 : 0.0015)), e.clientX, e.clientY); }, { passive: false });
+    const mid = () => { const p = Array.from(V.ptrs.values()); return { x: (p[0].x + p[1].x) / 2, y: (p[0].y + p[1].y) / 2, d: Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y) || 1 }; };
+    stage.addEventListener('pointerdown', (e) => {
+      try { stage.setPointerCapture(e.pointerId); } catch (x) { /* synthetic pointer */ }
+      V.ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (V.ptrs.size === 2) V.pinch = mid();
+      V.down = V.ptrs.size === 1 ? { x: e.clientX, y: e.clientY, t: Date.now() } : null;
+    });
+    stage.addEventListener('pointermove', (e) => {
+      const p = V.ptrs.get(e.pointerId); if (!p) return;
+      const dx = e.clientX - p.x, dy = e.clientY - p.y;
+      p.x = e.clientX; p.y = e.clientY;
+      if (V.ptrs.size === 1) { V.x += dx; V.y += dy; vClamp(); vApply(); }
+      else if (V.ptrs.size === 2 && V.pinch) {
+        const m = mid();
+        vZoom(m.d / V.pinch.d, m.x, m.y);
+        V.x += m.x - V.pinch.x; V.y += m.y - V.pinch.y; vClamp(); vApply();
+        V.pinch = m;
+      }
+    });
+    const up = (e) => {
+      if (!V.ptrs.has(e.pointerId)) return;
+      V.ptrs.delete(e.pointerId);
+      if (V.ptrs.size < 2) V.pinch = null;
+      const d = V.down; V.down = null;
+      if (e.type !== 'pointerup' || !d || V.ptrs.size) return;
+      if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > 10 || Date.now() - d.t > 300) { V.tap = 0; return; }
+      const now = Date.now();
+      if (now - V.tap < 320) { V.tap = 0; if (V.s > 1.5) vFit(); else vZoom(3, e.clientX, e.clientY); }
+      else V.tap = now;
+    };
+    stage.addEventListener('pointerup', up); stage.addEventListener('pointercancel', up);
+    addEventListener('resize', () => { if (V.open) { const s = V.s; vFit(); if (s > 1) vZoom(s, innerWidth / 2, innerHeight / 2); } });
+    // Follow #heroImg when something swaps it (a new release, a stars toggle).
+    new MutationObserver(() => { if (V.open) vLoad(); }).observe($('hero'), { subtree: true, childList: true, attributes: true, attributeFilter: ['src', 'data-full'] });
+  })();
+
   // The preview, shown once. #heroImg is the one image; a control that swaps
   // its src (e.g. stars on/off) can go in #heroTools.
   function drawHero(rel) {
@@ -943,9 +1070,16 @@ _PAGE = r"""<!doctype html>
     const previews = rel ? (rel.files || []).filter((x) => x.role === 'preview') : [];
     const hero = previews.find((x) => x.hero) || previews[0];
     if (!hero) { box.hidden = true; box.innerHTML = ''; return; }
-    box.innerHTML = `<figure><img id="heroImg" loading="lazy" decoding="async" width="2400" height="1600" src="${esc(hero.thumb || hero.url)}" alt="${esc(hero.title || 'Latest preview')}">
+    // Its full-resolution twin, for the viewer only (never offered as a download).
+    const stem = String(hero.name || '').replace(/_v\d+_preview\.jpe?g$/i, '');
+    const fullres = hero.fullres ? (rel.files || []).find((x) => x.name === hero.fullres)
+      : (rel.files || []).find((x) => x.role !== 'master' && x.name.startsWith(stem + '_') && /_fullres\.jpe?g$/i.test(x.name));
+    box.innerHTML = `<figure><span class="shot" id="heroOpen" role="button" tabindex="0" aria-label="Open the image full screen to zoom in"><img id="heroImg" loading="lazy" decoding="async" width="2400" height="1600" src="${esc(hero.thumb || hero.url)}" data-full="${esc(fullres ? fullres.url : '')}" alt="${esc(hero.title || 'Latest preview')}"><span class="zoomhint">🔍 Click to zoom</span></span>
       <figcaption class="small muted cap"><span id="heroTools"></span><b>Latest master ${esc(rel.version || '')}</b>${rel.released ? ' · ' + esc(rel.released) : ''}${rel.totalHours != null ? ` · ${Number(rel.totalHours).toFixed(0)} h` : ''} · ${esc(hero.caption || hero.title || '')} · <a href="#sec-release">masters and contributors</a></figcaption></figure>`;
     box.hidden = false;
+    const opener = $('heroOpen');
+    opener.addEventListener('click', () => viewerOpen());
+    opener.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); viewerOpen(); } });
     // The caption's link opens the Masters and contributors section, every time.
     const go = box.querySelector('a[href="#sec-release"]');
     if (go) go.addEventListener('click', (e) => {

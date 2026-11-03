@@ -169,3 +169,11 @@ def test_collab_list_is_public_and_ordered(world):
     p1 = info["collabs"][0]
     assert p1["files"] == 1 and p1["bytes"] > 0 and p1["collecting"] and not p1["closed"]
     assert set(p1) == {"id", "name", "coordinator", "closed", "collecting", "files", "bytes"}
+
+
+def test_page_has_the_viewer_and_no_preview_downloads(world):
+    client, *_ = world
+    html = client.get("/files").text
+    assert 'id="viewer"' in html and 'id="viewerImg"' in html and 'id="heroImg"' in html and 'id="heroTools"' in html
+    assert "data-full" in html and "max-height: 320px" not in html
+    assert " download>" not in html                       # nothing on this page is offered as a download
