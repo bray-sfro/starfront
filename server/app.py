@@ -2270,7 +2270,7 @@ files = Files(app, store, FILES_DIR, _person, owns_project, DISCORD.owners,
 # not hex), so a full set of masters has the big disk's room. The files
 # page's quotas count uploads only. See server/releases.py.
 RELEASES_DIR = Path(auth.setting("RELEASES") or FILES_DIR / "_releases")
-releases = Releases(app, store, RELEASES_DIR)
+releases = Releases(app, store, RELEASES_DIR, files.who, owns_project)
 
 
 # ---------------------------------------------------------------------------

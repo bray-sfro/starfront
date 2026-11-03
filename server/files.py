@@ -69,6 +69,12 @@ COOKIE_SECONDS = 90 * 86400
 KINDS = ("light", "flat", "dark", "bias", "darkflat")
 KIND_LABELS = {"light": "Lights", "flat": "Flats", "dark": "Darks",
                "bias": "Bias", "darkflat": "Dark flats"}
+#: What the files page offers for new uploads. Dark flats are no longer
+#: collected (Bray, 2026-11-03): the rules never need them. "darkflat" stays
+#: a kind so the ones already here still list and download, and so an older
+#: client that sends it is not refused - its file is kept, apart, as a
+#: flat-calibration aid that is never matched to a light.
+UPLOAD_KINDS = ("light", "flat", "dark", "bias")
 #: The folder each kind is kept in, under the person's.
 KIND_FOLDERS = {"light": "lights", "flat": "flats", "dark": "darks",
                 "bias": "bias", "darkflat": "darkflats"}
@@ -362,7 +368,10 @@ class Files:
                 "name": who["name"] if who else "",
                 "admin": bool(who and who["admin"]),
                 "projects": listed,
+                # Every kind, for labelling files already here; only
+                # uploadKinds are offered for new uploads.
                 "kinds": [{"id": kind, "label": KIND_LABELS[kind]} for kind in KINDS],
+                "uploadKinds": list(UPLOAD_KINDS),
                 "allowed": list(ALLOWED),
                 "maxBytes": MAX_BYTES,
                 "free": self.stats()["free"],
@@ -464,8 +473,9 @@ class Files:
                          kind: str = Query(default="", max_length=12)) -> dict[str, Any]:
             """One file, streamed to disk as it arrives.
 
-            `kind` says what it is - light, flat, dark, bias, darkflat - or
-            is left blank for the name to say (N.I.N.A. writes the image
+            `kind` says what it is - light, flat, dark, bias - or
+            is left blank (a legacy `darkflat` is still taken, kept apart and
+            never matched) for the name to say (N.I.N.A. writes the image
             type into the name). Idempotent by kind, name and size: a file
             already here at the same size is not taken again, which is what
             lets an upload that was cut off be run again over the whole
@@ -729,11 +739,6 @@ _PAGE = r"""<!doctype html>
       <div class="drop zone" data-kind="bias">
         <h3>Bias</h3>
         <p class="small muted">Same gain, offset and binning as the lights</p>
-        <p class="row" style="justify-content:center"><button class="btn ghost" data-pick="files">Choose files</button><button class="btn ghost" data-pick="folder">Choose a folder</button></p>
-      </div>
-      <div class="drop zone" data-kind="darkflat">
-        <h3>Dark flats</h3>
-        <p class="small muted">Only if you use them: darks matching the flats' exposure</p>
         <p class="row" style="justify-content:center"><button class="btn ghost" data-pick="files">Choose files</button><button class="btn ghost" data-pick="folder">Choose a folder</button></p>
       </div>
     </div>

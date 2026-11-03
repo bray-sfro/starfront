@@ -477,7 +477,9 @@ def header_problems(kind: str, f: dict[str, Any], rules: dict[str, Any]) -> list
             out.append("no gain or ISO in the header (GAIN)")
         if rules.get("requireTemperature") and f.get("temp") is None:
             out.append("no sensor temperature in the header (CCD-TEMP or SET-TEMP)")
-    elif kind == "dark" or kind == "darkflat":
+    elif kind == "darkflat":
+        pass                    # a legacy aid: never matched, so nothing to require
+    elif kind == "dark":
         if f.get("exposure") is None:
             out.append("no exposure time in the header (EXPTIME) or in the file name, "
                        "so it cannot be matched to any light")
@@ -681,6 +683,9 @@ def judge_calibration(kind: str, f: dict, rules: dict) -> tuple[str, list[str]]:
                      f"uploaded as {kind}")
     if f.get("exposureFrom") == "name":
         notes.append("exposure read from the file name")
+    if kind == "darkflat":
+        notes.insert(0, "dark flats are no longer collected on this server: kept as a "
+                        "flat-calibration aid, but never needed or matched by the upload rules")
     return READY, notes
 
 

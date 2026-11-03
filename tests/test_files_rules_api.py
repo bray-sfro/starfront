@@ -127,3 +127,28 @@ def test_page_has_the_checklist(world):
     client, *_ = world
     html = client.get("/files").text
     assert "Upload rules for this collaboration" in html and "Pending calibration" in html
+
+
+def test_darkflat_no_longer_offered_but_still_taken(world):
+    client, store, tmp, files = world
+    html = client.get("/files").text
+    assert 'data-kind="darkflat"' not in html and "<h3>Dark flats</h3>" not in html
+    info = client.get("/api/v1/files/projects", headers={"authorization": "Bearer alice-token"}).json()
+    assert "darkflat" not in info["uploadKinds"]
+    assert any(k["id"] == "darkflat" for k in info["kinds"])           # old ones still labelled
+    # An older client sending kind=darkflat: kept apart, never matched, told why.
+    r = put(client, tmp, "DARKFLAT_0001.fits", "darkflat", IMAGETYP="DARKFLAT", EXPTIME=2.0)
+    assert r.status_code == 200
+    f = r.json()["file"]
+    assert f["kind"] == "darkflat" and f["status"] == "ready"
+    assert "no longer collected" in f["reasons"][0]
+    assert files.path_of("p1", "u-alice", "DARKFLAT_0001.fits", "darkflat").is_file()
+    # It calibrates nothing: a light with only a dark flat still waits.
+    r = put(client, tmp, "L_0001.fits", "light")
+    assert r.json()["file"]["status"] == "pending"
+    # And it still downloads.
+    r = client.get("/api/v1/projects/p1/files/u-alice/darkflat/DARKFLAT_0001.fits",
+                   headers={"authorization": "Bearer alice-token"})
+    assert r.status_code == 200 and r.content.startswith(b"SIMPLE")
+    rules = " ".join(client.get("/api/v1/projects/p1/upload-rules").json()["checklist"]).lower()
+    assert "dark flat" not in rules

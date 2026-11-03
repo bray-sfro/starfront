@@ -45,7 +45,7 @@ def test_listing_and_latest_are_public(client):
 def test_download_and_refusals(client):
     c, _ = client
     r = c.get(f"/releases/{PID}/v1/M31_B_v1.fits.fz")
-    assert r.status_code == 200 and r.content.startswith(b"SIMPLE")
+    assert r.status_code == 403                      # masters: contributors only
     assert c.get(f"/releases/{PID}/v1/M31_B_v1_preview.jpg").headers["content-type"] == "image/jpeg"
     for bad in ["secret.txt", "release.json", "link.fits", "..%2Foutside.txt", "missing.fits"]:
         assert c.get(f"/releases/{PID}/v1/{bad}").status_code == 404, bad
