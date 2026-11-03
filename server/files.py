@@ -733,7 +733,7 @@ _PAGE = r"""<!doctype html>
   .ccard[aria-current="true"] { border-color: #7ee7a5; background: #13231a; }
   .ccard b { display: block; } .ccard .small { color: #8f9bb0; }
   .cgroup { font-size: 12px; color: #8f9bb0; text-transform: uppercase; letter-spacing: .05em; margin: 10px 0 0; }
-  #hero { margin: 12px 0; }
+  #hero { margin: 10px 0 4px; }
   #hero figure { margin: 0; }
   .btn.dl { padding: 3px 10px; font-size: 13px; }
   .btn.dl.locked { background: #1a2130; color: #8f9bb0; cursor: not-allowed; }
@@ -741,10 +741,10 @@ _PAGE = r"""<!doctype html>
   table.masters td, table.people td { vertical-align: middle; }
   table.masters td.dlc { white-space: nowrap; }
   tr.tot td { border-bottom: 0; }
-  #hero img { display: block; width: 100%; height: auto; border-radius: 10px; background: #000; }
+  #hero img { display: block; width: 100%; height: auto; max-height: 320px; object-fit: contain; border-radius: 8px; background: #000; }
   #hero .cap { margin: 4px 0 0; }
   .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
-  details.view { border: 1px solid #2a3344; border-radius: 10px; margin: 10px 0; background: #0f141d; }
+  details.view { scroll-margin-top: 64px; border: 1px solid #2a3344; border-radius: 10px; margin: 10px 0; background: #0f141d; }
   details.view > summary { cursor: pointer; padding: 11px 14px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
   details.view > summary::-webkit-details-marker { display: none; }
   details.view > summary::before { content: '▸'; color: #7ee7a5; width: 1em; flex: none; transition: transform .15s; }
@@ -764,6 +764,7 @@ _PAGE = r"""<!doctype html>
     .tin { padding: 8px 12px; }
     .cards { grid-template-columns: 1fr; }
     .curname { font-size: 19px; }
+    #hero img { max-height: none; }
     main { padding: 16px 12px 40px; }
     select, input[type=text], #telescope { min-width: 0; width: 100%; box-sizing: border-box; }
     .zones { grid-template-columns: 1fr 1fr; gap: 8px; }
@@ -789,6 +790,7 @@ _PAGE = r"""<!doctype html>
   <select id="collabSel"></select>
   <h1 class="curname" id="curName"></h1>
   <p class="small muted curmeta" id="curMeta"></p>
+  <section id="hero" hidden></section>
   <details class="allc" id="allCollabs"><summary>All collaborations (<span id="nAll">0</span>)</summary>
     <div id="cardList"></div>
   </details>
@@ -841,8 +843,6 @@ _PAGE = r"""<!doctype html>
     </div>
   </div>
 </section>
-
-<section id="hero" hidden></section>
 
 <div id="views">
   <details class="view" id="sec-release" hidden>
@@ -943,9 +943,19 @@ _PAGE = r"""<!doctype html>
     const previews = rel ? (rel.files || []).filter((x) => x.role === 'preview') : [];
     const hero = previews.find((x) => x.hero) || previews[0];
     if (!hero) { box.hidden = true; box.innerHTML = ''; return; }
-    box.innerHTML = `<figure><img id="heroImg" src="${esc(hero.thumb || hero.url)}" alt="${esc(hero.title || 'Latest preview')}">
+    box.innerHTML = `<figure><img id="heroImg" loading="lazy" decoding="async" width="2400" height="1600" src="${esc(hero.thumb || hero.url)}" alt="${esc(hero.title || 'Latest preview')}">
       <figcaption class="small muted cap"><span id="heroTools"></span><b>Latest master ${esc(rel.version || '')}</b>${rel.released ? ' · ' + esc(rel.released) : ''}${rel.totalHours != null ? ` · ${Number(rel.totalHours).toFixed(0)} h` : ''} · ${esc(hero.caption || hero.title || '')} · <a href="#sec-release">masters and contributors</a></figcaption></figure>`;
     box.hidden = false;
+    // The caption's link opens the Masters and contributors section, every time.
+    const go = box.querySelector('a[href="#sec-release"]');
+    if (go) go.addEventListener('click', (e) => {
+      e.preventDefault();
+      const sec = $('sec-release');
+      if (sec.hidden) return;
+      setOpen(sec, true);
+      history.replaceState(history.state, '', '#sec-release');
+      sec.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    });
     box.dispatchEvent(new CustomEvent('starfront:hero', { bubbles: true, detail: { rel, hero } }));
   }
   document.addEventListener('starfront:release', (e) => {
