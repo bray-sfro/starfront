@@ -504,6 +504,9 @@ _PAGE = r"""<!doctype html>
 <h1>Starfront files</h1>
 <p class="muted">Where a collaboration's frames are collected for stacking: lights, and the flats, darks and bias that calibrate them. Only FITS and XISF files are taken, and files already here are skipped, so you can send the same folder again tomorrow and only the new ones go.</p>
 
+<section id="release" hidden></section>
+<script src="/releases/page.js" defer></script>
+
 <section id="signin" hidden>
   <p>Sign in with the Discord account you use for Starfront. Signing in here does not sign your N.I.N.A. or Starfront out.</p>
   <p><a class="btn" href="/files/signin">Sign in with Discord</a></p>
