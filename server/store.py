@@ -202,6 +202,22 @@ class Store:
                 if column not in columns:
                     self._db.execute(f"ALTER TABLE files ADD COLUMN {column} "
                                      f"TEXT NOT NULL DEFAULT {default}")
+            # Auto-upload from telescopes (server/agentuploads.py): the
+            # content hash a rig sent and the server checked, and which rig
+            # and task the file came from. '' for anything uploaded before.
+            for column in ("sha256", "agent", "task"):
+                if column not in columns:
+                    self._db.execute(f"ALTER TABLE files ADD COLUMN {column} "
+                                     "TEXT NOT NULL DEFAULT ''")
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS uploads ("
+                " id TEXT PRIMARY KEY, project TEXT NOT NULL, agent TEXT NOT NULL,"
+                " user TEXT NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,"
+                " original TEXT NOT NULL DEFAULT '', bytes INTEGER NOT NULL,"
+                " sha256 TEXT NOT NULL, received INTEGER NOT NULL DEFAULT 0,"
+                " task TEXT NOT NULL DEFAULT '', created REAL NOT NULL,"
+                " updated REAL NOT NULL)")
+            self._db.execute("CREATE INDEX IF NOT EXISTS uploads_by_agent ON uploads (agent)")
             self._db.execute("DROP INDEX IF EXISTS files_once")
             self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS files_once_per_kind"
                              " ON files (project, user, kind, name)")
@@ -469,6 +485,54 @@ class Store:
                              project_id)
         return self._all("SELECT * FROM files WHERE project = ? AND user = ?"
                          " ORDER BY kind, name", project_id, user_id)
+
+    # -- auto-upload sessions (server/agentuploads.py) ----------------------
+    def set_file_origin(self, file_id: str, sha256: str, agent: str, task: str) -> None:
+        self._run("UPDATE files SET sha256 = ?, agent = ?, task = ? WHERE id = ?",
+                  sha256, agent, task, file_id)
+
+    def file_by_hash(self, project_id: str, user_id: str, kind: str,
+                     sha256: str) -> dict[str, Any] | None:
+        if not sha256:
+            return None
+        return self._one("SELECT * FROM files WHERE project = ? AND user = ? AND kind = ?"
+                         " AND sha256 = ?", project_id, user_id, kind, sha256)
+
+    def agent_task_in(self, agent_id: str, project_id: str,
+                      states: tuple[str, ...] = ("accepted", "done")) -> dict[str, Any] | None:
+        marks = ",".join("?" for _ in states)
+        return self._one(f"SELECT id, state FROM tasks WHERE agent = ? AND project = ?"
+                         f" AND state IN ({marks}) ORDER BY issued DESC LIMIT 1",
+                         agent_id, project_id, *states)
+
+    def add_upload(self, row: dict[str, Any]) -> dict[str, Any]:
+        now = time.time()
+        self._run("INSERT INTO uploads (id, project, agent, user, kind, name, original, bytes,"
+                  " sha256, received, task, created, updated) VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?)",
+                  row["id"], row["project"], row["agent"], row["user"], row["kind"],
+                  row["name"], row.get("original", ""), int(row["bytes"]), row["sha256"],
+                  row.get("task", ""), now, now)
+        return self.upload(row["id"])
+
+    def upload(self, upload_id: str) -> dict[str, Any] | None:
+        return self._one("SELECT * FROM uploads WHERE id = ?", upload_id)
+
+    def upload_for(self, agent_id: str, project_id: str, kind: str, name: str,
+                   sha256: str) -> dict[str, Any] | None:
+        return self._one("SELECT * FROM uploads WHERE agent = ? AND project = ? AND kind = ?"
+                         " AND name = ? AND sha256 = ?", agent_id, project_id, kind, name, sha256)
+
+    def set_upload_received(self, upload_id: str, received: int) -> None:
+        self._run("UPDATE uploads SET received = ?, updated = ? WHERE id = ?",
+                  int(received), time.time(), upload_id)
+
+    def remove_upload(self, upload_id: str) -> None:
+        self._run("DELETE FROM uploads WHERE id = ?", upload_id)
+
+    def uploads(self, project_id: str | None = None) -> list[dict[str, Any]]:
+        if project_id is None:
+            return self._all("SELECT * FROM uploads")
+        return self._all("SELECT * FROM uploads WHERE project = ?", project_id)
 
     def file_kinds(self, project_id: str) -> dict[str, int]:
         """How many files of each kind a project holds."""

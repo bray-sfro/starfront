@@ -44,6 +44,7 @@ from astrocontrol import catalog, collab, filters                # noqa: E402
 from astrocontrol.config import data_root                        # noqa: E402
 from server import auth                                          # noqa: E402
 from server.files import COOKIE, COOKIE_SECONDS, Files           # noqa: E402
+from server.agentuploads import AgentUploads  # noqa: E402
 from server.ratelimit import Limiter, client_address           # noqa: E402
 from server.jobs import Jobs                                     # noqa: E402
 from server.releases import Releases                             # noqa: E402
@@ -1739,6 +1740,10 @@ class ProjectUpdateRequest(BaseModel):
     goals: dict[str, float] | None = None
     notes: str | None = Field(default=None, max_length=2000)
     collectFiles: bool | None = None
+    # Telescopes may send their lights on their own (server/agentuploads.py),
+    # optionally only the rigs listed by agent id.
+    autoUpload: bool | None = None
+    autoUploadAgents: list[str] | None = Field(default=None, max_length=500)
     # open | closed. Closing takes it off everybody's list without deleting
     # the record of what was collected.
     status: str | None = Field(default=None, pattern="^(open|closed)$")
@@ -1772,6 +1777,10 @@ def update_project(project_id: str, body: ProjectUpdateRequest,
         payload["notes"] = body.notes
     if body.collectFiles is not None:
         payload["collectFiles"] = bool(body.collectFiles)
+    if body.autoUpload is not None:
+        payload["autoUpload"] = bool(body.autoUpload)
+    if body.autoUploadAgents is not None:
+        payload["autoUploadAgents"] = [str(a)[:64] for a in body.autoUploadAgents if str(a).strip()]
     if body.name is not None:
         store.rename_project(project_id, body.name.strip())
     updated = store.set_project(project_id, payload, body.status)
@@ -2270,6 +2279,11 @@ files = Files(app, store, FILES_DIR, _person, owns_project, DISCORD.owners,
 # On the files volume, in a folder no project id can be named like ("_" is
 # not hex), so a full set of masters has the big disk's room. The files
 # page's quotas count uploads only. See server/releases.py.
+# Telescopes sending their collaboration lights on their own, resumable and
+# checked by sha256; off on every collaboration until its owner turns it on.
+# See server/agentuploads.py.
+agent_uploads = AgentUploads(app, store, files)
+
 RELEASES_DIR = Path(auth.setting("RELEASES") or FILES_DIR / "_releases")
 # The coordinator's processing job (stacking, rendering), shown on the files page.
 # Before Releases: its GET /api/v1/releases/{project}/{version} would take /job.

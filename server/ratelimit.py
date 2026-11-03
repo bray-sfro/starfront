@@ -30,6 +30,13 @@ RULES: list[tuple[str, str, int, float]] = [
 ]
 
 
+#: What a page loads to draw itself - its script, the preview pictures, a
+#: release's manifest - is not limited: the page fetches several per view
+#: (one per filter and stars/starless), and they are small and cached. The
+#: masters under /releases still are.
+EXEMPT_SUFFIXES = (".js", ".css", ".jpg", ".jpeg", ".png", ".webp", ".json")
+
+
 def client_address(request) -> str:
     forwarded = request.headers.get("x-forwarded-for", "")
     if forwarded:
@@ -47,6 +54,8 @@ class Limiter:
         self._swept = time.monotonic()
 
     def rule(self, method: str, path: str):
+        if method == "GET" and path.startswith("/releases") and path.lower().endswith(EXEMPT_SUFFIXES):
+            return None
         for m, prefix, count, window in self.rules:
             if method == m and (path == prefix or path.startswith(prefix + "/")):
                 return prefix, count, window
