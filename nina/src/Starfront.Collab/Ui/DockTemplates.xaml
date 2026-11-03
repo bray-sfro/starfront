@@ -59,6 +59,30 @@
                     <TextBlock Opacity="0.7" Text="{Binding LastText}" TextWrapping="Wrap" Visibility="{Binding LastText, Converter={StaticResource Starfront_Dock_ShowWhenSomething}}" />
                     <TextBlock Opacity="0.7" Text="{Binding CalibrationText}" TextWrapping="Wrap" Visibility="{Binding CalibrationText, Converter={StaticResource Starfront_Dock_ShowWhenSomething}}" />
                     <TextBlock Margin="0,2,0,0" FontWeight="SemiBold" Text="{Binding Hint}" TextWrapping="Wrap" Visibility="{Binding Hint, Converter={StaticResource Starfront_Dock_ShowWhenSomething}}" />
+                    <!--  Projects whose uploads the queue is holding. Their lights are still queued, so without these rows the
+                          dock showed them only as waiting; Resume lifts the hold, and the next upload says if the cause remains.  -->
+                    <ItemsControl ItemsSource="{Binding Held}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Grid Margin="0,4,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Opacity="0.85" Text="{Binding Text}" TextWrapping="Wrap" VerticalAlignment="Center" />
+                                    <Button
+                                        Grid.Column="1"
+                                        Margin="8,0,0,0"
+                                        Padding="8,1"
+                                        VerticalAlignment="Top"
+                                        Command="{Binding DataContext.ResumeProjectCommand, RelativeSource={RelativeSource AncestorType=ItemsControl}}"
+                                        CommandParameter="{Binding}"
+                                        Content="Resume"
+                                        ToolTip="Send this project's lights again now; if the cause is still there, the next upload holds it again" />
+                                </Grid>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
                     <StackPanel Margin="0,4,0,0" Orientation="Horizontal">
                         <Button Padding="8,1" Command="{Binding TogglePauseCommand}" Content="{Binding PauseLabel}" />
                         <Button Margin="8,0,0,0" Padding="8,1" Command="{Binding UploadNowCommand}" Content="Upload now" ToolTip="Send what is waiting now, whatever the mode says; the pause still holds" />

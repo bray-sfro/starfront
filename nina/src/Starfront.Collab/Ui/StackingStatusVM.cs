@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using CommunityToolkit.Mvvm.Input;
 using RelayCommand = CommunityToolkit.Mvvm.Input.RelayCommand;
 using NINA.Core.Utility;
@@ -32,6 +33,7 @@ namespace Starfront.Collab.Ui {
             timer = new Timer(_ => Dispatch.OnUi(Update), null, Timeout.Infinite, Timeout.Infinite);
             TogglePauseCommand = new RelayCommand(() => { stacking.TogglePause(); Update(); }, () => stacking.Running);
             UploadNowCommand = new RelayCommand(() => { stacking.UploadNow(); Update(); }, () => stacking.Running && !settings.StackingPaused);
+            ResumeProjectCommand = new RelayCommand<HeldProject>(row => { if (row != null) stacking.ResumeProject(row.ProjectRef); Update(); }, _ => stacking.Running);
             stacking.Changed += OnChanged;
             stacking.SignIn.PropertyChanged += OnSignInChanged;
             settings.PropertyChanged += OnSettingChanged;
@@ -53,6 +55,10 @@ namespace Starfront.Collab.Ui {
 
         public RelayCommand TogglePauseCommand { get; }
         public RelayCommand UploadNowCommand { get; }
+        public RelayCommand<HeldProject> ResumeProjectCommand { get; }
+
+        /// <summary>The projects whose uploads are held, each with its own Resume button; empty when none is.</summary>
+        public ObservableCollection<HeldProject> Held { get; } = new();
 
         /// <summary>The panel was shown or hidden; the queue is read only while it is shown.</summary>
         public void PanelVisible(bool visible) {
@@ -88,13 +94,16 @@ namespace Starfront.Collab.Ui {
             try {
                 TogglePauseCommand.NotifyCanExecuteChanged();
                 UploadNowCommand.NotifyCanExecuteChanged();
+                ResumeProjectCommand.NotifyCanExecuteChanged();
                 if (!settings.StackingEnabled) {
                     Headline = CurrentText = ReasonText = LastText = Hint = CalibrationText = "";
+                    ShowHeld(Array.Empty<HeldProject>());
                     return;
                 }
                 if (!stacking.Running) {
                     Headline = "Live stacking is starting, or could not start; the N.I.N.A. log says which.";
                     CurrentText = ReasonText = LastText = CalibrationText = "";
+                    ShowHeld(Array.Empty<HeldProject>());
                     Hint = HintText();
                     return;
                 }
@@ -119,10 +128,18 @@ namespace Starfront.Collab.Ui {
                 ReasonText = waiting > 0 && decision is { Allow: false } ? decision.Reason : "";
                 LastText = stacking.LastResult;
                 CalibrationText = stacking.CalibrationText();
+                ShowHeld(stacking.HeldProjects());
                 Hint = HintText();
             } catch (Exception ex) {
                 Logger.Debug($"Starfront stacking: the panel could not be updated - {ex.Message}");
             }
+        }
+
+        /// <summary>Replace the rows only when they changed: rebuilt every two seconds, a button would be swapped out from under the click.</summary>
+        private void ShowHeld(IReadOnlyList<HeldProject> now) {
+            if (Held.SequenceEqual(now)) return;
+            Held.Clear();
+            foreach (var row in now) Held.Add(row);
         }
 
         private string HintText() {

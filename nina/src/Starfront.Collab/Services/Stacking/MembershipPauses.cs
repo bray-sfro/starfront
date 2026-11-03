@@ -3,6 +3,9 @@ using RapidStackerCollab.Core.Upload;
 
 namespace Starfront.Collab.Services.Stacking {
 
+    /// <summary>A project whose uploads the queue is holding, as the dock lists it, with the reference its Resume button lifts.</summary>
+    public sealed record HeldProject(string ProjectRef, string Text);
+
     /// <summary>
     /// A project pause that a confirmed membership answers. Core pauses a project with no end when an upload is
     /// told <c>not_member</c> (the person has to act), and only a timed recheck for <c>membership_pending</c>.
@@ -29,6 +32,17 @@ namespace Starfront.Collab.Services.Stacking {
                 .ToList();
             foreach (var pause in lifted) queue.ResumeProject(pause.ProjectRef);
             return lifted;
+        }
+
+        /// <summary>
+        /// The dock's line for a held project. A pause with no end of its own (not a member, or the person's own)
+        /// says so, because only a membership read or the Resume button next to it lets that project's lights go.
+        /// </summary>
+        public static string DockText(ProjectPause pause, string name) {
+            var label = string.IsNullOrWhiteSpace(name) ? pause.ProjectRef : name;
+            var tried = pause.ResumeAt is DateTimeOffset at ? $", tried again at {at.ToLocalTime():HH:mm}" : pause.ByUser ? ", paused by you" : ", until resumed";
+            var reason = string.IsNullOrWhiteSpace(pause.Reason) ? "" : $": {pause.Reason}";
+            return $"{label} held since {pause.PausedAt.ToLocalTime():d MMM HH:mm}{tried}{reason}";
         }
 
         /// <summary>One line for the log about a pause still holding a project's uploads.</summary>

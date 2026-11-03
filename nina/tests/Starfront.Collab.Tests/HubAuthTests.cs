@@ -120,6 +120,21 @@ namespace Starfront.Collab.Tests {
         }
 
         [Test]
+        public void TheDockSaysWhichHoldsOnlyItsResumeButtonOrAMembershipReadCanLift() {
+            var at = new DateTimeOffset(2026, 10, 28, 0, 8, 24, TimeSpan.Zero);
+            var stuck = new ProjectPause("prj_1", "You are not a member of this project.", ApiCodes.NotMember, at, null, false);
+            var text = MembershipPauses.DockText(stuck, "Bubble Nebula");
+            Assert.That(text, Does.StartWith("Bubble Nebula held since"));
+            Assert.That(text, Does.Contain("until resumed"));
+            Assert.That(text, Does.EndWith(": You are not a member of this project."));
+
+            var timed = stuck with { Code = ApiCodes.ProjectNotOpen, ResumeAt = at.AddMinutes(15) };
+            Assert.That(MembershipPauses.DockText(timed, "Bubble Nebula"), Does.Contain($"tried again at {at.AddMinutes(15).ToLocalTime():HH:mm}"));
+            Assert.That(MembershipPauses.DockText(stuck with { ByUser = true }, ""), Does.StartWith("prj_1 held since").And.Contain("paused by you"),
+                "with no link to name it, the reference stands in");
+        }
+
+        [Test]
         public async Task AHub401MidUploadClearsOnlyThatLinksGrantAndTheCloudKeepsUploading() {
             var hubItem = Enqueue(HubProject);
             var cloudItem = Enqueue(FakeCollabServer.ProjectId);

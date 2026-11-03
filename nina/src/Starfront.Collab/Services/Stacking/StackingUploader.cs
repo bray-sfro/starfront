@@ -4,6 +4,7 @@ using NINA.Core.Utility;
 using NINA.WPF.Base.Interfaces.Mediator;
 using RapidStackerCollab.Core.Api;
 using RapidStackerCollab.Core.Frames;
+using RapidStackerCollab.Core.Library;
 using RapidStackerCollab.Core.Upload;
 using RapidStackerCollab.Core.Util;
 using Starfront.Collab.Settings;
@@ -403,6 +404,43 @@ namespace Starfront.Collab.Services.Stacking {
         }
 
         // -- the buttons -----------------------------------------------------------
+
+        /// <summary>The projects the queue is holding, for the dock; empty while off. A held project still takes frames into the queue, so without this list the dock showed them only as "waiting".</summary>
+        public IReadOnlyList<HeldProject> HeldProjects() {
+            var q = queue;
+            if (q == null) return Array.Empty<HeldProject>();
+            try {
+                return q.ActivePauses().Select(p => new HeldProject(p.ProjectRef, MembershipPauses.DockText(p, ShortName(p.ProjectRef)))).ToList();
+            } catch (Exception) {
+                return Array.Empty<HeldProject>();
+            }
+        }
+
+        /// <summary>
+        /// The dock's Resume button: lift whatever pause holds one project, and send its lights again now. If the
+        /// cause is still there, the next upload says so and the project is held again, so this cannot do harm.
+        /// </summary>
+        public void ResumeProject(string projectRef) {
+            var q = queue;
+            if (q == null || string.IsNullOrEmpty(projectRef)) return;
+            try {
+                var pause = q.ActivePauses().FirstOrDefault(p => p.ProjectRef == projectRef);
+                if (pause == null) return;
+                q.ResumeProject(projectRef);
+                Logger.Info($"Starfront stacking: uploads to {NameOf(projectRef)} resumed from the dock (they were {MembershipPauses.Describe(pause)})");
+            } catch (Exception ex) {
+                Logger.Error("Starfront stacking: the project could not be resumed", ex);
+                return;
+            }
+            runner?.Wake();
+            RaiseChanged();
+        }
+
+        private string ShortName(string projectRef) {
+            if (LibraryRef.IsLibrary(projectRef)) return "Calibration library";
+            var link = Links.ByCollabProject(projectRef);
+            return link == null ? "" : link.CollabName.Length > 0 ? link.CollabName : link.StarfrontName;
+        }
 
         public void UploadNow() {
             Imaging.RequestUploadNow();
