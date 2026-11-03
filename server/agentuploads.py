@@ -207,6 +207,23 @@ class AgentUploads:
                                 detail="this telescope has no accepted task on that collaboration")
         return task
 
+    def label(self, rig: dict[str, Any]) -> str:
+        """The rig's name on the files page and for calibration matching.
+
+        What the rig calls itself on the chart (its equipment profile), else
+        its agent name. Many rigs are all called "Telescope 1" as agents;
+        when another of the same owner's rigs has the same name, the agent
+        id is added, so one rig's masters are never matched to another's
+        lights."""
+        def name_of(a: dict[str, Any]) -> str:
+            seen = (a.get("presence") or {}).get("telescope") if isinstance(a.get("presence"), dict) else ""
+            return str(seen or a.get("name") or "").strip()
+        mine = name_of(rig) or str(rig["id"])[:8]
+        owner = str(rig.get("owner_id") or "")
+        twins = [a for a in self.store.agents_of(owner)
+                 if a["id"] != rig["id"] and name_of(self.store.agent(a["id"]) or a) == mine] if owner else []
+        return (f"{mine} [{str(rig['id'])[:8]}]" if twins else mine)[:60]
+
     def stored_name(self, rig: dict[str, Any], name: str) -> str:
         prefix = str(rig["id"])[:8] + "-"
         return name if name.startswith(prefix) else prefix + name
@@ -415,7 +432,7 @@ class AgentUploads:
                     raise HTTPException(status_code=403, detail="not a light of this collaboration: " + why)
             final = self.files.path_of(project["id"], user["id"], name, kind)
             await asyncio.to_thread(_place, part, final)
-            label = str(rig.get("name") or "")[:60]
+            label = self.label(rig)
             file_id = secrets.token_hex(8)
             self.store.add_file(file_id, project["id"], user["id"], name, size, label, kind, meta)
             stored = self.store.file(project["id"], user["id"], name, kind)
@@ -438,7 +455,7 @@ class AgentUploads:
             task = self.store.agent_task_in(rig["id"], found["id"])
             if task is None and enabled:
                 enabled, why = False, "this telescope has no accepted task on that collaboration"
-            label = str(rig.get("name") or "")
+            label = self.label(rig)
             prefix = str(rig["id"])[:8] + "-"
             mine = [r for r in self.store.files_in(found["id"], user["id"])
                     if (r.get("agent") or "") == rig["id"] or r["name"].startswith(prefix)

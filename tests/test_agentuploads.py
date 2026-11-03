@@ -233,3 +233,10 @@ def test_page_assets_not_rate_limited_but_masters_are():
         assert lim.allow("GET", "/releases/p1/v2/preview_Ha.jpg", "1.2.3.4")[0]
     hits = [lim.allow("GET", "/releases/p1/v2/master_L.fits.fz", "1.2.3.4")[0] for _ in range(61)]
     assert hits.count(False) == 1
+
+
+def test_label_disambiguates_same_named_rigs(world):
+    client, store, tmp, files, up = world
+    store.add_agent("dddddddd4444", "rig-d", "fsq106", "astrofalls", "u-bray")
+    assert up.label(store.agent("aaaaaaaa1111")) == "fsq106 [aaaaaaaa]"
+    assert up.label(store.agent("bbbbbbbb2222")) == "vsd100"
