@@ -293,6 +293,10 @@ class Files:
                           "choices": list(lo) if k == "choice" else None, "about": w}
                          for n, d, k, lo, _hi, w in uploadrules.RULES]}
 
+    def _telescopes(self, project_id: str, user_id: str) -> dict[str, Any]:
+        totals = getattr(self.store, "contribution_totals_of", None)
+        return totals(project_id, user_id) if totals else {"sessions": 0, "hours": 0, "telescopes": 0, "filters": []}
+
     def collab_list(self) -> list[dict[str, Any]]:
         out = []
         for project in self.store.projects():
@@ -372,6 +376,8 @@ class Files:
                     "files": totals["count"], "bytes": totals["bytes"],
                     "kinds": self.store.file_kinds(project["id"]),
                     "myFiles": mine["count"], "myBytes": mine["bytes"],
+                    "myTelescopes": (self._telescopes(project["id"], who["id"])
+                                     if who is not None else None),
                     "owned": owned, "quota": quota, "closed": closed,
                     "full": totals["bytes"] >= quota,
                     # Lights by upload-rule status: only "ready" ones count.
@@ -417,7 +423,10 @@ class Files:
                     "rules": self.rules_view(project),
                     "myLights": self.store.file_status_counts(project_id, who["id"]),
                     "lights": self.store.file_status_counts(project_id) if owned else {},
-                    "gaps": self.gaps(project_id, who["id"])}
+                    "gaps": self.gaps(project_id, who["id"]),
+                    # Frames the person's own telescopes reported (N.I.N.A./
+                    # Starfront): a contribution that is not a web upload.
+                    "myTelescopes": self._telescopes(project_id, who["id"])}
 
         @app.get("/api/v1/projects/{project_id}/upload-rules")
         def get_rules(project_id: str) -> dict[str, Any]:
@@ -725,6 +734,13 @@ _PAGE = r"""<!doctype html>
   .ccard b { display: block; } .ccard .small { color: #8f9bb0; }
   .cgroup { font-size: 12px; color: #8f9bb0; text-transform: uppercase; letter-spacing: .05em; margin: 10px 0 0; }
   #hero { margin: 12px 0; }
+  #hero figure { margin: 0; }
+  .btn.dl { padding: 3px 10px; font-size: 13px; }
+  .btn.dl.locked { background: #1a2130; color: #8f9bb0; cursor: not-allowed; }
+  .lockline { color: #e5c07b; }
+  table.masters td, table.people td { vertical-align: middle; }
+  table.masters td.dlc { white-space: nowrap; }
+  tr.tot td { border-bottom: 0; }
   #hero img { display: block; width: 100%; height: auto; border-radius: 10px; background: #000; }
   #hero .cap { margin: 4px 0 0; }
   .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
@@ -757,6 +773,8 @@ _PAGE = r"""<!doctype html>
     .picks .btn { width: 100%; }
     table { font-size: 12px; }
     #release table, .inner table { display: block; overflow-x: auto; }
+    table.masters td.dlc { white-space: normal; }
+    table.masters td.dlc .small { display: block; }
     .ruleform { grid-template-columns: 1fr; }
   }
 </style></head>
@@ -828,7 +846,7 @@ _PAGE = r"""<!doctype html>
 
 <div id="views">
   <details class="view" id="sec-release" hidden>
-    <summary><span class="t">Latest master</span> <span class="sum" id="sumRelease"></span></summary>
+    <summary><span class="t">Masters and contributors</span> <span class="sum" id="sumRelease"></span></summary>
     <div class="inner"><section id="release" hidden></section></div>
   </details>
 
@@ -857,8 +875,9 @@ _PAGE = r"""<!doctype html>
   </details>
 
   <details class="view" id="sec-mine" hidden>
-    <summary><span class="t">My files</span> <span class="sum" id="sumMine"></span></summary>
+    <summary><span class="t">My contribution</span> <span class="sum" id="sumMine"></span></summary>
     <div class="inner">
+      <div id="mineScopes"></div>
       <p class="small muted" id="mineNote"></p>
       <div id="mineKinds"></div>
     </div>
@@ -917,15 +936,17 @@ _PAGE = r"""<!doctype html>
   }
   const s = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
   // The release section draws itself (/releases/page.js) and says when.
+  // The preview, shown once. #heroImg is the one image; a control that swaps
+  // its src (e.g. stars on/off) can go in #heroTools.
   function drawHero(rel) {
     const box = $('hero');
     const previews = rel ? (rel.files || []).filter((x) => x.role === 'preview') : [];
     const hero = previews.find((x) => x.hero) || previews[0];
     if (!hero) { box.hidden = true; box.innerHTML = ''; return; }
-    const full = (rel.files || []).find((x) => !x.locked && x.role !== 'master' && /fullres/i.test(x.name) && x.name.includes('_' + String(hero.name).split('_')[1] + '_'));
-    box.innerHTML = `<a href="${esc((full || hero).url)}"><img src="${esc(hero.thumb || hero.url)}" alt="${esc(hero.title || 'Latest preview')}"></a>
-      <p class="small muted cap"><b>Latest master ${esc(rel.version || '')}</b>${rel.released ? ' · ' + esc(rel.released) : ''}${rel.totalHours != null ? ` · ${Number(rel.totalHours).toFixed(0)} h` : ''} · ${esc(hero.caption || hero.title || '')} · <a href="#sec-release">downloads and details</a></p>`;
+    box.innerHTML = `<figure><img id="heroImg" src="${esc(hero.thumb || hero.url)}" alt="${esc(hero.title || 'Latest preview')}">
+      <figcaption class="small muted cap"><span id="heroTools"></span><b>Latest master ${esc(rel.version || '')}</b>${rel.released ? ' · ' + esc(rel.released) : ''}${rel.totalHours != null ? ` · ${Number(rel.totalHours).toFixed(0)} h` : ''} · ${esc(hero.caption || hero.title || '')} · <a href="#sec-release">masters and contributors</a></figcaption></figure>`;
     box.hidden = false;
+    box.dispatchEvent(new CustomEvent('starfront:hero', { bubbles: true, detail: { rel, hero } }));
   }
   document.addEventListener('starfront:release', (e) => {
     if (!e.detail || (state.current && e.detail.project !== state.current)) { $('sec-release').hidden = true; drawHero(null); return; }
@@ -933,7 +954,7 @@ _PAGE = r"""<!doctype html>
     drawHero(rel);
     const locked = (rel.files || []).some((x) => x.locked);
     const hours = rel.totalHours == null ? '' : ` · ${Number(rel.totalHours).toFixed(0)} h`;
-    show('sec-release', `${rel.version || ''}${hours} · ${s((rel.filters || []).length, 'filter')}` + (locked ? ' · 🔒 masters for contributors' : ''));
+    show('sec-release', `${rel.version || ''}${hours} · ${s((rel.filters || []).length, 'filter')} · ${s((rel.contributors || []).length, 'contributor')}` + (locked ? ' · 🔒 downloads for contributors' : ' · downloads'));
     if (location.hash.startsWith('#release-')) deepLink();
   });
   window.addEventListener('hashchange', deepLink);
@@ -1008,7 +1029,7 @@ _PAGE = r"""<!doctype html>
     }
     $('none').hidden = true;
     $('uploader').hidden = !!mine.closed;
-    $('curLine').innerHTML = mine.closed ? '<span class="muted">Closed: download only.</span>' : (mine.full ? '<span class="no">Storage limit reached for this collaboration.</span>' : `<span class="muted">Uploading to <b>${esc(x.name)}</b>${mine.myFiles ? ` · you have ${mine.myFiles.toLocaleString()} files here, ${mb(mine.myBytes)}` : ''}</span>`);
+    $('curLine').innerHTML = mine.closed ? '<span class="muted">Closed: download only.</span>' : (mine.full ? '<span class="no">Storage limit reached for this collaboration.</span>' : `<span class="muted">Uploading to <b>${esc(x.name)}</b>${myLine(mine)}</span>`);
     $('project').value = id;
     await pick();
   }
@@ -1102,6 +1123,13 @@ _PAGE = r"""<!doctype html>
     } catch (e) { $('rulesSaved').textContent = e.message; }
   }
 
+  function myLine(m) {
+    const t = m.myTelescopes || {};
+    const parts = [];
+    if (t.sessions) parts.push(`${Number(t.hours).toFixed(1)} h from your telescopes`);
+    if (m.myFiles) parts.push(`${m.myFiles.toLocaleString()} files uploaded (${mb(m.myBytes)})`);
+    return parts.length ? ' · you have ' + parts.join(' and ') : '';
+  }
   function drawMine(listing) {
     const my = listing.files.filter((f) => f.user === listing.me);
     const c = listing.myLights || {};
@@ -1112,8 +1140,14 @@ _PAGE = r"""<!doctype html>
     const parts = [`${c.ready || 0} ready`, `${c.pending || 0} pending`];
     if (c.quarantine) parts.push(`${c.quarantine} quarantined`);
     if (c['']) parts.push(`${c['']} not checked`);
-    show('sec-mine', my.length ? parts.join(' · ') + ` · ${cal} calibration · ${mb(my.reduce((t, f) => t + f.bytes, 0))}` : 'nothing yet');
-    $('mineNote').textContent = my.length ? `${kindSummary(counts)}. Lights: only ready ones go into the stack.` : 'Nothing uploaded to this collaboration yet.';
+    const t = listing.myTelescopes || {};
+    const sum = [];
+    if (t.sessions) sum.push(`${Number(t.hours).toFixed(1)} h from your telescopes`);
+    if (my.length) sum.push(parts.join(' · ') + ` · ${cal} calibration · ${mb(my.reduce((x, f) => x + f.bytes, 0))} uploaded`);
+    show('sec-mine', sum.length ? sum.join(' · ') : 'nothing yet');
+    $('mineScopes').innerHTML = t.sessions ? `<p>Your telescopes (N.I.N.A. / Starfront): <b>${Number(t.hours).toFixed(1)} h</b> accepted over ${t.sessions} session${t.sessions === 1 ? '' : 's'} from ${t.telescopes} telescope${t.telescopes === 1 ? '' : 's'}.</p>
+      <div class="scroll"><table><thead><tr><th>Filter</th><th class="num">Hours</th><th class="num">Sessions</th></tr></thead><tbody>${(t.filters || []).map((f) => `<tr><td>${esc(({ H: 'Ha', O: 'OIII', S: 'SII' })[f.filter] || f.filter)}</td><td class="num">${Number(f.hours).toFixed(1)} h</td><td class="num">${f.sessions}</td></tr>`).join('')}</tbody></table></div>` : '';
+    $('mineNote').textContent = my.length ? `Uploaded here: ${kindSummary(counts)}. Lights: only ready ones go into the stack.` : (t.sessions ? 'No files uploaded through this page yet; your telescopes\' reports are above.' : 'Nothing contributed to this collaboration yet.');
     // One folding table per kind, so a season of lights does not bury the calibration.
     const order = ['light', 'flat', 'dark', 'bias', 'darkflat'];
     const kinds = order.filter((k) => counts[k]).concat(Object.keys(counts).filter((k) => !order.includes(k)));

@@ -15,14 +15,15 @@ with their sizes and checksums, the preview image and the changelog. The
 server serves nothing that is not listed in it, so a stray file in the
 folder is never handed out, and a name can never climb out of the folder.
 
-What a release *is* is public: the previews, the filter and hours table,
-who contributed what share, and the changelog. The release.json carries
+What a release *is* is public: the preview images (shown on the page, not
+offered as downloads), the filter and hours table, who contributed how many
+hours, and the changelog. The release.json carries
 contributor *names* as the stacker chose to credit them, never Discord ids
 or telescope tokens.
 
 The masters themselves (the FITS files) are for contributors only (Bray,
 2026-11-03): a signed-in person who has uploaded at least one file to this
-collaboration, or to one of the collaborations it counts as its own for
+collaboration or whose own telescopes had a session accepted on it, or to one of the collaborations it counts as its own for
 this (its `releaseContributorProjects` setting; by default the one it was
 `continuedFrom`). The server's owners and the collaboration's owner always
 may. Everybody else gets a 403 with `LOCKED_MESSAGE`.
@@ -122,11 +123,20 @@ class Releases:
             elif any(self.store.file_totals_of(pid, who["id"])["count"] > 0
                      for pid in self.contributor_projects(project)):
                 allowed, why = True, "contributor"
+            elif any(self._telescope_sessions(pid, who["id"]) > 0
+                     for pid in self.contributor_projects(project)):
+                # Frames reported by their own telescopes (N.I.N.A./Starfront)
+                # count as much as a web upload.
+                allowed, why = True, "contributor"
             else:
                 why = "not a contributor"
         return {"allowed": allowed, "signedIn": who is not None, "why": why,
                 "message": "" if allowed else LOCKED_MESSAGE,
                 "signIn": "/files/signin"}
+
+    def _telescope_sessions(self, project_id: str, user_id: str) -> int:
+        totals = getattr(self.store, "contribution_totals_of", None)
+        return int(totals(project_id, user_id)["sessions"]) if totals else 0
 
     # -- reading ---------------------------------------------------------
     def latest_version(self, project_id: str) -> str:
@@ -352,37 +362,44 @@ _PAGE_JS = r"""
     return list.length ? list[0].project : '';
   }
 
+  // Only the masters are offered for download; previews are shown on the
+  // page (the hero image), never listed here. Everything comes from
+  // release.json, so a new version draws itself.
   function draw(rel, list) {
     const access = rel.access || {};
     const lockMsg = access.message || 'Masters are available to contributors. Upload data to this collab to unlock downloads.';
-    const locked = (rel.files || []).some((x) => x.locked);
-    const lockNote = locked ? `<p class="small" id="releaseLocked" style="color:#e5c07b">🔒 ${esc(lockMsg)}${access.signedIn ? '' : ` <a href="${esc(access.signIn || '/files/signin')}">Sign in</a> if you already have.`}</p>` : '';
+    const masters = (rel.files || []).filter((x) => x.role === 'master');
+    const locked = masters.some((x) => x.locked);
+    const lockNote = locked ? `<p class="small lockline" id="releaseLocked">🔒 ${esc(lockMsg)}${access.signedIn ? '' : ` <a href="${esc(access.signIn || '/files/signin')}">Sign in</a> if you already have.`}</p>` : '';
     // The files page has its own collab picker; it drives this.
     const pick = (list.length > 1 && !document.getElementById('collabSel')) ? `<select id="releasePick">${list.map((r) => `<option value="${esc(r.project)}"${r.project === rel.project ? ' selected' : ''}>${esc(r.name)}</option>`).join('')}</select>` : '';
-    const filters = (rel.filters || []).map((f) => `<tr><td>${esc(f.filter)}${f.note ? ` <span class="small muted">${esc(f.note)}</span>` : ''}</td><td class="num">${num(f.hours, 1)} h</td><td class="num">${esc(f.subs)}</td><td class="num">${esc(f.rigs)}</td>
-      <td>${(rel.files || []).filter((x) => x.filter === f.filter && x.role === 'master').map((x) => x.locked
-        ? `<span class="muted" title="${esc(lockMsg)}">🔒 ${x.full ? 'full lossless FITS' : 'compressed FITS'}</span> <span class="small muted">${size(x.bytes)}</span>`
-        : `<a href="${esc(x.url)}" download>${x.full ? 'full lossless FITS' : 'compressed FITS'}</a> <span class="small muted">${size(x.bytes)}</span>`).join('<br>')}</td></tr>`).join('');
-    const people = (rel.contributors || []).map((c) => `<tr><td>${esc(c.name)}</td><td>${esc((c.rigs || []).join(', '))}</td><td class="num">${num(c.hours, 1)} h</td>
-      ${(rel.filters || []).map((f) => `<td class="num">${c.share && c.share[f.filter] != null ? num(c.share[f.filter], 0) + '%' : ''}</td>`).join('')}</tr>`).join('');
-    const previews = (rel.files || []).filter((x) => x.role === 'preview');
-    const hero = previews.find((x) => x.hero) || previews[0];
-    const others = (rel.files || []).filter((x) => x.role !== 'master' && !x.locked && x !== hero);
-    const log = (rel.changelog || []).map((c) => `<li><b>${esc(c.version)}</b> ${esc(c.date)}: ${esc(c.text)}</li>`).join('');
+    const order = (rel.filters || []).map((f) => f.filter);
+    for (const x of masters) if (x.filter && !order.includes(x.filter)) order.push(x.filter);
+    const byF = Object.fromEntries((rel.filters || []).map((f) => [f.filter, f]));
+    const cell = (x, what) => !x ? '<td class="muted">-</td>' : `<td class="dlc">${x.locked
+      ? `<span class="btn dl locked" aria-disabled="true" title="${esc(lockMsg)}">🔒 Locked</span>`
+      : `<a class="btn dl" href="${esc(x.url)}" download>Download</a>`} <span class="small muted">${what} · ${size(x.bytes)}</span></td>`;
+    const rows = order.map((f) => {
+      const mine = masters.filter((x) => x.filter === f);
+      const fz = mine.find((x) => !x.full && /\.fz$/i.test(x.name)) || mine.find((x) => !x.full);
+      const full = mine.find((x) => x.full);
+      const info = byF[f] || {};
+      return `<tr><td><b>${esc(f)}</b></td><td class="num">${num(info.hours, 1)} h</td>${cell(fz, '.fits.fz')}${cell(full, 'full .fits')}</tr>`;
+    }).join('');
+    const people = (rel.contributors || []).slice().sort((a, b) => (b.hours || 0) - (a.hours || 0));
+    const total = people.reduce((t, c) => t + (Number(c.hours) || 0), 0);
+    const peopleRows = people.map((c) => `<tr><td>${esc(c.name)}</td><td class="small muted">${esc((c.rigs || []).join(', '))}</td><td class="num">${num(c.hours, 1)} h</td></tr>`).join('');
+    const last = (rel.changelog || [])[0];
     box.innerHTML = `
-      <h2>Latest master ${pick}</h2>
-      <p><b>${esc(rel.projectName)}</b> · <b>${esc(rel.version)}</b> released ${esc(rel.released)} · ${num(rel.totalHours, 1)} h from ${esc((rel.contributors || []).length)} contributors · ${size(rel.totalBytes)} in all</p>
-      ${hero ? `<p><a href="${esc(hero.url)}"><img src="${esc(hero.thumb || hero.url)}" alt="${esc(hero.title || 'preview')}" style="max-width:100%;border-radius:8px"></a><br><span class="small muted">${esc(hero.title || '')}</span></p>` : ''}
-      ${rel.about ? `<p class="small muted">${esc(rel.about)}</p>` : ''}
+      <h2>Masters ${pick}</h2>
+      <p class="small"><b>${esc(rel.version)}</b> released ${esc(rel.released)} · ${num(rel.totalHours, 1)} h · ${esc(people.length)} contributors</p>
       ${lockNote}
-      <table><thead><tr><th>Filter</th><th class="num">Hours</th><th class="num">Subs</th><th class="num">Rigs</th><th>Download</th></tr></thead><tbody>${filters}</tbody></table>
-      <h2>Who shot it</h2>
-      <p class="small muted">Share = each contributor's part of the stack's weight over M31 in that filter.</p>
-      <table><thead><tr><th>Contributor</th><th>Rigs</th><th class="num">Hours</th>${(rel.filters || []).map((f) => `<th class="num">${esc(f.filter)}</th>`).join('')}</tr></thead><tbody>${people}</tbody></table>
-      ${others.length ? `<h2>Previews and notes</h2><p>${others.map((x) => `<a href="${esc(x.url)}">${esc(x.title || x.name)}</a> <span class="small muted">${size(x.bytes)}</span>`).join('<br>')}</p>` : ''}
-      ${rel.elsewhere && rel.elsewhere.length ? `<p class="small">${rel.elsewhere.map((e) => `<a href="${esc(e.url)}">${esc(e.title)}</a>`).join(' · ')}</p>` : ''}
-      ${log ? `<h2>Changes</h2><ul class="small">${log}</ul>` : ''}
-      ${(rel.versions || []).length > 1 ? `<p class="small muted">Earlier versions: ${(rel.versions || []).filter((v) => v !== rel.version).map((v) => `<a href="/api/v1/releases/${esc(rel.project)}/${esc(v)}">${esc(v)}</a>`).join(', ')}</p>` : ''}`;
+      <div class="scroll"><table class="masters"><thead><tr><th>Filter</th><th class="num">Hours</th><th>Compressed</th><th>Full</th></tr></thead><tbody>${rows}</tbody></table></div>
+      <p class="small muted">Compressed = tile-compressed FITS (Siril, PixInsight, astropy open it). Full = lossless float32 with weight, coverage and hours maps. Every filter is on the same pixel grid.</p>
+      <h2>Contributors</h2>
+      <div class="scroll"><table class="people"><thead><tr><th>Name</th><th>Rigs</th><th class="num">Hours</th></tr></thead><tbody>${peopleRows}
+        <tr class="tot"><td><b>Total</b></td><td></td><td class="num"><b>${num(total, 1)} h</b></td></tr></tbody></table></div>
+      ${last ? `<p class="small muted">${esc(last.version)} ${esc(last.date)}: ${esc(last.text)}</p>` : ''}`;
     box.hidden = false;
     // The files page folds this into a section and summarises it.
     document.dispatchEvent(new CustomEvent('starfront:release', { detail: rel }));

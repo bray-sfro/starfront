@@ -486,6 +486,28 @@ class Store:
         return {"count": int((row or {}).get("count") or 0),
                 "bytes": int((row or {}).get("bytes") or 0)}
 
+    def contribution_totals_of(self, project_id: str, user_id: str) -> dict[str, Any]:
+        """What one person's telescopes (agents whose owner_id is them) have
+        had accepted on a collaboration: sessions (night x filter x panel
+        reports), hours, how many telescopes, and the split per filter.
+        This is the contribution N.I.N.A./Starfront report, which never
+        shows up as a web upload in the files table."""
+        rows = self._all("SELECT c.filter AS filter, COUNT(*) AS sessions,"
+                         " COALESCE(SUM(c.seconds), 0) AS seconds"
+                         " FROM contributions c JOIN agents a ON a.id = c.agent"
+                         " WHERE c.project = ? AND a.owner_id = ? AND c.accepted"
+                         " GROUP BY c.filter ORDER BY seconds DESC", project_id, user_id)
+        scopes = self._one("SELECT COUNT(DISTINCT c.agent) AS n"
+                           " FROM contributions c JOIN agents a ON a.id = c.agent"
+                           " WHERE c.project = ? AND a.owner_id = ? AND c.accepted",
+                           project_id, user_id) or {}
+        seconds = sum(float(r["seconds"] or 0) for r in rows)
+        return {"sessions": sum(int(r["sessions"] or 0) for r in rows),
+                "hours": round(seconds / 3600.0, 2),
+                "telescopes": int(scopes.get("n") or 0),
+                "filters": [{"filter": r["filter"] or "?", "sessions": int(r["sessions"] or 0),
+                             "hours": round(float(r["seconds"] or 0) / 3600.0, 2)} for r in rows]}
+
     def file_totals_of(self, project_id: str, user_id: str) -> dict[str, Any]:
         row = self._one("SELECT COUNT(*) AS count, COALESCE(SUM(bytes), 0) AS bytes"
                         " FROM files WHERE project = ? AND user = ?", project_id, user_id)

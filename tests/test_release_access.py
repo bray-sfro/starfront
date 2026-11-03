@@ -121,3 +121,32 @@ def test_predecessor_link_is_a_setting(world):
     r = c.put(f"/api/v1/releases/{PID}/access", json={"contributorProjects": None}, headers=H("bray"))
     assert r.json()["contributorProjects"] == [PID, OLD]
     assert "releaseContributorProjects" not in store.project(PID)["payload"]
+
+
+def test_telescope_contributor_gets_the_masters(world):
+    """Frames reported by your own telescope count like an upload (Bray, 2026-11-03)."""
+    c, store = world
+    PEOPLE["scope"] = {"kind": "user", "id": "u-scope", "name": "Max", "roles": [], "admin": False}
+    try:
+        url = f"/releases/{PID}/v1/M31_Ha_v1.fits.fz"
+        assert c.get(url, headers=H("scope")).status_code == 403
+        store.add_agent("ag1", "tok-ag1", "Rig", owner="Max", owner_id="u-scope")
+        store._run("INSERT INTO contributions (id, project, agent, task, night, filter, panel, seconds,"
+                   " accepted, overridden, received, payload, verdict) VALUES"
+                   " ('c1', ?, 'ag1', 't1', '2026-10-01', 'Ha', '', 7200, 1, 0, 0, '{}', '{}')", OLD)
+        t = store.contribution_totals_of(OLD, "u-scope")
+        assert t["sessions"] == 1 and t["hours"] == 2.0 and t["telescopes"] == 1
+        assert t["filters"] == [{"filter": "Ha", "sessions": 1, "hours": 2.0}]
+        assert c.get(url, headers=H("scope")).status_code == 200      # OLD counts for PID (continuedFrom)
+        # A rejected night does not count.
+        store._run("UPDATE contributions SET accepted = 0 WHERE id = 'c1'")
+        assert c.get(url, headers=H("scope")).status_code == 403
+    finally:
+        PEOPLE.pop("scope", None)
+
+
+def test_page_offers_only_masters(world):
+    c, _ = world
+    js = c.get("/releases/page.js").text
+    assert "Previews and notes" not in js and "Who shot it" not in js
+    assert "role === 'master'" in js and ">Download<" in js and "<h2>Contributors</h2>" in js
