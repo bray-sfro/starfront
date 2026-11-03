@@ -45,6 +45,7 @@ from astrocontrol.config import data_root                        # noqa: E402
 from server import auth                                          # noqa: E402
 from server.files import COOKIE, COOKIE_SECONDS, Files           # noqa: E402
 from server.ratelimit import Limiter, client_address           # noqa: E402
+from server.releases import Releases                             # noqa: E402
 from server.store import Store                                   # noqa: E402
 
 # No public API map: /docs, /redoc and /openapi.json are off in production.
@@ -1864,7 +1865,8 @@ def read_project(project_id: str,
         raise HTTPException(status_code=404, detail="no such project")
     if _optional_person(authorization) is not None:
         return {"project": project, "tasks": store.tasks_in(project_id),
-                "contributions": store.contributions(project_id)}
+                "contributions": store.contributions(project_id),
+                "release": releases.summary(project_id)}
     rows = store.contributions(project_id)
     collected, progress = _figures(project_id, project.get("payload") or {})
     return {"project": _public_project(project), "tasks": [], "contributions": [],
@@ -1873,7 +1875,8 @@ def read_project(project_id: str,
             "nights": len(rows),
             "acceptedHours": round(sum(float(r.get("seconds") or 0.0)
                                        for r in rows if r.get("accepted")) / 3600.0, 2),
-            "collected": collected, "progress": progress}
+            "collected": collected, "progress": progress,
+            "release": releases.summary(project_id)}
 
 
 def _may_offer_to(who: dict[str, Any], project_id: str, agent: dict[str, Any]) -> bool:
@@ -2261,6 +2264,13 @@ def sky_file(name: str):
 FILES_DIR = Path(auth.setting("FILES") or DATA / "files")
 files = Files(app, store, FILES_DIR, _person, owns_project, DISCORD.owners,
               DISCORD.public_url, auth.new_login_code)
+
+# Published coadds: the latest master of a collaboration, public, read-only.
+# On the files volume, in a folder no project id can be named like ("_" is
+# not hex), so a full set of masters has the big disk's room. The files
+# page's quotas count uploads only. See server/releases.py.
+RELEASES_DIR = Path(auth.setting("RELEASES") or FILES_DIR / "_releases")
+releases = Releases(app, store, RELEASES_DIR)
 
 
 # ---------------------------------------------------------------------------
