@@ -128,7 +128,7 @@ def test_page_has_the_checklist(world):
     html = client.get("/files").text
     assert "Upload rules" in html and "Pending calibration" in html
     assert "Everything on this collaboration" not in html and 'id="all"' not in html
-    assert '<details class="view" id="sec-release"' in html and 'id="switcher"' in html
+    assert '<details class="view" id="sec-release"' in html and 'id="collabSel"' in html and 'Starfront Files</a>' in html
 
 
 def test_darkflat_no_longer_offered_but_still_taken(world):
@@ -154,3 +154,18 @@ def test_darkflat_no_longer_offered_but_still_taken(world):
     assert r.status_code == 200 and r.content.startswith(b"SIMPLE")
     rules = " ".join(client.get("/api/v1/projects/p1/upload-rules").json()["checklist"]).lower()
     assert "dark flat" not in rules
+
+
+def test_collab_list_is_public_and_ordered(world):
+    client, store, tmp, _ = world
+    store.add_project("p2", "Old one", "Bray", {"collectFiles": True}, owner_id="u-owner")
+    store.set_project_status("p2", "closed") if hasattr(store, "set_project_status") else None
+    store.add_project("p3", "Not collecting", "Bray", {"collectFiles": False}, owner_id="u-owner")
+    put(client, tmp, "L_0001.fits", "light")
+    info = client.get("/api/v1/files/projects").json()            # signed out
+    assert info["signedIn"] is False
+    ids = [c["id"] for c in info["collabs"]]
+    assert ids[0] == "p1" and "p3" not in ids
+    p1 = info["collabs"][0]
+    assert p1["files"] == 1 and p1["bytes"] > 0 and p1["collecting"] and not p1["closed"]
+    assert set(p1) == {"id", "name", "coordinator", "closed", "collecting", "files", "bytes"}

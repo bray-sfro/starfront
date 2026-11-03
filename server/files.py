@@ -293,6 +293,22 @@ class Files:
                           "choices": list(lo) if k == "choice" else None, "about": w}
                          for n, d, k, lo, _hi, w in uploadrules.RULES]}
 
+    def collab_list(self) -> list[dict[str, Any]]:
+        out = []
+        for project in self.store.projects():
+            closed = project.get("status") != "open"
+            totals = self.store.file_totals(project["id"])
+            collecting = self.collecting(project) and not closed
+            if not totals["count"] and not collecting:
+                continue
+            out.append({"id": project["id"], "name": project["name"],
+                        "coordinator": project.get("coordinator") or "",
+                        "closed": closed, "collecting": collecting,
+                        "files": totals["count"], "bytes": totals["bytes"]})
+        # Open first (collecting before paused), then closed; biggest first.
+        out.sort(key=lambda x: (x["closed"], not x["collecting"], -x["bytes"], x["name"].lower()))
+        return out
+
     def _project(self, project_id: str) -> dict[str, Any]:
         project = self.store.project(project_id)
         if project is None:
@@ -366,6 +382,10 @@ class Files:
             return {
                 "signedIn": who is not None,
                 "name": who["name"] if who else "",
+                # Every collaboration worth picking, for everybody (signed
+                # out too): open ones that take files or hold some, closed
+                # ones that hold files. Totals only, never whose files.
+                "collabs": self.collab_list(),
                 "admin": bool(who and who["admin"]),
                 "projects": listed,
                 # Every kind, for labelling files already here; only
@@ -636,7 +656,7 @@ class _quiet:
 _PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Starfront files</title>
+<title>Starfront Files</title>
 <style>
   :root { color-scheme: dark; }
   body { margin: 0; background: #0d1017; color: #dbe3ee; font: 15px/1.5 system-ui, sans-serif; }
@@ -683,18 +703,30 @@ _PAGE = r"""<!doctype html>
   #gaps li { margin: 3px 0; }
   .ruleform { display: grid; grid-template-columns: minmax(200px, 1fr) 140px; gap: 6px 12px; align-items: center; font-size: 13px; margin: 8px 0; }
   .ruleform input[type=text], .ruleform select { min-width: 0; width: 100%; padding: 4px 6px; font-size: 13px; }
-  .switcher { position: sticky; top: 0; z-index: 5; background: #0b0e14ee; border-bottom: 1px solid #2a3344; backdrop-filter: blur(4px); }
-  .swin { max-width: 760px; margin: 0 auto; padding: 8px 20px; display: flex; gap: 8px; align-items: center; }
-  .swlabel { color: #8f9bb0; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; flex: none; }
-  .pills { display: flex; gap: 6px; overflow-x: auto; flex: 1; scrollbar-width: thin; padding: 2px 0; }
-  .pillbtn { flex: none; background: #1a2130; color: #dbe3ee; border: 1px solid #2a3344; border-radius: 999px; padding: 6px 12px;
-             font-size: 14px; cursor: pointer; white-space: nowrap; text-decoration: none; }
-  .pillbtn[aria-current="true"] { background: #7ee7a5; color: #0d1017; border-color: #7ee7a5; font-weight: 600; }
-  .pillbtn:focus-visible { outline: 2px solid #9fe4bd; outline-offset: 2px; }
-  .badge { font-size: 11px; padding: 0 6px; border-radius: 8px; margin-left: 6px; background: #16351f; color: #7ee7a5; }
+  .topbar { position: sticky; top: 0; z-index: 5; background: #0b0e14ee; border-bottom: 1px solid #2a3344; backdrop-filter: blur(4px); }
+  .tin { max-width: 760px; margin: 0 auto; padding: 10px 20px; display: flex; gap: 12px; align-items: center; justify-content: space-between; }
+  .brand { color: #dbe3ee; font-weight: 700; font-size: 17px; text-decoration: none; letter-spacing: .01em; }
+  .tright { font-size: 13px; color: #8f9bb0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+  .tright .btn { padding: 4px 10px; font-size: 13px; }
+  .collabs { background: #11161f; border: 1px solid #2a3344; border-radius: 12px; padding: 12px 14px; margin: 4px 0 12px; }
+  .clabel { display: block; font-size: 12px; color: #8f9bb0; text-transform: uppercase; letter-spacing: .05em; margin: 0 0 4px; }
+  #collabSel { width: 100%; min-width: 0; box-sizing: border-box; font-size: 16px; padding: 10px 12px; font-weight: 600; }
+  .curname { font-size: 22px; margin: 10px 0 2px; }
+  .curmeta { margin: 0; }
+  .badge { font-size: 11px; padding: 1px 7px; border-radius: 8px; margin-left: 6px; background: #16351f; color: #7ee7a5; font-weight: 600; vertical-align: middle; }
   .badge.closed { background: #1a2130; color: #8f9bb0; } .badge.paused { background: #3a3116; color: #e5c07b; }
-  .pillbtn[aria-current="true"] .badge { background: #0d1017; }
-  .closedpick select { min-width: 0; width: auto; padding: 6px 8px; font-size: 13px; }
+  .badge.rel { background: #1d2740; color: #9fc3ff; }
+  details.allc { margin: 8px 0 0; }
+  details.allc > summary { cursor: pointer; font-size: 13px; color: #9fe4bd; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; margin: 8px 0; }
+  .ccard { display: block; border: 1px solid #2a3344; border-radius: 10px; padding: 8px 10px; background: #0f141d; color: #dbe3ee; text-decoration: none; }
+  .ccard:hover, .ccard:focus-visible { border-color: #7ee7a5; outline: none; }
+  .ccard[aria-current="true"] { border-color: #7ee7a5; background: #13231a; }
+  .ccard b { display: block; } .ccard .small { color: #8f9bb0; }
+  .cgroup { font-size: 12px; color: #8f9bb0; text-transform: uppercase; letter-spacing: .05em; margin: 10px 0 0; }
+  #hero { margin: 12px 0; }
+  #hero img { display: block; width: 100%; height: auto; border-radius: 10px; background: #000; }
+  #hero .cap { margin: 4px 0 0; }
   .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
   details.view { border: 1px solid #2a3344; border-radius: 10px; margin: 10px 0; background: #0f141d; }
   details.view > summary { cursor: pointer; padding: 11px 14px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
@@ -713,10 +745,9 @@ _PAGE = r"""<!doctype html>
   .scroll { overflow-x: auto; }
   #telescope { min-width: 200px; }
   @media (max-width: 640px) {
-    .swin { padding: 6px 10px; flex-wrap: wrap; }
-    .swlabel { display: none; }
-    .pills { flex-basis: 100%; order: 1; }
-    .closedpick { order: 2; }
+    .tin { padding: 8px 12px; }
+    .cards { grid-template-columns: 1fr; }
+    .curname { font-size: 19px; }
     main { padding: 16px 12px 40px; }
     select, input[type=text], #telescope { min-width: 0; width: 100%; box-sizing: border-box; }
     .zones { grid-template-columns: 1fr 1fr; gap: 8px; }
@@ -730,16 +761,20 @@ _PAGE = r"""<!doctype html>
   }
 </style></head>
 <body>
-<nav id="switcher" class="switcher" aria-label="Collaborations" hidden>
-  <div class="swin">
-    <span class="swlabel">Collab</span>
-    <div class="pills" id="openPills" role="list"></div>
-    <label class="closedpick" id="closedWrap" hidden><span class="sr">Closed collaborations</span>
-      <select id="closedPick"><option value="">Closed…</option></select></label>
-  </div>
-</nav>
+<header class="topbar"><div class="tin">
+  <a class="brand" href="/files">Starfront Files</a>
+  <span class="tright" id="topWho"></span>
+</div></header>
 <main>
-<h1>Starfront files <span class="small muted" id="curName"></span></h1>
+<section id="collabs" class="collabs" aria-label="Collaboration" hidden>
+  <label class="clabel" for="collabSel">Collaboration</label>
+  <select id="collabSel"></select>
+  <h1 class="curname" id="curName"></h1>
+  <p class="small muted curmeta" id="curMeta"></p>
+  <details class="allc" id="allCollabs"><summary>All collaborations (<span id="nAll">0</span>)</summary>
+    <div id="cardList"></div>
+  </details>
+</section>
 <p class="muted small">Upload a collaboration's lights and the flats, darks or bias that calibrate them (FITS or XISF). Files already here are skipped, so a folder can be sent again. Lights only count once their calibration is here too.</p>
 
 <section id="signin" hidden>
@@ -749,7 +784,6 @@ _PAGE = r"""<!doctype html>
 </section>
 
 <section id="app" hidden>
-  <p class="row small"><span>Signed in as <b id="who"></b></span> <button class="btn ghost" id="signout" style="padding:4px 10px;font-size:13px">Sign out</button></p>
 
   <div class="upload">
     <select id="project" hidden aria-hidden="true"></select>
@@ -789,6 +823,8 @@ _PAGE = r"""<!doctype html>
     </div>
   </div>
 </section>
+
+<section id="hero" hidden></section>
 
 <div id="views">
   <details class="view" id="sec-release" hidden>
@@ -881,9 +917,20 @@ _PAGE = r"""<!doctype html>
   }
   const s = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
   // The release section draws itself (/releases/page.js) and says when.
+  function drawHero(rel) {
+    const box = $('hero');
+    const previews = rel ? (rel.files || []).filter((x) => x.role === 'preview') : [];
+    const hero = previews.find((x) => x.hero) || previews[0];
+    if (!hero) { box.hidden = true; box.innerHTML = ''; return; }
+    const full = (rel.files || []).find((x) => !x.locked && x.role !== 'master' && /fullres/i.test(x.name) && x.name.includes('_' + String(hero.name).split('_')[1] + '_'));
+    box.innerHTML = `<a href="${esc((full || hero).url)}"><img src="${esc(hero.thumb || hero.url)}" alt="${esc(hero.title || 'Latest preview')}"></a>
+      <p class="small muted cap"><b>Latest master ${esc(rel.version || '')}</b>${rel.released ? ' · ' + esc(rel.released) : ''}${rel.totalHours != null ? ` · ${Number(rel.totalHours).toFixed(0)} h` : ''} · ${esc(hero.caption || hero.title || '')} · <a href="#sec-release">downloads and details</a></p>`;
+    box.hidden = false;
+  }
   document.addEventListener('starfront:release', (e) => {
-    if (!e.detail || (state.current && e.detail.project !== state.current)) { $('sec-release').hidden = true; return; }
+    if (!e.detail || (state.current && e.detail.project !== state.current)) { $('sec-release').hidden = true; drawHero(null); return; }
     const rel = e.detail;
+    drawHero(rel);
     const locked = (rel.files || []).some((x) => x.locked);
     const hours = rel.totalHours == null ? '' : ` · ${Number(rel.totalHours).toFixed(0)} h`;
     show('sec-release', `${rel.version || ''}${hours} · ${s((rel.filters || []).length, 'filter')}` + (locked ? ' · 🔒 masters for contributors' : ''));
@@ -891,35 +938,43 @@ _PAGE = r"""<!doctype html>
   });
   window.addEventListener('hashchange', deepLink);
 
-  // -- the collab switcher: every collaboration worth picking, at the top --
+  // -- the collab picker, in the page: open collabs first, closed below --
   const STATUS = (p) => p.closed ? 'closed' : (p.collecting ? 'collecting' : 'paused');
+  const gb = (n) => n >= 1024 ** 3 ? (n / 1024 ** 3).toFixed(1) + ' GB' : (n >= 1024 ** 2 ? (n / 1024 ** 2).toFixed(0) + ' MB' : (n ? '<1 MB' : '0'));
+  const facts = (x) => [x.coordinator ? 'by ' + x.coordinator : '', x.files ? `${x.files.toLocaleString()} files, ${gb(x.bytes)}` : 'no files yet'].filter(Boolean).join(' · ');
   function buildSwitch(info, pub, rel) {
     const byId = new Map();
     const released = new Set((rel.releases || []).map((r) => r.project));
-    for (const p of info.projects || []) byId.set(p.id, { id: p.id, name: p.name, closed: !!p.closed, collecting: !!p.collecting, mine: true });
-    for (const p of pub.projects || []) {
-      if (byId.has(p.id)) continue;
-      const pay = p.payload || {};
-      const closed = p.status !== 'open';
-      // Only collabs that take (or took) files, or have a master out: not every old test.
-      if (!pay.collectFiles && !released.has(p.id)) continue;
-      byId.set(p.id, { id: p.id, name: p.name, closed, collecting: !closed && !!pay.collectFiles, mine: false });
+    for (const p of info.collabs || []) byId.set(p.id, Object.assign({}, p));
+    // Your own collabs (e.g. a paused one you coordinate) and any with a master out.
+    for (const p of info.projects || []) if (!byId.has(p.id)) byId.set(p.id, { id: p.id, name: p.name, coordinator: p.coordinator || '', closed: !!p.closed, collecting: !p.closed && !!p.collecting, files: p.files || 0, bytes: p.bytes || 0 });
+    for (const r of rel.releases || []) if (!byId.has(r.project)) {
+      const p = (pub.projects || []).find((q) => q.id === r.project) || {};
+      byId.set(r.project, { id: r.project, name: r.name || p.name || r.project, coordinator: p.coordinator || '', closed: p.status ? p.status !== 'open' : false, collecting: false, files: 0, bytes: 0 });
     }
-    for (const r of rel.releases || []) if (!byId.has(r.project)) byId.set(r.project, { id: r.project, name: r.name, closed: false, collecting: false, mine: false });
     for (const x of byId.values()) x.release = released.has(x.id);
     const all = Array.from(byId.values());
-    return { open: all.filter((x) => !x.closed), closed: all.filter((x) => x.closed) };
+    const order = (a, b) => (a.collecting === b.collecting ? 0 : (a.collecting ? -1 : 1)) || (b.bytes - a.bytes) || a.name.localeCompare(b.name);
+    return { open: all.filter((x) => !x.closed).sort(order), closed: all.filter((x) => x.closed).sort(order) };
   }
   function drawSwitcher() {
     const sw = state.switch;
-    $('openPills').innerHTML = sw.open.map((x) => `<button type="button" class="pillbtn" role="listitem" data-id="${esc(x.id)}" aria-current="${x.id === state.current}">${esc(x.name)}<span class="badge ${STATUS(x)}">${STATUS(x)}</span></button>`).join('');
-    $('closedWrap').hidden = !sw.closed.length;
-    $('closedPick').innerHTML = `<option value="">Closed (${sw.closed.length})…</option><optgroup label="Closed">` +
-      sw.closed.map((x) => `<option value="${esc(x.id)}"${x.id === state.current ? ' selected' : ''}>${esc(x.name)} · closed</option>`).join('') + '</optgroup>';
-    $('switcher').hidden = !(sw.open.length + sw.closed.length);
-    $('openPills').querySelectorAll('[data-id]').forEach((b) => b.addEventListener('click', () => choose(b.dataset.id, true)));
-    const cur = $('openPills').querySelector('[aria-current="true"]');
-    if (cur) cur.scrollIntoView({ block: 'nearest', inline: 'center' });
+    const opt = (x) => `<option value="${esc(x.id)}"${x.id === state.current ? ' selected' : ''}>${esc(x.name)} \u2014 ${STATUS(x)}${x.files ? ' \u00b7 ' + gb(x.bytes) : ''}</option>`;
+    $('collabSel').innerHTML = (sw.open.length ? `<optgroup label="Open">${sw.open.map(opt).join('')}</optgroup>` : '') +
+      (sw.closed.length ? `<optgroup label="Closed">${sw.closed.map(opt).join('')}</optgroup>` : '');
+    const card = (x) => `<a class="ccard" href="/files?project=${encodeURIComponent(x.id)}" data-id="${esc(x.id)}" aria-current="${x.id === state.current}"><b>${esc(x.name)}<span class="badge ${STATUS(x)}">${STATUS(x)}</span>${x.release ? '<span class="badge rel">master</span>' : ''}</b><span class="small">${esc(facts(x))}</span></a>`;
+    $('cardList').innerHTML = (sw.open.length ? `<p class="cgroup">Open</p><div class="cards">${sw.open.map(card).join('')}</div>` : '') +
+      (sw.closed.length ? `<p class="cgroup">Closed</p><div class="cards">${sw.closed.map(card).join('')}</div>` : '');
+    $('nAll').textContent = sw.open.length + sw.closed.length;
+    $('collabs').hidden = !(sw.open.length + sw.closed.length);
+    $('cardList').querySelectorAll('a[data-id]').forEach((a) => a.addEventListener('click', (e) => {
+      if (e.ctrlKey || e.metaKey || e.shiftKey || e.button) return;   // new tab: let the link work
+      e.preventDefault(); choose(a.dataset.id, true).catch((x) => alert(x.message));
+    }));
+  }
+  function drawCurrent(x) {
+    $('curName').innerHTML = `${esc(x.name)}<span class="badge ${STATUS(x)}">${STATUS(x)}</span>`;
+    $('curMeta').textContent = facts(x) + (x.closed ? ' · closed: takes no new frames' : (x.collecting ? ' · taking uploads' : ' · not taking uploads right now'));
   }
   async function choose(id, push) {
     const all = state.switch.open.concat(state.switch.closed);
@@ -932,9 +987,9 @@ _PAGE = r"""<!doctype html>
     if (url.hash && !url.hash.startsWith('#release-') && !url.hash.startsWith('#sec-')) url.hash = '';
     if (url.hash.startsWith('#release-') && url.hash.slice(9) !== id) url.hash = '';
     history[push ? 'pushState' : 'replaceState']({ project: id }, '', url);
-    $('curName').textContent = '· ' + x.name;
-    document.title = `${x.name} · Starfront files`;
+    document.title = `${x.name} · Starfront Files`;
     drawSwitcher();
+    drawCurrent(x);
     document.dispatchEvent(new CustomEvent('starfront:project', { detail: { id } }));
     const mine = state.projects.find((p) => p.id === id);
     const badge = `<span class="badge ${STATUS(x)}">${STATUS(x)}</span>`;
@@ -947,14 +1002,13 @@ _PAGE = r"""<!doctype html>
       $('uploader').hidden = true;
       $('none').hidden = false;
       $('none').textContent = x.closed ? `${x.name} is closed and you have no files on it.` : `${x.name} is not taking uploads right now.`;
-      $('curLine').innerHTML = `<b>${esc(x.name)}</b>${badge}`;
+      $('curLine').innerHTML = '';
       $('projectNote').textContent = '';
       return;
     }
     $('none').hidden = true;
     $('uploader').hidden = !!mine.closed;
-    $('curLine').innerHTML = `<b>${esc(x.name)}</b>${badge} <span class="muted">· ${esc(mine.coordinator || 'no coordinator')} · ${mine.files ? esc(kindSummary(mine.kinds)) : 'nothing yet'}, ${mb(mine.bytes)}</span>` +
-      (mine.closed ? ' <span class="muted">· closed: download only</span>' : (mine.full ? ' <span class="no">· storage limit reached</span>' : ''));
+    $('curLine').innerHTML = mine.closed ? '<span class="muted">Closed: download only.</span>' : (mine.full ? '<span class="no">Storage limit reached for this collaboration.</span>' : `<span class="muted">Uploading to <b>${esc(x.name)}</b>${mine.myFiles ? ` · you have ${mine.myFiles.toLocaleString()} files here, ${mb(mine.myBytes)}` : ''}</span>`);
     $('project').value = id;
     await pick();
   }
@@ -972,8 +1026,11 @@ _PAGE = r"""<!doctype html>
     state.signedIn = info.signedIn;
     state.switch = buildSwitch(info, pub, rel);
     $('signin').hidden = info.signedIn; $('app').hidden = !info.signedIn;
+    $('topWho').innerHTML = info.signedIn
+      ? `<span>Signed in as <b>${esc(info.name)}</b></span> <button class="btn ghost" id="signout">Sign out</button>`
+      : '<a class="btn" href="/files/signin">Sign in</a>';
+    if (info.signedIn) $('signout').addEventListener('click', async () => { await fetch('/files/signout', { method: 'POST' }); location.reload(); });
     if (info.signedIn) {
-      $('who').textContent = info.name;
       let warn = document.getElementById('diskwarn');
       if (!warn) { warn = document.createElement('p'); warn.id = 'diskwarn'; warn.className = 'small'; warn.style.color = '#ff8a7a'; $('app').prepend(warn); }
       warn.textContent = info.diskLow ? `Server disk is low: ${mb(info.free)} free. Uploads stop when it is full.` : '';
@@ -1166,7 +1223,7 @@ _PAGE = r"""<!doctype html>
     }
   }
 
-  $('closedPick').addEventListener('change', (e) => { if (e.target.value) choose(e.target.value, true).catch((x) => alert(x.message)); });
+  $('collabSel').addEventListener('change', (e) => { if (e.target.value) choose(e.target.value, true).catch((x) => alert(x.message)); });
   $('saveRules').addEventListener('click', () => saveRules());
   // One box per kind of frame. Its buttons open the shared pickers with the
   // box's kind remembered; a drop on it takes the box's kind.
@@ -1198,7 +1255,6 @@ _PAGE = r"""<!doctype html>
       take(files, kind);
     });
   });
-  $('signout').addEventListener('click', async () => { await fetch('/files/signout', { method: 'POST' }); location.reload(); });
   window.addEventListener('beforeunload', (e) => { if (state.running) { e.preventDefault(); e.returnValue = ''; } });
 
   load().catch((e) => { document.body.insertAdjacentHTML('beforeend', `<p class="no">${esc(e.message)}</p>`); });

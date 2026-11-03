@@ -340,8 +340,8 @@ _PAGE_JS = r"""
   async function get(url) { const r = await fetch(url, { credentials: 'same-origin' }); if (!r.ok) throw new Error(r.status); return r.json(); }
 
   function wanted(list) {
-    if (document.getElementById('switcher')) {
-      // On the files page the switcher has already put the collab in the URL.
+    if (document.getElementById('collabSel')) {
+      // On the files page the collab picker has already put the collab in the URL.
       const id = new URLSearchParams(location.search).get('project') || '';
       return list.some((r) => r.project === id) ? id : '';
     }
@@ -357,8 +357,8 @@ _PAGE_JS = r"""
     const lockMsg = access.message || 'Masters are available to contributors. Upload data to this collab to unlock downloads.';
     const locked = (rel.files || []).some((x) => x.locked);
     const lockNote = locked ? `<p class="small" id="releaseLocked" style="color:#e5c07b">🔒 ${esc(lockMsg)}${access.signedIn ? '' : ` <a href="${esc(access.signIn || '/files/signin')}">Sign in</a> if you already have.`}</p>` : '';
-    // The files page has its own collab switcher at the top; it drives this.
-    const pick = (list.length > 1 && !document.getElementById('switcher')) ? `<select id="releasePick">${list.map((r) => `<option value="${esc(r.project)}"${r.project === rel.project ? ' selected' : ''}>${esc(r.name)}</option>`).join('')}</select>` : '';
+    // The files page has its own collab picker; it drives this.
+    const pick = (list.length > 1 && !document.getElementById('collabSel')) ? `<select id="releasePick">${list.map((r) => `<option value="${esc(r.project)}"${r.project === rel.project ? ' selected' : ''}>${esc(r.name)}</option>`).join('')}</select>` : '';
     const filters = (rel.filters || []).map((f) => `<tr><td>${esc(f.filter)}${f.note ? ` <span class="small muted">${esc(f.note)}</span>` : ''}</td><td class="num">${num(f.hours, 1)} h</td><td class="num">${esc(f.subs)}</td><td class="num">${esc(f.rigs)}</td>
       <td>${(rel.files || []).filter((x) => x.filter === f.filter && x.role === 'master').map((x) => x.locked
         ? `<span class="muted" title="${esc(lockMsg)}">🔒 ${x.full ? 'full lossless FITS' : 'compressed FITS'}</span> <span class="small muted">${size(x.bytes)}</span>`
