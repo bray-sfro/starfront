@@ -668,8 +668,9 @@ _PAGE = r"""<!doctype html>
 <title>Starfront Files</title>
 <style>
   :root { color-scheme: dark; }
+  [hidden] { display: none !important; }
   body { margin: 0; background: #0d1017; color: #dbe3ee; font: 15px/1.5 system-ui, sans-serif; }
-  main { max-width: 760px; margin: 0 auto; padding: 28px 20px 60px; }
+  main { max-width: 1080px; margin: 0 auto; padding: 28px 20px 60px; }
   h1 { font-size: 24px; margin: 0 0 4px; }
   h2 { font-size: 16px; margin: 26px 0 8px; }
   p { margin: 6px 0; } .muted { color: #8f9bb0; } .small { font-size: 13px; }
@@ -713,29 +714,30 @@ _PAGE = r"""<!doctype html>
   .ruleform { display: grid; grid-template-columns: minmax(200px, 1fr) 140px; gap: 6px 12px; align-items: center; font-size: 13px; margin: 8px 0; }
   .ruleform input[type=text], .ruleform select { min-width: 0; width: 100%; padding: 4px 6px; font-size: 13px; }
   .topbar { position: sticky; top: 0; z-index: 5; background: #0b0e14ee; border-bottom: 1px solid #2a3344; backdrop-filter: blur(4px); }
-  .tin { max-width: 760px; margin: 0 auto; padding: 10px 20px; display: flex; gap: 12px; align-items: center; justify-content: space-between; }
+  .tin { max-width: 1080px; margin: 0 auto; padding: 10px 20px; display: flex; gap: 12px; align-items: center; justify-content: space-between; }
   .brand { color: #dbe3ee; font-weight: 700; font-size: 17px; text-decoration: none; letter-spacing: .01em; }
   .tright { font-size: 13px; color: #8f9bb0; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
   .tright .btn { padding: 4px 10px; font-size: 13px; }
-  .collabs { background: #11161f; border: 1px solid #2a3344; border-radius: 12px; padding: 12px 14px; margin: 4px 0 12px; }
-  .clabel { display: block; font-size: 12px; color: #8f9bb0; text-transform: uppercase; letter-spacing: .05em; margin: 0 0 4px; }
-  #collabSel { width: 100%; min-width: 0; box-sizing: border-box; font-size: 16px; padding: 10px 12px; font-weight: 600; }
-  .curname { font-size: 22px; margin: 10px 0 2px; }
-  .curmeta { margin: 0; }
+  .collabs { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 0 0 20px; }
+  .clabel { font-size: 12px; color: #8f9bb0; text-transform: uppercase; letter-spacing: .06em; }
+  #collabSel { width: auto; min-width: 0; max-width: 100%; box-sizing: border-box; font-size: 14px; padding: 6px 10px; font-weight: 600; }
+  .curmeta { margin: 0; font-size: 13px; color: #8f9bb0; }
+  #curName .badge { margin-left: 0; }
   .badge { font-size: 11px; padding: 1px 7px; border-radius: 8px; margin-left: 6px; background: #16351f; color: #7ee7a5; font-weight: 600; vertical-align: middle; }
   .badge.closed { background: #1a2130; color: #8f9bb0; } .badge.paused { background: #3a3116; color: #e5c07b; }
   .badge.rel { background: #1d2740; color: #9fc3ff; }
-  details.allc { margin: 8px 0 0; }
-  details.allc > summary { cursor: pointer; font-size: 13px; color: #9fe4bd; }
+  details.allc { margin-left: auto; }
+  details.allc[open] { flex-basis: 100%; margin-left: 0; }
+  details.allc > summary { cursor: pointer; font-size: 13px; color: #c3ccd9; }
   .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; margin: 8px 0; }
   .ccard { display: block; border: 1px solid #2a3344; border-radius: 10px; padding: 8px 10px; background: #0f141d; color: #dbe3ee; text-decoration: none; }
   .ccard:hover, .ccard:focus-visible { border-color: #7ee7a5; outline: none; }
   .ccard[aria-current="true"] { border-color: #7ee7a5; background: #13231a; }
   .ccard b { display: block; } .ccard .small { color: #8f9bb0; }
   .cgroup { font-size: 12px; color: #8f9bb0; text-transform: uppercase; letter-spacing: .05em; margin: 10px 0 0; }
-  #hero { margin: 10px 0 4px; position: relative; left: 50%; transform: translateX(-50%); width: min(1240px, calc(100vw - 32px)); }
-  #hero .shot { position: relative; display: block; cursor: zoom-in; }
-  #hero .shot .zoomhint { position: absolute; right: 10px; bottom: 10px; background: #0d1017cc; color: #dbe3ee; border: 1px solid #2a3344; border-radius: 8px; padding: 4px 10px; font-size: 13px; pointer-events: none; }
+  #hero { margin: 0 0 28px; border: 1px solid #2a3344; border-radius: 12px; overflow: hidden; background: #0f141d; }
+  #hero .shot { position: relative; display: block; cursor: zoom-in; background: #000; }
+  #hero .shot:focus-visible { outline: 2px solid #9fe4bd; outline-offset: -2px; }
   #viewer { position: fixed; inset: 0; z-index: 50; background: #000; }
   #viewer[hidden] { display: none; }
   #viewerStage { position: absolute; inset: 0; overflow: hidden; touch-action: none; cursor: grab; }
@@ -746,11 +748,12 @@ _PAGE = r"""<!doctype html>
                background: linear-gradient(transparent, #000d); color: #cfd8e6; font-size: 13px; pointer-events: none; }
   #viewerBar button { pointer-events: auto; background: #1a2130dd; color: #fff; border: 1px solid #2a3344; border-radius: 8px; min-width: 40px; height: 36px; font-size: 16px; cursor: pointer; }
   #viewerBar #viewerTools { pointer-events: auto; }
-  .seg { display: inline-flex; border: 1px solid #2a3344; border-radius: 999px; overflow: hidden; vertical-align: middle; background: #1a2130; }
-  .seg button, #viewerBar .seg button { background: transparent; color: #dbe3ee; border: 0; border-radius: 0; min-width: 0; height: auto; min-height: 34px; padding: 4px 14px; font-size: 14px; cursor: pointer; }
-  .seg button[aria-pressed="true"], #viewerBar .seg button[aria-pressed="true"] { background: #7ee7a5; color: #0d1017; font-weight: 600; }
+  .seg { display: inline-flex; border: 1px solid #2a3344; border-radius: 8px; overflow: hidden; vertical-align: middle; background: #141a25; }
+  .seg button, #viewerBar .seg button { background: transparent; color: #c3ccd9; border: 0; border-radius: 0; min-width: 0; height: auto; min-height: 32px; padding: 4px 14px; font-size: 13px; font-weight: 500; cursor: pointer; }
+  .seg button + button { border-left: 1px solid #2a3344; }
+  .seg button[aria-pressed="true"], #viewerBar .seg button[aria-pressed="true"] { background: #e6ebf2; color: #0d1017; font-weight: 600; }
   .seg button:focus-visible { outline: 2px solid #9fe4bd; outline-offset: -2px; }
-  #heroTools:not(:empty) { display: block; margin: 8px 0 4px; }
+  #heroTools:empty { display: none; }
   #hero figure { margin: 0; }
   .btn.dl { padding: 3px 10px; font-size: 13px; }
   .btn.dl.locked { background: #1a2130; color: #8f9bb0; cursor: not-allowed; }
@@ -758,10 +761,15 @@ _PAGE = r"""<!doctype html>
   table.masters td, table.people td { vertical-align: middle; }
   table.masters td.dlc { white-space: nowrap; }
   tr.tot td { border-bottom: 0; }
-  #hero img { display: block; width: 100%; height: auto; border-radius: 8px; background: #000; }
-  #hero .cap { margin: 6px 0 0; color: #a9b4c6; }
-  #hero .cap b { color: #e6ebf2; font-weight: 600; }
-  #hero .cap a { color: #dbe3ee; text-decoration: underline; text-decoration-color: #5a6477; }
+  #hero img { display: block; width: 100%; height: auto; aspect-ratio: 3 / 2; object-fit: cover; }
+  #hero .hbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 24px; padding: 14px 18px; border-top: 1px solid #1f2634; }
+  #hero .ttl { margin: 0; font-size: 16px; font-weight: 600; color: #e6ebf2; letter-spacing: .01em; }
+  #hero .sub { margin: 2px 0 0; font-size: 13px; color: #8f9bb0; }
+  #hero .acts { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 14px; }
+  .btn.quiet { background: transparent; border: 1px solid #2a3344; color: #dbe3ee; padding: 6px 12px; font-size: 13px; font-weight: 500; min-height: 32px; box-sizing: border-box; }
+  .btn.quiet:hover { border-color: #4a5466; }
+  .lnk { color: #c3ccd9; font-size: 13px; text-decoration: underline; text-decoration-color: #4a5466; text-underline-offset: 3px; }
+  .lnk:hover { color: #e6ebf2; }
   .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
   details.view { scroll-margin-top: 64px; border: 1px solid #2a3344; border-radius: 10px; margin: 10px 0; background: #0f141d; }
   details.view > summary { cursor: pointer; padding: 11px 14px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
@@ -774,6 +782,8 @@ _PAGE = r"""<!doctype html>
   details.kind { margin: 6px 0; border-top: 1px solid #1f2634; }
   details.kind > summary { cursor: pointer; padding: 6px 0; font-size: 14px; }
   #release > h2:first-child { font-size: 14px; margin-top: 4px; }
+  .signcard { display: flex; align-items: center; justify-content: space-between; gap: 12px 24px; flex-wrap: wrap; background: #11161f; border: 1px solid #2a3344; border-radius: 12px; padding: 14px 18px; margin: 10px 0 14px; }
+  .signcard p { margin: 0; } .signcard .st { font-weight: 600; color: #e6ebf2; margin-bottom: 2px; }
   .upload { background: #11161f; border: 1px solid #2a3344; border-radius: 12px; padding: 12px 14px; margin: 10px 0 14px; }
   .picker .lbl { font-weight: 600; }
   .picks { justify-content: center; }
@@ -782,9 +792,18 @@ _PAGE = r"""<!doctype html>
   @media (max-width: 640px) {
     .tin { padding: 8px 12px; }
     .cards { grid-template-columns: 1fr; }
-    .curname { font-size: 19px; }
-    #hero { width: calc(100vw - 16px); }
-    #hero img { border-radius: 6px; }
+    .clabel { display: none; }
+    #collabSel { flex: 1 1 100%; width: 100%; }
+    .curmeta .by { display: none; }
+    #hero { margin: 0 -12px 22px; border-radius: 0; border-left: 0; border-right: 0; }
+    #hero .hbar { padding: 12px; }
+    #hero .hbar { gap: 12px; }
+    #hero .acts { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    #hero #heroTools { grid-column: 1 / -1; display: flex; }
+    #hero #heroTools .seg { flex: 1; } #hero #heroTools .seg button { flex: 1; }
+    #hero .acts .btn { text-align: center; }
+    .curmeta { flex: 1 1 0; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .signcard .btn { width: 100%; text-align: center; box-sizing: border-box; }
     main { padding: 16px 12px 40px; }
     select, input[type=text], #telescope { min-width: 0; width: 100%; box-sizing: border-box; }
     .zones { grid-template-columns: 1fr 1fr; gap: 8px; }
@@ -808,19 +827,19 @@ _PAGE = r"""<!doctype html>
 <section id="collabs" class="collabs" aria-label="Collaboration" hidden>
   <label class="clabel" for="collabSel">Collaboration</label>
   <select id="collabSel"></select>
-  <h1 class="curname" id="curName"></h1>
-  <p class="small muted curmeta" id="curMeta"></p>
-  <section id="hero" hidden></section>
-  <details class="allc" id="allCollabs"><summary>All collaborations (<span id="nAll">0</span>)</summary>
+  <span id="curName"></span>
+  <span class="curmeta" id="curMeta"></span>
+  <details class="allc" id="allCollabs"><summary>All collabs (<span id="nAll">0</span>)</summary>
     <div id="cardList"></div>
   </details>
 </section>
+<section id="hero" hidden aria-label="Latest image"></section>
 <p class="muted small">Upload a collaboration's lights and the flats, darks or bias that calibrate them (FITS or XISF). Files already here are skipped, so a folder can be sent again. Lights only count once their calibration is here too.</p>
 
-<section id="signin" hidden>
-  <p>Sign in with the Discord account you use for Starfront to upload. Signing in here does not sign your N.I.N.A. or Starfront out.</p>
-  <p id="signinNote" class="small"></p>
-  <p><a class="btn" href="/files/signin">Sign in with Discord</a></p>
+<section id="signin" class="signcard" hidden>
+  <div><p class="st">Sign in to upload your frames</p>
+  <p class="small muted"><span id="signinNote"></span> Use the Discord account you use for Starfront; this does not sign your N.I.N.A. or Starfront out.</p></div>
+  <a class="btn" href="/files/signin">Sign in with Discord</a>
 </section>
 
 <section id="app" hidden>
@@ -1103,7 +1122,7 @@ _PAGE = r"""<!doctype html>
     preload(other.src); if (V.open) preload(other.full);
   }
   function drawStarTools() {
-    const html = starModes ? `<span class="seg" role="group" aria-label="Stars on or off"><button type="button" data-stars="stars" aria-pressed="${starMode === 'stars'}">★ Stars</button><button type="button" data-stars="starless" aria-pressed="${starMode === 'starless'}">Starless</button></span>` : '';
+    const html = starModes ? `<span class="seg" role="group" aria-label="Stars on or off"><button type="button" data-stars="stars" aria-pressed="${starMode === 'stars'}">Stars</button><button type="button" data-stars="starless" aria-pressed="${starMode === 'starless'}">Starless</button></span>` : '';
     for (const id of ['heroTools', 'viewerTools']) {
       const el = $(id); if (!el) continue;
       el.innerHTML = html;
@@ -1139,14 +1158,25 @@ _PAGE = r"""<!doctype html>
       starModes = { stars: { src: hero.thumb || hero.url, full: viewUrl(full), alt: hero.title || 'Latest preview' },
                     starless: { src: twin.thumb || twin.url, full: viewUrl(twinFull), alt: twin.title || 'Latest preview, starless' } };
     }
-    box.innerHTML = `<figure><span class="shot" id="heroOpen" role="button" tabindex="0" aria-label="Open the image full screen to zoom in"><img id="heroImg" loading="lazy" decoding="async" width="2400" height="1600" src="${esc(hero.thumb || hero.url)}" data-full="${esc(viewUrl(full))}" alt="${esc(hero.title || 'Latest preview')}"><span class="zoomhint">🔍 Click to zoom</span></span>
-      <figcaption class="small muted cap"><span id="heroTools"></span><b>Latest master ${esc(rel.version || '')}</b>${rel.released ? ' · ' + esc(rel.released) : ''}${rel.totalHours != null ? ` · ${Number(rel.totalHours).toFixed(0)} h` : ''} · ${esc(hero.caption || hero.title || '')} · <a href="#sec-release">masters and contributors</a></figcaption></figure>`;
+    const name = String(rel.title || '').replace(/\s+coadd\s+v\d+\s*$/i, '') || rel.projectName || '';
+    const ymd = /^(\d{4})-(\d\d)-(\d\d)$/.exec(rel.released || '');
+    const date = ymd ? new Date(+ymd[1], +ymd[2] - 1, +ymd[3]).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : (rel.released || '');
+    const people = (rel.contributors || []).length;
+    const filters = (rel.filters || []).map((f) => f.filter).join(', ');
+    const sub = [rel.totalHours != null ? `${Number(rel.totalHours).toFixed(0)} h` : '', people ? `${people} contributor${people === 1 ? '' : 's'}` : '', filters].filter(Boolean).join(' · ');
+    box.innerHTML = `<figure>
+      <div class="shot" id="heroOpen" role="button" tabindex="0" aria-label="View full size"><img id="heroImg" loading="lazy" decoding="async" width="2400" height="1600" src="${esc(hero.thumb || hero.url)}" data-full="${esc(viewUrl(full))}" alt="${esc(hero.title || 'Latest preview')}" title="${esc(hero.title || '')}"></div>
+      <figcaption class="hbar">
+        <div><p class="ttl">${esc([name, rel.version, date].filter(Boolean).join(' · '))}</p><p class="sub">${esc(sub)}</p></div>
+        <div class="acts"><span id="heroTools"></span><button type="button" class="btn quiet" id="heroView">View full size</button><a class="btn quiet" href="#sec-release">Masters &amp; contributors</a></div>
+      </figcaption></figure>`;
     box.hidden = false;
     drawStarTools();
     // The starless 2400 px is small: fetch it once the page has settled.
     if (starModes) setTimeout(() => preload(starModes && starModes.starless.src), 1500);
     const opener = $('heroOpen');
     opener.addEventListener('click', () => viewerOpen());
+    $('heroView').addEventListener('click', () => viewerOpen());
     opener.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); viewerOpen(); } });
     // The caption's link opens the Masters and contributors section, every time.
     const go = box.querySelector('a[href="#sec-release"]');
@@ -1166,7 +1196,7 @@ _PAGE = r"""<!doctype html>
     drawHero(rel);
     const locked = (rel.files || []).some((x) => x.locked);
     const hours = rel.totalHours == null ? '' : ` · ${Number(rel.totalHours).toFixed(0)} h`;
-    show('sec-release', `${rel.version || ''}${hours} · ${s((rel.filters || []).length, 'filter')} · ${s((rel.contributors || []).length, 'contributor')}` + (locked ? ' · 🔒 downloads for contributors' : ' · downloads'));
+    show('sec-release', `${rel.version || ''}${hours} · ${s((rel.filters || []).length, 'filter')} · ${s((rel.contributors || []).length, 'contributor')}` + (locked ? ' · downloads for contributors' : ' · downloads'));
     if (location.hash.startsWith('#release-')) deepLink();
   });
   window.addEventListener('hashchange', deepLink);
@@ -1174,7 +1204,7 @@ _PAGE = r"""<!doctype html>
   // -- the collab picker, in the page: open collabs first, closed below --
   const STATUS = (p) => p.closed ? 'closed' : (p.collecting ? 'collecting' : 'paused');
   const gb = (n) => n >= 1024 ** 3 ? (n / 1024 ** 3).toFixed(1) + ' GB' : (n >= 1024 ** 2 ? (n / 1024 ** 2).toFixed(0) + ' MB' : (n ? '<1 MB' : '0'));
-  const facts = (x) => [x.coordinator ? 'by ' + x.coordinator : '', x.files ? `${x.files.toLocaleString()} files, ${gb(x.bytes)}` : 'no files yet'].filter(Boolean).join(' · ');
+  const facts = (x) => [x.coordinator ? 'by ' + x.coordinator : '', x.files ? `${x.files.toLocaleString()} files` : 'no files yet', x.files ? gb(x.bytes) : ''].filter(Boolean).join(' · ');
   function buildSwitch(info, pub, rel) {
     const byId = new Map();
     const released = new Set((rel.releases || []).map((r) => r.project));
@@ -1192,7 +1222,7 @@ _PAGE = r"""<!doctype html>
   }
   function drawSwitcher() {
     const sw = state.switch;
-    const opt = (x) => `<option value="${esc(x.id)}"${x.id === state.current ? ' selected' : ''}>${esc(x.name)} \u2014 ${STATUS(x)}${x.files ? ' \u00b7 ' + gb(x.bytes) : ''}</option>`;
+    const opt = (x) => `<option value="${esc(x.id)}"${x.id === state.current ? ' selected' : ''}>${esc(x.name)}</option>`;
     $('collabSel').innerHTML = (sw.open.length ? `<optgroup label="Open">${sw.open.map(opt).join('')}</optgroup>` : '') +
       (sw.closed.length ? `<optgroup label="Closed">${sw.closed.map(opt).join('')}</optgroup>` : '');
     const card = (x) => `<a class="ccard" href="/files?project=${encodeURIComponent(x.id)}" data-id="${esc(x.id)}" aria-current="${x.id === state.current}"><b>${esc(x.name)}<span class="badge ${STATUS(x)}">${STATUS(x)}</span>${x.release ? '<span class="badge rel">master</span>' : ''}</b><span class="small">${esc(facts(x))}</span></a>`;
@@ -1206,8 +1236,8 @@ _PAGE = r"""<!doctype html>
     }));
   }
   function drawCurrent(x) {
-    $('curName').innerHTML = `${esc(x.name)}<span class="badge ${STATUS(x)}">${STATUS(x)}</span>`;
-    $('curMeta').textContent = facts(x) + (x.closed ? ' · closed: takes no new frames' : (x.collecting ? ' · taking uploads' : ' · not taking uploads right now'));
+    $('curName').innerHTML = `<span class="badge ${STATUS(x)}">${STATUS(x)}</span>`;
+    $('curMeta').innerHTML = (x.coordinator ? `<span class="by">by ${esc(x.coordinator)} · </span>` : '') + esc(facts({ ...x, coordinator: '' }));
   }
   async function choose(id, push) {
     const all = state.switch.open.concat(state.switch.closed);
@@ -1227,7 +1257,7 @@ _PAGE = r"""<!doctype html>
     const mine = state.projects.find((p) => p.id === id);
     const badge = `<span class="badge ${STATUS(x)}">${STATUS(x)}</span>`;
     if (!state.signedIn) {
-      $('signinNote').innerHTML = `<b>${esc(x.name)}</b>${badge} ` + (x.collecting ? 'is collecting frames: sign in to upload yours.' : (x.closed ? 'is closed and takes no new frames.' : 'is not taking uploads right now.'));
+      $('signinNote').textContent = x.collecting ? 'This collaboration is collecting frames.' : (x.closed ? 'This collaboration is closed and takes no new frames.' : 'This collaboration is not taking uploads right now.');
       return;
     }
     ['sec-rules', 'sec-needed', 'sec-mine'].forEach((k) => { $(k).hidden = !mine; });
