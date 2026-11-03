@@ -746,6 +746,11 @@ _PAGE = r"""<!doctype html>
                background: linear-gradient(transparent, #000d); color: #cfd8e6; font-size: 13px; pointer-events: none; }
   #viewerBar button { pointer-events: auto; background: #1a2130dd; color: #fff; border: 1px solid #2a3344; border-radius: 8px; min-width: 40px; height: 36px; font-size: 16px; cursor: pointer; }
   #viewerBar #viewerTools { pointer-events: auto; }
+  .seg { display: inline-flex; border: 1px solid #2a3344; border-radius: 999px; overflow: hidden; vertical-align: middle; background: #1a2130; }
+  .seg button, #viewerBar .seg button { background: transparent; color: #dbe3ee; border: 0; border-radius: 0; min-width: 0; height: auto; min-height: 34px; padding: 4px 14px; font-size: 14px; cursor: pointer; }
+  .seg button[aria-pressed="true"], #viewerBar .seg button[aria-pressed="true"] { background: #7ee7a5; color: #0d1017; font-weight: 600; }
+  .seg button:focus-visible { outline: 2px solid #9fe4bd; outline-offset: -2px; }
+  #heroTools:not(:empty) { display: block; margin: 8px 0 4px; }
   #hero figure { margin: 0; }
   .btn.dl { padding: 3px 10px; font-size: 13px; }
   .btn.dl.locked { background: #1a2130; color: #8f9bb0; cursor: not-allowed; }
@@ -754,7 +759,9 @@ _PAGE = r"""<!doctype html>
   table.masters td.dlc { white-space: nowrap; }
   tr.tot td { border-bottom: 0; }
   #hero img { display: block; width: 100%; height: auto; border-radius: 8px; background: #000; }
-  #hero .cap { margin: 4px 0 0; }
+  #hero .cap { margin: 6px 0 0; color: #a9b4c6; }
+  #hero .cap b { color: #e6ebf2; font-weight: 600; }
+  #hero .cap a { color: #dbe3ee; text-decoration: underline; text-decoration-color: #5a6477; }
   .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
   details.view { scroll-margin-top: 64px; border: 1px solid #2a3344; border-radius: 10px; margin: 10px 0; background: #0f141d; }
   details.view > summary { cursor: pointer; padding: 11px 14px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
@@ -903,7 +910,7 @@ _PAGE = r"""<!doctype html>
     <button type="button" data-z="in" aria-label="Zoom in">+</button><button type="button" data-z="out" aria-label="Zoom out">−</button><button type="button" data-z="fit" aria-label="Fit to screen">Fit</button>
     <span id="viewerTools"></span>
     <span id="viewerNote"></span>
-    <span class="muted">Scroll or pinch to zoom · drag to pan · double-tap to zoom · Esc to close</span>
+    <span class="muted">Scroll or pinch to zoom · drag to pan · double-tap to zoom · T: stars on/off · Esc to close</span>
   </div>
 </div>
 <script src="/releases/page.js" defer></script>
@@ -982,26 +989,40 @@ _PAGE = r"""<!doctype html>
     const s = Math.min(16, Math.max(1, V.s * f)), k = s / V.s;
     V.x = px - (px - V.x) * k; V.y = py - (py - V.y) * k; V.s = s; vClamp(); vApply();
   }
+  // Images already fetched (full-res ones are big): url -> Image, kept for the page's life.
+  const imgCache = new Map();
+  function preload(url) {
+    if (!url) return null;
+    let im = imgCache.get(url);
+    if (!im) { im = new Image(); im.decoding = 'async'; im.src = url; imgCache.set(url, im); }
+    return im;
+  }
+  const ready = (im) => !!(im && im.complete && im.naturalWidth);
   function vLoad() {
     const hero = $('heroImg'); if (!hero) return;
-    const img = vImg(), base = hero.currentSrc || hero.src, full = hero.dataset.full || '';
+    const img = vImg(), base = hero.getAttribute('src') || '', full = hero.dataset.full || '';
+    const note = (hi) => { $('viewerNote').textContent = `${/_5k\.jpe?g$/i.test(hi.src) ? 'Phone-size detail' : 'Full resolution'} · ${hi.naturalWidth.toLocaleString()} × ${hi.naturalHeight.toLocaleString()} px`; };
     if (img.dataset.base !== base) {
       const first = !img.dataset.base;
-      img.dataset.base = base; img.dataset.full = ''; img.src = base;
+      img.dataset.base = base; img.dataset.full = '';
+      // Already have the full-res of the new image (a flip back): straight to it.
+      const hi = full ? imgCache.get(full) : null;
+      if (ready(hi)) { img.src = full; img.dataset.full = full; note(hi); }
+      else img.src = base;
       if (first) vFit(hero.naturalWidth && hero.naturalHeight ? hero.naturalWidth / hero.naturalHeight : 1.5);
     }
     if (full && img.dataset.full !== full) {
       img.dataset.full = full; $('viewerNote').textContent = 'Loading full resolution…';
-      const hi = new Image(); hi.decoding = 'async';
-      hi.onload = () => { if (img.dataset.full !== full) return; img.src = full; $('viewerNote').textContent = `Full resolution · ${hi.naturalWidth.toLocaleString()} × ${hi.naturalHeight.toLocaleString()} px`; };
-      hi.onerror = () => { if (img.dataset.full === full) $('viewerNote').textContent = ''; };
-      hi.src = full;
+      const hi = preload(full);
+      const done = () => { if (img.dataset.full !== full || img.dataset.base !== base) return; img.src = full; note(hi); };
+      if (ready(hi)) done(); else { hi.addEventListener('load', done, { once: true }); hi.addEventListener('error', () => { if (img.dataset.full === full) $('viewerNote').textContent = ''; }, { once: true }); }
     } else if (!full) $('viewerNote').textContent = '';
   }
   function viewerOpen() {
     if (!$('heroImg')) return;
     V.open = true; $('viewer').hidden = false; document.body.style.overflow = 'hidden';
     delete vImg().dataset.base; vLoad(); $('viewerClose').focus();
+    if (starModes) setTimeout(() => preload(starModes && starModes[starMode === 'stars' ? 'starless' : 'stars'].full), 2000);
     document.dispatchEvent(new CustomEvent('starfront:viewer', { detail: { open: true } }));
   }
   function viewerClose() {
@@ -1019,6 +1040,7 @@ _PAGE = r"""<!doctype html>
       else if (e.key === '+' || e.key === '=') vZoom(1.5, innerWidth / 2, innerHeight / 2);
       else if (e.key === '-') vZoom(1 / 1.5, innerWidth / 2, innerHeight / 2);
       else if (e.key === '0') vFit();
+      else if ((e.key === 't' || e.key === 'T' || e.key === 's' || e.key === 'S') && starModes && !e.ctrlKey && !e.metaKey && !e.altKey) setStars(starMode === 'stars' ? 'starless' : 'stars');
     });
     $('viewerBar').addEventListener('click', (e) => {
       const z = e.target && e.target.dataset ? e.target.dataset.z : '';
@@ -1065,18 +1087,64 @@ _PAGE = r"""<!doctype html>
 
   // The preview, shown once. #heroImg is the one image; a control that swaps
   // its src (e.g. stars on/off) can go in #heroTools.
+  // Small screens get the ~5000 px version of a full-res image when the
+  // release has one (its `small`), big screens the full thing.
+  const smallScreen = () => matchMedia('(pointer: coarse)').matches && Math.min(screen.width, screen.height) <= 900;
+  // The stars on/off switch: { stars: {src, full}, starless: {src, full} }, or null.
+  let starModes = null, starMode = 'stars';
+  function setStars(mode) {
+    if (!starModes || !starModes[mode]) return;
+    starMode = mode;
+    const img = $('heroImg'), m = starModes[mode];
+    if (img) { img.src = m.src; img.dataset.full = m.full; img.alt = m.alt; }   // the viewer follows (MutationObserver)
+    document.querySelectorAll('.seg [data-stars]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.stars === mode)));
+    // The other one, so the next flip is instant: its 2400 px now, its full-res when the viewer is open.
+    const other = starModes[mode === 'stars' ? 'starless' : 'stars'];
+    preload(other.src); if (V.open) preload(other.full);
+  }
+  function drawStarTools() {
+    const html = starModes ? `<span class="seg" role="group" aria-label="Stars on or off"><button type="button" data-stars="stars" aria-pressed="${starMode === 'stars'}">★ Stars</button><button type="button" data-stars="starless" aria-pressed="${starMode === 'starless'}">Starless</button></span>` : '';
+    for (const id of ['heroTools', 'viewerTools']) {
+      const el = $(id); if (!el) continue;
+      el.innerHTML = html;
+      el.querySelectorAll('[data-stars]').forEach((b) => {
+        b.addEventListener('click', (e) => { e.stopPropagation(); setStars(b.dataset.stars); });
+        // Hover or focus: fetch the other one's full-res ahead of a flip.
+        const warm = () => { if (!starModes) return; const m = starModes[b.dataset.stars]; preload(m.src); preload(m.full); };
+        b.addEventListener('pointerenter', warm); b.addEventListener('focus', warm);
+      });
+    }
+  }
   function drawHero(rel) {
     const box = $('hero');
-    const previews = rel ? (rel.files || []).filter((x) => x.role === 'preview') : [];
+    const files = rel ? (rel.files || []) : [];
+    const byName = new Map(files.map((x) => [x.name, x]));
+    // Never a starless twin as the main image.
+    const previews = files.filter((x) => x.role === 'preview' && x.starless !== true && !x.starlessOf);
     const hero = previews.find((x) => x.hero) || previews[0];
-    if (!hero) { box.hidden = true; box.innerHTML = ''; return; }
+    starModes = null; starMode = 'stars';
+    if (!hero) { box.hidden = true; box.innerHTML = ''; drawStarTools(); return; }
     // Its full-resolution twin, for the viewer only (never offered as a download).
-    const stem = String(hero.name || '').replace(/_v\d+_preview\.jpe?g$/i, '');
-    const fullres = hero.fullres ? (rel.files || []).find((x) => x.name === hero.fullres)
-      : (rel.files || []).find((x) => x.role !== 'master' && x.name.startsWith(stem + '_') && /_fullres\.jpe?g$/i.test(x.name));
-    box.innerHTML = `<figure><span class="shot" id="heroOpen" role="button" tabindex="0" aria-label="Open the image full screen to zoom in"><img id="heroImg" loading="lazy" decoding="async" width="2400" height="1600" src="${esc(hero.thumb || hero.url)}" data-full="${esc(fullres ? fullres.url : '')}" alt="${esc(hero.title || 'Latest preview')}"><span class="zoomhint">🔍 Click to zoom</span></span>
+    const fullOf = (prev) => {
+      if (!prev) return null;
+      if (prev.fullres && byName.get(prev.fullres)) return byName.get(prev.fullres);
+      const m = String(prev.name || '').match(/^(.*)_preview\.jpe?g$/i);
+      return m ? (byName.get(m[1] + '_fullres.jpg') || byName.get(m[1] + '_fullres.jpeg') || null) : null;
+    };
+    const viewUrl = (f) => { if (!f) return ''; const sm = f.small && byName.get(f.small); return (smallScreen() && sm ? sm : f).url; };
+    const full = fullOf(hero);
+    const twin = typeof hero.starless === 'string' ? byName.get(hero.starless) : null;
+    if (twin) {
+      const twinFull = (full && typeof full.starless === 'string' && byName.get(full.starless)) || fullOf(twin);
+      starModes = { stars: { src: hero.thumb || hero.url, full: viewUrl(full), alt: hero.title || 'Latest preview' },
+                    starless: { src: twin.thumb || twin.url, full: viewUrl(twinFull), alt: twin.title || 'Latest preview, starless' } };
+    }
+    box.innerHTML = `<figure><span class="shot" id="heroOpen" role="button" tabindex="0" aria-label="Open the image full screen to zoom in"><img id="heroImg" loading="lazy" decoding="async" width="2400" height="1600" src="${esc(hero.thumb || hero.url)}" data-full="${esc(viewUrl(full))}" alt="${esc(hero.title || 'Latest preview')}"><span class="zoomhint">🔍 Click to zoom</span></span>
       <figcaption class="small muted cap"><span id="heroTools"></span><b>Latest master ${esc(rel.version || '')}</b>${rel.released ? ' · ' + esc(rel.released) : ''}${rel.totalHours != null ? ` · ${Number(rel.totalHours).toFixed(0)} h` : ''} · ${esc(hero.caption || hero.title || '')} · <a href="#sec-release">masters and contributors</a></figcaption></figure>`;
     box.hidden = false;
+    drawStarTools();
+    // The starless 2400 px is small: fetch it once the page has settled.
+    if (starModes) setTimeout(() => preload(starModes && starModes.starless.src), 1500);
     const opener = $('heroOpen');
     opener.addEventListener('click', () => viewerOpen());
     opener.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); viewerOpen(); } });

@@ -177,3 +177,10 @@ def test_page_has_the_viewer_and_no_preview_downloads(world):
     assert 'id="viewer"' in html and 'id="viewerImg"' in html and 'id="heroImg"' in html and 'id="heroTools"' in html
     assert "data-full" in html and "max-height: 320px" not in html
     assert " download>" not in html                       # nothing on this page is offered as a download
+
+
+def test_page_has_the_stars_toggle(world):
+    client, *_ = world
+    html = client.get("/files").text
+    assert 'data-stars="starless"' in html and "setStars" in html and "starlessOf" in html
+    assert "e.key === 't'" in html and "small" in html
