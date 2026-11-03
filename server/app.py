@@ -45,6 +45,7 @@ from astrocontrol.config import data_root                        # noqa: E402
 from server import auth                                          # noqa: E402
 from server.files import COOKIE, COOKIE_SECONDS, Files           # noqa: E402
 from server.ratelimit import Limiter, client_address           # noqa: E402
+from server.jobs import Jobs                                     # noqa: E402
 from server.releases import Releases                             # noqa: E402
 from server.store import Store                                   # noqa: E402
 
@@ -2270,7 +2271,12 @@ files = Files(app, store, FILES_DIR, _person, owns_project, DISCORD.owners,
 # not hex), so a full set of masters has the big disk's room. The files
 # page's quotas count uploads only. See server/releases.py.
 RELEASES_DIR = Path(auth.setting("RELEASES") or FILES_DIR / "_releases")
+# The coordinator's processing job (stacking, rendering), shown on the files page.
+# Before Releases: its GET /api/v1/releases/{project}/{version} would take /job.
+jobs = Jobs(app, store, RELEASES_DIR, files.who, owns_project, DATA / "job-token.txt",
+            latest=lambda pid: releases.latest_version(pid))
 releases = Releases(app, store, RELEASES_DIR, files.who, owns_project)
+
 
 
 # ---------------------------------------------------------------------------

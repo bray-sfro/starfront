@@ -779,6 +779,27 @@ _PAGE = r"""<!doctype html>
   .btn.quiet:hover { border-color: #4a5466; }
   .lnk { color: #c3ccd9; font-size: 13px; text-decoration: underline; text-decoration-color: #4a5466; text-underline-offset: 3px; }
   .lnk:hover { color: #e6ebf2; }
+  .job { padding: 12px 18px 13px; border-top: 1px solid #1f2634; background: #111722; font-size: 13px; color: #c3ccd9; }
+  .job.solo { border: 1px solid #2a3344; border-radius: 12px; background: #0f141d; margin: 0 0 20px; }
+  .job .jl { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 16px; }
+  .job .jt { color: #e6ebf2; font-weight: 600; }
+  .job .jm { color: #8f9bb0; }
+  .job .track { height: 3px; border-radius: 2px; background: #1f2634; margin: 9px 0 0; overflow: hidden; }
+  .job .fill { height: 100%; width: 0; background: #c3ccd9; border-radius: 2px; transition: width .6s ease; }
+  .job.indet .fill { width: 30%; animation: jobslide 1.6s ease-in-out infinite; }
+  @keyframes jobslide { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+  @media (prefers-reduced-motion: reduce) { .job.indet .fill { animation: none; width: 100%; opacity: .4; } }
+  .job.failed .fill { background: #b86b6b; } .job.failed .jt { color: #e8b4b4; }
+  .job.stale .fill { background: #5b6577; }
+  .job.done .fill { background: #8fc9a5; }
+  .job details { margin-top: 8px; } .job summary { cursor: pointer; color: #8f9bb0; font-size: 12px; }
+  .job ol { margin: 6px 0 0; padding: 0; list-style: none; display: grid; gap: 3px; }
+  .job li { display: flex; gap: 10px; align-items: baseline; font-size: 12px; color: #8f9bb0; }
+  .job li::before { content: ""; flex: none; width: 7px; height: 7px; border-radius: 50%; border: 1px solid #4a5466; transform: translateY(1px); }
+  .job li.done { color: #c3ccd9; } .job li.done::before { background: #8f9bb0; border-color: #8f9bb0; }
+  .job li.running { color: #e6ebf2; font-weight: 600; } .job li.running::before { background: #e6ebf2; border-color: #e6ebf2; }
+  .job li.failed { color: #e8b4b4; } .job li.failed::before { background: #b86b6b; border-color: #b86b6b; }
+  .job li .sd { margin-left: auto; font-weight: 400; color: #8f9bb0; }
   .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
   details.view { scroll-margin-top: 64px; border: 1px solid #2a3344; border-radius: 10px; margin: 10px 0; background: #0f141d; }
   details.view > summary { cursor: pointer; padding: 11px 14px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
@@ -1040,7 +1061,7 @@ _PAGE = r"""<!doctype html>
   function vLoad() {
     const hero = $('heroImg'); if (!hero) return;
     const img = vImg(), base = hero.getAttribute('src') || '', full = hero.dataset.full || '';
-    const note = (hi) => { $('viewerNote').textContent = `${/_5k\.jpe?g$/i.test(hi.src) ? 'Phone-size detail' : 'Full resolution'} · ${hi.naturalWidth.toLocaleString()} × ${hi.naturalHeight.toLocaleString()} px`; };
+    const note = (hi) => { $('viewerNote').textContent = `${/_(5k|phone)\.jpe?g$/i.test(hi.src) ? 'Phone-size detail' : 'Full resolution'} · ${hi.naturalWidth.toLocaleString()} × ${hi.naturalHeight.toLocaleString()} px`; };
     if (img.dataset.base !== base) {
       const first = !img.dataset.base;
       img.dataset.base = base; img.dataset.full = '';
@@ -1245,13 +1266,16 @@ _PAGE = r"""<!doctype html>
       const m = String(prev.name || '').match(/^(.*)_preview\.jpe?g$/i);
       return m ? (byName.get(m[1] + '_fullres.jpg') || byName.get(m[1] + '_fullres.jpeg') || null) : null;
     };
-    const viewUrl = (f) => { if (!f) return ''; const sm = f.small && byName.get(f.small); return (smallScreen() && sm ? sm : f).url; };
+    // The phone copy: `small` (make_5k.py) or the _phone twin build_release.py writes (size "phone").
+    const phoneOf = (f) => (f.small && byName.get(f.small)) || byName.get(String(f.name || '').replace(/_fullres\.(jpe?g)$/i, '_phone.$1')) || null;
+    const viewUrl = (f) => { if (!f) return ''; const sm = phoneOf(f); return (smallScreen() && sm && sm !== f ? sm : f).url; };
     const full = fullOf(hero);
     // Hero first ("Color" unless it has a label), then the other colour kinds, then single filters in the release's filter order.
     // No kind/filter field (v1): the bit before _vN in M31_RGB_v1_preview.jpg.
     const nameKind = (n) => { const m = /^(?:.*_)?([^_]+)_v\d+(?:_[^_]+)*?_preview\.jpe?g$/i.exec(n || ''); return m ? m[1] : String(n || '').replace(/_preview\.jpe?g$/i, ''); };
     const order = (rel.filters || []).map((f) => f.filter);
-    const rank = (x) => x === hero ? -1 : (x.kind || !x.filter ? 0 : 1);
+    const isMono = (x) => x !== hero && (x.group ? x.group === 'filter' : (!!x.filter && (!x.kind || x.kind === x.filter)));
+    const rank = (x) => x === hero ? -1 : (isMono(x) ? 1 : 0);
     const seen = new Set();
     for (const p of previews.slice().sort((a, b) => rank(a) - rank(b) || (rank(a) === 1 ? order.indexOf(a.filter) - order.indexOf(b.filter) : 0))) {
       const label = p.label || (p === hero ? 'Color' : (p.kind || p.filter || nameKind(p.name)));
@@ -1259,7 +1283,7 @@ _PAGE = r"""<!doctype html>
       const f = fullOf(p);
       const tw = typeof p.starless === 'string' ? byName.get(p.starless) : null;
       const twf = tw ? ((f && typeof f.starless === 'string' && byName.get(f.starless)) || fullOf(tw)) : null;
-      views.push({ key: label, label, kind: p.kind || '', filter: p.filter || '', mono: !p.kind && !!p.filter && p !== hero, title: p.title || label,
+      views.push({ key: label, label, kind: p.kind || '', filter: p.filter || '', mono: isMono(p), title: p.title || label,
         stars: { src: p.thumb || p.url, full: viewUrl(f), alt: p.title || 'Latest preview', title: p.title || '' },
         starless: tw ? { src: tw.thumb || tw.url, full: viewUrl(twf), alt: tw.title || 'Latest preview, starless', title: tw.title || '' } : null });
     }
@@ -1312,6 +1336,67 @@ _PAGE = r"""<!doctype html>
     if (location.hash.startsWith('#release-')) deepLink();
   });
   window.addEventListener('hashchange', deepLink);
+
+  // -- the coordinator's processing job (stacking, rendering on their own machine) --
+  // GET /api/v1/releases/<project>/job. Shown while running, for a day after a failure,
+  // and once built until it is published. Polled every 15 s while running and visible.
+  const JOB = { pid: '', timer: 0, data: null, open: false, seq: 0 };
+  const ago = (sec) => sec < 60 ? 'just now' : (sec < 3600 ? `${Math.round(sec / 60)} min ago` : (sec < 86400 ? `${Math.round(sec / 3600)} h ago` : `${Math.round(sec / 86400)} d ago`));
+  const mins = (sec) => sec < 3600 ? `${Math.max(1, Math.round(sec / 60))} min` : `${(sec / 3600).toFixed(1)} h`;
+  function jobVisible(j) {
+    if (!j) return false;
+    const age = (j.now || Date.now() / 1000) - (j.updated || 0);
+    if (j.status === 'running') return true;
+    if (j.status === 'failed') return age < 86400;
+    if (j.status === 'done') return !!j.version && j.version !== j.published && age < 14 * 86400;
+    return false;
+  }
+  function drawJob() {
+    const j = JOB.data, hero = $('hero');
+    let el = $('job');
+    if (!jobVisible(j) || !hero) { if (el) el.remove(); return; }
+    if (!el) { el = document.createElement('div'); el.id = 'job'; el.setAttribute('role', 'status'); }
+    const fig = !hero.hidden && hero.querySelector('figure');
+    // Between the image and its caption: it is news about the next version, so it comes first.
+    const cap = fig && fig.querySelector('figcaption');
+    if (fig) { if (el.nextSibling !== cap) fig.insertBefore(el, cap); }
+    else if (el.nextSibling !== hero) hero.parentNode.insertBefore(el, hero);
+    const now = j.now || Date.now() / 1000, age = now - (j.updated || now);
+    const steps = j.steps || [], n = steps.length, i = Number.isInteger(j.step) ? j.step : -1;
+    const cur = i >= 0 && steps[i] ? `${steps[i].name} (${i + 1}/${n})` : '';
+    const v = j.version || '';
+    let title, bits = [], pct = j.percent;
+    if (j.status === 'done') { title = `${v || 'New version'} ready, awaiting approval`; bits = [`built ${ago(age)}`]; pct = 100; }
+    else if (j.status === 'failed') { title = `${v ? v + ' build' : 'Build'} failed`; bits = [cur, `${ago(age)}`]; }
+    else {
+      title = j.title || (v ? `Building ${v}` : 'Processing');
+      bits = [cur, pct != null ? `${Math.round(pct)}%` : '', j.stale ? `no update for ${mins(age)}` : `updated ${ago(age)}`];
+      if (!j.stale && j.eta && j.eta > now) bits.push(`about ${mins(j.eta - now)} left`);
+    }
+    el.className = 'job' + (fig ? '' : ' solo') + (j.status === 'failed' ? ' failed' : '') + (j.status === 'done' ? ' done' : '') + (j.stale ? ' stale' : '') + (j.status === 'running' && pct == null && !j.stale ? ' indet' : '');
+    const msg = j.message && j.message !== (steps[i] || {}).name ? j.message : '';
+    const list = n ? `<details${JOB.open ? ' open' : ''}><summary>Steps</summary><ol>${steps.map((st) => `<li class="${esc(st.state)}"><span>${esc(st.name)}</span>${st.detail ? `<span class="sd">${esc(st.detail)}</span>` : (st.state === 'running' || st.state === 'failed' ? `<span class="sd">${esc(st.state)}</span>` : '')}</li>`).join('')}</ol></details>` : '';
+    el.innerHTML = `<div class="jl"><span><span class="jt">${esc(title)}</span>${bits.filter(Boolean).map((b) => ` <span class="jm">· ${esc(b)}</span>`).join('')}</span>${msg ? `<span class="jm">${esc(msg)}</span>` : ''}</div>
+      <div class="track" aria-hidden="true"><div class="fill" style="width:${pct != null ? Math.max(2, Math.min(100, pct)) : (j.status === 'running' ? 30 : 100)}%"></div></div>${list}`;
+    const d = el.querySelector('details'); if (d) d.addEventListener('toggle', () => { JOB.open = d.open; });
+  }
+  async function jobPoll() {
+    clearTimeout(JOB.timer); JOB.timer = 0;
+    const pid = JOB.pid, seq = ++JOB.seq;
+    if (!pid) return;
+    try {
+      const r = await fetch(`/api/v1/releases/${encodeURIComponent(pid)}/job`, { credentials: 'omit' });
+      if (seq !== JOB.seq || pid !== JOB.pid) return;
+      JOB.data = r.ok ? await r.json() : null;
+    } catch (e) { if (seq !== JOB.seq) return; }
+    drawJob();
+    // Keep polling only while something is running; a hidden tab waits for visibilitychange.
+    if (JOB.data && JOB.data.status === 'running' && document.visibilityState === 'visible') JOB.timer = setTimeout(jobPoll, 15000);
+  }
+  function jobWatch(pid) { if (pid === JOB.pid) return; JOB.pid = pid; JOB.data = null; drawJob(); jobPoll(); }
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && JOB.data && JOB.data.status === 'running' && !JOB.timer) jobPoll(); });
+  document.addEventListener('starfront:hero', drawJob);
+  document.addEventListener('starfront:release', () => setTimeout(drawJob, 0));
 
   // -- the collab picker, in the page: open collabs first, closed below --
   const STATUS = (p) => p.closed ? 'closed' : (p.collecting ? 'collecting' : 'paused');
@@ -1367,6 +1452,7 @@ _PAGE = r"""<!doctype html>
     document.title = `${x.name} · Starfront Files`;
     drawSwitcher();
     drawCurrent(x);
+    jobWatch(id);
     document.dispatchEvent(new CustomEvent('starfront:project', { detail: { id } }));
     const mine = state.projects.find((p) => p.id === id);
     const badge = `<span class="badge ${STATUS(x)}">${STATUS(x)}</span>`;
