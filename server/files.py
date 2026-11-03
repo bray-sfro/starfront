@@ -800,6 +800,7 @@ _PAGE = r"""<!doctype html>
     #hero .hbar { gap: 12px; }
     #hero .acts { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
     #hero #heroTools { grid-column: 1 / -1; display: flex; }
+    #hero #heroTools:empty { display: none; }
     #hero #heroTools .seg { flex: 1; } #hero #heroTools .seg button { flex: 1; }
     #hero .acts .btn { text-align: center; }
     .curmeta { flex: 1 1 0; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
