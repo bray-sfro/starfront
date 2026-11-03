@@ -184,3 +184,12 @@ def test_page_has_the_stars_toggle(world):
     html = client.get("/files").text
     assert 'data-stars="starless"' in html and "setStars" in html and "starlessOf" in html
     assert "e.key === 't'" in html and "small" in html
+
+
+def test_page_has_the_image_picker(world):
+    client, *_ = world
+    html = client.get("/files").text
+    # one button per preview (kind / filter), hidden when there is only one; choice in the hash
+    assert 'data-view="' in html and "views.length > 1" in html and "p.kind || p.filter" in html
+    assert "new URLSearchParams({ view: v.key, stars:" in html and "No starless version of" in html
+    assert "vReshape" in html and "ghost" in html

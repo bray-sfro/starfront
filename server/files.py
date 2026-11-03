@@ -747,13 +747,13 @@ _PAGE = r"""<!doctype html>
   #viewerBar { position: absolute; left: 0; right: 0; bottom: 0; z-index: 2; padding: 10px 12px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
                background: linear-gradient(transparent, #000d); color: #cfd8e6; font-size: 13px; pointer-events: none; }
   #viewerBar button { pointer-events: auto; background: #1a2130dd; color: #fff; border: 1px solid #2a3344; border-radius: 8px; min-width: 40px; height: 36px; font-size: 16px; cursor: pointer; }
-  #viewerBar #viewerTools { pointer-events: auto; }
+  #viewerBar #viewerTools { pointer-events: auto; display: inline-flex; flex-wrap: wrap; gap: 8px; max-width: 100%; min-width: 0; }
+  #viewerTools:empty { display: none; }
   .seg { display: inline-flex; border: 1px solid #2a3344; border-radius: 8px; overflow: hidden; vertical-align: middle; background: #141a25; }
   .seg button, #viewerBar .seg button { background: transparent; color: #c3ccd9; border: 0; border-radius: 0; min-width: 0; height: auto; min-height: 32px; padding: 4px 14px; font-size: 13px; font-weight: 500; cursor: pointer; }
   .seg button + button { border-left: 1px solid #2a3344; }
   .seg button[aria-pressed="true"], #viewerBar .seg button[aria-pressed="true"] { background: #e6ebf2; color: #0d1017; font-weight: 600; }
   .seg button:focus-visible { outline: 2px solid #9fe4bd; outline-offset: -2px; }
-  #heroTools:empty { display: none; }
   #hero figure { margin: 0; }
   .btn.dl { padding: 3px 10px; font-size: 13px; }
   .btn.dl.locked { background: #1a2130; color: #8f9bb0; cursor: not-allowed; }
@@ -761,7 +761,16 @@ _PAGE = r"""<!doctype html>
   table.masters td, table.people td { vertical-align: middle; }
   table.masters td.dlc { white-space: nowrap; }
   tr.tot td { border-bottom: 0; }
-  #hero img { display: block; width: 100%; height: auto; aspect-ratio: 3 / 2; object-fit: cover; }
+  #hero .shot img { display: block; width: 100%; height: min(760px, max(320px, calc(100vh - 250px))); object-fit: contain; background: #000; }
+  #hero .shot .ghost { position: absolute; inset: 0; pointer-events: none; transition: opacity .28s ease; }
+  #hero .htools { flex: 1 1 100%; display: flex; align-items: center; justify-content: space-between; gap: 10px 16px; min-width: 0; }
+  #hero .htools:empty { display: none; }
+  .views { display: flex; gap: 6px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+  .views::-webkit-scrollbar { display: none; }
+  .views .seg { flex: none; }
+  .views .seg button { padding: 4px 11px; }
+  .seg button:disabled { color: #566173; cursor: not-allowed; }
+  #viewerBar .views { max-width: 100%; }
   #hero .hbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 24px; padding: 14px 18px; border-top: 1px solid #1f2634; }
   #hero .ttl { margin: 0; font-size: 16px; font-weight: 600; color: #e6ebf2; letter-spacing: .01em; }
   #hero .sub { margin: 2px 0 0; font-size: 13px; color: #8f9bb0; }
@@ -798,10 +807,12 @@ _PAGE = r"""<!doctype html>
     #hero { margin: 0 -12px 22px; border-radius: 0; border-left: 0; border-right: 0; }
     #hero .hbar { padding: 12px; }
     #hero .hbar { gap: 12px; }
-    #hero .acts { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-    #hero #heroTools { grid-column: 1 / -1; display: flex; }
-    #hero #heroTools:empty { display: none; }
-    #hero #heroTools .seg { flex: 1; } #hero #heroTools .seg button { flex: 1; }
+    #hero .shot img { height: min(calc(100vw / var(--ar, 1)), 62vh); }
+    #hero .acts { width: 100%; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; order: 3; }
+    #hero .htools { flex-direction: column; align-items: stretch; gap: 8px; order: 2; }
+    #hero .views { margin: 0 -12px; padding: 0 12px; }
+    #hero .views.more { -webkit-mask-image: linear-gradient(to right, #000 82%, transparent); mask-image: linear-gradient(to right, #000 82%, transparent); }
+    #hero .htools > .seg { display: flex; } #hero .htools > .seg button { flex: 1; }
     #hero .acts .btn { text-align: center; }
     .curmeta { flex: 1 1 0; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .signcard .btn { width: 100%; text-align: center; box-sizing: border-box; }
@@ -930,7 +941,7 @@ _PAGE = r"""<!doctype html>
     <button type="button" data-z="in" aria-label="Zoom in">+</button><button type="button" data-z="out" aria-label="Zoom out">−</button><button type="button" data-z="fit" aria-label="Fit to screen">Fit</button>
     <span id="viewerTools"></span>
     <span id="viewerNote"></span>
-    <span class="muted">Scroll or pinch to zoom · drag to pan · double-tap to zoom · T: stars on/off · Esc to close</span>
+    <span class="muted">Scroll or pinch to zoom · drag to pan · double-tap to zoom · S: stars on/off · [ ]: image · Esc to close</span>
   </div>
 </div>
 <script src="/releases/page.js" defer></script>
@@ -1005,6 +1016,14 @@ _PAGE = r"""<!doctype html>
     vImg().style.width = V.w0 + 'px'; vImg().style.height = V.h0 + 'px';
     V.s = 1; vClamp(); vApply();
   }
+  // A new image of another shape: same zoom, same spot (as a fraction of the image) in the middle.
+  function vReshape(r) {
+    if (!V.w0 || !V.h0 || Math.abs(r - V.w0 / V.h0) < 0.01 * r) return;
+    const W = innerWidth, H = innerHeight, s = V.s;
+    const fx = (W / 2 - V.x) / (V.w0 * s), fy = (H / 2 - V.y) / (V.h0 * s);
+    vFit(r);
+    if (s > 1) { V.s = s; V.x = W / 2 - fx * V.w0 * s; V.y = H / 2 - fy * V.h0 * s; vClamp(); vApply(); }
+  }
   function vZoom(f, px, py) {
     const s = Math.min(16, Math.max(1, V.s * f)), k = s / V.s;
     V.x = px - (px - V.x) * k; V.y = py - (py - V.y) * k; V.s = s; vClamp(); vApply();
@@ -1029,7 +1048,9 @@ _PAGE = r"""<!doctype html>
       const hi = full ? imgCache.get(full) : null;
       if (ready(hi)) { img.src = full; img.dataset.full = full; note(hi); }
       else img.src = base;
-      if (first) vFit(hero.naturalWidth && hero.naturalHeight ? hero.naturalWidth / hero.naturalHeight : 1.5);
+      const lo = imgCache.get(base);
+      const r = ready(lo) ? lo.naturalWidth / lo.naturalHeight : (hero.naturalWidth && hero.naturalHeight ? hero.naturalWidth / hero.naturalHeight : 1.5);
+      if (first) vFit(r); else vReshape(r);
     }
     if (full && img.dataset.full !== full) {
       img.dataset.full = full; $('viewerNote').textContent = 'Loading full resolution…';
@@ -1042,7 +1063,7 @@ _PAGE = r"""<!doctype html>
     if (!$('heroImg')) return;
     V.open = true; $('viewer').hidden = false; document.body.style.overflow = 'hidden';
     delete vImg().dataset.base; vLoad(); $('viewerClose').focus();
-    if (starModes) setTimeout(() => preload(starModes && starModes[starMode === 'stars' ? 'starless' : 'stars'].full), 2000);
+    setTimeout(() => { const v = views[viewIdx]; if (v && v.starless) preload(v[curMode() === 'stars' ? 'starless' : 'stars'].full); }, 2000);
     document.dispatchEvent(new CustomEvent('starfront:viewer', { detail: { open: true } }));
   }
   function viewerClose() {
@@ -1060,7 +1081,8 @@ _PAGE = r"""<!doctype html>
       else if (e.key === '+' || e.key === '=') vZoom(1.5, innerWidth / 2, innerHeight / 2);
       else if (e.key === '-') vZoom(1 / 1.5, innerWidth / 2, innerHeight / 2);
       else if (e.key === '0') vFit();
-      else if ((e.key === 't' || e.key === 'T' || e.key === 's' || e.key === 'S') && starModes && !e.ctrlKey && !e.metaKey && !e.altKey) setStars(starMode === 'stars' ? 'starless' : 'stars');
+      else if ((e.key === 't' || e.key === 'T' || e.key === 's' || e.key === 'S') && !e.ctrlKey && !e.metaKey && !e.altKey) setStars(curMode() === 'stars' ? 'starless' : 'stars');
+      else if ((e.key === '[' || e.key === ']') && views.length > 1) setView((viewIdx + (e.key === ']' ? 1 : views.length - 1)) % views.length);
     });
     $('viewerBar').addEventListener('click', (e) => {
       const z = e.target && e.target.dataset ? e.target.dataset.z : '';
@@ -1110,31 +1132,103 @@ _PAGE = r"""<!doctype html>
   // Small screens get the ~5000 px version of a full-res image when the
   // release has one (its `small`), big screens the full thing.
   const smallScreen = () => matchMedia('(pointer: coarse)').matches && Math.min(screen.width, screen.height) <= 900;
-  // The stars on/off switch: { stars: {src, full}, starless: {src, full} }, or null.
-  let starModes = null, starMode = 'stars';
+  // What the preview can show: one entry per preview image in release.json
+  // (role "preview", not a starless twin), each { key, label, title, stars, starless }
+  // where stars/starless are { src, full, alt, title } (starless null when there is
+  // no twin). The picker shows when there are two or more; Stars/Starless when any
+  // has a twin. The choice lives in the URL hash: #view=Ha&stars=0.
+  let views = [], viewIdx = 0, wantStarless = false;
+  const curMode = () => { const v = views[viewIdx]; return v && v.starless && wantStarless ? 'starless' : 'stars'; };
+  let swapTok = 0;
+  // Swap #heroImg once the new image is in, with a short crossfade. The viewer follows (MutationObserver).
+  function swapHero(m) {
+    const img = $('heroImg'); if (!img || !m) return;
+    const set = () => { img.src = m.src; img.dataset.full = m.full; img.alt = m.alt; img.title = m.title; };
+    if (img.getAttribute('src') === m.src) { set(); return; }
+    const tok = ++swapTok, pre = preload(m.src);
+    let done = false;
+    const go = () => {
+      if (done || tok !== swapTok) return; done = true;
+      if (img.complete && img.naturalWidth && !matchMedia('(prefers-reduced-motion: reduce)').matches) {
+        const g = img.cloneNode(); g.removeAttribute('id'); g.className = 'ghost'; g.alt = ''; g.setAttribute('aria-hidden', 'true'); g.removeAttribute('loading');
+        img.parentNode.appendChild(g);
+        requestAnimationFrame(() => requestAnimationFrame(() => { g.style.opacity = '0'; }));
+        setTimeout(() => g.remove(), 450);
+      }
+      set();
+    };
+    if (ready(pre)) go(); else { pre.addEventListener('load', go, { once: true }); pre.addEventListener('error', go, { once: true }); setTimeout(go, 6000); }
+  }
+  function writeHash() {
+    const v = views[viewIdx]; if (!v) return;
+    history.replaceState(history.state, '', '#' + new URLSearchParams({ view: v.key, stars: wantStarless ? '0' : '1' }).toString());
+  }
+  function readHash() {
+    const h = location.hash.slice(1);
+    if (!/(^|&)(view|stars)=/.test(h)) return null;
+    const p = new URLSearchParams(h);
+    return { view: (p.get('view') || '').toLowerCase(), stars: p.get('stars') };
+  }
+  function applyView(user) {
+    const v = views[viewIdx]; if (!v) return;
+    const mode = curMode();
+    swapHero(v[mode]);
+    document.querySelectorAll('[data-view]').forEach((b) => b.setAttribute('aria-pressed', String(+b.dataset.view === viewIdx)));
+    document.querySelectorAll('[data-stars]').forEach((b) => {
+      b.setAttribute('aria-pressed', String(b.dataset.stars === mode));
+      if (b.dataset.stars === 'starless') {
+        b.disabled = !v.starless;
+        b.title = v.starless ? 'Stars removed (S)' : `No starless version of ${v.label}`;
+      }
+    });
+    if (user) writeHash();
+    // The other half of the pair, so the next flip is instant.
+    if (v.starless) { const o = v[mode === 'stars' ? 'starless' : 'stars']; preload(o.src); if (V.open) preload(o.full); }
+  }
   function setStars(mode) {
-    if (!starModes || !starModes[mode]) return;
-    starMode = mode;
-    const img = $('heroImg'), m = starModes[mode];
-    if (img) { img.src = m.src; img.dataset.full = m.full; img.alt = m.alt; }   // the viewer follows (MutationObserver)
-    document.querySelectorAll('.seg [data-stars]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.stars === mode)));
-    // The other one, so the next flip is instant: its 2400 px now, its full-res when the viewer is open.
-    const other = starModes[mode === 'stars' ? 'starless' : 'stars'];
-    preload(other.src); if (V.open) preload(other.full);
+    const v = views[viewIdx]; if (!v) return;
+    if (mode === 'starless' && !v.starless) return;
+    wantStarless = mode === 'starless'; applyView(true);
+  }
+  function setView(i) {
+    if (!views[i]) return;
+    viewIdx = i; applyView(true);
+    document.querySelectorAll(`[data-view="${i}"]`).forEach((b) => b.scrollIntoView({ block: 'nearest', inline: 'nearest' }));
+  }
+  function fromHash() {
+    const h = readHash(); if (!h || !views.length) return false;
+    const i = views.findIndex((v) => [v.key, v.kind, v.filter].some((k) => k && String(k).toLowerCase() === h.view));
+    if (i >= 0) viewIdx = i;
+    if (h.stars != null) wantStarless = h.stars === '0';
+    return true;
   }
   function drawStarTools() {
-    const html = starModes ? `<span class="seg" role="group" aria-label="Stars on or off"><button type="button" data-stars="stars" aria-pressed="${starMode === 'stars'}">Stars</button><button type="button" data-stars="starless" aria-pressed="${starMode === 'starless'}">Starless</button></span>` : '';
+    const pick = views.length > 1;
+    const any = views.some((v) => v.starless);
+    const btn = (v, i) => `<button type="button" data-view="${i}" aria-pressed="${i === viewIdx}" title="${esc(v.title)}">${esc(v.label)}</button>`;
+    const groups = [views.map((v, i) => [v, i]).filter(([v]) => !v.mono), views.map((v, i) => [v, i]).filter(([v]) => v.mono)].filter((g) => g.length);
+    const picker = pick ? `<span class="views" role="group" aria-label="Which image">${groups.map((g) => `<span class="seg">${g.map(([v, i]) => btn(v, i)).join('')}</span>`).join('')}</span>` : '';
+    const stars = any ? `<span class="seg" role="group" aria-label="Stars on or off"><button type="button" data-stars="stars" aria-pressed="true">Stars</button><button type="button" data-stars="starless" aria-pressed="false">Starless</button></span>` : '';
     for (const id of ['heroTools', 'viewerTools']) {
       const el = $(id); if (!el) continue;
-      el.innerHTML = html;
+      el.innerHTML = picker + stars;
       el.querySelectorAll('[data-stars]').forEach((b) => {
         b.addEventListener('click', (e) => { e.stopPropagation(); setStars(b.dataset.stars); });
-        // Hover or focus: fetch the other one's full-res ahead of a flip.
-        const warm = () => { if (!starModes) return; const m = starModes[b.dataset.stars]; preload(m.src); preload(m.full); };
+        // Hover or focus: fetch it ahead of a flip.
+        const warm = () => { const v = views[viewIdx]; const m = v && v[b.dataset.stars]; if (m) { preload(m.src); if (V.open) preload(m.full); } };
         b.addEventListener('pointerenter', warm); b.addEventListener('focus', warm);
       });
+      el.querySelectorAll('[data-view]').forEach((b) => {
+        b.addEventListener('click', (e) => { e.stopPropagation(); setView(+b.dataset.view); });
+        const warm = () => { const v = views[+b.dataset.view]; const m = v && v[curMode() === 'starless' && v.starless ? 'starless' : 'stars']; if (m) { preload(m.src); if (V.open) preload(m.full); } };
+        b.addEventListener('pointerenter', warm); b.addEventListener('focus', warm);
+      });
+      const sc = el.querySelector('.views');
+      if (sc) { const edge = () => sc.classList.toggle('more', sc.scrollLeft + sc.clientWidth < sc.scrollWidth - 2); sc.addEventListener('scroll', edge, { passive: true }); requestAnimationFrame(edge); addEventListener('resize', edge); }
     }
+    applyView(false);
   }
+  window.addEventListener('hashchange', () => { if (fromHash()) applyView(false); });
   function drawHero(rel) {
     const box = $('hero');
     const files = rel ? (rel.files || []) : [];
@@ -1142,7 +1236,7 @@ _PAGE = r"""<!doctype html>
     // Never a starless twin as the main image.
     const previews = files.filter((x) => x.role === 'preview' && x.starless !== true && !x.starlessOf);
     const hero = previews.find((x) => x.hero) || previews[0];
-    starModes = null; starMode = 'stars';
+    views = []; viewIdx = 0;
     if (!hero) { box.hidden = true; box.innerHTML = ''; drawStarTools(); return; }
     // Its full-resolution twin, for the viewer only (never offered as a download).
     const fullOf = (prev) => {
@@ -1153,12 +1247,24 @@ _PAGE = r"""<!doctype html>
     };
     const viewUrl = (f) => { if (!f) return ''; const sm = f.small && byName.get(f.small); return (smallScreen() && sm ? sm : f).url; };
     const full = fullOf(hero);
-    const twin = typeof hero.starless === 'string' ? byName.get(hero.starless) : null;
-    if (twin) {
-      const twinFull = (full && typeof full.starless === 'string' && byName.get(full.starless)) || fullOf(twin);
-      starModes = { stars: { src: hero.thumb || hero.url, full: viewUrl(full), alt: hero.title || 'Latest preview' },
-                    starless: { src: twin.thumb || twin.url, full: viewUrl(twinFull), alt: twin.title || 'Latest preview, starless' } };
+    // Hero first ("Color" unless it has a label), then the other colour kinds, then single filters in the release's filter order.
+    // No kind/filter field (v1): the bit before _vN in M31_RGB_v1_preview.jpg.
+    const nameKind = (n) => { const m = /^(?:.*_)?([^_]+)_v\d+(?:_[^_]+)*?_preview\.jpe?g$/i.exec(n || ''); return m ? m[1] : String(n || '').replace(/_preview\.jpe?g$/i, ''); };
+    const order = (rel.filters || []).map((f) => f.filter);
+    const rank = (x) => x === hero ? -1 : (x.kind || !x.filter ? 0 : 1);
+    const seen = new Set();
+    for (const p of previews.slice().sort((a, b) => rank(a) - rank(b) || (rank(a) === 1 ? order.indexOf(a.filter) - order.indexOf(b.filter) : 0))) {
+      const label = p.label || (p === hero ? 'Color' : (p.kind || p.filter || nameKind(p.name)));
+      if (seen.has(label.toLowerCase())) continue; seen.add(label.toLowerCase());
+      const f = fullOf(p);
+      const tw = typeof p.starless === 'string' ? byName.get(p.starless) : null;
+      const twf = tw ? ((f && typeof f.starless === 'string' && byName.get(f.starless)) || fullOf(tw)) : null;
+      views.push({ key: label, label, kind: p.kind || '', filter: p.filter || '', mono: !p.kind && !!p.filter && p !== hero, title: p.title || label,
+        stars: { src: p.thumb || p.url, full: viewUrl(f), alt: p.title || 'Latest preview', title: p.title || '' },
+        starless: tw ? { src: tw.thumb || tw.url, full: viewUrl(twf), alt: tw.title || 'Latest preview, starless', title: tw.title || '' } : null });
     }
+    fromHash();
+    const first = views[viewIdx][curMode()];
     const name = String(rel.title || '').replace(/\s+coadd\s+v\d+\s*$/i, '') || rel.projectName || '';
     const ymd = /^(\d{4})-(\d\d)-(\d\d)$/.exec(rel.released || '');
     const date = ymd ? new Date(+ymd[1], +ymd[2] - 1, +ymd[3]).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : (rel.released || '');
@@ -1166,16 +1272,21 @@ _PAGE = r"""<!doctype html>
     const filters = (rel.filters || []).map((f) => f.filter).join(', ');
     const sub = [rel.totalHours != null ? `${Number(rel.totalHours).toFixed(0)} h` : '', people ? `${people} contributor${people === 1 ? '' : 's'}` : '', filters].filter(Boolean).join(' · ');
     box.innerHTML = `<figure>
-      <div class="shot" id="heroOpen" role="button" tabindex="0" aria-label="View full size"><img id="heroImg" loading="lazy" decoding="async" width="2400" height="1600" src="${esc(hero.thumb || hero.url)}" data-full="${esc(viewUrl(full))}" alt="${esc(hero.title || 'Latest preview')}" title="${esc(hero.title || '')}"></div>
+      <div class="shot" id="heroOpen" role="button" tabindex="0" aria-label="View full size"><img id="heroImg" decoding="async" width="2400" height="1600" src="${esc(first.src)}" data-full="${esc(first.full)}" alt="${esc(first.alt)}" title="${esc(first.title)}"></div>
       <figcaption class="hbar">
         <div><p class="ttl">${esc([name, rel.version, date].filter(Boolean).join(' · '))}</p><p class="sub">${esc(sub)}</p></div>
-        <div class="acts"><span id="heroTools"></span><button type="button" class="btn quiet" id="heroView">View full size</button><a class="btn quiet" href="#sec-release">Masters &amp; contributors</a></div>
+        <div class="acts"><button type="button" class="btn quiet" id="heroView">View full size</button><a class="btn quiet" href="#sec-release">Masters &amp; contributors</a></div>
+        <div class="htools" id="heroTools"></div>
       </figcaption></figure>`;
     box.hidden = false;
     drawStarTools();
-    // The starless 2400 px is small: fetch it once the page has settled.
-    if (starModes) setTimeout(() => preload(starModes && starModes.starless.src), 1500);
+    // The starless twin's 2400 px: fetch it once the page has settled.
+    setTimeout(() => { const v = views[viewIdx]; if (v && v.starless) preload(v.starless.src); }, 1500);
+    // Phones: the frame takes the first image's shape (between 3:2 and 4:5); the others fit inside it.
+    const hi = $('heroImg');
+    const shape = () => { if (hi.naturalWidth) opener.style.setProperty('--ar', Math.min(1.5, Math.max(0.8, hi.naturalWidth / hi.naturalHeight)).toFixed(3)); };
     const opener = $('heroOpen');
+    if (hi.complete) shape(); else hi.addEventListener('load', shape, { once: true });
     opener.addEventListener('click', () => viewerOpen());
     $('heroView').addEventListener('click', () => viewerOpen());
     opener.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); viewerOpen(); } });
@@ -1244,11 +1355,13 @@ _PAGE = r"""<!doctype html>
     const all = state.switch.open.concat(state.switch.closed);
     const x = all.find((p) => p.id === id);
     if (!x) return;
+    const prevCurrent = state.current;
     state.current = id;
     localStorage.setItem('starfront-files-project', id);
     const url = new URL(location.href);
     url.searchParams.set('project', id);
-    if (url.hash && !url.hash.startsWith('#release-') && !url.hash.startsWith('#sec-')) url.hash = '';
+    const keepView = /^#(view|stars)=/.test(url.hash) && (!prevCurrent || prevCurrent === id);
+    if (url.hash && !keepView && !url.hash.startsWith('#release-') && !url.hash.startsWith('#sec-')) url.hash = '';
     if (url.hash.startsWith('#release-') && url.hash.slice(9) !== id) url.hash = '';
     history[push ? 'pushState' : 'replaceState']({ project: id }, '', url);
     document.title = `${x.name} · Starfront Files`;
