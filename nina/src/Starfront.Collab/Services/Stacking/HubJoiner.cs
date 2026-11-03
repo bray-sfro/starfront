@@ -77,6 +77,9 @@ namespace Starfront.Collab.Services.Stacking {
         private readonly Func<StackingLink, IApiClient> clientFor;
         private readonly Action<string> log;
 
+        /// <summary>The hub read this telescope's membership as active; the time is when that read was sent (see <see cref="MembershipPauses"/>).</summary>
+        public Action<StackingLink, DateTimeOffset> MembershipConfirmed { get; set; }
+
         public HubJoiner(IHubJoinContext context, IHubLinkStore links, Func<StackingLink, IApiClient> clientFor, Action<string> log = null) {
             this.context = context;
             this.links = links;
@@ -125,6 +128,7 @@ namespace Starfront.Collab.Services.Stacking {
         /// <summary>Join (or find the membership of) the hub project behind a link that already holds its binding.</summary>
         public async Task JoinAsync(StackingLink link, CancellationToken ct) {
             var client = clientFor(link);
+            var asked = DateTimeOffset.Now;
             try {
                 var project = await client.GetProjectAsync(link.CollabProjectId, ct).ConfigureAwait(false);
                 link.CollabName = project.Name;
@@ -137,7 +141,7 @@ namespace Starfront.Collab.Services.Stacking {
                 link.TermsVersion = project.TermsVersion;
 
                 if (project.MyMembership is { } mine && mine.Status is MemberStatuses.Active or MemberStatuses.Pending) {
-                    Joined(link, mine, "already a member");
+                    Joined(link, mine, "already a member", asked);
                     return;
                 }
 
@@ -170,7 +174,7 @@ namespace Starfront.Collab.Services.Stacking {
                     joined = await client.GetMembershipAsync(link.CollabProjectId, ct).ConfigureAwait(false);
                 }
                 log($"Starfront stacking: filters for {link.CollabName}: {mapping.Summary}");
-                Joined(link, joined, "joined");
+                Joined(link, joined, "joined", asked);
             } catch (OperationCanceledException) {
                 throw;
             } catch (ApiException ex) when (ex.Code == ApiCodes.TermsOutdated) {
@@ -189,7 +193,7 @@ namespace Starfront.Collab.Services.Stacking {
             }
         }
 
-        private void Joined(StackingLink link, Membership membership, string how) {
+        private void Joined(StackingLink link, Membership membership, string how, DateTimeOffset asked) {
             link.Status = membership.Status == MemberStatuses.Active ? LinkStatus.Active
                         : membership.Status == MemberStatuses.Pending ? LinkStatus.Pending : LinkStatus.Failed;
             link.Message = link.Status == LinkStatus.Failed ? $"the membership of {link.CollabName} is {membership.Status}" : "";
@@ -199,6 +203,7 @@ namespace Starfront.Collab.Services.Stacking {
             if (!string.IsNullOrEmpty(membership.AcceptedTermsVersion)) link.TermsVersion = membership.AcceptedTermsVersion;
             links.Upsert(link);
             log($"Starfront stacking: {link.StarfrontName} -> {link.CollabName} ({how}, hub): {link.Describe()}");
+            if (link.Status == LinkStatus.Active) MembershipConfirmed?.Invoke(link, asked);
         }
 
         private void Hold(StackingLink link, string status, string message, TimeSpan? retryAfter) {

@@ -116,6 +116,27 @@ namespace Starfront.Collab.Tests {
         }
 
         [Test]
+        public async Task AnActiveMembershipIsReportedAndAPendingOneIsNot() {
+            var confirmed = new List<(string, DateTimeOffset)>();
+            joiner.MembershipConfirmed = (link, asked) => confirmed.Add((link.CollabProjectId, asked));
+            var before = DateTimeOffset.Now;
+            var (listing, binding) = Listing(Grant(1_900_000_000));
+            await joiner.SyncAsync(listing, binding, CancellationToken.None);
+            Assert.That(confirmed.Select(c => c.Item1), Is.EqualTo(new[] { "p1" }));
+            Assert.That(confirmed[0].Item2, Is.InRange(before, DateTimeOffset.Now), "the time is when the read was sent");
+
+            confirmed.Clear();
+            links.Lookup("s1")!.Status = LinkStatus.Failed;
+            script.Script[nameof(IApiClient.GetProjectAsync)] = _ => new ProjectDetail {
+                ProjectId = "p1", Name = "M31", Filters = new[] { "L" }, TermsVersion = "t1",
+                MyMembership = new Membership { Status = MemberStatuses.Pending },
+            };
+            await joiner.JoinAsync(links.Lookup("s1")!, CancellationToken.None);
+            Assert.That(links.Lookup("s1")!.Status, Is.EqualTo(LinkStatus.Pending));
+            Assert.That(confirmed, Is.Empty, "a pending membership answers nothing");
+        }
+
+        [Test]
         public async Task EveryCheckInRefreshesTheGrantWithoutJoiningAgain() {
             var (listing, binding) = Listing(Grant(1_900_000_000));
             await joiner.SyncAsync(listing, binding, CancellationToken.None);

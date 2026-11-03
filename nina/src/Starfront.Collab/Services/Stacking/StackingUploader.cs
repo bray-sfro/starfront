@@ -63,6 +63,7 @@ namespace Starfront.Collab.Services.Stacking {
             SignIn = new StackingSignIn(settings, () => Api);
             Joiner = new StackingJoiner(host, settings, Links, () => Api, link => EnsureClients().For(link), () => EnsureClients().Cloud);
             Joiner.AuthRequired += (_, _) => OnAuthRequired();
+            Joiner.MembershipConfirmed += OnMembershipConfirmed;
             SignIn.Changed += OnSignInChanged;
             Links.Changed += (_, _) => RaiseChanged();
             settings.PropertyChanged += OnSettingChanged;
@@ -204,6 +205,7 @@ namespace Starfront.Collab.Services.Stacking {
                 }
             }
             Logger.Info("Starfront stacking: on" + (settings.StackingSignedIn || HasHubLink ? "" : "; not signed in to Rapid Stacker Collab yet (hub projects need no sign-in)"));
+            LogPauses();
             _ = ReconcileAsync();
             RaiseChanged();
         }
@@ -332,6 +334,49 @@ namespace Starfront.Collab.Services.Stacking {
         /// <summary>The key lights and flats are grouped under, so a hub-only telescope has one too.</summary>
         private string LocalRigKey() => RigIds.LocalKey(settings.StackingDefaultBackend, settings.StackingRigId, Links.All());
 
+        /// <summary>
+        /// A backend read the membership as active: a "not a member" pause recorded before that read is answered, and
+        /// goes. Without this a single not_member held a project's uploads for good, across restarts and reinstalls.
+        /// </summary>
+        private void OnMembershipConfirmed(StackingLink link, DateTimeOffset asked) {
+            var q = queue;
+            if (q == null || link == null) return;
+            try {
+                var lifted = MembershipPauses.ResumeConfirmed(q, link.CollabProjectId, asked);
+                if (lifted.Count == 0) return;
+                foreach (var pause in lifted)
+                    Logger.Info($"Starfront stacking: {link.CollabName} reads this telescope as an active member, so its uploads go again (they were {MembershipPauses.Describe(pause)})");
+                runner?.Wake();
+                RaiseChanged();
+            } catch (Exception ex) {
+                Logger.Error("Starfront stacking: a membership pause could not be lifted", ex);
+            }
+        }
+
+        /// <summary>Every project whose uploads are held, said once at start: a held project still takes frames into the queue, so the queued lines alone look healthy.</summary>
+        private void LogPauses() {
+            try {
+                foreach (var pause in queue?.ActivePauses() ?? Array.Empty<ProjectPause>())
+                    Logger.Warning($"Starfront stacking: uploads to {NameOf(pause.ProjectRef)} are {MembershipPauses.Describe(pause)}");
+            } catch (Exception ex) {
+                Logger.Error("Starfront stacking: the paused projects could not be read", ex);
+            }
+        }
+
+        /// <summary>A frame was queued for a held project: say so once per pause, not once per frame.</summary>
+        private void WarnIfPaused(StackingLink link) {
+            var q = queue;
+            if (q == null || link == null || link.CollabProjectId.Length == 0) return;
+            var pause = q.ActivePauses().FirstOrDefault(p => p.ProjectRef == link.CollabProjectId);
+            if (pause == null || !NoteOnce($"pause:{pause.ProjectRef}:{pause.PausedAt.ToUnixTimeMilliseconds()}")) return;
+            Logger.Warning($"Starfront stacking: frames for {NameOf(pause.ProjectRef)} are queued but not sent: its uploads are {MembershipPauses.Describe(pause)}");
+        }
+
+        private string NameOf(string projectRef) {
+            var link = Links.ByCollabProject(projectRef);
+            return link == null || link.CollabName.Length == 0 ? projectRef : $"{link.CollabName} ({projectRef})";
+        }
+
         /// <summary>Only the cloud sign-in lands here: a hub's refusal never reaches the runner as one (the router makes it a project pause).</summary>
         private void OnAuthRequired() {
             SignIn.MarkAuthRequired();
@@ -393,7 +438,10 @@ namespace Starfront.Collab.Services.Stacking {
                             var decision = current.Evaluate(next.Frame.Path, next.Frame.Filter, next.Link, Options());
                             switch (decision.Route) {
                                 case IntakeRoute.Project:
-                                    if (current.Enqueue(next.Frame.Path, decision, next.Link)?.Added == true) Logger.Info($"Starfront stacking: {name} {decision.Reason}");
+                                    if (current.Enqueue(next.Frame.Path, decision, next.Link)?.Added == true) {
+                                        Logger.Info($"Starfront stacking: {name} {decision.Reason}");
+                                        WarnIfPaused(next.Link);
+                                    }
                                     break;
                                 case IntakeRoute.Library:
                                     if (current.EnqueueLibrary(next.Frame.Path, decision)?.Added == true) Logger.Info($"Starfront stacking: {name} {decision.Reason}");

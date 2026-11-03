@@ -70,6 +70,55 @@ namespace Starfront.Collab.Tests {
         private void HubAnswers401() => hub.Script[nameof(IApiClient.InitFrameAsync)] =
             _ => throw new ApiException(ApiCodes.TokenInvalid, "The grant was not accepted.", 401);
 
+        /// <summary>
+        /// 2026-10-28: one upload was told not_member. Core paused the project with no end; the membership read as
+        /// active every 30 minutes for six days, and every light of the next night was queued behind the pause and
+        /// never tried. A membership read as active after the pause was set now lifts it.
+        /// </summary>
+        [Test]
+        public async Task ANotMemberPauseHoldsUntilAMembershipReadSaysActive() {
+            var item = Enqueue(HubProject);
+            hub.Script[nameof(IApiClient.InitFrameAsync)] = _ => throw new ApiException(ApiCodes.NotMember, "You are not a member of this project.", 401);
+            var runner = Runner();
+
+            Assert.That(await runner.RunOnceAsync(), Is.EqualTo(1));
+            var pause = queue.ActivePauses().Single();
+            Assert.That(pause.Code, Is.EqualTo(ApiCodes.NotMember));
+            Assert.That(pause.ResumeAt, Is.Null, "Core's not_member pause has no end of its own");
+            Assert.That(routes.Refused, Is.Empty, "not_member is not a refused grant: the grant stays");
+            Assert.That(runner.AuthRequired, Is.False);
+
+            clock.Advance(TimeSpan.FromDays(6));
+            Assert.That(await runner.RunOnceAsync(), Is.Zero, "days later the item is still held: the fault");
+            Assert.That(queue.Get(item.Id)!.State, Is.EqualTo(QueueStates.Pending));
+
+            var lifted = MembershipPauses.ResumeConfirmed(queue, HubProject, clock.Now);
+            Assert.That(lifted.Select(p => p.Code), Is.EqualTo(new[] { ApiCodes.NotMember }));
+            Assert.That(queue.IsPaused(HubProject), Is.False);
+            Assert.That(await runner.RunOnceAsync(), Is.EqualTo(1), "the held light is tried again");
+        }
+
+        [Test]
+        public void AnActiveMembershipLiftsOnlyThePausesItAnswers() {
+            var asked = clock.Now;
+            clock.Advance(TimeSpan.FromMinutes(-10));
+            queue.PauseProject("byUser", "paused from the dock", null, null, byUser: true);
+            queue.PauseProject("quota", "full", ApiCodes.QuotaExceeded, clock.Now + TimeSpan.FromHours(6));
+            queue.PauseProject("other", "not a member", ApiCodes.NotMember);
+            queue.PauseProject("pending", "awaiting approval", ApiCodes.MembershipPending, clock.Now + TimeSpan.FromMinutes(15));
+            clock.Advance(TimeSpan.FromMinutes(20));
+            queue.PauseProject("newer", "not a member", ApiCodes.NotMember);
+
+            foreach (var project in new[] { "byUser", "quota", "pending", "newer" }) MembershipPauses.ResumeConfirmed(queue, project, asked);
+
+            Assert.That(queue.IsPaused("byUser"), Is.True, "the person's own pause is theirs to lift");
+            Assert.That(queue.IsPaused("quota"), Is.True, "a full project is not answered by membership");
+            Assert.That(queue.IsPaused("other"), Is.True, "another project's pause stays");
+            Assert.That(queue.IsPaused("pending"), Is.False, "an approval the read confirms goes too");
+            Assert.That(queue.IsPaused("newer"), Is.True, "a pause set after the read was sent is newer than its answer");
+            Assert.That(MembershipPauses.ResumeConfirmed(null!, "x", asked), Is.Empty);
+        }
+
         [Test]
         public async Task AHub401MidUploadClearsOnlyThatLinksGrantAndTheCloudKeepsUploading() {
             var hubItem = Enqueue(HubProject);
