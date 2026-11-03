@@ -340,6 +340,11 @@ _PAGE_JS = r"""
   async function get(url) { const r = await fetch(url, { credentials: 'same-origin' }); if (!r.ok) throw new Error(r.status); return r.json(); }
 
   function wanted(list) {
+    if (document.getElementById('switcher')) {
+      // On the files page the switcher has already put the collab in the URL.
+      const id = new URLSearchParams(location.search).get('project') || '';
+      return list.some((r) => r.project === id) ? id : '';
+    }
     const h = location.hash.slice(1).replace(/^release-/, '');
     const q = new URLSearchParams(location.search).get('project') || '';
     const stored = localStorage.getItem('starfront-files-project') || '';
@@ -352,7 +357,8 @@ _PAGE_JS = r"""
     const lockMsg = access.message || 'Masters are available to contributors. Upload data to this collab to unlock downloads.';
     const locked = (rel.files || []).some((x) => x.locked);
     const lockNote = locked ? `<p class="small" id="releaseLocked" style="color:#e5c07b">🔒 ${esc(lockMsg)}${access.signedIn ? '' : ` <a href="${esc(access.signIn || '/files/signin')}">Sign in</a> if you already have.`}</p>` : '';
-    const pick = list.length > 1 ? `<select id="releasePick">${list.map((r) => `<option value="${esc(r.project)}"${r.project === rel.project ? ' selected' : ''}>${esc(r.name)}</option>`).join('')}</select>` : '';
+    // The files page has its own collab switcher at the top; it drives this.
+    const pick = (list.length > 1 && !document.getElementById('switcher')) ? `<select id="releasePick">${list.map((r) => `<option value="${esc(r.project)}"${r.project === rel.project ? ' selected' : ''}>${esc(r.name)}</option>`).join('')}</select>` : '';
     const filters = (rel.filters || []).map((f) => `<tr><td>${esc(f.filter)}${f.note ? ` <span class="small muted">${esc(f.note)}</span>` : ''}</td><td class="num">${num(f.hours, 1)} h</td><td class="num">${esc(f.subs)}</td><td class="num">${esc(f.rigs)}</td>
       <td>${(rel.files || []).filter((x) => x.filter === f.filter && x.role === 'master').map((x) => x.locked
         ? `<span class="muted" title="${esc(lockMsg)}">🔒 ${x.full ? 'full lossless FITS' : 'compressed FITS'}</span> <span class="small muted">${size(x.bytes)}</span>`
@@ -378,15 +384,24 @@ _PAGE_JS = r"""
       ${log ? `<h2>Changes</h2><ul class="small">${log}</ul>` : ''}
       ${(rel.versions || []).length > 1 ? `<p class="small muted">Earlier versions: ${(rel.versions || []).filter((v) => v !== rel.version).map((v) => `<a href="/api/v1/releases/${esc(rel.project)}/${esc(v)}">${esc(v)}</a>`).join(', ')}</p>` : ''}`;
     box.hidden = false;
+    // The files page folds this into a section and summarises it.
+    document.dispatchEvent(new CustomEvent('starfront:release', { detail: rel }));
     const sel = document.getElementById('releasePick');
     if (sel) sel.addEventListener('change', () => show(sel.value, list));
   }
 
   async function show(id, list) {
     try { draw(await get(`/api/v1/releases/${encodeURIComponent(id)}`), list); }
-    catch (e) { box.hidden = true; }
+    catch (e) { box.hidden = true; document.dispatchEvent(new CustomEvent('starfront:release', { detail: null })); }
   }
 
-  get('/api/v1/releases').then((r) => { const list = r.releases || []; const id = wanted(list); if (id) show(id, list); }).catch(() => {});
+  let known = [];
+  // The files page's switcher says which collab is in view.
+  document.addEventListener('starfront:project', (e) => {
+    const id = (e.detail || {}).id;
+    if (known.some((r) => r.project === id)) show(id, known);
+    else { box.hidden = true; document.dispatchEvent(new CustomEvent('starfront:release', { detail: null })); }
+  });
+  get('/api/v1/releases').then((r) => { const list = r.releases || []; known = list; const id = wanted(list); if (id) show(id, list); }).catch(() => {});
 })();
 """

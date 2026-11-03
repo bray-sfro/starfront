@@ -126,7 +126,9 @@ def test_recheck_grandfathered_files(world):
 def test_page_has_the_checklist(world):
     client, *_ = world
     html = client.get("/files").text
-    assert "Upload rules for this collaboration" in html and "Pending calibration" in html
+    assert "Upload rules" in html and "Pending calibration" in html
+    assert "Everything on this collaboration" not in html and 'id="all"' not in html
+    assert '<details class="view" id="sec-release"' in html and 'id="switcher"' in html
 
 
 def test_darkflat_no_longer_offered_but_still_taken(world):

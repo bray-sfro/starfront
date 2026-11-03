@@ -651,13 +651,13 @@ _PAGE = r"""<!doctype html>
   .btn:disabled { opacity: .5; cursor: default; }
   select, input[type=text] { background: #11161f; color: #dbe3ee; border: 1px solid #2a3344; border-radius: 8px;
          padding: 8px 10px; font-size: 15px; min-width: 260px; }
-  .drop { margin: 12px 0; padding: 26px 18px; border: 2px dashed #2a3344; border-radius: 12px; text-align: center; }
+  .drop { margin: 12px 0; padding: 16px 12px; border: 2px dashed #2a3344; border-radius: 12px; text-align: center; }
   .drop.over { border-color: #7ee7a5; background: #11161f; }
-  .zones { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; margin: 10px 0; }
+  .zones { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 10px 0; }
   .zone { margin: 0; padding: 16px 12px 10px; }
   .zone h3 { margin: 0 0 2px; font-size: 16px; }
-  .zone p.small { min-height: 2.6em; margin: 0 0 8px; }
-  .zone .btn { padding: 6px 10px; font-size: 13px; }
+  .zone p.small { min-height: 2.6em; margin: 0 0 8px; font-size: 12px; }
+  .zone .btn { padding: 7px 12px; font-size: 14px; }
   .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
   table { width: 100%; border-collapse: collapse; font-size: 14px; margin: 8px 0; }
   th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid #1f2634; vertical-align: top; }
@@ -683,89 +683,152 @@ _PAGE = r"""<!doctype html>
   #gaps li { margin: 3px 0; }
   .ruleform { display: grid; grid-template-columns: minmax(200px, 1fr) 140px; gap: 6px 12px; align-items: center; font-size: 13px; margin: 8px 0; }
   .ruleform input[type=text], .ruleform select { min-width: 0; width: 100%; padding: 4px 6px; font-size: 13px; }
+  .switcher { position: sticky; top: 0; z-index: 5; background: #0b0e14ee; border-bottom: 1px solid #2a3344; backdrop-filter: blur(4px); }
+  .swin { max-width: 760px; margin: 0 auto; padding: 8px 20px; display: flex; gap: 8px; align-items: center; }
+  .swlabel { color: #8f9bb0; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; flex: none; }
+  .pills { display: flex; gap: 6px; overflow-x: auto; flex: 1; scrollbar-width: thin; padding: 2px 0; }
+  .pillbtn { flex: none; background: #1a2130; color: #dbe3ee; border: 1px solid #2a3344; border-radius: 999px; padding: 6px 12px;
+             font-size: 14px; cursor: pointer; white-space: nowrap; text-decoration: none; }
+  .pillbtn[aria-current="true"] { background: #7ee7a5; color: #0d1017; border-color: #7ee7a5; font-weight: 600; }
+  .pillbtn:focus-visible { outline: 2px solid #9fe4bd; outline-offset: 2px; }
+  .badge { font-size: 11px; padding: 0 6px; border-radius: 8px; margin-left: 6px; background: #16351f; color: #7ee7a5; }
+  .badge.closed { background: #1a2130; color: #8f9bb0; } .badge.paused { background: #3a3116; color: #e5c07b; }
+  .pillbtn[aria-current="true"] .badge { background: #0d1017; }
+  .closedpick select { min-width: 0; width: auto; padding: 6px 8px; font-size: 13px; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  details.view { border: 1px solid #2a3344; border-radius: 10px; margin: 10px 0; background: #0f141d; }
+  details.view > summary { cursor: pointer; padding: 11px 14px; font-weight: 600; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  details.view > summary::-webkit-details-marker { display: none; }
+  details.view > summary::before { content: '▸'; color: #7ee7a5; width: 1em; flex: none; transition: transform .15s; }
+  details.view[open] > summary::before { transform: rotate(90deg); }
+  details.view > summary:focus-visible { outline: 2px solid #7ee7a5; outline-offset: -2px; border-radius: 10px; }
+  details.view > summary .sum { font-weight: 400; color: #8f9bb0; font-size: 13px; }
+  details.view > .inner { padding: 0 14px 12px; }
+  details.kind { margin: 6px 0; border-top: 1px solid #1f2634; }
+  details.kind > summary { cursor: pointer; padding: 6px 0; font-size: 14px; }
+  #release > h2:first-child { font-size: 14px; margin-top: 4px; }
+  .upload { background: #11161f; border: 1px solid #2a3344; border-radius: 12px; padding: 12px 14px; margin: 10px 0 14px; }
+  .picker .lbl { font-weight: 600; }
+  .picks { justify-content: center; }
+  .scroll { overflow-x: auto; }
+  #telescope { min-width: 200px; }
+  @media (max-width: 640px) {
+    .swin { padding: 6px 10px; flex-wrap: wrap; }
+    .swlabel { display: none; }
+    .pills { flex-basis: 100%; order: 1; }
+    .closedpick { order: 2; }
+    main { padding: 16px 12px 40px; }
+    select, input[type=text], #telescope { min-width: 0; width: 100%; box-sizing: border-box; }
+    .zones { grid-template-columns: 1fr 1fr; gap: 8px; }
+    .zone { padding: 10px 8px 8px; }
+    .zone p.small { display: none; }
+    .picks { flex-direction: column; gap: 6px; }
+    .picks .btn { width: 100%; }
+    table { font-size: 12px; }
+    #release table, .inner table { display: block; overflow-x: auto; }
+    .ruleform { grid-template-columns: 1fr; }
+  }
 </style></head>
-<body><main>
-<h1>Starfront files</h1>
-<p class="muted">Where a collaboration's frames are collected for stacking: lights, and the flats, darks and bias that calibrate them. Only FITS and XISF files are taken, and files already here are skipped, so you can send the same folder again tomorrow and only the new ones go. Lights only count once their flats and darks (or bias) are here too.</p>
-
-<section id="release" hidden></section>
-<script src="/releases/page.js" defer></script>
+<body>
+<nav id="switcher" class="switcher" aria-label="Collaborations" hidden>
+  <div class="swin">
+    <span class="swlabel">Collab</span>
+    <div class="pills" id="openPills" role="list"></div>
+    <label class="closedpick" id="closedWrap" hidden><span class="sr">Closed collaborations</span>
+      <select id="closedPick"><option value="">Closed…</option></select></label>
+  </div>
+</nav>
+<main>
+<h1>Starfront files <span class="small muted" id="curName"></span></h1>
+<p class="muted small">Upload a collaboration's lights and the flats, darks or bias that calibrate them (FITS or XISF). Files already here are skipped, so a folder can be sent again. Lights only count once their calibration is here too.</p>
 
 <section id="signin" hidden>
-  <p>Sign in with the Discord account you use for Starfront. Signing in here does not sign your N.I.N.A. or Starfront out.</p>
+  <p>Sign in with the Discord account you use for Starfront to upload. Signing in here does not sign your N.I.N.A. or Starfront out.</p>
+  <p id="signinNote" class="small"></p>
   <p><a class="btn" href="/files/signin">Sign in with Discord</a></p>
 </section>
 
 <section id="app" hidden>
-  <p class="row"><span>Signed in as <b id="who"></b></span> <button class="btn ghost" id="signout" style="padding:5px 10px;font-size:13px">Sign out</button></p>
+  <p class="row small"><span>Signed in as <b id="who"></b></span> <button class="btn ghost" id="signout" style="padding:4px 10px;font-size:13px">Sign out</button></p>
 
-  <h2>Collaboration</h2>
-  <p class="row">
-    <select id="project"></select>
-    <span class="small muted" id="projectNote"></span>
-  </p>
-  <p id="none" class="muted" hidden>No collaboration is collecting files right now.</p>
+  <div class="upload">
+    <select id="project" hidden aria-hidden="true"></select>
+    <p class="row small" id="curLine"></p>
+    <p class="small muted" id="projectNote"></p>
+    <p id="none" class="muted" hidden>No collaboration is collecting files right now.</p>
 
-  <div class="rules" id="rulesBox" hidden>
-    <h2>Upload rules for this collaboration</h2>
-    <p class="small muted">Every light needs its calibration on the server. Check each item before you upload; the server checks them too, file by file, and tells you what is missing.</p>
-    <ul id="rules"></ul>
-    <details id="ownerRules" hidden>
-      <summary class="small">Change the rules (coordinator)</summary>
-      <div class="ruleform" id="ruleForm"></div>
-      <p class="row"><button class="btn ghost" id="saveRules" style="padding:5px 10px;font-size:13px">Save rules</button> <span class="small muted" id="rulesSaved"></span></p>
-    </details>
-  </div>
-
-  <div id="uploader" hidden>
-    <h2>Your frames</h2>
-    <p class="small muted">As N.I.N.A. saved them, raw. Drop each kind on its own box, or press its button; a whole folder can be dropped and only its FITS and XISF files are taken. Keep this tab open while it uploads.</p>
-    <div class="zones">
-      <div class="drop zone" data-kind="light">
-        <h3>Lights</h3>
-        <p class="small muted">The subs themselves, named as N.I.N.A. saved them</p>
-        <p class="row" style="justify-content:center"><button class="btn ghost" data-pick="files">Choose files</button><button class="btn ghost" data-pick="folder">Choose a folder</button></p>
+    <div id="uploader" hidden>
+      <div class="zones">
+        <div class="drop zone" data-kind="light">
+          <h3>Lights</h3>
+          <p class="small muted">The subs, as N.I.N.A. saved them</p>
+          <p class="row picks"><button class="btn" data-pick="files">Choose files</button><button class="btn ghost" data-pick="folder">Folder</button></p>
+        </div>
+        <div class="drop zone" data-kind="flat">
+          <h3>Flats</h3>
+          <p class="small muted">One set per filter, same camera angle</p>
+          <p class="row picks"><button class="btn" data-pick="files">Choose files</button><button class="btn ghost" data-pick="folder">Folder</button></p>
+        </div>
+        <div class="drop zone" data-kind="dark">
+          <h3>Darks</h3>
+          <p class="small muted">Same gain, offset, binning, temperature, exposure</p>
+          <p class="row picks"><button class="btn" data-pick="files">Choose files</button><button class="btn ghost" data-pick="folder">Folder</button></p>
+        </div>
+        <div class="drop zone" data-kind="bias">
+          <h3>Bias</h3>
+          <p class="small muted">Same gain, offset and binning</p>
+          <p class="row picks"><button class="btn" data-pick="files">Choose files</button><button class="btn ghost" data-pick="folder">Folder</button></p>
+        </div>
       </div>
-      <div class="drop zone" data-kind="flat">
-        <h3>Flats</h3>
-        <p class="small muted">One set per filter you shot, from the same camera angle</p>
-        <p class="row" style="justify-content:center"><button class="btn ghost" data-pick="files">Choose files</button><button class="btn ghost" data-pick="folder">Choose a folder</button></p>
-      </div>
-      <div class="drop zone" data-kind="dark">
-        <h3>Darks</h3>
-        <p class="small muted">Same gain, offset, binning, temperature and exposure as the lights</p>
-        <p class="row" style="justify-content:center"><button class="btn ghost" data-pick="files">Choose files</button><button class="btn ghost" data-pick="folder">Choose a folder</button></p>
-      </div>
-      <div class="drop zone" data-kind="bias">
-        <h3>Bias</h3>
-        <p class="small muted">Same gain, offset and binning as the lights</p>
-        <p class="row" style="justify-content:center"><button class="btn ghost" data-pick="files">Choose files</button><button class="btn ghost" data-pick="folder">Choose a folder</button></p>
-      </div>
-    </div>
-    <input type="file" id="files" multiple hidden>
-    <input type="file" id="folder" webkitdirectory multiple hidden>
-    <p class="row"><input type="text" id="telescope" placeholder="Telescope (optional)" style="min-width:220px"> <span class="small muted">written against each file, so the coordinator can tell rigs apart</span></p>
-    <p id="progress" hidden><span id="progressText"></span></p>
-    <div class="bar" id="allBar" hidden><i></i></div>
-    <table id="queue" hidden><thead><tr><th>File</th><th>Kind</th><th class="num">Size</th><th>State</th></tr></thead><tbody></tbody></table>
-
-    <h2 id="mineHead">Already here from you</h2>
-    <p class="small muted" id="mineNote"></p>
-    <p id="myStatus"></p>
-    <div id="gapBox" hidden>
-      <p class="small"><b>Still needed before these lights count:</b></p>
-      <ul id="gaps" class="small"></ul>
-    </div>
-    <table id="mine"><thead><tr><th>File</th><th>Kind</th><th>Telescope</th><th class="num">Size</th><th>Status</th><th>Received</th><th></th></tr></thead><tbody></tbody></table>
-
-    <div id="ownerBox" hidden>
-      <h2>Everything on this collaboration</h2>
-      <p class="small muted" id="allNote"></p>
-      <p id="allStatus"></p>
-      <table id="all"><thead><tr><th>Person</th><th>File</th><th>Kind</th><th>Telescope</th><th class="num">Size</th><th>Status</th><th>Received</th><th></th></tr></thead><tbody></tbody></table>
+      <input type="file" id="files" multiple hidden>
+      <input type="file" id="folder" webkitdirectory multiple hidden>
+      <p class="row"><input type="text" id="telescope" placeholder="Telescope (optional)"> <span class="small muted">written against each file, so rigs can be told apart. Drop a folder on a box, or press its button; keep this tab open while it uploads.</span></p>
+      <p id="progress" hidden><span id="progressText"></span></p>
+      <div class="bar" id="allBar" hidden><i></i></div>
+      <div class="scroll"><table id="queue" hidden><thead><tr><th>File</th><th>Kind</th><th class="num">Size</th><th>State</th></tr></thead><tbody></tbody></table></div>
     </div>
   </div>
 </section>
+
+<div id="views">
+  <details class="view" id="sec-release" hidden>
+    <summary><span class="t">Latest master</span> <span class="sum" id="sumRelease"></span></summary>
+    <div class="inner"><section id="release" hidden></section></div>
+  </details>
+
+  <details class="view" id="sec-rules" hidden>
+    <summary><span class="t">Upload rules</span> <span class="sum" id="sumRules"></span></summary>
+    <div class="inner rules">
+      <p class="small muted">Every light needs its calibration on the server. The server checks each file and says what is missing.</p>
+      <ul id="rules"></ul>
+      <details id="ownerRules" hidden>
+        <summary class="small">Change the rules (coordinator)</summary>
+        <div class="ruleform" id="ruleForm"></div>
+        <p class="row"><button class="btn ghost" id="saveRules" style="padding:5px 10px;font-size:13px">Save rules</button> <span class="small muted" id="rulesSaved"></span></p>
+      </details>
+    </div>
+  </details>
+
+  <details class="view" id="sec-needed" hidden>
+    <summary><span class="t" id="neededTitle">Still needed</span> <span class="sum" id="sumNeeded"></span></summary>
+    <div class="inner">
+      <p id="myStatus"></p>
+      <div id="gapBox" hidden>
+        <p class="small"><b>Still needed before these lights count:</b></p>
+        <ul id="gaps" class="small"></ul>
+      </div>
+    </div>
+  </details>
+
+  <details class="view" id="sec-mine" hidden>
+    <summary><span class="t">My files</span> <span class="sum" id="sumMine"></span></summary>
+    <div class="inner">
+      <p class="small muted" id="mineNote"></p>
+      <div id="mineKinds"></div>
+    </div>
+  </details>
+</div>
+<script src="/releases/page.js" defer></script>
 
 <script>
 (function () {
@@ -795,29 +858,139 @@ _PAGE = r"""<!doctype html>
     return 'Lights: ' + parts.join(' · ') + '. Only ready lights go into the stack.';
   };
 
-  async function load() {
-    const info = await api('/api/v1/files/projects');
-    state.projects = info.projects; state.allowed = info.allowed; state.kinds = info.kinds || [];
-    $('signin').hidden = info.signedIn; $('app').hidden = !info.signedIn;
-    if (!info.signedIn) return;
-    $('who').textContent = info.name;
-    let warn = document.getElementById('diskwarn');
-    if (!warn) { warn = document.createElement('p'); warn.id = 'diskwarn'; warn.className = 'small'; warn.style.color = '#ff8a7a'; $('app').prepend(warn); }
-    warn.textContent = info.diskLow ? `Server disk is low: ${mb(info.free)} free. Uploads stop when it is full.` : '';
-    warn.hidden = !info.diskLow;
-    const select = $('project');
-    select.innerHTML = '';
-    for (const p of info.projects) {
-      const o = document.createElement('option');
-      o.value = p.id;
-      o.textContent = `${p.name} — ${p.coordinator || 'no coordinator'} · ${p.files ? kindSummary(p.kinds) : 'nothing yet'}, ${mb(p.bytes)}` + (p.collecting ? '' : ' (not collecting; yours)') + (p.closed ? ' (closed: download only)' : (p.full ? ' (storage limit reached)' : ''));
-      select.appendChild(o);
+  // -- the collapsible views: closed unless opened, each remembered -------
+  const OPEN_KEY = 'starfront-files-open';
+  const remembered = () => { try { return JSON.parse(localStorage.getItem(OPEN_KEY) || '{}') || {}; } catch (e) { return {}; } };
+  function setOpen(el, open) { if (el.open !== open) { el.dataset.auto = '1'; el.open = open; } }
+  function restore(el) { const r = remembered(); if (el.id in r) setOpen(el, !!r[el.id]); }
+  document.querySelectorAll('details.view').forEach((el) => {
+    restore(el);
+    el.addEventListener('toggle', () => {
+      if (el.dataset.auto) { delete el.dataset.auto; return; }   // opened by the page, not the person
+      const r = remembered(); r[el.id] = el.open; localStorage.setItem(OPEN_KEY, JSON.stringify(r));
+    });
+  });
+  function show(id, summary) { const el = $(id); el.hidden = false; if (summary !== undefined) el.querySelector('.sum').textContent = summary; return el; }
+  function deepLink() {
+    const h = location.hash.slice(1);
+    const target = h.startsWith('release-') ? $('sec-release') : (h.startsWith('sec-') ? $(h) : null);
+    if (!target || target.hidden) return false;
+    setOpen(target, true);
+    target.scrollIntoView({ block: 'start' });
+    return true;
+  }
+  const s = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  // The release section draws itself (/releases/page.js) and says when.
+  document.addEventListener('starfront:release', (e) => {
+    if (!e.detail || (state.current && e.detail.project !== state.current)) { $('sec-release').hidden = true; return; }
+    const rel = e.detail;
+    const locked = (rel.files || []).some((x) => x.locked);
+    const hours = rel.totalHours == null ? '' : ` · ${Number(rel.totalHours).toFixed(0)} h`;
+    show('sec-release', `${rel.version || ''}${hours} · ${s((rel.filters || []).length, 'filter')}` + (locked ? ' · 🔒 masters for contributors' : ''));
+    if (location.hash.startsWith('#release-')) deepLink();
+  });
+  window.addEventListener('hashchange', deepLink);
+
+  // -- the collab switcher: every collaboration worth picking, at the top --
+  const STATUS = (p) => p.closed ? 'closed' : (p.collecting ? 'collecting' : 'paused');
+  function buildSwitch(info, pub, rel) {
+    const byId = new Map();
+    const released = new Set((rel.releases || []).map((r) => r.project));
+    for (const p of info.projects || []) byId.set(p.id, { id: p.id, name: p.name, closed: !!p.closed, collecting: !!p.collecting, mine: true });
+    for (const p of pub.projects || []) {
+      if (byId.has(p.id)) continue;
+      const pay = p.payload || {};
+      const closed = p.status !== 'open';
+      // Only collabs that take (or took) files, or have a master out: not every old test.
+      if (!pay.collectFiles && !released.has(p.id)) continue;
+      byId.set(p.id, { id: p.id, name: p.name, closed, collecting: !closed && !!pay.collectFiles, mine: false });
     }
-    $('none').hidden = info.projects.length > 0;
-    $('uploader').hidden = info.projects.length === 0;
-    const wanted = location.hash.slice(1) || localStorage.getItem('starfront-files-project') || '';
-    if (info.projects.some((p) => p.id === wanted)) select.value = wanted;
-    if (info.projects.length) await pick();
+    for (const r of rel.releases || []) if (!byId.has(r.project)) byId.set(r.project, { id: r.project, name: r.name, closed: false, collecting: false, mine: false });
+    for (const x of byId.values()) x.release = released.has(x.id);
+    const all = Array.from(byId.values());
+    return { open: all.filter((x) => !x.closed), closed: all.filter((x) => x.closed) };
+  }
+  function drawSwitcher() {
+    const sw = state.switch;
+    $('openPills').innerHTML = sw.open.map((x) => `<button type="button" class="pillbtn" role="listitem" data-id="${esc(x.id)}" aria-current="${x.id === state.current}">${esc(x.name)}<span class="badge ${STATUS(x)}">${STATUS(x)}</span></button>`).join('');
+    $('closedWrap').hidden = !sw.closed.length;
+    $('closedPick').innerHTML = `<option value="">Closed (${sw.closed.length})…</option><optgroup label="Closed">` +
+      sw.closed.map((x) => `<option value="${esc(x.id)}"${x.id === state.current ? ' selected' : ''}>${esc(x.name)} · closed</option>`).join('') + '</optgroup>';
+    $('switcher').hidden = !(sw.open.length + sw.closed.length);
+    $('openPills').querySelectorAll('[data-id]').forEach((b) => b.addEventListener('click', () => choose(b.dataset.id, true)));
+    const cur = $('openPills').querySelector('[aria-current="true"]');
+    if (cur) cur.scrollIntoView({ block: 'nearest', inline: 'center' });
+  }
+  async function choose(id, push) {
+    const all = state.switch.open.concat(state.switch.closed);
+    const x = all.find((p) => p.id === id);
+    if (!x) return;
+    state.current = id;
+    localStorage.setItem('starfront-files-project', id);
+    const url = new URL(location.href);
+    url.searchParams.set('project', id);
+    if (url.hash && !url.hash.startsWith('#release-') && !url.hash.startsWith('#sec-')) url.hash = '';
+    if (url.hash.startsWith('#release-') && url.hash.slice(9) !== id) url.hash = '';
+    history[push ? 'pushState' : 'replaceState']({ project: id }, '', url);
+    $('curName').textContent = '· ' + x.name;
+    document.title = `${x.name} · Starfront files`;
+    drawSwitcher();
+    document.dispatchEvent(new CustomEvent('starfront:project', { detail: { id } }));
+    const mine = state.projects.find((p) => p.id === id);
+    const badge = `<span class="badge ${STATUS(x)}">${STATUS(x)}</span>`;
+    if (!state.signedIn) {
+      $('signinNote').innerHTML = `<b>${esc(x.name)}</b>${badge} ` + (x.collecting ? 'is collecting frames: sign in to upload yours.' : (x.closed ? 'is closed and takes no new frames.' : 'is not taking uploads right now.'));
+      return;
+    }
+    ['sec-rules', 'sec-needed', 'sec-mine'].forEach((k) => { $(k).hidden = !mine; });
+    if (!mine) {
+      $('uploader').hidden = true;
+      $('none').hidden = false;
+      $('none').textContent = x.closed ? `${x.name} is closed and you have no files on it.` : `${x.name} is not taking uploads right now.`;
+      $('curLine').innerHTML = `<b>${esc(x.name)}</b>${badge}`;
+      $('projectNote').textContent = '';
+      return;
+    }
+    $('none').hidden = true;
+    $('uploader').hidden = !!mine.closed;
+    $('curLine').innerHTML = `<b>${esc(x.name)}</b>${badge} <span class="muted">· ${esc(mine.coordinator || 'no coordinator')} · ${mine.files ? esc(kindSummary(mine.kinds)) : 'nothing yet'}, ${mb(mine.bytes)}</span>` +
+      (mine.closed ? ' <span class="muted">· closed: download only</span>' : (mine.full ? ' <span class="no">· storage limit reached</span>' : ''));
+    $('project').value = id;
+    await pick();
+  }
+  window.addEventListener('popstate', () => {
+    const id = new URL(location.href).searchParams.get('project');
+    if (id && id !== state.current) choose(id, false).catch((e) => alert(e.message));
+  });
+
+  async function load() {
+    const [info, pub, rel] = await Promise.all([
+      api('/api/v1/files/projects'),
+      api('/api/v1/projects').catch(() => ({ projects: [] })),
+      api('/api/v1/releases').catch(() => ({ releases: [] }))]);
+    state.projects = info.projects; state.allowed = info.allowed; state.kinds = info.kinds || [];
+    state.signedIn = info.signedIn;
+    state.switch = buildSwitch(info, pub, rel);
+    $('signin').hidden = info.signedIn; $('app').hidden = !info.signedIn;
+    if (info.signedIn) {
+      $('who').textContent = info.name;
+      let warn = document.getElementById('diskwarn');
+      if (!warn) { warn = document.createElement('p'); warn.id = 'diskwarn'; warn.className = 'small'; warn.style.color = '#ff8a7a'; $('app').prepend(warn); }
+      warn.textContent = info.diskLow ? `Server disk is low: ${mb(info.free)} free. Uploads stop when it is full.` : '';
+      warn.hidden = !info.diskLow;
+      const select = $('project');
+      select.innerHTML = info.projects.map((p) => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
+    }
+    const all = state.switch.open.concat(state.switch.closed);
+    const url = new URL(location.href);
+    const hash = location.hash.slice(1).replace(/^release-/, '');
+    // First visit: a collab with a master out, then one taking frames, then anything open.
+    const firstOpen = (state.switch.open.find((x) => x.release) || state.switch.open.find((x) => x.collecting)
+                       || state.switch.open[0] || all[0] || {}).id;
+    const id = [url.searchParams.get('project'), hash, localStorage.getItem('starfront-files-project'), firstOpen]
+      .find((c) => c && all.some((p) => p.id === c));
+    if (!id) { drawSwitcher(); $('none').hidden = !info.signedIn; $('uploader').hidden = true; return; }
+    await choose(id, false);
   }
 
   async function pick() {
@@ -831,12 +1004,20 @@ _PAGE = r"""<!doctype html>
     state.owned = listing.owned;
     drawRules(listing);
     drawMine(listing);
-    drawAll(listing);
+    deepLink();
   }
 
   function drawRules(listing) {
     const r = listing.rules || { checklist: [], spec: [], values: {} };
-    $('rulesBox').hidden = !r.checklist.length;
+    const v = r.values || {};
+    const parts = [];
+    if (v.enforce === false) parts.push('calibration not checked');
+    else {
+      parts.push({ darkOrBias: 'darks or bias', dark: 'darks', none: 'no darks needed' }[v.darkPolicy] || 'darks or bias');
+      if (v.requireFlats !== false) parts.push('flats per filter');
+    }
+    const box = show('sec-rules', parts.join(', '));
+    box.hidden = !r.checklist.length;
     $('rules').innerHTML = r.checklist.map((x) => `<li>${esc(x)}</li>`).join('');
     $('ownerRules').hidden = !listing.owned;
     if (!listing.owned) return;
@@ -865,40 +1046,46 @@ _PAGE = r"""<!doctype html>
   }
 
   function drawMine(listing) {
-    const body = $('mine').querySelector('tbody');
     const my = listing.files.filter((f) => f.user === listing.me);
-    body.innerHTML = my.map((f) => `<tr><td>${esc(f.name)}</td><td>${esc(label(f.kind))}</td><td>${esc(f.telescope)}</td><td class="num">${mb(f.bytes)}</td><td>${statusCell(f)}</td><td>${when(f.received)}</td>
-      <td><button class="x" data-del="${esc(f.name)}" data-kind="${esc(f.kind)}" title="Take it off the server">✕</button></td></tr>`).join('');
+    const c = listing.myLights || {};
+    const lights = my.filter((f) => f.kind === 'light').length;
+    const cal = my.length - lights;
     const counts = {};
     for (const f of my) counts[f.kind] = (counts[f.kind] || 0) + 1;
-    $('mineNote').textContent = my.length ? `${kindSummary(counts)}, ${mb(my.reduce((s, f) => s + f.bytes, 0))}` : 'nothing yet';
-    $('myStatus').textContent = my.length ? lightLine(listing.myLights) : '';
+    const parts = [`${c.ready || 0} ready`, `${c.pending || 0} pending`];
+    if (c.quarantine) parts.push(`${c.quarantine} quarantined`);
+    if (c['']) parts.push(`${c['']} not checked`);
+    show('sec-mine', my.length ? parts.join(' · ') + ` · ${cal} calibration · ${mb(my.reduce((t, f) => t + f.bytes, 0))}` : 'nothing yet');
+    $('mineNote').textContent = my.length ? `${kindSummary(counts)}. Lights: only ready ones go into the stack.` : 'Nothing uploaded to this collaboration yet.';
+    // One folding table per kind, so a season of lights does not bury the calibration.
+    const order = ['light', 'flat', 'dark', 'bias', 'darkflat'];
+    const kinds = order.filter((k) => counts[k]).concat(Object.keys(counts).filter((k) => !order.includes(k)));
+    $('mineKinds').innerHTML = kinds.map((k) => {
+      const rows = my.filter((f) => f.kind === k);
+      const st = {};
+      for (const f of rows) st[f.status || ''] = (st[f.status || ''] || 0) + 1;
+      const stText = Object.entries(st).map(([x, n]) => `${n} ${(LABELS[x] || x).toLowerCase()}`).join(' · ');
+      return `<details class="kind" data-kind="${esc(k)}"><summary>${esc(label(k))} <span class="muted small">(${rows.length}) ${esc(stText)}</span></summary>
+        <div class="scroll"><table><thead><tr><th>File</th><th>Telescope</th><th class="num">Size</th><th>Status</th><th>Received</th><th></th></tr></thead><tbody>${rows.map((f) => `<tr><td>${esc(f.name)}</td><td>${esc(f.telescope)}</td><td class="num">${mb(f.bytes)}</td><td>${statusCell(f)}</td><td>${when(f.received)}</td>
+        <td><button class="x" data-del="${esc(f.name)}" data-kind="${esc(f.kind)}" title="Take it off the server" aria-label="Remove ${esc(f.name)}">✕</button></td></tr>`).join('')}</tbody></table></div></details>`;
+    }).join('');
+    // What is holding lights back, opened by itself when something is.
     const gaps = listing.gaps || [];
+    const needed = show('sec-needed');
+    needed.hidden = !my.length;
+    $('myStatus').textContent = my.length ? lightLine(c) : '';
     $('gapBox').hidden = !gaps.length;
     $('gaps').innerHTML = gaps.map((g) => `<li>${pill(g.status)} ${esc(g.reason)} <span class="muted">(${g.files} file${g.files === 1 ? '' : 's'})</span></li>`).join('');
-    body.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
+    const held = (c.pending || 0) + (c.quarantine || 0);
+    $('neededTitle').textContent = held ? 'Still needed' : 'Lights status';
+    needed.querySelector('.sum').textContent = held
+      ? `${s(c.pending || 0, 'light')} pending` + (c.quarantine ? ` · ${c.quarantine} quarantined` : '')
+      : (lights ? `all ${lights} ready` : 'no lights yet');
+    const r = remembered();
+    if (c.pending && !('sec-needed' in r && r['sec-needed'] === false)) setOpen(needed, true);
+    $('mineKinds').querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
       if (!confirm(`Remove ${b.dataset.del} from the server?`)) return;
       try { await api(`/api/v1/projects/${encodeURIComponent(state.project.id)}/files/${encodeURIComponent(b.dataset.del)}?kind=${encodeURIComponent(b.dataset.kind)}`, { method: 'DELETE' }); await pick(); }
-      catch (e) { alert(e.message); }
-    }));
-  }
-
-  function drawAll(listing) {
-    $('ownerBox').hidden = !listing.owned;
-    if (!listing.owned) return;
-    const body = $('all').querySelector('tbody');
-    body.innerHTML = listing.files.map((f) => `<tr><td>${esc(f.uploader)}</td>
-      <td><a href="/api/v1/projects/${encodeURIComponent(state.project.id)}/files/${encodeURIComponent(f.user)}/${encodeURIComponent(f.kind)}/${encodeURIComponent(f.name)}">${esc(f.name)}</a></td>
-      <td>${esc(label(f.kind))}</td><td>${esc(f.telescope)}</td><td class="num">${mb(f.bytes)}</td><td>${statusCell(f)}</td><td>${when(f.received)}</td>
-      <td><button class="x" data-rm="${esc(f.name)}" data-user="${esc(f.user)}" data-kind="${esc(f.kind)}">✕</button></td></tr>`).join('');
-    $('allStatus').textContent = lightLine(listing.lights);
-    const people = new Set(listing.files.map((f) => f.user)).size;
-    const counts = {};
-    for (const f of listing.files) counts[f.kind] = (counts[f.kind] || 0) + 1;
-    $('allNote').textContent = `${kindSummary(counts) || 'nothing yet'} from ${people} ${people === 1 ? 'person' : 'people'}, ${mb(listing.bytes)}; ${mb(listing.free)} free on the server. Each link downloads one file; the whole set sits in the server's files folder under this collaboration's id, one folder per person with lights, flats, darks and bias inside.`;
-    body.querySelectorAll('[data-rm]').forEach((b) => b.addEventListener('click', async () => {
-      if (!confirm(`Remove ${b.dataset.rm}?`)) return;
-      try { await api(`/api/v1/projects/${encodeURIComponent(state.project.id)}/files/${encodeURIComponent(b.dataset.rm)}?user=${encodeURIComponent(b.dataset.user)}&kind=${encodeURIComponent(b.dataset.kind)}`, { method: 'DELETE' }); await pick(); }
       catch (e) { alert(e.message); }
     }));
   }
@@ -928,7 +1115,7 @@ _PAGE = r"""<!doctype html>
     if (left) $('progressText').textContent = `${left} to go · ${mb(sent)} of ${mb(total)}`;
     else if (state.queue.length) {
       const n = (st) => state.queue.filter((q) => q.kind === 'light' && (q.state === 'done' || q.state === 'already') && q.status === st).length;
-      $('progressText').textContent = `All done: ${state.queue.filter((q) => q.state === 'done').length} uploaded, ${state.queue.filter((q) => q.state === 'already').length} already here, ${state.queue.filter((q) => q.state === 'failed').length} failed. Lights in this batch: ${n('ready')} ready, ${n('pending')} pending calibration, ${n('quarantine')} quarantined (see below for why).`;
+      $('progressText').textContent = `All done: ${state.queue.filter((q) => q.state === 'done').length} uploaded, ${state.queue.filter((q) => q.state === 'already').length} already here, ${state.queue.filter((q) => q.state === 'failed').length} failed. Lights in this batch: ${n('ready')} ready, ${n('pending')} pending calibration, ${n('quarantine')} quarantined (reasons in each row, and under Still needed).`;
     }
   }
 
@@ -979,7 +1166,7 @@ _PAGE = r"""<!doctype html>
     }
   }
 
-  $('project').addEventListener('change', () => pick().catch((e) => alert(e.message)));
+  $('closedPick').addEventListener('change', (e) => { if (e.target.value) choose(e.target.value, true).catch((x) => alert(x.message)); });
   $('saveRules').addEventListener('click', () => saveRules());
   // One box per kind of frame. Its buttons open the shared pickers with the
   // box's kind remembered; a drop on it takes the box's kind.
