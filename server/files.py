@@ -37,6 +37,8 @@ from typing import Any, Callable
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
+from server import uploadrules
+
 #: What a light is. Compressed FITS (`.fits.fz`) ends in `.fz`; XISF is
 #: PixInsight's. Nothing else: a stray `.txt` or a `.jpg` of the result is
 #: not data for a stack.
@@ -222,11 +224,68 @@ class Files:
         if user not in names:
             found = self.store.user(user)
             names[user] = str((found or {}).get("name") or user)
+        status = str(row.get("status") or "")
         return {"name": row["name"], "kind": row.get("kind") or "light",
                 "bytes": int(row.get("bytes") or 0),
                 "received": float(row.get("received") or 0.0),
                 "telescope": row.get("telescope") or "",
-                "user": user, "uploader": names[user]}
+                "user": user, "uploader": names[user],
+                "status": status,
+                "statusLabel": uploadrules.STATUS_LABELS.get(status, status),
+                "reasons": _json(row.get("reasons"), [])}
+
+    # -- the upload rules ---------------------------------------------------
+    def recheck(self, project: dict[str, Any], user_id: str,
+                only_light: str | None = None) -> dict[str, int]:
+        """Judge every file one contributor has on a collaboration again, and
+        store the statuses that changed. Header facts come from the database,
+        so this never touches the files themselves. A new light changes no
+        other file's status, so `only_light` judges just it (against the
+        calibration) and keeps an upload's cost flat however many lights
+        the contributor already has."""
+        rules = uploadrules.rules_of(project)
+        rows = self.store.files_in(project["id"], user_id)
+        if only_light is not None:
+            rows = [row for row in rows if row["kind"] != "light" or row["id"] == only_light]
+        for row in rows:
+            row["meta"] = _json(row.get("meta"), {})
+            row["label"] = row.get("telescope") or ""
+        verdicts = uploadrules.judge_all(rows, rules)
+        changes = []
+        moved = {"ready": 0, "pending": 0, "quarantine": 0}
+        for row in rows:
+            if row["id"] not in verdicts:
+                continue
+            status, reasons = verdicts[row["id"]]
+            if status != (row.get("status") or "") or reasons != _json(row.get("reasons"), []):
+                changes.append((row["id"], status, reasons))
+                # What moved means to a person: lights that changed state.
+                if status != (row.get("status") or "") and row["kind"] == "light":
+                    moved[status] = moved.get(status, 0) + 1
+        self.store.set_file_statuses(changes)
+        return moved
+
+    def gaps(self, project_id: str, user_id: str) -> list[dict[str, Any]]:
+        """What one contributor's pending and quarantined lights are waiting
+        for, each distinct reason once with how many lights it holds back."""
+        counts: dict[tuple[str, str], int] = {}
+        for row in self.store.files_in(project_id, user_id):
+            status = row.get("status") or ""
+            if status not in (uploadrules.PENDING, uploadrules.QUARANTINE):
+                continue
+            for reason in _json(row.get("reasons"), []):
+                key = (status, reason)
+                counts[key] = counts.get(key, 0) + 1
+        return [{"status": status, "reason": reason, "files": n}
+                for (status, reason), n in sorted(counts.items(), key=lambda kv: -kv[1])]
+
+    def rules_view(self, project: dict[str, Any]) -> dict[str, Any]:
+        rules = uploadrules.rules_of(project)
+        return {"checklist": uploadrules.checklist(rules), "values": rules,
+                "defaults": uploadrules.DEFAULTS,
+                "spec": [{"name": n, "default": d, "type": k,
+                          "choices": list(lo) if k == "choice" else None, "about": w}
+                         for n, d, k, lo, _hi, w in uploadrules.RULES]}
 
     def _project(self, project_id: str) -> dict[str, Any]:
         project = self.store.project(project_id)
@@ -293,6 +352,10 @@ class Files:
                     "myFiles": mine["count"], "myBytes": mine["bytes"],
                     "owned": owned, "quota": quota, "closed": closed,
                     "full": totals["bytes"] >= quota,
+                    # Lights by upload-rule status: only "ready" ones count.
+                    "lights": self.store.file_status_counts(project["id"]),
+                    "myLights": (self.store.file_status_counts(project["id"], who["id"])
+                                 if who is not None else {}),
                 })
             return {
                 "signedIn": who is not None,
@@ -321,7 +384,79 @@ class Files:
                     "collecting": self.collecting(project), "owned": owned,
                     "me": who["id"], "files": listed,
                     "bytes": sum(row["bytes"] for row in listed),
-                    "free": self.stats()["free"]}
+                    "free": self.stats()["free"],
+                    "rules": self.rules_view(project),
+                    "myLights": self.store.file_status_counts(project_id, who["id"]),
+                    "lights": self.store.file_status_counts(project_id) if owned else {},
+                    "gaps": self.gaps(project_id, who["id"])}
+
+        @app.get("/api/v1/projects/{project_id}/upload-rules")
+        def get_rules(project_id: str) -> dict[str, Any]:
+            """The rules a collaboration's uploads are held to. Public: a
+            contributor should be able to read them before signing in."""
+            return self.rules_view(self._project(project_id))
+
+        @app.put("/api/v1/projects/{project_id}/upload-rules")
+        async def put_rules(project_id: str, request: Request) -> dict[str, Any]:
+            """The coordinator changes the rules. Only the changes from the
+            defaults are kept; every file on the collaboration is judged again
+            on the stored header facts (no file is re-read)."""
+            who = self.require(request)
+            project = self._project(project_id)
+            if who.get("kind") == "agent" or not self.owns_project(who, project):
+                raise HTTPException(status_code=403,
+                                    detail="only the collaboration's coordinator sets its upload rules")
+            try:
+                body = await request.json()
+            except ValueError:
+                raise HTTPException(status_code=400, detail="send the rules as JSON") from None
+            try:
+                own = uploadrules.clean_rules(body.get("rules") if isinstance(body, dict)
+                                              and "rules" in body else body)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from None
+            payload = dict(project.get("payload") or {})
+            if body.get("replace") if isinstance(body, dict) else False:
+                payload["uploadRules"] = own
+            else:
+                payload["uploadRules"] = {**(payload.get("uploadRules") or {}), **own}
+            # A value set back to its default is the default again.
+            payload["uploadRules"] = {k: v for k, v in payload["uploadRules"].items()
+                                      if uploadrules.DEFAULTS.get(k, object()) != v}
+            project = self.store.set_project(project_id, payload)
+            moved: dict[str, int] = {}
+            for user in self.store.file_users(project_id):
+                for key, n in self.recheck(project, user).items():
+                    moved[key] = moved.get(key, 0) + n
+            return {"rules": self.rules_view(project), "moved": moved}
+
+        @app.post("/api/v1/projects/{project_id}/files/recheck")
+        def recheck_all(project_id: str, request: Request) -> dict[str, Any]:
+            """The coordinator has the files from before the rules checked:
+            each one's header is read (header only) and every file judged.
+            Nothing is deleted or moved on disk."""
+            who = self.require(request)
+            project = self._project(project_id)
+            if who.get("kind") == "agent" or not self.owns_project(who, project):
+                raise HTTPException(status_code=403, detail="only the coordinator can recheck")
+            read = missing = 0
+            for row in self.store.files_in(project_id):
+                if _json(row.get("meta"), {}):
+                    continue
+                path = self.path_of(project_id, row["user"], row["name"], row.get("kind") or "light")
+                if not path.is_file():
+                    missing += 1
+                    meta = {"error": "the file is not on the server's disk"}
+                else:
+                    meta = uploadrules.facts_of_file(path, row["name"])
+                    read += 1
+                self.store.set_file_meta(row["id"], meta)
+            moved: dict[str, int] = {}
+            for user in self.store.file_users(project_id):
+                for key, n in self.recheck(project, user).items():
+                    moved[key] = moved.get(key, 0) + n
+            return {"read": read, "missing": missing, "moved": moved,
+                    "lights": self.store.file_status_counts(project_id)}
 
         @app.put("/api/v1/projects/{project_id}/files/{name}")
         async def upload(project_id: str, name: str, request: Request,
@@ -403,6 +538,15 @@ class Files:
                     raise HTTPException(status_code=400,
                                         detail=f"{clean} does not start like a "
                                                f"{'XISF' if clean.lower().endswith('.xisf') else 'FITS'} file")
+                # The header only - never the pixels - for the upload rules.
+                meta = uploadrules.facts_of_file(part, clean)
+                if (kind or "").strip().lower() in ("", "auto") and meta.get("headerKind") in KINDS \
+                        and meta["headerKind"] != what:
+                    # Nothing said what it is and the name guessed: the
+                    # camera's own IMAGETYP is the better witness.
+                    what = meta["headerKind"]
+                    final = self.path_of(project_id, who["id"], clean, what)
+                    final.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(part, final)
             except BaseException:
                 with _quiet():
@@ -410,8 +554,15 @@ class Files:
                 raise
             label = telescope.strip() or str(who.get("telescope") or "")
             row = self.store.add_file(secrets.token_hex(8), project_id, who["id"],
-                                      clean, written, label[:60], what)
-            return {"file": self._row(row, {}), "already": False}
+                                      clean, written, label[:60], what, meta)
+            # A light is judged; a calibration frame may also release (or,
+            # replaced, hold back) lights already here. Either way the whole
+            # of this contributor's set is judged on stored facts - no disk.
+            moved = self.recheck(project, who["id"],
+                                 only_light=row["id"] if what == "light" else None)
+            row = self.store.file(project_id, who["id"], clean, what)
+            return {"file": self._row(row, {}), "already": False, "moved": moved,
+                    "myLights": self.store.file_status_counts(project_id, who["id"])}
 
         @app.get("/api/v1/projects/{project_id}/files/{user_id}/{kind}/{name}")
         def download(project_id: str, user_id: str, kind: str, name: str, request: Request):
@@ -445,7 +596,17 @@ class Files:
             with _quiet():
                 self.path_of(project_id, target, clean, kind).unlink()
             self.store.remove_file(project_id, target, clean, kind)
-            return {"removed": clean, "kind": kind}
+            moved = self.recheck(project, target) if kind != "light" else {}
+            return {"removed": clean, "kind": kind, "moved": moved}
+
+
+def _json(value: Any, default: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value) if value else default
+    except (TypeError, ValueError):
+        return default
 
 
 class _quiet:
@@ -499,10 +660,23 @@ _PAGE = r"""<!doctype html>
   .x:hover { color: #ff8a7a; }
   #queue tr.done td { color: #8f9bb0; }
   code { background: #11161f; padding: 1px 5px; border-radius: 4px; }
+  .rules { background: #11161f; border: 1px solid #2a3344; border-radius: 12px; padding: 12px 16px; margin: 12px 0; }
+  .rules h2 { margin-top: 0; }
+  .rules ul { margin: 6px 0; padding-left: 0; list-style: none; }
+  .rules li { margin: 4px 0; padding-left: 24px; position: relative; }
+  .rules li::before { content: '☐'; position: absolute; left: 0; color: #7ee7a5; }
+  .pill { display: inline-block; padding: 0 8px; border-radius: 10px; font-size: 12px; font-weight: 600; }
+  .pill.ready { background: #16351f; color: #7ee7a5; } .pill.pending { background: #3a3116; color: #e5c07b; }
+  .pill.quarantine { background: #3b1a17; color: #ff8a7a; } .pill.unchecked { background: #1a2130; color: #8f9bb0; }
+  .why { font-size: 12px; color: #8f9bb0; margin: 2px 0 0; }
+  .why.pending { color: #e5c07b; } .why.quarantine { color: #ff8a7a; }
+  #gaps li { margin: 3px 0; }
+  .ruleform { display: grid; grid-template-columns: minmax(200px, 1fr) 140px; gap: 6px 12px; align-items: center; font-size: 13px; margin: 8px 0; }
+  .ruleform input[type=text], .ruleform select { min-width: 0; width: 100%; padding: 4px 6px; font-size: 13px; }
 </style></head>
 <body><main>
 <h1>Starfront files</h1>
-<p class="muted">Where a collaboration's frames are collected for stacking: lights, and the flats, darks and bias that calibrate them. Only FITS and XISF files are taken, and files already here are skipped, so you can send the same folder again tomorrow and only the new ones go.</p>
+<p class="muted">Where a collaboration's frames are collected for stacking: lights, and the flats, darks and bias that calibrate them. Only FITS and XISF files are taken, and files already here are skipped, so you can send the same folder again tomorrow and only the new ones go. Lights only count once their flats and darks (or bias) are here too.</p>
 
 <section id="signin" hidden>
   <p>Sign in with the Discord account you use for Starfront. Signing in here does not sign your N.I.N.A. or Starfront out.</p>
@@ -518,6 +692,17 @@ _PAGE = r"""<!doctype html>
     <span class="small muted" id="projectNote"></span>
   </p>
   <p id="none" class="muted" hidden>No collaboration is collecting files right now.</p>
+
+  <div class="rules" id="rulesBox" hidden>
+    <h2>Upload rules for this collaboration</h2>
+    <p class="small muted">Every light needs its calibration on the server. Check each item before you upload; the server checks them too, file by file, and tells you what is missing.</p>
+    <ul id="rules"></ul>
+    <details id="ownerRules" hidden>
+      <summary class="small">Change the rules (coordinator)</summary>
+      <div class="ruleform" id="ruleForm"></div>
+      <p class="row"><button class="btn ghost" id="saveRules" style="padding:5px 10px;font-size:13px">Save rules</button> <span class="small muted" id="rulesSaved"></span></p>
+    </details>
+  </div>
 
   <div id="uploader" hidden>
     <h2>Your frames</h2>
@@ -558,12 +743,18 @@ _PAGE = r"""<!doctype html>
 
     <h2 id="mineHead">Already here from you</h2>
     <p class="small muted" id="mineNote"></p>
-    <table id="mine"><thead><tr><th>File</th><th>Kind</th><th>Telescope</th><th class="num">Size</th><th>Received</th><th></th></tr></thead><tbody></tbody></table>
+    <p id="myStatus"></p>
+    <div id="gapBox" hidden>
+      <p class="small"><b>Still needed before these lights count:</b></p>
+      <ul id="gaps" class="small"></ul>
+    </div>
+    <table id="mine"><thead><tr><th>File</th><th>Kind</th><th>Telescope</th><th class="num">Size</th><th>Status</th><th>Received</th><th></th></tr></thead><tbody></tbody></table>
 
     <div id="ownerBox" hidden>
       <h2>Everything on this collaboration</h2>
       <p class="small muted" id="allNote"></p>
-      <table id="all"><thead><tr><th>Person</th><th>File</th><th>Kind</th><th>Telescope</th><th class="num">Size</th><th>Received</th><th></th></tr></thead><tbody></tbody></table>
+      <p id="allStatus"></p>
+      <table id="all"><thead><tr><th>Person</th><th>File</th><th>Kind</th><th>Telescope</th><th class="num">Size</th><th>Status</th><th>Received</th><th></th></tr></thead><tbody></tbody></table>
     </div>
   </div>
 </section>
@@ -585,6 +776,16 @@ _PAGE = r"""<!doctype html>
     return body;
   };
   const allowed = (name) => state.allowed.some((ext) => name.toLowerCase().endsWith(ext));
+  const LABELS = { ready: 'Ready', pending: 'Pending calibration', quarantine: 'Quarantined', '': 'Not checked' };
+  const pill = (st) => `<span class="pill ${st || 'unchecked'}">${LABELS[st || ''] || esc(st)}</span>`;
+  const whyList = (st, reasons) => (reasons || []).map((r) => `<div class="why ${st || ''}">${esc(r)}</div>`).join('');
+  const statusCell = (f) => pill(f.status) + whyList(f.status, f.reasons);
+  const lightLine = (c) => {
+    c = c || {};
+    const parts = [`${c.ready || 0} ready`, `${c.pending || 0} pending calibration`, `${c.quarantine || 0} quarantined`];
+    if (c['']) parts.push(`${c['']} not checked (uploaded before the rules)`);
+    return 'Lights: ' + parts.join(' · ') + '. Only ready lights go into the stack.';
+  };
 
   async function load() {
     const info = await api('/api/v1/files/projects');
@@ -620,18 +821,53 @@ _PAGE = r"""<!doctype html>
     $('projectNote').textContent = p.notes || '';
     const listing = await api(`/api/v1/projects/${encodeURIComponent(id)}/files`);
     state.owned = listing.owned;
+    drawRules(listing);
     drawMine(listing);
     drawAll(listing);
+  }
+
+  function drawRules(listing) {
+    const r = listing.rules || { checklist: [], spec: [], values: {} };
+    $('rulesBox').hidden = !r.checklist.length;
+    $('rules').innerHTML = r.checklist.map((x) => `<li>${esc(x)}</li>`).join('');
+    $('ownerRules').hidden = !listing.owned;
+    if (!listing.owned) return;
+    $('ruleForm').innerHTML = r.spec.map((s) => {
+      const v = r.values[s.name];
+      let input;
+      if (s.type === 'bool') input = `<select data-rule="${s.name}" data-type="bool"><option value="true"${v ? ' selected' : ''}>yes</option><option value="false"${v ? '' : ' selected'}>no</option></select>`;
+      else if (s.type === 'choice') input = `<select data-rule="${s.name}" data-type="choice">${s.choices.map((c) => `<option${c === v ? ' selected' : ''}>${esc(c)}</option>`).join('')}</select>`;
+      else input = `<input type="text" data-rule="${s.name}" data-type="${s.type}" value="${v === null || v === undefined ? '' : esc(v)}" placeholder="${s.type === 'float_or_none' ? 'off' : ''}">`;
+      return `<label for="">${esc(s.about)} <span class="muted">(${esc(s.name)}, default ${s.default === null ? 'off' : esc(s.default)})</span></label>${input}`;
+    }).join('');
+  }
+
+  async function saveRules() {
+    const rules = {};
+    $('ruleForm').querySelectorAll('[data-rule]').forEach((el) => {
+      const t = el.dataset.type, v = el.value.trim();
+      rules[el.dataset.rule] = t === 'bool' ? v === 'true' : t === 'choice' ? v : (v === '' ? null : Number(v));
+    });
+    try {
+      const out = await api(`/api/v1/projects/${encodeURIComponent(state.project.id)}/upload-rules`, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ rules, replace: true }) });
+      const m = out.moved || {};
+      $('rulesSaved').textContent = `Saved. Rechecked every file: ${m.ready || 0} became ready, ${m.pending || 0} pending, ${m.quarantine || 0} quarantined.`;
+      await pick();
+    } catch (e) { $('rulesSaved').textContent = e.message; }
   }
 
   function drawMine(listing) {
     const body = $('mine').querySelector('tbody');
     const my = listing.files.filter((f) => f.user === listing.me);
-    body.innerHTML = my.map((f) => `<tr><td>${esc(f.name)}</td><td>${esc(label(f.kind))}</td><td>${esc(f.telescope)}</td><td class="num">${mb(f.bytes)}</td><td>${when(f.received)}</td>
+    body.innerHTML = my.map((f) => `<tr><td>${esc(f.name)}</td><td>${esc(label(f.kind))}</td><td>${esc(f.telescope)}</td><td class="num">${mb(f.bytes)}</td><td>${statusCell(f)}</td><td>${when(f.received)}</td>
       <td><button class="x" data-del="${esc(f.name)}" data-kind="${esc(f.kind)}" title="Take it off the server">✕</button></td></tr>`).join('');
     const counts = {};
     for (const f of my) counts[f.kind] = (counts[f.kind] || 0) + 1;
     $('mineNote').textContent = my.length ? `${kindSummary(counts)}, ${mb(my.reduce((s, f) => s + f.bytes, 0))}` : 'nothing yet';
+    $('myStatus').textContent = my.length ? lightLine(listing.myLights) : '';
+    const gaps = listing.gaps || [];
+    $('gapBox').hidden = !gaps.length;
+    $('gaps').innerHTML = gaps.map((g) => `<li>${pill(g.status)} ${esc(g.reason)} <span class="muted">(${g.files} file${g.files === 1 ? '' : 's'})</span></li>`).join('');
     body.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
       if (!confirm(`Remove ${b.dataset.del} from the server?`)) return;
       try { await api(`/api/v1/projects/${encodeURIComponent(state.project.id)}/files/${encodeURIComponent(b.dataset.del)}?kind=${encodeURIComponent(b.dataset.kind)}`, { method: 'DELETE' }); await pick(); }
@@ -645,8 +881,9 @@ _PAGE = r"""<!doctype html>
     const body = $('all').querySelector('tbody');
     body.innerHTML = listing.files.map((f) => `<tr><td>${esc(f.uploader)}</td>
       <td><a href="/api/v1/projects/${encodeURIComponent(state.project.id)}/files/${encodeURIComponent(f.user)}/${encodeURIComponent(f.kind)}/${encodeURIComponent(f.name)}">${esc(f.name)}</a></td>
-      <td>${esc(label(f.kind))}</td><td>${esc(f.telescope)}</td><td class="num">${mb(f.bytes)}</td><td>${when(f.received)}</td>
+      <td>${esc(label(f.kind))}</td><td>${esc(f.telescope)}</td><td class="num">${mb(f.bytes)}</td><td>${statusCell(f)}</td><td>${when(f.received)}</td>
       <td><button class="x" data-rm="${esc(f.name)}" data-user="${esc(f.user)}" data-kind="${esc(f.kind)}">✕</button></td></tr>`).join('');
+    $('allStatus').textContent = lightLine(listing.lights);
     const people = new Set(listing.files.map((f) => f.user)).size;
     const counts = {};
     for (const f of listing.files) counts[f.kind] = (counts[f.kind] || 0) + 1;
@@ -673,7 +910,7 @@ _PAGE = r"""<!doctype html>
     $('queue').hidden = !state.queue.length;
     const body = $('queue').querySelector('tbody');
     body.innerHTML = state.queue.map((q) => `<tr class="${q.state === 'done' || q.state === 'already' ? 'done' : ''}"><td>${esc(q.file.name)}</td><td>${esc(label(q.kind))}</td><td class="num">${mb(q.file.size)}</td>
-      <td class="${q.state === 'failed' ? 'no' : (q.state === 'done' || q.state === 'already' ? 'ok' : 'wait')}">${esc(q.text || q.state)}</td></tr>`).join('');
+      <td class="${q.state === 'failed' ? 'no' : (q.state === 'done' || q.state === 'already' ? 'ok' : 'wait')}">${esc(q.text || q.state)}${q.state === 'done' || q.state === 'already' ? ' ' + pill(q.status) + whyList(q.status, q.reasons) : ''}</td></tr>`).join('');
     const total = state.queue.reduce((s, q) => s + q.file.size, 0);
     const sent = state.queue.reduce((s, q) => s + (q.state === 'done' || q.state === 'already' ? q.file.size : q.sent), 0);
     $('allBar').hidden = !state.queue.length;
@@ -681,7 +918,10 @@ _PAGE = r"""<!doctype html>
     const left = state.queue.filter((q) => q.state === 'waiting' || q.state === 'sending').length;
     $('progress').hidden = false;
     if (left) $('progressText').textContent = `${left} to go · ${mb(sent)} of ${mb(total)}`;
-    else if (state.queue.length) $('progressText').textContent = `All done: ${state.queue.filter((q) => q.state === 'done').length} uploaded, ${state.queue.filter((q) => q.state === 'already').length} already here, ${state.queue.filter((q) => q.state === 'failed').length} failed.`;
+    else if (state.queue.length) {
+      const n = (st) => state.queue.filter((q) => q.kind === 'light' && (q.state === 'done' || q.state === 'already') && q.status === st).length;
+      $('progressText').textContent = `All done: ${state.queue.filter((q) => q.state === 'done').length} uploaded, ${state.queue.filter((q) => q.state === 'already').length} already here, ${state.queue.filter((q) => q.state === 'failed').length} failed. Lights in this batch: ${n('ready')} ready, ${n('pending')} pending calibration, ${n('quarantine')} quarantined (see below for why).`;
+    }
   }
 
   function send(q, attempt) {
@@ -693,7 +933,15 @@ _PAGE = r"""<!doctype html>
       xhr.onload = () => {
         let body = {};
         try { body = JSON.parse(xhr.responseText || '{}'); } catch (e) { /* not json */ }
-        if (xhr.status >= 200 && xhr.status < 300) { q.state = body.already ? 'already' : 'done'; q.text = body.already ? 'already here' : 'uploaded'; resolve(true); }
+        if (xhr.status >= 200 && xhr.status < 300) {
+          q.state = body.already ? 'already' : 'done';
+          const f = body.file || {};
+          q.status = f.status || ''; q.reasons = f.reasons || [];
+          q.text = (body.already ? 'already here' : 'uploaded');
+          const m = body.moved || {};
+          if (q.kind !== 'light' && m.ready) q.reasons = q.reasons.concat([`${m.ready} of your lights became ready`]);
+          resolve(true);
+        }
         else if (xhr.status === 507 || xhr.status === 400 || xhr.status === 409 || xhr.status === 413) { q.state = 'failed'; q.text = body.detail || xhr.statusText; resolve(true); }
         else resolve(false);
       };
@@ -724,6 +972,7 @@ _PAGE = r"""<!doctype html>
   }
 
   $('project').addEventListener('change', () => pick().catch((e) => alert(e.message)));
+  $('saveRules').addEventListener('click', () => saveRules());
   // One box per kind of frame. Its buttons open the shared pickers with the
   // box's kind remembered; a drop on it takes the box's kind.
   $('files').addEventListener('change', (e) => { take(e.target.files, state.picking); e.target.value = ''; });

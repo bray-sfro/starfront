@@ -194,6 +194,14 @@ class Store:
             if "kind" not in columns:
                 self._db.execute("ALTER TABLE files ADD COLUMN kind "
                                  "TEXT NOT NULL DEFAULT 'light'")
+            # What the upload rules made of each file (server/uploadrules.py):
+            # its status (ready, pending, quarantine; '' for a file from before
+            # the rules), the reasons shown to the contributor, and the header
+            # facts calibration is matched on, so a recheck never re-reads disk.
+            for column, default in (("status", "''"), ("reasons", "'[]'"), ("meta", "'{}'")):
+                if column not in columns:
+                    self._db.execute(f"ALTER TABLE files ADD COLUMN {column} "
+                                     f"TEXT NOT NULL DEFAULT {default}")
             self._db.execute("DROP INDEX IF EXISTS files_once")
             self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS files_once_per_kind"
                              " ON files (project, user, kind, name)")
@@ -404,16 +412,51 @@ class Store:
 
     # -- files -------------------------------------------------------------
     def add_file(self, file_id: str, project_id: str, user_id: str, name: str,
-                 size: int, telescope: str = "", kind: str = "light") -> dict[str, Any]:
+                 size: int, telescope: str = "", kind: str = "light",
+                 meta: dict[str, Any] | None = None) -> dict[str, Any]:
         """A file received, or received again: one row per project, person,
-        kind and name, at the latest size."""
+        kind and name, at the latest size. Its status is set by the upload
+        rules straight after (`set_file_status`)."""
         self._run(
-            "INSERT INTO files (id, project, user, kind, name, bytes, received, telescope)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO files (id, project, user, kind, name, bytes, received, telescope, meta)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT(project, user, kind, name) DO UPDATE SET bytes = excluded.bytes,"
-            " received = excluded.received, telescope = excluded.telescope",
-            file_id, project_id, user_id, kind, name, int(size), time.time(), telescope)
+            " received = excluded.received, telescope = excluded.telescope,"
+            " meta = excluded.meta",
+            file_id, project_id, user_id, kind, name, int(size), time.time(), telescope,
+            json.dumps(meta or {}))
         return self.file(project_id, user_id, name, kind)
+
+    def set_file_meta(self, file_id: str, meta: dict[str, Any]) -> None:
+        self._run("UPDATE files SET meta = ? WHERE id = ?", json.dumps(meta or {}), file_id)
+
+    def set_file_statuses(self, changes: list[tuple[str, str, list[str]]]) -> None:
+        """Many (id, status, reasons) at once, in one transaction."""
+        if not changes:
+            return
+        with self._lock:
+            self._db.executemany("UPDATE files SET status = ?, reasons = ? WHERE id = ?",
+                                 [(status, json.dumps(reasons), fid)
+                                  for fid, status, reasons in changes])
+            self._db.commit()
+
+    def file_status_counts(self, project_id: str, user_id: str | None = None,
+                           kind: str | None = "light") -> dict[str, int]:
+        """How many files (lights, by default) are in each upload-rule status."""
+        sql = "SELECT status, COUNT(*) AS count FROM files WHERE project = ?"
+        args: list[Any] = [project_id]
+        if user_id is not None:
+            sql += " AND user = ?"
+            args.append(user_id)
+        if kind is not None:
+            sql += " AND kind = ?"
+            args.append(kind)
+        rows = self._all(sql + " GROUP BY status", *args)
+        return {str(row["status"]): int(row["count"]) for row in rows}
+
+    def file_users(self, project_id: str) -> list[str]:
+        return [str(row["user"]) for row in
+                self._all("SELECT DISTINCT user FROM files WHERE project = ?", project_id)]
 
     def file(self, project_id: str, user_id: str, name: str,
              kind: str = "light") -> dict[str, Any] | None:

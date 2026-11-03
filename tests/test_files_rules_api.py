@@ -1,0 +1,129 @@
+"""The files routes under the upload rules, end to end on a bare app."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from server.files import Files  # noqa: E402
+from server.store import Store  # noqa: E402
+from fitsfake import light_cards, write_fits  # noqa: E402
+
+PEOPLE = {"owner-token": {"kind": "user", "id": "u-owner", "name": "Bray", "roles": [], "admin": False},
+          "alice-token": {"kind": "user", "id": "u-alice", "name": "Alice", "roles": [], "admin": False}}
+
+
+@pytest.fixture()
+def world(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    app = FastAPI()
+    owns = lambda who, project: who["admin"] or project.get("owner_id") == who["id"]  # noqa: E731
+    files = Files(app, store, tmp_path / "files", PEOPLE.get, owns, [], "http://test", lambda: "c")
+    store.add_project("p1", "M31 test", "Bray", {"collectFiles": True, "region": {}}, owner_id="u-owner")
+    return TestClient(app), store, tmp_path, files
+
+
+def put(client, tmp, name, kind, token="alice-token", **cards):
+    path = write_fits(tmp / name, light_cards(**cards))
+    return client.put(f"/api/v1/projects/p1/files/{name}?kind={kind}&telescope=RC8",
+                      content=path.read_bytes(), headers={"authorization": f"Bearer {token}"})
+
+
+def test_light_waits_for_calibration_then_counts(world):
+    client, store, tmp, _ = world
+    r = put(client, tmp, "L_0001.fits", "light")
+    assert r.status_code == 200
+    f = r.json()["file"]
+    assert f["status"] == "pending" and any("flats in filter Ha" in x for x in f["reasons"])
+    assert r.json()["myLights"] == {"pending": 1}
+    r = put(client, tmp, "flat_0001.fits", "flat", IMAGETYP="FLAT", EXPTIME=2.0)
+    assert r.json()["file"]["status"] == "ready"
+    r = put(client, tmp, "dark_0001.fits", "dark", IMAGETYP="DARK")
+    assert r.json()["moved"]["ready"] == 1
+    listing = client.get("/api/v1/projects/p1/files", headers={"authorization": "Bearer alice-token"}).json()
+    light = next(x for x in listing["files"] if x["kind"] == "light")
+    assert light["status"] == "ready" and listing["myLights"] == {"ready": 1}
+    assert listing["gaps"] == [] and listing["rules"]["checklist"]
+    # Take the dark off again: the light goes back to waiting.
+    r = client.delete("/api/v1/projects/p1/files/dark_0001.fits?kind=dark",
+                      headers={"authorization": "Bearer alice-token"})
+    assert r.json()["moved"]["pending"] == 1
+
+
+def test_bad_header_is_quarantined_not_deleted(world):
+    client, store, tmp, files = world
+    r = put(client, tmp, "nofilter.fits", "light", FILTER=None)
+    f = r.json()["file"]
+    assert f["status"] == "quarantine" and "no filter" in f["reasons"][0]
+    assert files.path_of("p1", "u-alice", "nofilter.fits").is_file()
+    listing = client.get("/api/v1/projects/p1/files", headers={"authorization": "Bearer alice-token"}).json()
+    assert listing["gaps"][0]["status"] == "quarantine"
+
+
+def test_header_kind_used_when_none_given(world):
+    client, store, tmp, files = world
+    path = write_fits(tmp / "x.fits", light_cards(IMAGETYP="FLAT"))
+    r = client.put("/api/v1/projects/p1/files/M31_0001.fits", content=path.read_bytes(),
+                   headers={"authorization": "Bearer alice-token"})
+    assert r.json()["file"]["kind"] == "flat"
+    assert files.path_of("p1", "u-alice", "M31_0001.fits", "flat").is_file()
+
+
+def test_not_fits_still_refused_outright(world):
+    client, store, tmp, _ = world
+    r = client.put("/api/v1/projects/p1/files/a.fits", content=b"hello world",
+                   headers={"authorization": "Bearer alice-token"})
+    assert r.status_code == 400
+
+
+def test_owner_changes_rules_and_everything_is_rejudged(world):
+    client, store, tmp, _ = world
+    put(client, tmp, "L_0001.fits", "light")
+    put(client, tmp, "flat_0001.fits", "flat", IMAGETYP="FLAT")
+    put(client, tmp, "bias_0001.fits", "bias", IMAGETYP="BIAS", EXPTIME=0.0)
+    listing = client.get("/api/v1/projects/p1/files", headers={"authorization": "Bearer alice-token"}).json()
+    assert listing["myLights"] == {"ready": 1}
+    r = client.put("/api/v1/projects/p1/upload-rules", json={"rules": {"darkPolicy": "dark"}},
+                   headers={"authorization": "Bearer alice-token"})
+    assert r.status_code == 403
+    r = client.put("/api/v1/projects/p1/upload-rules", json={"rules": {"darkPolicy": "maybe"}},
+                   headers={"authorization": "Bearer owner-token"})
+    assert r.status_code == 400
+    r = client.put("/api/v1/projects/p1/upload-rules", json={"rules": {"darkPolicy": "dark"}},
+                   headers={"authorization": "Bearer owner-token"})
+    assert r.status_code == 200 and r.json()["moved"]["pending"] == 1
+    assert store.project("p1")["payload"]["uploadRules"] == {"darkPolicy": "dark"}
+    assert client.get("/api/v1/projects/p1/upload-rules").json()["values"]["darkPolicy"] == "dark"
+    # Back to the default: stored as no change at all.
+    client.put("/api/v1/projects/p1/upload-rules", json={"rules": {"darkPolicy": "darkOrBias"}},
+               headers={"authorization": "Bearer owner-token"})
+    assert store.project("p1")["payload"]["uploadRules"] == {}
+
+
+def test_recheck_grandfathered_files(world):
+    client, store, tmp, files = world
+    # A file from before the rules: on disk and in the table, no facts, no status.
+    folder = files.path_of("p1", "u-alice", "old.fits").parent
+    folder.mkdir(parents=True, exist_ok=True)
+    write_fits(folder / "old.fits", light_cards())
+    store.add_file("old1", "p1", "u-alice", "old.fits", (folder / "old.fits").stat().st_size, "", "light")
+    listing = client.get("/api/v1/projects/p1/files", headers={"authorization": "Bearer owner-token"}).json()
+    assert listing["files"][0]["status"] == "" and listing["lights"] == {"": 1}
+    assert client.post("/api/v1/projects/p1/files/recheck",
+                       headers={"authorization": "Bearer alice-token"}).status_code == 403
+    r = client.post("/api/v1/projects/p1/files/recheck", headers={"authorization": "Bearer owner-token"})
+    assert r.json()["read"] == 1 and r.json()["lights"] == {"pending": 1}
+
+
+def test_page_has_the_checklist(world):
+    client, *_ = world
+    html = client.get("/files").text
+    assert "Upload rules for this collaboration" in html and "Pending calibration" in html
