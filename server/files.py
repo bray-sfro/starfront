@@ -242,7 +242,8 @@ class Files:
                 "user": user, "uploader": names[user],
                 "status": status,
                 "statusLabel": uploadrules.STATUS_LABELS.get(status, status),
-                "reasons": _json(row.get("reasons"), [])}
+                "reasons": _json(row.get("reasons"), []),
+                **_select_facts(row)}
 
     # -- the upload rules ---------------------------------------------------
     def recheck(self, project: dict[str, Any], user_id: str,
@@ -679,6 +680,47 @@ class Files:
                 raise HTTPException(status_code=404, detail="no such file")
             return FileResponse(path, media_type="application/octet-stream", filename=clean)
 
+        @app.post("/api/v1/projects/{project_id}/files/remove")
+        async def remove_many(project_id: str, request: Request) -> dict[str, Any]:
+            """Take many files off at once: each your own, or, as the
+            coordinator, anybody's. Calibration is rechecked once per
+            contributor at the end, not once per file."""
+            who = self.require(request)
+            project = self._project(project_id)
+            try:
+                body = await request.json()
+            except ValueError:
+                raise HTTPException(status_code=400, detail="send JSON")
+            items = body.get("files") if isinstance(body, dict) else None
+            if not isinstance(items, list) or not items:
+                raise HTTPException(status_code=400, detail="no files listed")
+            if len(items) > 5000:
+                raise HTTPException(status_code=400, detail="at most 5000 files at once")
+            owned = self.owns_project(who, project)
+            results, recheck_for = [], set()
+            for item in items:
+                item = item if isinstance(item, dict) else {}
+                name = str(item.get("name") or "")
+                kind = str(item.get("kind") or "light")
+                target = str(item.get("user") or "") or who["id"]
+                out = {"name": name, "kind": kind, "user": target}
+                if target != who["id"] and not owned:
+                    results.append({**out, "ok": False, "error": "not your file"})
+                    continue
+                clean = clean_name(name)
+                if not clean or kind not in KINDS or self.store.file(project_id, target, clean, kind) is None:
+                    results.append({**out, "ok": False, "error": "no such file"})
+                    continue
+                with _quiet():
+                    self.path_of(project_id, target, clean, kind).unlink()
+                self.store.remove_file(project_id, target, clean, kind)
+                if kind != "light":
+                    recheck_for.add(target)
+                results.append({**out, "name": clean, "ok": True})
+            moved = {user: self.recheck(project, user) for user in sorted(recheck_for)}
+            done = sum(1 for r in results if r["ok"])
+            return {"removed": done, "failed": len(results) - done, "results": results, "moved": moved}
+
         @app.delete("/api/v1/projects/{project_id}/files/{name}")
         def remove(project_id: str, name: str, request: Request,
                    user: str = Query(default="", max_length=64),
@@ -697,6 +739,18 @@ class Files:
             self.store.remove_file(project_id, target, clean, kind)
             moved = self.recheck(project, target) if kind != "light" else {}
             return {"removed": clean, "kind": kind, "moved": moved}
+
+
+_PANEL = re.compile(r"(?:panel|pane|tile|mosaic)[ _-]?(\d{1,3})|(?:^|[_ -])p(\d{1,3})(?=[_ .-])", re.I)
+
+
+def _select_facts(row: dict[str, Any]) -> dict[str, str]:
+    """Filter, night and mosaic panel of a file, for picking files in bulk."""
+    meta = _json(row.get("meta"), {}) or {}
+    found = _PANEL.search(str(row.get("name") or ""))
+    return {"filter": str(meta.get("filter") or ""),
+            "night": str(meta.get("date") or "")[:10],
+            "panel": (found.group(1) or found.group(2)).lstrip("0") or "0" if found else ""}
 
 
 def _json(value: Any, default: Any) -> Any:
@@ -756,6 +810,10 @@ _PAGE = r"""<!doctype html>
   .bar { height: 8px; background: #1a2130; border-radius: 4px; overflow: hidden; }
   .bar > i { display: block; height: 100%; background: #7ee7a5; width: 0; }
   .ok { color: #7ee7a5; } .no { color: #ff8a7a; } .wait { color: #e5c07b; }
+  .pickbar { margin: 6px 0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .pickbar select, .pickbar button { font-size: 12px; }
+  .pickbar button.rm { background: none; border: 1px solid #5a6478; color: #c9d1de; border-radius: 4px; padding: 2px 8px; cursor: pointer; }
+  .pickbar button.rm:disabled { opacity: .4; cursor: default; }
   .x { background: none; border: 0; color: #8f9bb0; cursor: pointer; font-size: 14px; }
   .x:hover { color: #ff8a7a; }
   #queue tr.done td { color: #8f9bb0; }
@@ -1012,6 +1070,14 @@ _PAGE = r"""<!doctype html>
       <div id="mineScopes"></div>
       <p class="small muted" id="mineNote"></p>
       <div id="mineKinds"></div>
+    </div>
+  </details>
+
+  <details class="view" id="sec-others" hidden>
+    <summary><span class="t">Contributors' files</span> <span class="sum" id="sumOthers"></span></summary>
+    <div class="inner">
+      <p class="small muted">Only you, as coordinator, see this. Tick bad frames and remove them.</p>
+      <div id="othersKinds"></div>
     </div>
   </details>
 </div>
@@ -1522,6 +1588,7 @@ _PAGE = r"""<!doctype html>
       return;
     }
     ['sec-rules', 'sec-needed', 'sec-mine'].forEach((k) => { $(k).hidden = !mine; });
+    if (!mine) $('sec-others').hidden = true;
     if (!mine) {
       $('uploader').hidden = true;
       $('none').hidden = false;
@@ -1586,6 +1653,7 @@ _PAGE = r"""<!doctype html>
     state.owned = listing.owned;
     drawRules(listing);
     drawMine(listing);
+    drawOthers(listing);
     deepLink();
   }
 
@@ -1677,15 +1745,7 @@ _PAGE = r"""<!doctype html>
     // One folding table per kind, so a season of lights does not bury the calibration.
     const order = ['light', 'flat', 'dark', 'bias', 'darkflat'];
     const kinds = order.filter((k) => counts[k]).concat(Object.keys(counts).filter((k) => !order.includes(k)));
-    $('mineKinds').innerHTML = kinds.map((k) => {
-      const rows = my.filter((f) => f.kind === k);
-      const st = {};
-      for (const f of rows) st[f.status || ''] = (st[f.status || ''] || 0) + 1;
-      const stText = Object.entries(st).map(([x, n]) => `${n} ${(LABELS[x] || x).toLowerCase()}`).join(' · ');
-      return `<details class="kind" data-kind="${esc(k)}"><summary>${esc(label(k))} <span class="muted small">(${rows.length}) ${esc(stText)}</span></summary>
-        <div class="scroll"><table><thead><tr><th>File</th><th>Telescope</th><th class="num">Size</th><th>Status</th><th>Received</th><th></th></tr></thead><tbody>${rows.map((f) => `<tr><td>${esc(f.name)}</td><td>${esc(f.telescope)}</td><td class="num">${mb(f.bytes)}</td><td>${statusCell(f)}</td><td>${when(f.received)}</td>
-        <td><button class="x" data-del="${esc(f.name)}" data-kind="${esc(f.kind)}" title="Take it off the server" aria-label="Remove ${esc(f.name)}">✕</button></td></tr>`).join('')}</tbody></table></div></details>`;
-    }).join('');
+    drawPicker('mineKinds', my, false);
     // What is holding lights back, opened by itself when something is.
     const gaps = listing.gaps || [];
     const needed = show('sec-needed');
@@ -1700,11 +1760,90 @@ _PAGE = r"""<!doctype html>
       : (lights ? `all ${lights} ready` : 'no lights yet');
     const r = remembered();
     if (c.pending && !('sec-needed' in r && r['sec-needed'] === false)) setOpen(needed, true);
-    $('mineKinds').querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', async () => {
-      if (!confirm(`Remove ${b.dataset.del} from the server?`)) return;
-      try { await api(`/api/v1/projects/${encodeURIComponent(state.project.id)}/files/${encodeURIComponent(b.dataset.del)}?kind=${encodeURIComponent(b.dataset.kind)}`, { method: 'DELETE' }); await pick(); }
-      catch (e) { alert(e.message); }
+  }
+
+  // Tick-box tables with bulk remove, for your own files and (coordinator) everyone else's.
+  function drawPicker(boxId, files, others) {
+    const box = $(boxId);
+    const order = ['light', 'flat', 'dark', 'bias', 'darkflat'];
+    const counts = {};
+    for (const f of files) counts[f.kind] = (counts[f.kind] || 0) + 1;
+    const kinds = order.filter((k) => counts[k]).concat(Object.keys(counts).filter((k) => !order.includes(k)));
+    const key = (f) => JSON.stringify([f.user, f.kind, f.name]);
+    const byKey = {};
+    files.forEach((f) => { byKey[key(f)] = f; });
+    const opts = (field, title) => {
+      const vals = [...new Set(files.map((f) => f[field]).filter(Boolean))].sort((a, b) => (Number(a) - Number(b)) || String(a).localeCompare(String(b)));
+      return vals.length ? `<optgroup label="${title}">${vals.map((v) => `<option value="${field}:${esc(v)}">${title} ${esc(v)}</option>`).join('')}</optgroup>` : '';
+    };
+    const uploaders = others ? opts('uploader', 'Contributor') : '';
+    const shortcut = opts('filter', 'Filter') + opts('panel', 'Panel') + opts('night', 'Date') + uploaders;
+    const bar = files.length ? `<div class="pickbar small"><span class="muted" data-count>0 selected</span>
+      ${shortcut ? `<select data-by><option value="">Select by…</option>${shortcut}</select>` : ''}
+      <button type="button" class="rm" data-clear disabled>Clear</button>
+      <button type="button" class="rm" data-rm disabled>Remove selected (0)</button></div>` : '';
+    box.innerHTML = bar + kinds.map((k) => {
+      const rows = files.filter((f) => f.kind === k);
+      const st = {};
+      for (const f of rows) st[f.status || ''] = (st[f.status || ''] || 0) + 1;
+      const stText = Object.entries(st).map(([x, n]) => `${n} ${(LABELS[x] || x).toLowerCase()}`).join(' · ');
+      return `<details class="kind" data-kind="${esc(k)}"><summary>${esc(label(k))} <span class="muted small">(${rows.length}) ${esc(stText)}</span></summary>
+        <div class="scroll"><table><thead><tr><th><input type="checkbox" data-all="${esc(k)}" title="Select all ${esc(label(k)).toLowerCase()}" aria-label="Select all"></th><th>File</th>${others ? '<th>Contributor</th>' : ''}<th>Telescope</th><th class="num">Size</th><th>Status</th><th>Received</th><th></th></tr></thead><tbody>${rows.map((f) => `<tr><td><input type="checkbox" data-pick="${esc(key(f))}" aria-label="Select ${esc(f.name)}"></td><td>${esc(f.name)}</td>${others ? `<td>${esc(f.uploader)}</td>` : ''}<td>${esc(f.telescope)}</td><td class="num">${mb(f.bytes)}</td><td>${statusCell(f)}</td><td>${when(f.received)}</td>
+        <td><button class="x" data-del="${esc(key(f))}" title="Take it off the server" aria-label="Remove ${esc(f.name)}">✕</button></td></tr>`).join('')}</tbody></table></div></details>`;
+    }).join('');
+    const picks = () => [...box.querySelectorAll('[data-pick]')];
+    const chosen = () => picks().filter((c) => c.checked).map((c) => byKey[c.dataset.pick]);
+    const sync = () => {
+      const sel = chosen();
+      const size = sel.reduce((x, f) => x + f.bytes, 0);
+      const c = box.querySelector('[data-count]'); if (c) c.textContent = sel.length ? `${sel.length} selected · ${mb(size)}` : '0 selected';
+      const b = box.querySelector('[data-rm]'); if (b) { b.disabled = !sel.length; b.textContent = `Remove selected (${sel.length})`; }
+      const cl = box.querySelector('[data-clear]'); if (cl) cl.disabled = !sel.length;
+      box.querySelectorAll('[data-all]').forEach((a) => {
+        const mine = picks().filter((c) => byKey[c.dataset.pick].kind === a.dataset.all);
+        const n = mine.filter((c) => c.checked).length;
+        a.checked = n > 0 && n === mine.length; a.indeterminate = n > 0 && n < mine.length;
+      });
+    };
+    const removeList = async (list) => {
+      const size = list.reduce((x, f) => x + f.bytes, 0);
+      const who = new Set(list.map((f) => f.uploader));
+      if (!confirm(`Remove ${list.length} file${list.length === 1 ? '' : 's'} (${mb(size)})${others ? ` from ${[...who].join(', ')}` : ''} from the server? This cannot be undone.`)) return;
+      try {
+        const r = await api(`/api/v1/projects/${encodeURIComponent(state.project.id)}/files/remove`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ files: list.map((f) => ({ name: f.name, kind: f.kind, user: f.user })) }) });
+        if (r.failed) alert(`${r.removed} removed, ${r.failed} not removed:\n` + r.results.filter((x) => !x.ok).slice(0, 10).map((x) => `${x.name}: ${x.error}`).join('\n'));
+        await pick();
+      } catch (e) { alert(e.message); }
+    };
+    picks().forEach((c) => c.addEventListener('change', sync));
+    box.querySelectorAll('[data-all]').forEach((a) => a.addEventListener('change', () => {
+      picks().filter((c) => byKey[c.dataset.pick].kind === a.dataset.all).forEach((c) => { c.checked = a.checked; });
+      sync();
     }));
+    const by = box.querySelector('[data-by]');
+    if (by) by.addEventListener('change', () => {
+      const v = by.value; by.value = '';
+      if (!v) return;
+      const i = v.indexOf(':'); const field = v.slice(0, i); const val = v.slice(i + 1);
+      picks().forEach((c) => { if (String(byKey[c.dataset.pick][field]) === val) c.checked = true; });
+      box.querySelectorAll('details.kind').forEach((d) => { if (d.querySelector('[data-pick]:checked')) d.open = true; });
+      sync();
+    });
+    const cl = box.querySelector('[data-clear]');
+    if (cl) cl.addEventListener('click', () => { picks().forEach((c) => { c.checked = false; }); sync(); });
+    const rm = box.querySelector('[data-rm]');
+    if (rm) rm.addEventListener('click', () => removeList(chosen()));
+    box.querySelectorAll('[data-del]').forEach((b) => b.addEventListener('click', () => removeList([byKey[b.dataset.del]])));
+  }
+
+  function drawOthers(listing) {
+    const sec = $('sec-others');
+    const rest = listing.owned ? listing.files.filter((f) => f.user !== listing.me) : [];
+    sec.hidden = !rest.length;
+    if (!rest.length) { $('othersKinds').innerHTML = ''; return; }
+    const people = new Set(rest.map((f) => f.user)).size;
+    sec.querySelector('.sum').textContent = `${rest.length.toLocaleString()} files from ${people} contributor${people === 1 ? '' : 's'} · ${mb(rest.reduce((x, f) => x + f.bytes, 0))}`;
+    drawPicker('othersKinds', rest, true);
   }
 
   function take(fileList, kind) {
