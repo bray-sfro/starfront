@@ -2614,6 +2614,75 @@ case("a second collaboration of the same name gets its own unique slug and join 
      and other_row["join_code"] != row["join_code"]
      and other_row["doc"]["visibility"] == "public")
 
+# A mosaic is stacked on a grid its panels frame, not one the first light
+# moves. On 2026-11-04 M81_M82 (a 2 x 2 mosaic, FRA600 with its camera at
+# 268 degrees) had the region's placeholder with rotation_from_first_light,
+# the first light (panel 1) moved the grid's centre onto itself, and panel 2's
+# clear frames fell 90 % off it: refused pointing_off_target.
+M81_REGION = {"ra": 148.94167, "dec": 69.32278, "width": 1.06, "height": 1.08, "rotation": 5.06}
+status, made = call("POST", "/api/v1/projects", {
+    "name": "M81 mosaic", "region": M81_REGION, "kind": "mosaic",
+    "requirements": {"filters": {"L": None}}, "stacking": {"backend": "hub", "hubId": BH}}, token=BOBH)
+M81P = made["project"]["id"]
+m81_doc = (server_app.store.stack_project_of(M81P) or {}).get("doc") or {}
+case("a mosaic nobody has joined is stacked on the region's placeholder, framed by the first light",
+     status == 200 and m81_doc.get("rotation_from_first_light") is True
+     and m81_doc.get("grid", {}).get("center_ra_deg") == 148.94167, str(m81_doc.get("grid")))
+_, fra = call("POST", "/api/v1/agents", {"name": "FRA600"}, token=BOBH)
+call("POST", "/api/v1/agent/hello", {
+    "protocol": collab.PROTOCOL,
+    "profile": {"name": "FRA600", "focalLength": 600.0, "pixelSize": 2.9, "sensorWidth": 3840,
+                "sensorHeight": 2160, "binning": 1, "filters": {"Lum": None},
+                "channels": {"Lum": ["L"]}, "rotation": 268.18, "client": "nina"}}, token=fra["token"])
+status, m81_join = call("POST", f"/api/v1/agent/projects/{M81P}/join", {}, token=fra["token"])
+m81_cells = m81_join.get("task", {}).get("cells") or []
+m81_doc = server_app.store.stack_project_of(M81P)["doc"]
+m81_grid = m81_doc.get("grid") or {}
+m81_scale = 206.265 * 2.9 / 600.0
+
+
+def _on_m81_grid(ra, dec):
+    """A sky position's offset from the M81 grid's centre, in its pixels."""
+    dx, dy = stack_defaults._offsets(*stack_defaults._to_plane(
+        m81_grid["center_ra_deg"], m81_grid["center_dec_deg"], ra, dec), m81_grid["rotation_deg"])
+    return dx * 3600.0 / m81_grid["scale_arcsec_px"], dy * 3600.0 / m81_grid["scale_arcsec_px"]
+
+
+m81_inside = []
+for cell in m81_cells:
+    cx, cy = _on_m81_grid(cell["ra"], cell["dec"])
+    m81_inside.append(abs(cx) + 3840 / 2 <= m81_grid.get("width_px", 0) / 2
+                      and abs(cy) + 2160 / 2 <= m81_grid.get("height_px", 0) / 2)
+case("once a rig joins, the grid is framed by its panels and no longer by the first light",
+     status == 200 and len(m81_cells) == 4 and "rotation_from_first_light" not in m81_doc,
+     f"{len(m81_cells)} cells, {m81_doc.get('rotation_from_first_light')}")
+case("...every panel lies wholly on it",
+     m81_inside == [True] * 4, f"{m81_inside} {m81_grid}")
+case("...centred on the mosaic, not on one panel",
+     abs(m81_grid.get("center_ra_deg", 0) - 148.94) < 0.02
+     and abs(m81_grid.get("center_dec_deg", 0) - 69.32) < 0.02, str(m81_grid))
+case("...turned to the camera, at its scale, about 2.1 x 1.2 degrees",
+     m81_grid.get("rotation_deg") == 88.18 and abs(m81_grid.get("scale_arcsec_px", 0) - m81_scale) < 1e-3
+     and 7400 < m81_grid.get("width_px", 0) < 7800 and 4200 < m81_grid.get("height_px", 0) < 4500,
+     str(m81_grid))
+_, pulled = call("GET", f"/api/v1/hubs/{BH}/pull?since={SINCE}&wait=0", token=BHTOK)
+case("...and the hub is told", any(c["key"] == m81_doc["project_id"] for c in pulled["changes"]),
+     str(pulled["changes"]))
+SINCE = pulled["seq"]
+_, again = call("GET", "/api/v1/agent/task?night=2026-11-04", token=fra["token"])
+_, pulled = call("GET", f"/api/v1/hubs/{BH}/pull?since={SINCE}&wait=0", token=BHTOK)
+case("...a poll with nothing moved sends the hub nothing",
+     not any(c["key"] == m81_doc["project_id"] for c in pulled["changes"]), str(pulled["changes"]))
+SINCE = pulled["seq"]
+case("a mosaic grid wider than the contract's 12 000 px is coarsened to fit, not cut",
+     (lambda g: g["width_px"] <= 12000 and g["height_px"] <= 12000
+      and g["width_px"] * g["scale_arcsec_px"] / 3600.0 > 6.0)(stack_defaults.mosaic_grid(
+          [{"ra": 84.0 + i * 1.0, "dec": 0.0, "width": 1.06, "height": 0.6, "rotation": 0.0}
+           for i in range(6)], 1.0)))
+case("...and a mosaic with no camera known keeps the placeholder",
+     stack_defaults.mosaic_grid([], 1.0) is None
+     and stack_defaults.mosaic_grid([{"ra": 1.0, "dec": 1.0, "width": 1.0, "height": 1.0}], 0.0) is None)
+
 status, made = call("POST", "/api/v1/projects", {
     "name": "Coordinator's", "region": REGION, "requirements": {"filters": {"Ha": 3.0}},
     "stacking": {"backend": "hub", "hubId": BH}}, token=CAROL)

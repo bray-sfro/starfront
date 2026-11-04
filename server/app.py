@@ -718,12 +718,18 @@ def _policy_for(requirements: dict[str, Any], filters_: list[str]) -> dict[str, 
 
 
 def _stack_fields(name: str, coordinator: str, payload: dict[str, Any],
-                  binding: dict[str, Any], status: str = "open") -> dict[str, Any]:
+                  binding: dict[str, Any], status: str = "open",
+                  sf_project: str = "") -> dict[str, Any]:
     """What the stacking engine is told about a collaboration, on a hub or the
     cloud alike: the one derivation both backends use (T706).
 
     `status` is the collaboration's (`open` or `closed`); the caller maps it to
     each backend's lifecycle.
+
+    The grid: a mosaic with panels dealt (`sf_project` names it, so its tasks
+    can be read) is framed by its panels (`_mosaic_grid`), complete, and the
+    first light is not asked to frame it (`rotation_from_first_light` false).
+    Anything else gets the region's placeholder, which the first light frames.
     """
     region = payload.get("region") or {}
     wants = collab.Requirements.read(payload.get("requirements") or {})
@@ -737,11 +743,90 @@ def _stack_fields(name: str, coordinator: str, payload: dict[str, Any],
         "policy": _policy_for(payload.get("requirements") or {}, chosen),
         "status": "open" if status == "open" else "closed",
     }
-    if region:
+    mosaic = _mosaic_grid(sf_project, payload) if sf_project else None
+    if mosaic is not None:
+        out["grid"] = mosaic
+        out["rotation_from_first_light"] = False
+    elif region:
         out["grid"] = stack_defaults.placeholder_grid(
             region.get("ra", 0.0), region.get("dec", 0.0),
             region.get("width", 1.0), region.get("height", 1.0))
+        out["rotation_from_first_light"] = True
     return out
+
+
+#: The task states whose cells a mosaic's grid is framed to: the panels being
+#: shot, or shot. A declined or cancelled share frames nothing.
+_FRAMING_TASK_STATES = ("offered", "accepted", "complete")
+
+
+def _mosaic_grid(sf_project: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    """The grid a mosaic collaboration is stacked on, from the panels dealt to
+    its rigs (`stack_defaults.mosaic_grid`), or None for a single target, or
+    a mosaic no rig with a known camera has joined yet.
+
+    Each cell is a panel at its rig's camera angle; its field along the
+    camera's own axes comes from the rig's profile (a cell stores only the
+    north-up box the turned frame spans). The scale is the finest rig's: the
+    grid is the resolution every panel is resampled to.
+    """
+    if (payload.get("kind") or "mosaic") != "mosaic":
+        return None
+    panels: list[dict[str, Any]] = []
+    scales: list[float] = []
+    for task in store.tasks_in(sf_project):
+        if task.get("state") not in _FRAMING_TASK_STATES or not task.get("cells"):
+            continue
+        agent = store.agent(str(task.get("agent") or "")) or {}
+        profile = collab.RigProfile.read(agent.get("profile") or {})
+        field = profile.field()
+        if profile.scale():
+            scales.append(float(profile.scale()))
+        for cell in task["cells"]:
+            rotation = cell.get("rotation")
+            if field is not None and rotation is not None:
+                width, height = field
+            else:
+                # A rotator rig's cells are north-up frames already; one with no
+                # field known is framed by the box its cell spans.
+                width, height, rotation = cell.get("width"), cell.get("height"), 0.0
+            panels.append({"ra": cell.get("ra"), "dec": cell.get("dec"),
+                           "width": width, "height": height, "rotation": rotation})
+    if not panels or not scales:
+        return None
+    return stack_defaults.mosaic_grid(panels, min(scales))
+
+
+def _restack_grid(sf_project: str) -> None:
+    """Send a mosaic's stacking project the grid its panels now frame, when the
+    panels changed (a rig joined, left, or turned its camera) and no light has
+    locked it yet. Called wherever cells are dealt; cheap when nothing moved,
+    because nothing is written or sent then.
+    """
+    project = store.project(sf_project)
+    if project is None:
+        return
+    payload = project.get("payload") or {}
+    if (payload.get("kind") or "mosaic") != "mosaic":
+        return
+    binding = _stacking_of(payload)
+    fields = _stack_fields(project["name"], project.get("coordinator") or "", payload,
+                           binding, sf_project=sf_project)
+    grid, framed = fields.get("grid"), fields.get("rotation_from_first_light")
+    if binding["backend"] == "hub":
+        row = store.stack_project_of(sf_project)
+        if (row is None or store.stack_frame_count(row["project_id"])
+                or (row["doc"].get("grid") == grid
+                    and bool(row["doc"].get("rotation_from_first_light")) == bool(framed))):
+            return
+    elif _is_managed(binding):
+        cloud = CLOUD.row(sf_project)
+        if cloud is None or cloud["doc"].get("grid_locked") or cloud["doc"].get("grid_sent") == grid:
+            return
+    else:
+        return
+    _sync_stack(sf_project, project["name"], project.get("coordinator") or "", payload,
+                binding, binding, status=project.get("status") or "open")
 
 
 def _stack_doc(sf_project: str, name: str, coordinator: str, payload: dict[str, Any],
@@ -756,15 +841,16 @@ def _stack_doc(sf_project: str, name: str, coordinator: str, payload: dict[str, 
     reopening it reopens it (until T706 every edit wrote `open`, so a closed
     collaboration went on taking joins on its hub).
     """
-    fields = _stack_fields(name, coordinator, payload, binding, status)
+    fields = _stack_fields(name, coordinator, payload, binding, status, sf_project=sf_project)
     grid = fields.pop("grid", None)
+    framed = fields.pop("rotation_from_first_light", None)
     doc = dict(old or {})
     doc.update(fields)
     doc["licence"] = (old or {}).get("licence") or "members_only"
     if old is None:
         doc.update({
             "project_id": "", "slug": "",
-            "approval": "open", "rotation_from_first_light": True,
+            "approval": "open",
             "quotas": dict(stack_defaults.QUOTAS),
             "counts": {"member_count": 0, "frames_accepted": 0, "integration_s": 0},
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
@@ -772,6 +858,13 @@ def _stack_doc(sf_project: str, name: str, coordinator: str, payload: dict[str, 
     doc["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
     if grid and not (keep_grid and old and old.get("grid")):
         doc["grid"] = grid
+        # The placeholder asks the first light to frame it; a mosaic's grid,
+        # framed by its panels, does not (and a hub drops the flag when it is
+        # gone from the document).
+        if framed:
+            doc["rotation_from_first_light"] = True
+        else:
+            doc.pop("rotation_from_first_light", None)
     return doc
 
 
@@ -842,7 +935,8 @@ def _cloud_wants(sf_project: str) -> dict[str, Any] | None:
         return None
     payload = project.get("payload") or {}
     binding = _stacking_of(payload)
-    fields = _stack_fields(project["name"], project.get("coordinator") or "", payload, binding)
+    fields = _stack_fields(project["name"], project.get("coordinator") or "", payload, binding,
+                           sf_project=sf_project)
     return {"bound": _is_managed(binding), "fields": fields,
             "status": "open" if project.get("status") == "open" else "paused",
             "owner_name": project.get("coordinator") or ""}
@@ -1003,6 +1097,7 @@ def current_task(agent: dict[str, Any] = Depends(agent_from),
     for project_id in {task["project"] for task in tasks}:
         _redeal(project_id, {agent["id"]: night.strip()} if night.strip() else None,
                 moon=sky)
+        _restack_grid(project_id)
     tasks = store.tasks_for(agent["id"])
     task = tasks[0]
     project = store.project(task["project"])
@@ -1675,6 +1770,7 @@ def join_project(project_id: str, body: JoinRequest,
     # by declining its last share comes back (an owner's removal does not).
     stack_projects.member_returned(store, project_id, agent.get("owner_id") or agent["id"])
     _redeal(project_id, nights, moon=sky)
+    _restack_grid(project_id)
     return {"task": store.task(task.id), "requirements": wants.payload()}
 
 
@@ -2101,6 +2197,7 @@ def set_task_state(task_id: str, body: TaskStateRequest,
         if not still:
             stack_projects.member_left(store, task["project"],
                                        person or agent["id"], by="telescope")
+    _restack_grid(task["project"])
     return {"task": task}
 
 
@@ -2592,7 +2689,9 @@ def create_task(project_id: str, body: TaskRequest,
         agent=body.agent, region=collab.Region.read(body.region),
         filters=[collab.FilterTask.read(entry) for entry in body.filters],
         state="offered", version=1, issued=time.time(), note=body.note)
-    return {"task": store.add_task(task.payload())}
+    added = store.add_task(task.payload())
+    _restack_grid(project_id)
+    return {"task": added}
 
 
 @app.post("/api/v1/contributions/{row_id}/verdict")

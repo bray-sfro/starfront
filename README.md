@@ -2214,7 +2214,7 @@ collaboration into what the engine is told, and both the hub's document
 |---|---|
 | name | `name`, `target_name` (the slug is made once and never changes) |
 | notes | `description` (2000 characters) |
-| region | `grid`, a placeholder with `rotation_from_first_light` until the first light frames it; after a frame the grid is the engine's |
+| region | `grid`, a placeholder with `rotation_from_first_light` until the first light frames it; after a frame the grid is the engine's. A **mosaic** with panels dealt is framed by them instead: centred on the box its panels' corners fill, turned to their camera angle, at the finest rig's scale, with a 2 % margin a side (coarsened only to keep within 12 000 px), and no `rotation_from_first_light`. The first light of a mosaic is one panel, and taking the centre from it moved M81_M82's grid onto panel 1 on 2026-11-04, so panel 2's clear frames fell 90 % off it (`pointing_off_target`). The grid follows the panels as rigs join, leave or turn, until a light locks it |
 | filters | `filters` (contract names: H -> HA, OSC-RGB -> OSC, OSC-Ha+OIII -> DUO), `palette`; a colour band whose switch is off is left out |
 | requirements | `policy`: colour taken -> `osc_allowed`; calibrated only -> `calibration: required`; shortest sub -> `min_exposure_s`; star size only raises `max_fwhm_arcsec` (to twice the HFR, at most 20); the rest are the contract's defaults |
 | who may watch | `visibility` (unlisted by default, D003) |

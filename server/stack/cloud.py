@@ -436,7 +436,10 @@ class Cloud:
             owner = "Starfront owner"
         body = {k: fields[k] for k in ("name", "target_name", "description", "visibility", "licence",
                                         "palette", "filters", "grid", "policy") if k in fields}
-        body.update(rotation_from_first_light=True, owner_display_name=owner)
+        # A mosaic framed by its panels says so (false); the placeholder asks
+        # the first light to frame it.
+        body.update(rotation_from_first_light=fields.get("rotation_from_first_light", True) is not False,
+                    owner_display_name=owner)
         for n in range(1, 21):
             slug = slug_for(fields["name"], n)
             if not _SLUG_OK.match(slug):
@@ -498,7 +501,8 @@ class Cloud:
                                         "palette", "filters", "policy") if k in fields}
         grid = fields.get("grid")
         if grid and not d.get("grid_locked") and grid != d.get("grid_sent"):
-            body.update(grid=grid, rotation_from_first_light=True)
+            body.update(grid=grid, rotation_from_first_light=fields.get(
+                "rotation_from_first_light", True) is not False)
         # Refused before anything is sent when the project can no longer get there.
         self._status_path(d.get("remote_status", "draft"), want.get("status", "open"))
         try:
