@@ -376,6 +376,7 @@ class Files:
                     "coordinator": project.get("coordinator") or "",
                     "kind": (project.get("payload") or {}).get("kind") or "mosaic",
                     "collecting": self.collecting(project),
+                    "autoUpload": bool((project.get("payload") or {}).get("autoUpload")),
                     "notes": (project.get("payload") or {}).get("notes") or "",
                     "files": totals["count"], "bytes": totals["bytes"],
                     "kinds": self.store.file_kinds(project["id"]),
@@ -437,6 +438,30 @@ class Files:
             """The rules a collaboration's uploads are held to. Public: a
             contributor should be able to read them before signing in."""
             return self.rules_view(self._project(project_id))
+
+        @app.put("/api/v1/projects/{project_id}/collecting")
+        async def put_collecting(project_id: str, request: Request) -> dict[str, Any]:
+            """The coordinator turns file collection on or off from this page:
+            `collectFiles` (uploads accepted at all) and `autoUpload` (rigs may
+            send their lights on their own, as they are captured)."""
+            who = self.require(request)
+            project = self._project(project_id)
+            if who.get("kind") == "agent" or not self.owns_project(who, project):
+                raise HTTPException(status_code=403,
+                                    detail="only the collaboration's coordinator turns collection on or off")
+            try:
+                body = await request.json()
+            except ValueError:
+                raise HTTPException(status_code=400, detail="send JSON") from None
+            if not isinstance(body, dict):
+                raise HTTPException(status_code=400, detail="send JSON")
+            payload = dict(project.get("payload") or {})
+            for key in ("collectFiles", "autoUpload"):
+                if key in body:
+                    payload[key] = bool(body[key])
+            project = self.store.set_project(project_id, payload)
+            return {"collecting": self.collecting(project),
+                    "autoUpload": bool(payload.get("autoUpload"))}
 
         @app.put("/api/v1/projects/{project_id}/upload-rules")
         async def put_rules(project_id: str, request: Request) -> dict[str, Any]:
@@ -1435,6 +1460,7 @@ _PAGE = r"""<!doctype html>
 
   // -- the collab picker, in the page: open collabs first, closed below --
   const STATUS = (p) => p.closed ? 'closed' : (p.collecting ? 'collecting' : 'paused');
+  const STATUS_WORD = (p) => p.closed ? 'closed' : (p.collecting ? 'collecting' : 'not collecting');
   const gb = (n) => n >= 1024 ** 3 ? (n / 1024 ** 3).toFixed(1) + ' GB' : (n >= 1024 ** 2 ? (n / 1024 ** 2).toFixed(0) + ' MB' : (n ? '<1 MB' : '0'));
   const facts = (x) => [x.coordinator ? 'by ' + x.coordinator : '', x.files ? `${x.files.toLocaleString()} files` : 'no files yet', x.files ? gb(x.bytes) : ''].filter(Boolean).join(' · ');
   function buildSwitch(info, pub, rel) {
@@ -1457,7 +1483,7 @@ _PAGE = r"""<!doctype html>
     const opt = (x) => `<option value="${esc(x.id)}"${x.id === state.current ? ' selected' : ''}>${esc(x.name)}</option>`;
     $('collabSel').innerHTML = (sw.open.length ? `<optgroup label="Open">${sw.open.map(opt).join('')}</optgroup>` : '') +
       (sw.closed.length ? `<optgroup label="Closed">${sw.closed.map(opt).join('')}</optgroup>` : '');
-    const card = (x) => `<a class="ccard" href="/files?project=${encodeURIComponent(x.id)}" data-id="${esc(x.id)}" aria-current="${x.id === state.current}"><b>${esc(x.name)}<span class="badge ${STATUS(x)}">${STATUS(x)}</span>${x.release ? '<span class="badge rel">master</span>' : ''}</b><span class="small">${esc(facts(x))}</span></a>`;
+    const card = (x) => `<a class="ccard" href="/files?project=${encodeURIComponent(x.id)}" data-id="${esc(x.id)}" aria-current="${x.id === state.current}"><b>${esc(x.name)}<span class="badge ${STATUS(x)}">${STATUS_WORD(x)}</span>${x.release ? '<span class="badge rel">master</span>' : ''}</b><span class="small">${esc(facts(x))}</span></a>`;
     $('cardList').innerHTML = (sw.open.length ? `<p class="cgroup">Open</p><div class="cards">${sw.open.map(card).join('')}</div>` : '') +
       (sw.closed.length ? `<p class="cgroup">Closed</p><div class="cards">${sw.closed.map(card).join('')}</div>` : '');
     $('nAll').textContent = sw.open.length + sw.closed.length;
@@ -1468,7 +1494,7 @@ _PAGE = r"""<!doctype html>
     }));
   }
   function drawCurrent(x) {
-    $('curName').innerHTML = `<span class="badge ${STATUS(x)}">${STATUS(x)}</span>`;
+    $('curName').innerHTML = `<span class="badge ${STATUS(x)}">${STATUS_WORD(x)}</span>`;
     $('curMeta').innerHTML = (x.coordinator ? `<span class="by">by ${esc(x.coordinator)} · </span>` : '') + esc(facts({ ...x, coordinator: '' }));
   }
   async function choose(id, push) {
@@ -1490,7 +1516,7 @@ _PAGE = r"""<!doctype html>
     jobWatch(id);
     document.dispatchEvent(new CustomEvent('starfront:project', { detail: { id } }));
     const mine = state.projects.find((p) => p.id === id);
-    const badge = `<span class="badge ${STATUS(x)}">${STATUS(x)}</span>`;
+    const badge = `<span class="badge ${STATUS(x)}">${STATUS_WORD(x)}</span>`;
     if (!state.signedIn) {
       $('signinNote').textContent = x.collecting ? 'This collaboration is collecting frames.' : (x.closed ? 'This collaboration is closed and takes no new frames.' : 'This collaboration is not taking uploads right now.');
       return;
@@ -1506,6 +1532,7 @@ _PAGE = r"""<!doctype html>
     }
     $('none').hidden = true;
     $('uploader').hidden = !!mine.closed;
+    drawCollect(mine, x);
     $('curLine').innerHTML = mine.closed ? '<span class="muted">Closed: download only.</span>' : (mine.full ? '<span class="no">Storage limit reached for this collaboration.</span>' : `<span class="muted">Uploading to <b>${esc(x.name)}</b>${myLine(mine)}</span>`);
     $('project').value = id;
     await pick();
@@ -1600,6 +1627,28 @@ _PAGE = r"""<!doctype html>
     } catch (e) { $('rulesSaved').textContent = e.message; }
   }
 
+  function collectText(m) {
+    if (m.closed) return 'Closed: takes no new files.';
+    if (!m.collecting) return 'Uploads are off: nobody can add files until the coordinator turns collecting on.';
+    if (m.full) return 'Uploads open, but the storage limit is reached.';
+    return m.autoUpload ? 'Uploads open. Rig auto-upload is on: rigs send each light as it is captured, day or night.'
+                        : 'Uploads open from this page. Rig auto-upload is off.';
+  }
+  function drawCollect(m, x) {
+    let el = document.getElementById('collectLine');
+    if (!el) { el = document.createElement('p'); el.id = 'collectLine'; el.className = 'row small'; $('curLine').before(el); }
+    const sw = (key, label, on) => `<label class="inline small"><input type="checkbox" data-k="${key}"${on ? ' checked' : ''}> ${label}: ${on ? 'On' : 'Off'}</label>`;
+    el.innerHTML = `<span class="muted">${esc(collectText(m))}</span>` + (m.owned && !m.closed
+      ? ' ' + sw('collectFiles', 'Collecting files', !!m.collecting) + ' ' + sw('autoUpload', 'Rig auto-upload', !!m.autoUpload) : '');
+    el.querySelectorAll('input[data-k]').forEach((box) => box.addEventListener('change', async () => {
+      box.disabled = true;
+      try {
+        const r = await api(`/api/v1/projects/${encodeURIComponent(m.id)}/collecting`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ [box.dataset.k]: box.checked }) });
+        m.collecting = r.collecting; m.autoUpload = r.autoUpload; x.collecting = r.collecting;
+        drawCurrent(x); drawSwitcher(); drawCollect(m, x);
+      } catch (e) { alert(e.message); box.checked = !box.checked; box.disabled = false; }
+    }));
+  }
   function myLine(m) {
     const t = m.myTelescopes || {};
     const parts = [];
