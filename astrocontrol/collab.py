@@ -851,9 +851,12 @@ def assign(cells: list[dict[str, Any]], goals: dict[str, float],
                 total += common
         return total
 
-    order = sorted(open_cells, key=lambda i: (round(elsewhere(i), 6),
-                                              round(mine.get(i, 0.0), 1),
-                                              -round(wanted[i], 1), i))
+    def pull(i: int) -> tuple[float, float, float, int]:
+        return (round(elsewhere(i), 6), round(mine.get(i, 0.0), 1),
+                -round(wanted[i], 1), i)
+
+    pulls = {i: pull(i) for i in open_cells}
+    order = sorted(open_cells, key=lambda i: pulls[i])
 
     budget = hours * 3600.0
     full = sum(max(0.0, f.hours) for f in filters) * 3600.0 or budget
@@ -867,11 +870,138 @@ def assign(cells: list[dict[str, Any]], goals: dict[str, float],
     floor = min(floor, full) if floor > 0 else min(full, budget)
     visits = int(budget // (floor + VISIT_OVERHEAD_SECONDS))
     visits = max(1, min(len(order), visits))
+    # One block of sky, never a scatter (2026-11-03: FSQ106 on the M42
+    # mosaic was dealt panels 1,2,5,6,7,8 of a 4x2 - the six least shot by
+    # the RASA - with the middle column left out, two islands to slew
+    # between and two seams to blend). The pulls above still decide which
+    # block: the 4-connected, near-rectangular one with the least of them.
+    block = contiguous_block(cells, open_cells, visits, pulls)
+    if block is not None:
+        order = sorted(block, key=lambda i: pulls[i])
+        visits = len(order)
     seconds = max(floor, min(full, budget / visits - VISIT_OVERHEAD_SECONDS))
     frames = visit_frames(filters, seconds, min_frames, need)
     seconds = sum(n * f.exposure for f in filters for name, n in frames.items()
                   if name == f.filter)
     return order[:visits], {"seconds": round(seconds, 1), "frames": frames}
+
+
+#: Above this many cells the exhaustive near-rectangle search is skipped and
+#: the block is grown greedily instead; no real mosaic is anywhere near it.
+CONTIGUOUS_SEARCH_LIMIT = 900
+
+
+def _grid_of(cells: list[dict[str, Any]]) -> dict[tuple[int, int], int] | None:
+    """(row, column) -> cell index, or None when the cells carry no grid."""
+    grid: dict[tuple[int, int], int] = {}
+    for index, cell in enumerate(cells):
+        row, column = cell.get("row"), cell.get("column")
+        if row is None or column is None:
+            return None
+        key = (int(row), int(column))
+        if key in grid:
+            return None
+        grid[key] = index
+    return grid
+
+
+def _near_rectangles(rows: int, columns: int, count: int):
+    """Every placement of `count` cells as a rectangle, or as a rectangle
+    of full lines plus one part line along an edge: the compact,
+    4-connected shapes, as lists of (row, column)."""
+    seen: set[frozenset] = set()
+    for along_rows in (True, False):
+        lines_max, width_max = (rows, columns) if along_rows else (columns, rows)
+        for width in range(1, width_max + 1):
+            lines = -(-count // width)
+            if lines > lines_max:
+                continue
+            last = count - (lines - 1) * width
+            for line0 in range(lines_max - lines + 1):
+                for start in range(width_max - width + 1):
+                    for part_first in ((False, True) if last < width else (False,)):
+                        for part_left in ((True, False) if last < width else (True,)):
+                            shape = []
+                            for k in range(lines):
+                                line = line0 + k
+                                is_part = (k == 0) if part_first else (k == lines - 1)
+                                span = range(width)
+                                if is_part and last < width:
+                                    span = (range(last) if part_left
+                                            else range(width - last, width))
+                                for offset in span:
+                                    a, b = line, start + offset
+                                    shape.append((a, b) if along_rows else (b, a))
+                            key = frozenset(shape)
+                            if key not in seen:
+                                seen.add(key)
+                                yield shape
+
+
+def _perimeter(shape: set[tuple[int, int]]) -> int:
+    return sum(1 for (r, c) in shape
+               for n in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1))
+               if n not in shape)
+
+
+def contiguous_block(cells: list[dict[str, Any]], open_cells: list[int], count: int,
+                     pulls: dict[int, tuple]) -> list[int] | None:
+    """`count` open cells forming one 4-connected block, the one whose
+    summed pulls (sky held by others tonight, this rig's own past time,
+    minus what is still wanted) are least, compact shapes first on a tie.
+
+    Near-rectangles are tried first: a rectangle, or full lines plus one part
+    line. When completed cells leave no such shape, the block is grown from
+    the best seed one neighbour at a time, which may end smaller than
+    `count` if the open sky is in pieces - fewer panels, longer visits, but
+    still one block. None when the cells have no grid to be contiguous on.
+    """
+    if count <= 0 or not open_cells:
+        return None
+    grid = _grid_of(cells)
+    if grid is None:
+        return None
+    open_set = set(open_cells)
+    count = min(count, len(open_set))
+
+    def score(indices: list[int]) -> tuple:
+        return (round(sum(pulls[i][0] for i in indices), 6),
+                round(sum(pulls[i][1] for i in indices), 1),
+                round(sum(pulls[i][2] for i in indices), 1))
+
+    rows = max(r for r, _ in grid) + 1
+    columns = max(c for _, c in grid) + 1
+    best = None
+    if len(grid) <= CONTIGUOUS_SEARCH_LIMIT:
+        for shape in _near_rectangles(rows, columns, count):
+            indices = [grid.get(spot) for spot in shape]
+            if any(i is None or i not in open_set for i in indices):
+                continue
+            rank = (score(indices), _perimeter(set(shape)), sorted(indices))
+            if best is None or rank < best[0]:
+                best = (rank, indices)
+    if best is not None:
+        return best[1]
+
+    # Grown greedily: completed cells, or a ragged grid, left no near-rectangle.
+    where = {index: spot for spot, index in grid.items()}
+    grown_best = None
+    for seed in sorted(open_set, key=lambda i: pulls[i])[:24]:
+        block = [seed]
+        inside = {where[seed]}
+        while len(block) < count:
+            frontier = {grid[n] for (r, c) in inside
+                        for n in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1))
+                        if n in grid and grid[n] in open_set and n not in inside}
+            if not frontier:
+                break
+            pick = min(frontier, key=lambda i: (pulls[i], _perimeter(inside | {where[i]})))
+            block.append(pick)
+            inside.add(where[pick])
+        rank = (-len(block), score(block), _perimeter(inside), sorted(block))
+        if grown_best is None or rank < grown_best[0]:
+            grown_best = (rank, block)
+    return grown_best[1] if grown_best else None
 
 
 def night_need(filters: list["FilterTask"], goals: dict[str, float],
