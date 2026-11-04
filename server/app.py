@@ -963,6 +963,11 @@ class ProjectRequest(BaseModel):
     # page, and in time the programs themselves), for the coordinator to
     # stack. Off unless asked: gigabytes a night are nobody's by accident.
     collectFiles: bool = False
+    # How much neighbouring mosaic panels share, in percent of a panel (0 to
+    # 50). Left out: `DEFAULT_OVERLAP_PERCENT`. More overlap costs panels but
+    # gives the stacking engine more shared sky to match panels' brightness
+    # and background by; N.I.N.A.'s Framing Assistant usually asks for 20.
+    overlap: float | None = Field(default=None, ge=0, le=50)
     # The Discord webhook joins and gold integrations are posted to (server/
     # notify.py). Owner-only: `_without_owner_fields` keeps it out of every read.
     discordWebhookUrl: str = Field(default="", max_length=300)
@@ -1388,6 +1393,8 @@ def open_projects(agent: dict[str, Any] = Depends(agent_from)) -> dict[str, Any]
             "created": float(project.get("created") or 0.0),
             "region": payload.get("region") or {},
             "kind": payload.get("kind") or "mosaic",
+            # The panel overlap the mosaic is cut with, in percent.
+            "overlap": round(_overlap_of(payload) * 100.0, 1),
             "requirements": wants.payload(),
             "goals": payload.get("goals") or {},
             "notes": payload.get("notes") or "",
@@ -1709,7 +1716,7 @@ def join_project(project_id: str, body: JoinRequest,
 
     region = collab.Region.read(payload["region"])
     kind = "single" if payload.get("kind") == "single" else "mosaic"
-    cells = _tile(region, kind, profile)
+    cells = _tile(region, kind, profile, _overlap_of(payload))
     if not cells:
         raise HTTPException(status_code=409,
                             detail="there is nothing left to hand out")
@@ -1765,6 +1772,7 @@ def join_project(project_id: str, body: JoinRequest,
     # The angle the cells were cut for, so a camera that turns out to sit
     # somewhere else can be noticed and the cells cut again.
     stored["tiledRotation"] = profile.rotation
+    stored["tiledOverlap"] = _overlap_of(payload)
     store.add_task(stored)
     # Joining again undoes a Leave: a stacking membership the telescope gave up
     # by declining its last share comes back (an owner's removal does not).
@@ -1774,8 +1782,24 @@ def join_project(project_id: str, body: JoinRequest,
     return {"task": store.task(task.id), "requirements": wants.payload()}
 
 
+#: A mosaic's panel overlap when its collaboration does not say: what every
+#: collaboration was cut with before the overlap could be chosen, so a task
+#: cut then and one cut now agree.
+DEFAULT_OVERLAP_PERCENT = 10.0
+
+
+def _overlap_of(payload: dict[str, Any]) -> float:
+    """A collaboration's panel overlap as a fraction (0 to 0.5)."""
+    try:
+        percent = float(payload.get("overlap", DEFAULT_OVERLAP_PERCENT))
+    except (TypeError, ValueError):
+        percent = DEFAULT_OVERLAP_PERCENT
+    return round(min(50.0, max(0.0, percent)) / 100.0, 4)
+
+
 def _tile(region: collab.Region, kind: str,
-          profile: collab.RigProfile) -> list[dict[str, Any]]:
+          profile: collab.RigProfile, overlap: float = DEFAULT_OVERLAP_PERCENT / 100.0
+          ) -> list[dict[str, Any]]:
     """A rig's cells over a project: its own frame, or its own tiling.
 
     Tiled with what the camera really spans on the sky. A rig that cannot
@@ -1793,8 +1817,8 @@ def _tile(region: collab.Region, kind: str,
     if profile.rotation is not None:
         # No rotator: the grid the rig's own program lays, cell for panel,
         # so what is dealt here is exactly what is shot there.
-        return collab.camera_grid(region, field[0], field[1], float(profile.rotation), 0.1)
-    return collab.grid(region, across, down, 0.1)
+        return collab.camera_grid(region, field[0], field[1], float(profile.rotation), overlap)
+    return collab.grid(region, across, down, overlap)
 
 
 #: How far a camera may turn before its cells are cut again. The same figure
@@ -1857,8 +1881,9 @@ def _retile_if_turned(task: dict[str, Any], profile: collab.RigProfile,
     turned = ((was is None) != (now is None)
               or (was is not None and now is not None
                   and abs(((float(was) - float(now) + 90.0) % 180.0) - 90.0) > RETILE_DEGREES))
+    overlap = _overlap_of(payload)
     cells = _tile(collab.Region.read(payload["region"]),
-                  task.get("kind") or "mosaic", profile)
+                  task.get("kind") or "mosaic", profile, overlap)
     if not cells:
         return False
     # Cells cut by an older rule are cut again too: the tiling of a fixed
@@ -1869,10 +1894,17 @@ def _retile_if_turned(task: dict[str, Any], profile: collab.RigProfile,
     held_tonight = bool(task.get("share")) and night and task.get("assignedNight") == night
     if not turned and not held_tonight and not _same_cells(task.get("cells") or [], cells):
         turned = True
+    # A new overlap moves the cells by less than `SAME_CELL_DEGREES` (10 to 20 %
+    # of a panel is a twentieth of one), so it is noticed by what they were cut
+    # with; like a new rule, it waits for the night in hand to end.
+    was_overlap = float(task.get("tiledOverlap", DEFAULT_OVERLAP_PERCENT / 100.0))
+    if not turned and not held_tonight and abs(was_overlap - overlap) > 1e-6:
+        turned = True
     if not turned:
         return False
     task.update({"cells": cells, "share": [], "visit": {},
-                 "tiledRotation": now, "assignedNight": "", "assignedAt": 0.0,
+                 "tiledRotation": now, "tiledOverlap": overlap,
+                 "assignedNight": "", "assignedAt": 0.0,
                  "version": int(task.get("version") or 1) + 1})
     store.set_task(task)
     return True
@@ -2299,6 +2331,8 @@ def create_project(body: ProjectRequest,
         "collectFiles": bool(body.collectFiles),
         "discordWebhookUrl": _discord_webhook(body.discordWebhookUrl),
     }
+    if body.overlap is not None:
+        payload["overlap"] = round(float(body.overlap), 1)
     blank = _stacking_of({})
     if body.stacking is not None:
         binding = _resolve_stacking(who, project_id, blank, body.stacking)
@@ -2328,6 +2362,7 @@ class ProjectUpdateRequest(BaseModel):
     goals: dict[str, float] | None = None
     notes: str | None = Field(default=None, max_length=2000)
     collectFiles: bool | None = None
+    overlap: float | None = Field(default=None, ge=0, le=50)
     # Blank clears the webhook; left out, it is left alone.
     discordWebhookUrl: str | None = Field(default=None, max_length=300)
     # Blank clears it; left out, it is left alone like every other field.
@@ -2373,6 +2408,8 @@ def update_project(project_id: str, body: ProjectUpdateRequest,
         payload["notes"] = body.notes
     if body.collectFiles is not None:
         payload["collectFiles"] = bool(body.collectFiles)
+    if body.overlap is not None:
+        payload["overlap"] = round(float(body.overlap), 1)
     if body.discordWebhookUrl is not None:
         payload["discordWebhookUrl"] = _discord_webhook(body.discordWebhookUrl)
     before = _stacking_of(payload)

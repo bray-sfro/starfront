@@ -57,6 +57,7 @@ namespace Starfront.Collab.Ui {
         private double rotation;
         private bool single = true;
         private string widthText = "";
+        private string overlapText = "10";
         private string heightText = "";
         private string notes = "";
         private string minFocal = "", maxFocal = "", maxHfr = "", maxGuideRms = "", minExposure = "", maxExposure = "";
@@ -111,6 +112,13 @@ namespace Starfront.Collab.Ui {
         };
         public string WidthText { get => widthText; set { widthText = value ?? ""; RaisePropertyChanged(); } }
         public string HeightText { get => heightText; set { heightText = value ?? ""; RaisePropertyChanged(); } }
+        /// <summary>
+        /// How much neighbouring panels share, in percent: the server cuts every
+        /// telescope's panels with it. Taken from the Framing Assistant with the
+        /// rest of the framing (N.I.N.A. usually asks for 20); more overlap costs
+        /// panels but gives the stack more shared sky to even the panels out by.
+        /// </summary>
+        public string OverlapText { get => overlapText; set { overlapText = value ?? ""; RaisePropertyChanged(); } }
         public string Notes { get => notes; set { notes = value ?? ""; RaisePropertyChanged(); } }
         public string MinFocal { get => minFocal; set { minFocal = value ?? ""; RaisePropertyChanged(); } }
         public string MaxFocal { get => maxFocal; set { maxFocal = value ?? ""; RaisePropertyChanged(); } }
@@ -175,7 +183,7 @@ namespace Starfront.Collab.Ui {
         public void Reset() {
             editingId = "";
             Name = ""; Target = ""; RaText = ""; DecText = ""; rotation = 0; Single = true;
-            WidthText = ""; HeightText = ""; Notes = ""; FoundText = "";
+            WidthText = ""; HeightText = ""; OverlapText = "10"; Notes = ""; FoundText = "";
             MinFocal = ""; MaxFocal = ""; MaxHfr = ""; MaxGuideRms = ""; MinExposure = ""; MaxExposure = "";
             MaxMoon = ""; MinMoonSeparation = ""; MinAltitude = ""; MinFrames = "10"; MaxBortle = "";
             RequireCalibrated = false;
@@ -239,6 +247,7 @@ namespace Starfront.Collab.Ui {
                 WidthText = region.Width.ToString("0.00", CultureInfo.InvariantCulture);
                 HeightText = region.Height.ToString("0.00", CultureInfo.InvariantCulture);
             }
+            OverlapText = listing.Overlap.ToString("0.#", CultureInfo.InvariantCulture);
             var wants = listing.Requirements ?? new Requirements();
             MinFocal = Text(wants.MinFocalLength); MaxFocal = Text(wants.MaxFocalLength);
             MaxHfr = Text(wants.MaxHfr); MaxGuideRms = Text(wants.MaxGuideRms);
@@ -337,6 +346,11 @@ namespace Starfront.Collab.Ui {
                 } else {
                     overlapW = overlapH = Math.Max(0, framing.OverlapPixels) * (scale > 0 ? scale : 0) / 3600.0;
                 }
+                // The panels are cut on the server with one fraction for both axes:
+                // the larger of the two keeps at least what was drawn everywhere.
+                var share = Math.Max(fieldW > 0 ? overlapW / fieldW : 0, fieldH > 0 ? overlapH / fieldH : 0);
+                if (across > 1 || down > 1)
+                    OverlapText = Math.Round(Math.Min(50, Math.Max(0, share * 100)), 1).ToString("0.#", CultureInfo.InvariantCulture);
                 var width = across * fieldW - (across - 1) * overlapW;
                 var height = down * fieldH - (down - 1) * overlapH;
 
@@ -417,6 +431,11 @@ namespace Starfront.Collab.Ui {
                 if (width <= 0 || height <= 0) throw new ArgumentException("A mosaic needs its width and height in degrees.");
                 if (width > 60 || height > 60) throw new ArgumentException("A region is at most 60° across.");
             }
+            double? overlap = null;
+            if (!Single) {
+                overlap = Num(OverlapText);
+                if (overlap is not double o || o < 0 || o > 50) throw new ArgumentException("The panel overlap is 0 to 50 %.");
+            }
 
             var filters = new JObject();
             var goals = new JObject();
@@ -463,6 +482,7 @@ namespace Starfront.Collab.Ui {
                 ["kind"] = Single ? "single" : "mosaic",
                 ["notes"] = Notes.Trim(),
                 ["collectFiles"] = CollectFiles,
+                ["overlap"] = overlap.HasValue ? new JValue(overlap.Value) : JValue.CreateNull(),
                 ["region"] = new JObject {
                     ["ra"] = Math.Round(ra.Value, 5), ["dec"] = Math.Round(dec.Value, 5),
                     ["width"] = Math.Round(width, 4), ["height"] = Math.Round(height, 4),

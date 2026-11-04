@@ -155,6 +155,8 @@ namespace Starfront.Collab.Server {
         [JsonProperty("notes")] public string Notes { get; set; } = "";
         /// <summary>Whether the lights are collected on the server for the coordinator to stack, and where to send them.</summary>
         [JsonProperty("collectFiles")] public bool CollectFiles { get; set; }
+        /// <summary>The panel overlap a mosaic is cut with, in percent (the server's 10 when it never said).</summary>
+        [JsonProperty("overlap")] public double Overlap { get; set; } = 10.0;
         [JsonProperty("filesUrl")] public string FilesUrl { get; set; } = "";
         /// <summary>Whether the lights are stacked as they land by Rapid Stacker Collab, and the code that gets this telescope into that project (handed to telescopes on the collaboration and to the owner's own; blank to the rest).</summary>
         [JsonProperty("stackingLinked")] public bool StackingLinked { get; set; }

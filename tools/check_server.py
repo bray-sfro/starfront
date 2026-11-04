@@ -12,6 +12,7 @@ No test framework, for the same reason as the other checks here.
 """
 
 import json
+import math
 import os
 import socket
 import sys
@@ -2674,6 +2675,45 @@ _, pulled = call("GET", f"/api/v1/hubs/{BH}/pull?since={SINCE}&wait=0", token=BH
 case("...a poll with nothing moved sends the hub nothing",
      not any(c["key"] == m81_doc["project_id"] for c in pulled["changes"]), str(pulled["changes"]))
 SINCE = pulled["seq"]
+def _cell_gap(cells):
+    """The sky distance between the first two cells of a column, in degrees."""
+    a, b = cells[0], cells[1]
+    dx = (b["ra"] - a["ra"]) * math.cos(math.radians((a["dec"] + b["dec"]) / 2.0))
+    return math.hypot(dx, b["dec"] - a["dec"])
+
+
+# The overlap between panels is the collaboration's to choose. It was a fixed
+# 10 %, which on M81_M82 (2026-11-04) left the panels about 0.1 degrees of
+# shared sky to match their brightness by.
+m81_gap10 = _cell_gap(m81_cells)
+status, _ = call("PUT", f"/api/v1/projects/{M81P}", {"overlap": 20}, token=BOBH)
+_, tonight = call("GET", "/api/v1/agent/task?night=2026-11-04", token=fra["token"])
+still = next(t for t in tonight["tasks"] if t["project"] == M81P)
+case("a panel overlap of 10 % is what a collaboration that says nothing gets",
+     abs(m81_gap10 - 1.0633 * 0.9) < 0.01, f"{m81_gap10:.3f} degrees")
+case("editing the overlap leaves a night already dealt alone",
+     status == 200 and _cell_gap(still["cells"]) == m81_gap10 and still.get("tiledOverlap") in (None, 0.1),
+     f"{_cell_gap(still['cells']):.3f} {still.get('tiledOverlap')}")
+_, next_night = call("GET", "/api/v1/agent/task?night=2026-11-05", token=fra["token"])
+recut = next(t for t in next_night["tasks"] if t["project"] == M81P)
+case("...and the next night's cells are cut 20 % apart",
+     abs(_cell_gap(recut["cells"]) - 1.0633 * 0.8) < 0.01 and recut.get("tiledOverlap") == 0.2,
+     f"{_cell_gap(recut['cells']):.3f} degrees, {recut.get('tiledOverlap')}")
+m81_regrid = server_app.store.stack_project_of(M81P)["doc"]["grid"]
+case("...and the stacking grid follows the new panels, still centred on the mosaic",
+     m81_regrid != m81_grid and abs(m81_regrid["center_dec_deg"] - 69.32) < 0.02
+     and abs(m81_regrid["center_ra_deg"] - 148.94) < 0.02,
+     f"{len(recut['cells'])} cells, {m81_regrid}")
+status, made = call("POST", "/api/v1/projects", {
+    "name": "Wide overlap", "region": M81_REGION, "kind": "mosaic", "overlap": 20,
+    "requirements": {"filters": {"L": None}}}, token=BOBH)
+case("a collaboration can be started with its overlap",
+     status == 200 and server_app.store.project(made["project"]["id"])["payload"].get("overlap") == 20.0,
+     str(made)[:160])
+status, _ = call("POST", "/api/v1/projects", {
+    "name": "Too much", "region": M81_REGION, "overlap": 60}, token=BOBH)
+case("...of at most 50 %", status == 422, str(status))
+
 case("a mosaic grid wider than the contract's 12 000 px is coarsened to fit, not cut",
      (lambda g: g["width_px"] <= 12000 and g["height_px"] <= 12000
       and g["width_px"] * g["scale_arcsec_px"] / 3600.0 > 6.0)(stack_defaults.mosaic_grid(
