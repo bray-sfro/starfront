@@ -886,6 +886,34 @@ def assign(cells: list[dict[str, Any]], goals: dict[str, float],
     return order[:visits], {"seconds": round(seconds, 1), "frames": frames}
 
 
+def assign_together(cells: list[dict[str, Any]], goals: dict[str, float],
+                    depth: dict[int, dict[str, float]], mine: dict[int, float],
+                    claimed: list[Region], hours: float, filters: list["FilterTask"],
+                    min_frames: int) -> tuple[list[int], dict[str, Any]]:
+    """Tonight's panels for a mount whose telescopes shoot `filters` at once.
+
+    A triple RASA with R, G and B in three drawers spends a visit to a panel
+    shooting all three together, so the night is cut into visits exactly as
+    for one telescope - by the wall-clock time a visit takes, paced by the
+    longest sub among them - and each filter's frames are however many of its
+    own subs fit that time (never under `min_frames`). The share is the same
+    one 4-connected block `assign` deals. `goals` should be the goals of every
+    channel the filters deliver, so a panel counts as wanted while any of them
+    still wants it.
+    """
+    usable = [f for f in filters if f.exposure > 0]
+    if not usable:
+        return assign(cells, goals, depth, mine, claimed, hours, filters, min_frames)
+    slowest = max(usable, key=lambda f: f.exposure)
+    pace = FilterTask(filter=slowest.filter, exposure=slowest.exposure,
+                      hours=max(f.hours for f in usable), channels=list(slowest.channels))
+    share, visit = assign(cells, goals, depth, mine, claimed, hours, [pace], min_frames)
+    seconds = float(visit.get("seconds") or 0.0)
+    frames = {f.filter: max(min_frames, int(seconds // f.exposure)) for f in usable}
+    return share, {"seconds": round(seconds, 1), "frames": frames,
+                   "together": [f.filter for f in usable]}
+
+
 #: Above this many cells the exhaustive near-rectangle search is skipped and
 #: the block is grown greedily instead; no real mosaic is anywhere near it.
 CONTIGUOUS_SEARCH_LIMIT = 900
@@ -1257,6 +1285,12 @@ class RigProfile:
     #: The sky's Bortle class at the site, 1 (darkest) to 9, as the operator
     #: rates it; None when they have not said. A project may set a limit.
     bortle: int | None = None
+    #: The telescopes on this mount, when there is more than one: each one's
+    #: name, the filters it carries and whether it has a wheel to change
+    #: them, as `{"name": "rasa2", "filters": ["G"], "wheel": false}`. A
+    #: mount carrying three RASAs with R, G and B in their drawers is one rig
+    #: to the server but shoots three filters at once; see `simultaneous`.
+    telescopes: list[dict[str, Any]] = field(default_factory=list)
 
     def scale(self) -> float | None:
         """Arcseconds per pixel, by the small-angle formula."""
@@ -1275,6 +1309,27 @@ class RigProfile:
 
     def payload(self) -> dict[str, Any]:
         return {**asdict(self), "scale": self.scale(), "field": self.field()}
+
+    def simultaneous(self) -> list[str]:
+        """The filters this mount shoots at once, one per telescope, or [].
+
+        Only for a mount of two or more telescopes none of which can change
+        its filter: each has exactly one, fitted in a drawer, and every panel
+        the mount visits is shot through all of them together. Dealing such a
+        rig "one filter tonight" asks two of its three telescopes for a filter
+        they do not have (2026-11-03: the triple RASA on the M42 mosaic was
+        dealt R for all three). A mount with any wheel among its telescopes,
+        or one telescope, is [] and is dealt as before.
+        """
+        if len(self.telescopes) < 2:
+            return []
+        out: list[str] = []
+        for scope in self.telescopes:
+            names = list(scope.get("filters") or [])
+            if scope.get("wheel") or len(names) != 1:
+                return []
+            out.append(names[0])
+        return out
 
     def delivers(self, name: str) -> list[str]:
         """The channels a sub through one of this rig's filters gives."""
@@ -1317,7 +1372,27 @@ class RigProfile:
             windowFrom=str(data.get("windowFrom") or ""),
             windowTo=str(data.get("windowTo") or ""),
             bortle=_bortle(data.get("bortle")),
+            telescopes=_telescopes(data.get("telescopes")),
         )
+
+
+def _telescopes(value: Any) -> list[dict[str, Any]]:
+    """A profile's list of telescopes, cleaned: names canonical, nonsense out."""
+    out: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return out
+    for scope in value[:16]:
+        if not isinstance(scope, dict):
+            continue
+        names = []
+        for name in (scope.get("filters") or [])[:32]:
+            text = str(name or "").strip()
+            if text:
+                names.append(_canonical(text) or text)
+        out.append({"name": str(scope.get("name") or "")[:64],
+                    "filters": names,
+                    "wheel": bool(scope.get("wheel", False))})
+    return out
 
 
 def _bortle(value: Any) -> int | None:

@@ -1469,7 +1469,25 @@ def _redeal(project_id: str, nights: dict[str, str] | None = None,
         night_goals = goals
         chosen = None
         need = None
-        if (task.get("kind") or "mosaic") == "mosaic" and len(filters) > 1:
+        # A mount whose telescopes each carry one filter they cannot change
+        # (a triple RASA: R, G and B in three drawers) shoots all of them at
+        # once on every panel. It is dealt every one of those the project
+        # wants, together - not one filter for the lot, which asked two of
+        # the three telescopes for a filter they do not have.
+        together_keys = {collab._key(name) for name in profile.simultaneous()}
+        together = [f for f in filters if collab._key(f.filter) in together_keys]
+        at_once = (task.get("kind") or "mosaic") == "mosaic" and bool(together)
+        if at_once:
+            filters = together
+            channels = {key for f in together for key in f.keys()}
+            night_goals = {name: value for name, value in goals.items()
+                           if collab._key(name) in channels}
+            if not night_goals:
+                night_goals = {f.filter: f.hours for f in together}
+            share, visit = collab.assign_together(cells, night_goals, depth,
+                                                  mine.get(agent_id, {}), tonight, hours,
+                                                  filters, wants.minFramesPerVisit)
+        elif (task.get("kind") or "mosaic") == "mosaic" and len(filters) > 1:
             # A mosaic night is one filter per telescope, and which one is
             # the collaboration's call: the filter thinnest across the field
             # once what the other rigs are putting in tonight is counted.
@@ -1492,9 +1510,10 @@ def _redeal(project_id: str, nights: dict[str, str] | None = None,
             # every rig's night and the first thing dawn cut.
             need = collab.night_need(filters, goals, depth, cells, spoken,
                                      moon if asked is not None else None)
-        share, visit = collab.assign(cells, night_goals, depth, mine.get(agent_id, {}),
-                                     tonight, hours, filters,
-                                     wants.minFramesPerVisit, need)
+        if not at_once:
+            share, visit = collab.assign(cells, night_goals, depth, mine.get(agent_id, {}),
+                                         tonight, hours, filters,
+                                         wants.minFramesPerVisit, need)
         if chosen is not None:
             visit["filter"] = chosen.filter
         if need is not None and visit.get("frames"):
