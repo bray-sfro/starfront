@@ -9,6 +9,8 @@ User=starfront
 Group=starfront
 WorkingDirectory=/opt/starfront
 Environment=STARFRONT_DATA=/var/lib/starfront
+# Everything but uploads, which starfront-uploads.service takes (port 8801).
+Environment=STARFRONT_ROLE=control
 # Loopback only: Caddy in front of it does TLS and is what the world talks to.
 ExecStart=/opt/starfront/venv/bin/python server/run.py --host 127.0.0.1 --port 8800
 Restart=always

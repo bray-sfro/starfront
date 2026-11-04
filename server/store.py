@@ -150,12 +150,20 @@ class Store:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._db = sqlite3.connect(str(self.path), check_same_thread=False)
+        # timeout is SQLite's busy_timeout: the upload process
+        # (starfront-uploads.service) writes to the same file, and a writer
+        # that finds the other mid-commit waits for it instead of failing.
+        self._db = sqlite3.connect(str(self.path), check_same_thread=False, timeout=10.0)
         self._db.row_factory = sqlite3.Row
         # Write-ahead logging: readers do not block the writer, which is what
         # keeps a polling agent from ever waiting on a coordinator's edit.
         with self._lock:
             self._db.execute("PRAGMA journal_mode=WAL")
+            self._db.execute("PRAGMA busy_timeout=10000")
+            # With WAL, NORMAL is durable against an application crash and
+            # only loses the last commits on a power cut; it saves an fsync
+            # per write, which on the files volume is what a write costs.
+            self._db.execute("PRAGMA synchronous=NORMAL")
             self._db.execute("PRAGMA foreign_keys=ON")
             self._db.executescript(SCHEMA)
             # Columns added since the first release, on a database that may

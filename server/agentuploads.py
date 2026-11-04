@@ -342,8 +342,10 @@ class AgentUploads:
         @app.put("/api/v1/agent/uploads/{upload_id}")
         async def chunk(upload_id: str, request: Request,
                         offset: int = Query(..., ge=0)) -> dict[str, Any]:
-            rig, _ = self.agent(request)
-            row = owned(upload_id, rig)
+            # The database calls go to a worker thread too: the store's lock
+            # may be held by a control call, and the event loop must not wait on it.
+            rig, _ = await asyncio.to_thread(self.agent, request)
+            row = await asyncio.to_thread(owned, upload_id, rig)
             try:
                 length = int(request.headers.get("content-length") or "-1")
             except ValueError:
@@ -379,15 +381,18 @@ class AgentUploads:
                 now_have = await asyncio.to_thread(write)
             finally:
                 self.release(rig["id"])
-            self.store.set_upload_received(upload_id, now_have)
+            await asyncio.to_thread(self.store.set_upload_received, upload_id, now_have)
             return {"offset": now_have, "bytes": total, "complete": now_have == total}
 
         @app.post("/api/v1/agent/uploads/{upload_id}/finish")
         async def finish(upload_id: str, request: Request) -> dict[str, Any]:
-            rig, user = self.agent(request)
-            row = owned(upload_id, rig)
-            project = self._project(row["project"])
-            self._check(project, rig)
+            def begin() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+                rig, user = self.agent(request)
+                row = owned(upload_id, rig)
+                project = self._project(row["project"])
+                self._check(project, rig)
+                return rig, user, row, project
+            rig, user, row, project = await asyncio.to_thread(begin)
             part = self.part(upload_id)
             total = int(row["bytes"])
 
@@ -405,7 +410,7 @@ class AgentUploads:
                         size += len(block)
                         h.update(block)
                 return size, h.hexdigest(), head
-            if not part.is_file():
+            if not await asyncio.to_thread(part.is_file):
                 raise HTTPException(status_code=409, detail="nothing received yet")
             size, sha, head = await asyncio.to_thread(digest)
             if size != total:
@@ -413,37 +418,41 @@ class AgentUploads:
                     "detail": f"only {size} of {total} bytes are here", "offset": size})
             if sha != row["sha256"]:
                 await asyncio.to_thread(part.unlink)
-                self.store.remove_upload(upload_id)
+                await asyncio.to_thread(self.store.remove_upload, upload_id)
                 raise HTTPException(status_code=422, detail="the sha256 does not match what arrived; "
                                                             "send the file again")
             name, kind = row["name"], row["kind"]
             if not looks_like_data(head, name):
                 await asyncio.to_thread(part.unlink)
-                self.store.remove_upload(upload_id)
+                await asyncio.to_thread(self.store.remove_upload, upload_id)
                 raise HTTPException(status_code=400, detail=f"{name} does not start like a "
                                     f"{'XISF' if name.lower().endswith('.xisf') else 'FITS'} file")
             header = await asyncio.to_thread(_header_or_empty, part)
-            meta = uploadrules.facts(header, name) if header else uploadrules.facts_of_file(part, name)
+            meta = uploadrules.facts(header, name) if header else \
+                await asyncio.to_thread(uploadrules.facts_of_file, part, name)
             if kind == "light":
                 ok, why = of_this_collaboration(header.get("cards") or {}, project)
                 if not ok:
                     await asyncio.to_thread(part.unlink)
-                    self.store.remove_upload(upload_id)
+                    await asyncio.to_thread(self.store.remove_upload, upload_id)
                     raise HTTPException(status_code=403, detail="not a light of this collaboration: " + why)
             final = self.files.path_of(project["id"], user["id"], name, kind)
-            await asyncio.to_thread(_place, part, final)
-            label = self.label(rig)
-            file_id = secrets.token_hex(8)
-            self.store.add_file(file_id, project["id"], user["id"], name, size, label, kind, meta)
-            stored = self.store.file(project["id"], user["id"], name, kind)
-            self.store.set_file_origin(stored["id"], sha, rig["id"], row["task"])
-            self.store.remove_upload(upload_id)
-            moved = self.files.recheck(project, user["id"],
-                                       only_light=stored["id"] if kind == "light" else None)
-            stored = self.store.file(project["id"], user["id"], name, kind)
-            return {"already": False, "name": name, "kind": kind,
-                    "status": stored.get("status") or "",
-                    "reasons": uploadrules_reasons(stored), "moved": moved}
+
+            def settle() -> dict[str, Any]:
+                _place(part, final)
+                label = self.label(rig)
+                file_id = secrets.token_hex(8)
+                self.store.add_file(file_id, project["id"], user["id"], name, size, label, kind, meta)
+                stored = self.store.file(project["id"], user["id"], name, kind)
+                self.store.set_file_origin(stored["id"], sha, rig["id"], row["task"])
+                self.store.remove_upload(upload_id)
+                moved = self.files.recheck(project, user["id"],
+                                           only_light=stored["id"] if kind == "light" else None)
+                stored = self.store.file(project["id"], user["id"], name, kind)
+                return {"already": False, "name": name, "kind": kind,
+                        "status": stored.get("status") or "",
+                        "reasons": uploadrules_reasons(stored), "moved": moved}
+            return await asyncio.to_thread(settle)
 
         @app.get("/api/v1/agent/uploads")
         def status(request: Request, project: str = Query(..., max_length=64)) -> dict[str, Any]:

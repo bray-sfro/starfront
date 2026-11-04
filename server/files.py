@@ -24,6 +24,7 @@ the server on its own.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -57,6 +58,9 @@ PROJECT_QUOTA = int(float(os.environ.get("STARFRONT_PROJECT_QUOTA_GB", "40")) * 
 #: warns: in the journal, in /api/v1/health and on the files page to owners.
 LOW_FREE = 10 * 1024 ** 3
 LOW_FRACTION = 0.10
+#: An upload is written in pieces this big, off the event loop, so a
+#: stream of files never holds up a telescope's or a coordinator's call.
+WRITE_BUFFER = 1024 ** 2
 _log = logging.getLogger("starfront.files")
 
 #: The cookie a browser sign-in lives in, and how long it lasts unused.
@@ -510,55 +514,69 @@ class Files:
             lets an upload that was cut off be run again over the whole
             folder. A different size replaces.
             """
-            who = self.require(request)
-            project = self._project(project_id)
-            if project.get("status") != "open":
-                raise HTTPException(status_code=409, detail="that collaboration is closed")
-            if not self.collecting(project) and not self.owns_project(who, project):
-                raise HTTPException(status_code=409,
-                                    detail="that collaboration is not collecting files")
-            clean = clean_name(name)
-            if not clean:
-                raise HTTPException(status_code=400,
-                                    detail="not a frame: a file name ending in "
-                                           + ", ".join(ALLOWED) + " is expected")
-            what = clean_kind(kind, clean)
-            try:
-                length = int(request.headers.get("content-length") or "-1")
-            except ValueError:
-                length = -1
-            if length < 0:
-                raise HTTPException(status_code=411, detail="the file's size must be sent")
-            if length > MAX_BYTES:
-                raise HTTPException(status_code=413,
-                                    detail=f"larger than {MAX_BYTES // 1024 ** 3} GB")
-            if length == 0:
-                raise HTTPException(status_code=400, detail="an empty file")
-            existing = self.store.file(project_id, who["id"], clean, what)
-            final = self.path_of(project_id, who["id"], clean, what)
-            if existing is not None and int(existing["bytes"]) == length and final.is_file():
-                return {"file": self._row(existing, {}), "already": True}
-            held = int(self.store.file_totals(project_id)["bytes"])
-            replacing = int(existing["bytes"]) if existing is not None else 0
-            quota = self.quota_of(project)
-            if quota == 0:
-                raise HTTPException(status_code=409,
-                                    detail="this collaboration is not taking files")
-            if held - replacing + length > quota:
-                raise HTTPException(status_code=507,
-                                    detail=f"this collaboration is at its storage limit "
-                                           f"({quota / 1024 ** 3:g} GB); "
-                                           "tell the coordinator")
-            if self.stats()["free"] - length < KEEP_FREE:
-                raise HTTPException(status_code=507,
-                                    detail="the server has no room left for files; "
-                                           "tell the coordinator")
-            final.parent.mkdir(parents=True, exist_ok=True)
+            # Everything here but the body itself runs in a worker thread:
+            # the checks, the database, the disk, the header and the
+            # judging. The event loop only moves bytes, so open/close, task
+            # offers and reports are never queued behind a file.
+            def prepare() -> tuple[dict[str, Any], dict[str, Any], str, str, int,
+                                   Path, dict[str, Any] | None]:
+                who = self.require(request)
+                project = self._project(project_id)
+                if project.get("status") != "open":
+                    raise HTTPException(status_code=409, detail="that collaboration is closed")
+                if not self.collecting(project) and not self.owns_project(who, project):
+                    raise HTTPException(status_code=409,
+                                        detail="that collaboration is not collecting files")
+                clean = clean_name(name)
+                if not clean:
+                    raise HTTPException(status_code=400,
+                                        detail="not a frame: a file name ending in "
+                                               + ", ".join(ALLOWED) + " is expected")
+                what = clean_kind(kind, clean)
+                try:
+                    length = int(request.headers.get("content-length") or "-1")
+                except ValueError:
+                    length = -1
+                if length < 0:
+                    raise HTTPException(status_code=411, detail="the file's size must be sent")
+                if length > MAX_BYTES:
+                    raise HTTPException(status_code=413,
+                                        detail=f"larger than {MAX_BYTES // 1024 ** 3} GB")
+                if length == 0:
+                    raise HTTPException(status_code=400, detail="an empty file")
+                existing = self.store.file(project_id, who["id"], clean, what)
+                final = self.path_of(project_id, who["id"], clean, what)
+                if existing is not None and int(existing["bytes"]) == length and final.is_file():
+                    return who, project, clean, what, length, final, \
+                        {"file": self._row(existing, {}), "already": True}
+                held = int(self.store.file_totals(project_id)["bytes"])
+                replacing = int(existing["bytes"]) if existing is not None else 0
+                quota = self.quota_of(project)
+                if quota == 0:
+                    raise HTTPException(status_code=409,
+                                        detail="this collaboration is not taking files")
+                if held - replacing + length > quota:
+                    raise HTTPException(status_code=507,
+                                        detail=f"this collaboration is at its storage limit "
+                                               f"({quota / 1024 ** 3:g} GB); "
+                                               "tell the coordinator")
+                if self.stats()["free"] - length < KEEP_FREE:
+                    raise HTTPException(status_code=507,
+                                        detail="the server has no room left for files; "
+                                               "tell the coordinator")
+                final.parent.mkdir(parents=True, exist_ok=True)
+                return who, project, clean, what, length, final, None
+
+            who, project, clean, what, length, final, done = await asyncio.to_thread(prepare)
+            if done is not None:
+                return done
             part = final.with_name(final.name + ".part")
             written = 0
             head = b""
+            handle = await asyncio.to_thread(open, part, "wb")
             try:
-                with open(part, "wb") as handle:
+                try:
+                    buffer = bytearray()
                     async for chunk in request.stream():
                         if not chunk:
                             continue
@@ -568,7 +586,14 @@ class Files:
                         if written > length:
                             raise HTTPException(status_code=400,
                                                 detail="more arrived than the size said")
-                        handle.write(chunk)
+                        buffer += chunk
+                        if len(buffer) >= WRITE_BUFFER:
+                            data, buffer = bytes(buffer), bytearray()
+                            await asyncio.to_thread(handle.write, data)
+                    if buffer:
+                        await asyncio.to_thread(handle.write, bytes(buffer))
+                finally:
+                    await asyncio.to_thread(handle.close)
                 if written != length:
                     raise HTTPException(status_code=400,
                                         detail=f"the upload stopped short "
@@ -577,31 +602,41 @@ class Files:
                     raise HTTPException(status_code=400,
                                         detail=f"{clean} does not start like a "
                                                f"{'XISF' if clean.lower().endswith('.xisf') else 'FITS'} file")
-                # The header only - never the pixels - for the upload rules.
-                meta = uploadrules.facts_of_file(part, clean)
-                if (kind or "").strip().lower() in ("", "auto") and meta.get("headerKind") in KINDS \
-                        and meta["headerKind"] != what:
-                    # Nothing said what it is and the name guessed: the
-                    # camera's own IMAGETYP is the better witness.
-                    what = meta["headerKind"]
-                    final = self.path_of(project_id, who["id"], clean, what)
-                    final.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(part, final)
             except BaseException:
                 with _quiet():
-                    part.unlink()
+                    await asyncio.to_thread(part.unlink)
                 raise
-            label = telescope.strip() or str(who.get("telescope") or "")
-            row = self.store.add_file(secrets.token_hex(8), project_id, who["id"],
-                                      clean, written, label[:60], what, meta)
-            # A light is judged; a calibration frame may also release (or,
-            # replaced, hold back) lights already here. Either way the whole
-            # of this contributor's set is judged on stored facts - no disk.
-            moved = self.recheck(project, who["id"],
-                                 only_light=row["id"] if what == "light" else None)
-            row = self.store.file(project_id, who["id"], clean, what)
-            return {"file": self._row(row, {}), "already": False, "moved": moved,
-                    "myLights": self.store.file_status_counts(project_id, who["id"])}
+
+            def settle() -> dict[str, Any]:
+                nonlocal what, final
+                try:
+                    # The header only - never the pixels - for the upload rules.
+                    meta = uploadrules.facts_of_file(part, clean)
+                    if (kind or "").strip().lower() in ("", "auto") and meta.get("headerKind") in KINDS \
+                            and meta["headerKind"] != what:
+                        # Nothing said what it is and the name guessed: the
+                        # camera's own IMAGETYP is the better witness.
+                        what = meta["headerKind"]
+                        final = self.path_of(project_id, who["id"], clean, what)
+                        final.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(part, final)
+                except BaseException:
+                    with _quiet():
+                        part.unlink()
+                    raise
+                label = telescope.strip() or str(who.get("telescope") or "")
+                row = self.store.add_file(secrets.token_hex(8), project_id, who["id"],
+                                          clean, written, label[:60], what, meta)
+                # A light is judged; a calibration frame may also release (or,
+                # replaced, hold back) lights already here. Either way the whole
+                # of this contributor's set is judged on stored facts - no disk.
+                moved = self.recheck(project, who["id"],
+                                     only_light=row["id"] if what == "light" else None)
+                row = self.store.file(project_id, who["id"], clean, what)
+                return {"file": self._row(row, {}), "already": False, "moved": moved,
+                        "myLights": self.store.file_status_counts(project_id, who["id"])}
+
+            return await asyncio.to_thread(settle)
 
         @app.get("/api/v1/projects/{project_id}/files/{user_id}/{kind}/{name}")
         def download(project_id: str, user_id: str, kind: str, name: str, request: Request):

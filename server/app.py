@@ -60,6 +60,36 @@ app = FastAPI(title="Starfront collaboration server", version="0.1.0",
 
 limiter = Limiter()
 
+#: Which requests this process answers. Uploads run in their own process
+#: (starfront-uploads.service, port 8801, Caddy routes them there) so a
+#: stream of files can never queue a telescope's or a coordinator's call:
+#:   all      - everything (the default; a laptop, the tests)
+#:   control  - everything but uploads, which are told to go round
+#:   uploads  - only uploads, and /api/v1/health for the health check
+ROLE = os.environ.get("STARFRONT_ROLE", "all").strip().lower() or "all"
+_UPLOAD_PATH = re.compile(r"^/api/v1/projects/[^/]+/files/[^/]+$")
+
+
+def is_upload(method: str, path: str) -> bool:
+    """A file's bytes coming in: the files page's PUT, or a telescope's
+    resumable upload (all of /api/v1/agent/uploads, whose throttles are
+    kept in memory and so must all live in one process)."""
+    if path == "/api/v1/agent/uploads" or path.startswith("/api/v1/agent/uploads/"):
+        return True
+    return method == "PUT" and bool(_UPLOAD_PATH.match(path))
+
+
+@app.middleware("http")
+async def _role(request: Request, call_next):
+    if ROLE != "all":
+        upload = is_upload(request.method, request.url.path)
+        if ROLE == "control" and upload:
+            return JSONResponse(status_code=503, headers={"Retry-After": "30"},
+                                content={"detail": "uploads are taken by the upload service"})
+        if ROLE == "uploads" and not upload and request.url.path != "/api/v1/health":
+            return JSONResponse(status_code=404, content={"detail": "not here"})
+    return await call_next(request)
+
 
 @app.middleware("http")
 async def _rate_limit(request: Request, call_next):
@@ -2308,6 +2338,8 @@ def health() -> dict[str, Any]:
             "adminConfigured": bool(ADMIN_TOKEN),
             "discord": DISCORD.configured(),
             "roleRequired": False,
+            # control, uploads or all: which process answered (see ROLE).
+            "role": ROLE,
             # The N.I.N.A. plugin releases this server offers, so a deploy
             # can be checked from outside.
             "ninaPlugins": [f'{m.get("Name")} {".".join(str(m["Version"][k]) for k in ("Major", "Minor", "Patch", "Build"))}'

@@ -1,0 +1,29 @@
+[Unit]
+Description=Starfront collaboration server - file uploads
+# The same program as starfront.service, answering only uploads (STARFRONT_ROLE),
+# on its own port; Caddy sends the upload paths here. Run at a lower CPU and IO
+# weight, so on a one-CPU droplet the control process always goes first.
+After=network-online.target starfront.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=starfront
+Group=starfront
+WorkingDirectory=/opt/starfront
+Environment=STARFRONT_DATA=/var/lib/starfront
+Environment=STARFRONT_ROLE=uploads
+ExecStart=/opt/starfront/venv/bin/python server/run.py --host 127.0.0.1 --port 8801
+Restart=always
+RestartSec=3
+Nice=10
+CPUWeight=20
+IOWeight=20
+ProtectSystem=strict
+ReadWritePaths=/var/lib/starfront /var/lib/starfront/files
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
