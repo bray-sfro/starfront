@@ -910,6 +910,8 @@ _PAGE = r"""<!doctype html>
   .job.failed .fill { background: #b86b6b; } .job.failed .jt { color: #e8b4b4; }
   .job.stale .fill { background: #5b6577; }
   .job.done .fill { background: #8fc9a5; }
+  .stackctl { padding: 10px 18px; font-size: 13px; display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+  .stackctl button[disabled] { opacity: .55; cursor: default; }
   .job details { margin-top: 8px; } .job summary { cursor: pointer; color: #8f9bb0; font-size: 12px; }
   .job ol { margin: 6px 0 0; padding: 0; list-style: none; display: grid; gap: 3px; }
   .job li { display: flex; gap: 10px; align-items: baseline; font-size: 12px; color: #8f9bb0; }
@@ -1505,6 +1507,7 @@ _PAGE = r"""<!doctype html>
     el.innerHTML = `<div class="jl"><span><span class="jt">${esc(title)}</span>${bits.filter(Boolean).map((b) => ` <span class="jm">· ${esc(b)}</span>`).join('')}</span>${msg ? `<span class="jm">${esc(msg)}</span>` : ''}</div>
       <div class="track" aria-hidden="true"><div class="fill" style="width:${pct != null ? Math.max(2, Math.min(100, pct)) : (j.status === 'running' ? 30 : 100)}%"></div></div>${list}`;
     const d = el.querySelector('details'); if (d) d.addEventListener('toggle', () => { JOB.open = d.open; });
+    if (typeof drawStack === 'function') drawStack();
   }
   async function jobPoll() {
     clearTimeout(JOB.timer); JOB.timer = 0;
@@ -1519,7 +1522,59 @@ _PAGE = r"""<!doctype html>
     // Keep polling only while something is running; a hidden tab waits for visibilitychange.
     if (JOB.data && JOB.data.status === 'running' && document.visibilityState === 'visible') JOB.timer = setTimeout(jobPoll, 15000);
   }
-  function jobWatch(pid) { if (pid === JOB.pid) return; JOB.pid = pid; JOB.data = null; drawJob(); jobPoll(); }
+  // -- "Start new stack": owners only. POST /api/v1/releases/<project>/stack queues a request the
+  // stacking machine picks up; disabled while one is queued or a job is running.
+  const STACK = { data: null, timer: 0, seq: 0, sending: false };
+  function drawStack() {
+    const d = STACK.data, hero = $('hero');
+    let el = $('stackCtl');
+    if (!d || !d.canStack || !hero) { if (el) el.remove(); return; }
+    if (!el) { el = document.createElement('div'); el.id = 'stackCtl'; el.className = 'stackctl'; }
+    const job = $('job');
+    const anchor = job || hero;
+    if (anchor.nextSibling !== el) anchor.parentNode.insertBefore(el, anchor.nextSibling);
+    const now = d.now || Date.now() / 1000;
+    let label = 'Start new stack', note = '', dis = STACK.sending || d.busy;
+    if (STACK.sending) label = 'Starting…';
+    else if (d.active && d.state === 'queued') { label = 'Stack queued'; note = `requested ${ago(now - (d.requested || now))}; waiting for the stacking machine` + (now - (d.requested || now) > 900 ? ' (not picked up yet: is it running?)' : ''); }
+    else if (d.active || (d.job === 'running' && !d.stale)) { label = 'Stacking…'; note = d.message || 'progress is shown above'; }
+    else if (d.state === 'failed') note = `last request failed: ${d.message || 'see the stacking machine'}`;
+    else if (d.state === 'done') note = `last stack finished ${ago(now - (d.updated || now))}`;
+    el.innerHTML = `<button type="button" id="stackBtn"${dis ? ' disabled' : ''}>${esc(label)}</button>` +
+      (d.active && d.state === 'queued' ? ' <button type="button" class="link" id="stackCancel">Cancel</button>' : '') +
+      (note ? ` <span class="jm">${esc(note)}</span>` : '');
+    const b = $('stackBtn');
+    if (b) b.addEventListener('click', async () => {
+      if (!confirm('Start a new stack of everything collected so far? It runs on the stacking machine and the new version goes live when it is done.')) return;
+      STACK.sending = true; drawStack();
+      try { STACK.data = await api(`/api/v1/releases/${encodeURIComponent(JOB.pid)}/stack`, { method: 'POST' }); }
+      catch (e) { alert(e.message); }
+      STACK.sending = false; stackPoll(); jobPoll();
+    });
+    const c = $('stackCancel');
+    if (c) c.addEventListener('click', async () => {
+      try { STACK.data = await api(`/api/v1/releases/${encodeURIComponent(JOB.pid)}/stack`, { method: 'DELETE' }); } catch (e) { alert(e.message); }
+      stackPoll();
+    });
+  }
+  async function stackPoll() {
+    clearTimeout(STACK.timer); STACK.timer = 0;
+    const pid = JOB.pid, seq = ++STACK.seq;
+    if (!pid) return;
+    try {
+      const r = await fetch(`/api/v1/releases/${encodeURIComponent(pid)}/stack`, { credentials: 'same-origin' });
+      if (seq !== STACK.seq || pid !== JOB.pid) return;
+      STACK.data = r.ok ? await r.json() : null;
+    } catch (e) { if (seq !== STACK.seq) return; }
+    drawStack();
+    if (STACK.data && STACK.data.canStack && STACK.data.busy && document.visibilityState === 'visible') {
+      STACK.timer = setTimeout(stackPoll, 15000);
+      if (!JOB.timer) JOB.timer = setTimeout(jobPoll, 15000);   // the bar appears once the machine starts
+    }
+  }
+  document.addEventListener('starfront:hero', drawStack);
+  document.addEventListener('starfront:release', () => setTimeout(drawStack, 0));
+  function jobWatch(pid) { if (pid === JOB.pid) return; JOB.pid = pid; JOB.data = null; STACK.data = null; drawJob(); drawStack(); jobPoll(); stackPoll(); }
   document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && JOB.data && JOB.data.status === 'running' && !JOB.timer) jobPoll(); });
   document.addEventListener('starfront:hero', drawJob);
   document.addEventListener('starfront:release', () => setTimeout(drawJob, 0));

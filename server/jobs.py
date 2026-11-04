@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -33,6 +34,13 @@ STEP_STATES = ("pending", "running", "done", "failed", "skipped")
 STALE_SECONDS = 15 * 60
 MAX_STEPS = 30
 FILE = "JOB.json"
+#: A request for a new stack, from the "Start new stack" button. The stacking
+#: box polls it over ssh, claims it and runs the stack; see STACK-BUTTON.md.
+REQUEST = "STACK_REQUEST.json"
+REQUEST_STATES = ("queued", "claimed", "running", "done", "failed", "cancelled")
+ACTIVE = ("queued", "claimed", "running")
+#: A request nobody has touched for this long no longer blocks a new one.
+REQUEST_EXPIRE_SECONDS = 6 * 3600
 
 
 def _text(value: Any, size: int) -> str:
@@ -113,6 +121,7 @@ class Jobs:
         self.store, self.folder, self.who, self.owns_project = store, Path(folder), who, owns_project
         self.token_file, self.latest, self.clock = token_file, latest or (lambda pid: ""), clock
         self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._lock = threading.Lock()
         self._routes(app)
 
     def _job_token_ok(self, request: Request) -> bool:
@@ -147,7 +156,95 @@ class Jobs:
         job["now"] = round(now, 1)
         return job
 
+    def read_request(self, project_id: str) -> dict[str, Any]:
+        try:
+            req = json.loads((self.folder / project_id / REQUEST).read_text("utf-8"))
+            return req if isinstance(req, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def stack_view(self, project_id: str) -> dict[str, Any]:
+        """The request as the page shows it (no names), and whether it blocks a new one."""
+        now = self.clock()
+        req = self.read_request(project_id)
+        state = str(req.get("state") or "")
+        touched = max(float(req.get(k) or 0) for k in ("requested", "updated", "claimed")) if req else 0.0
+        active = state in ACTIVE and now - touched < REQUEST_EXPIRE_SECONDS
+        job = self.read(project_id)
+        busy = active or (job["status"] == "running" and not job["stale"])
+        view = {"state": state if req else "", "active": active, "busy": busy,
+                "requested": req.get("requested"), "updated": req.get("updated"),
+                "message": _text(req.get("message"), 300), "id": _text(req.get("id"), 40),
+                "job": job["status"], "stale": job["stale"], "now": round(now, 1)}
+        return view
+
+    def _write_request(self, project_id: str, req: dict[str, Any]) -> None:
+        folder = self.folder / project_id
+        folder.mkdir(parents=True, exist_ok=True)
+        tmp = folder / (REQUEST + ".tmp")
+        tmp.write_text(json.dumps(req, indent=1), "utf-8")
+        os.replace(tmp, folder / REQUEST)
+
+    def _owner(self, request: Request, project: dict[str, Any]) -> dict[str, Any] | None:
+        try:
+            who = self.who(request)
+        except HTTPException:
+            who = None
+        if who is None or who.get("kind") == "agent" or not self.owns_project(who, project):
+            return None
+        return who
+
     def _routes(self, app: FastAPI) -> None:
+        @app.get("/api/v1/releases/{project_id}/stack")
+        def get_stack(project_id: str, request: Request) -> JSONResponse:
+            """The stack button's state: whether you may press it, and the last request."""
+            project = self.store.project(project_id)
+            if project is None:
+                raise HTTPException(status_code=404, detail="no such collaboration")
+            view = self.stack_view(project_id)
+            view["canStack"] = self._owner(request, project) is not None
+            return JSONResponse(view, headers={"Cache-Control": "private, no-store"})
+
+        @app.post("/api/v1/releases/{project_id}/stack")
+        def post_stack(project_id: str, request: Request) -> JSONResponse:
+            """The owner asks for a new stack. One at a time: 409 while one is queued or running."""
+            project = self.store.project(project_id)
+            if project is None:
+                raise HTTPException(status_code=404, detail="no such collaboration")
+            who = self._owner(request, project)
+            if who is None:
+                raise HTTPException(status_code=403, detail="only the collaboration's owner starts a stack")
+            with self._lock:
+                view = self.stack_view(project_id)
+                if view["busy"]:
+                    raise HTTPException(status_code=409, detail="a stack is already queued or running")
+                now = self.clock()
+                req = {"id": secrets.token_hex(6), "state": "queued", "project": project_id,
+                       "requested": now, "updated": now, "by": _text(who.get("id"), 40),
+                       "byName": _text(who.get("name"), 80), "message": "waiting for the stacking machine"}
+                self._write_request(project_id, req)
+            view = self.stack_view(project_id)
+            view["canStack"] = True
+            return JSONResponse(view, status_code=202, headers={"Cache-Control": "private, no-store"})
+
+        @app.delete("/api/v1/releases/{project_id}/stack")
+        def cancel_stack(project_id: str, request: Request) -> JSONResponse:
+            """The owner takes back a request the stacking machine has not picked up yet."""
+            project = self.store.project(project_id)
+            if project is None:
+                raise HTTPException(status_code=404, detail="no such collaboration")
+            if self._owner(request, project) is None:
+                raise HTTPException(status_code=403, detail="only the collaboration's owner cancels a stack")
+            with self._lock:
+                req = self.read_request(project_id)
+                if req.get("state") != "queued":
+                    raise HTTPException(status_code=409, detail="nothing queued to cancel (a started stack cannot be cancelled here)")
+                req.update(state="cancelled", updated=self.clock(), message="cancelled")
+                self._write_request(project_id, req)
+            view = self.stack_view(project_id)
+            view["canStack"] = True
+            return JSONResponse(view, headers={"Cache-Control": "private, no-store"})
+
         @app.get("/api/v1/releases/{project_id}/job")
         def get_job(project_id: str) -> JSONResponse:
             """What the coordinator's processing job is doing. Public, cheap, cached a few seconds."""
