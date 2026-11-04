@@ -481,9 +481,12 @@ class ProjectRequest(BaseModel):
     goals: dict[str, float] = Field(default_factory=dict)
     notes: str = Field(default="", max_length=2000)
     # Whether contributors' lights are collected on this server (the files
-    # page, and in time the programs themselves), for the coordinator to
-    # stack. Off unless asked: gigabytes a night are nobody's by accident.
-    collectFiles: bool = False
+    # page and the programs themselves), for the coordinator to stack, and
+    # whether the telescopes send them on their own as each is captured.
+    # Both on for a new collaboration unless the request says otherwise
+    # (2026-11-04); the coordinator switches either off on the files page.
+    collectFiles: bool = True
+    autoUpload: bool = True
 
 
 class TaskRequest(BaseModel):
@@ -1770,6 +1773,7 @@ def create_project(body: ProjectRequest,
         "goals": _goals(body.goals),
         "notes": body.notes,
         "collectFiles": bool(body.collectFiles),
+        "autoUpload": bool(body.autoUpload),
     }
     # The name on it is the person's Discord name unless the owner, on the
     # admin token, chose to write one.
