@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Query, Request
+from starlette.requests import ClientDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
 from server import uploadrules
@@ -62,6 +63,20 @@ LOW_FRACTION = 0.10
 #: stream of files never holds up a telescope's or a coordinator's call.
 WRITE_BUFFER = 1024 ** 2
 _log = logging.getLogger("starfront.files")
+
+
+async def _drain(request: Request, length: int) -> bool:
+    """Read and drop a request body (up to its Content-Length). False if the
+    client went away first."""
+    got = 0
+    try:
+        async for chunk in request.stream():
+            got += len(chunk)
+            if got >= length:
+                break
+    except ClientDisconnect:
+        return False
+    return True
 
 #: The cookie a browser sign-in lives in, and how long it lasts unused.
 COOKIE = "starfront_web"
@@ -595,6 +610,12 @@ class Files:
 
             who, project, clean, what, length, final, done = await asyncio.to_thread(prepare)
             if done is not None:
+                # Already here: still take the body (to nowhere) before
+                # answering, so the browser's request finishes cleanly; an
+                # answer with the body unread can leave an HTTP/2 or HTTP/3
+                # PUT hanging at 'sending'.
+                if not await _drain(request, length):
+                    return JSONResponse(status_code=499, content={"detail": "the upload was cut off"})
                 return done
             part = final.with_name(final.name + ".part")
             written = 0
@@ -618,6 +639,13 @@ class Files:
                             await asyncio.to_thread(handle.write, data)
                     if buffer:
                         await asyncio.to_thread(handle.write, bytes(buffer))
+                except ClientDisconnect:
+                    _log.info("upload of %s cut off by the client after %d of %d bytes",
+                              clean, written, length)
+                    await asyncio.to_thread(handle.close)
+                    with _quiet():
+                        await asyncio.to_thread(part.unlink)
+                    return JSONResponse(status_code=499, content={"detail": "the upload was cut off"})
                 finally:
                     await asyncio.to_thread(handle.close)
                 if written != length:
@@ -1705,6 +1733,7 @@ _PAGE = r"""<!doctype html>
     const p = state.project;
     $('projectNote').textContent = p.notes || '';
     const listing = await api(`/api/v1/projects/${encodeURIComponent(id)}/files`);
+    state.listing = listing;
     state.owned = listing.owned;
     drawRules(listing);
     drawMine(listing);
@@ -1930,9 +1959,22 @@ _PAGE = r"""<!doctype html>
     }
   }
 
+  // A file of mine already on the server at the same name and size (and kind,
+  // when the box said one) is not sent again: the server would skip it anyway.
+  function alreadyHere(q) {
+    const l = state.listing;
+    if (!l || !state.project || l.project !== state.project.id) return null;
+    return (l.files || []).find((f) => f.user === l.me && f.name === q.file.name && f.bytes === q.file.size
+      && (!q.kind || f.kind === q.kind)) || null;
+  }
+
   function send(q, attempt) {
     return new Promise((resolve) => {
       const xhr = new XMLHttpRequest();
+      // At least 2 minutes, plus about 10 minutes per 50 MB: a stalled
+      // request becomes a retry instead of 'sending' for ever.
+      xhr.timeout = 120000 + Math.ceil(q.file.size / (50 * 1024 * 1024) * 600000);
+      xhr.ontimeout = () => resolve(false);
       const tel = encodeURIComponent($('telescope').value.trim());
       xhr.open('PUT', `/api/v1/projects/${encodeURIComponent(state.project.id)}/files/${encodeURIComponent(q.file.name)}?telescope=${tel}&kind=${encodeURIComponent(q.kind)}`);
       xhr.upload.onprogress = (e) => { q.sent = e.loaded; drawQueue(); };
@@ -1962,6 +2004,8 @@ _PAGE = r"""<!doctype html>
     try {
       for (const q of state.queue) {
         if (q.state !== 'waiting') continue;
+        const have = alreadyHere(q);
+        if (have) { q.state = 'already'; q.text = 'already here'; q.status = have.status || ''; q.reasons = have.reasons || []; drawQueue(); continue; }
         q.state = 'sending'; q.text = 'sending'; drawQueue();
         let ok = false;
         for (let attempt = 1; attempt <= 3 && !ok; attempt++) {
