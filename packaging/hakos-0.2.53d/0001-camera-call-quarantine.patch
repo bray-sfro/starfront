@@ -1,0 +1,753 @@
+diff --git a/astrocontrol/__init__.py b/astrocontrol/__init__.py
+index 6f388d8..e8b37d8 100644
+--- a/astrocontrol/__init__.py
++++ b/astrocontrol/__init__.py
+@@ -1,4 +1,4 @@
+ ﻿"""Starfront - astrophotography equipment control."""
+ 
+-__version__ = "0.2.53c"
++__version__ = "0.2.53d"
+ 
+diff --git a/astrocontrol/cameragate.py b/astrocontrol/cameragate.py
+new file mode 100644
+index 0000000..58c6af0
+--- /dev/null
++++ b/astrocontrol/cameragate.py
+@@ -0,0 +1,120 @@
++"""One camera, one mutating driver call at a time.
++
++A Python timeout cannot cancel a COM or SDK call that is already inside the
++driver. This gate does not pretend otherwise. When a call overruns or the
++operator cancels, the call is abandoned: its result is discarded, and nothing
++else may start an exposure, download, abort, settings write, or reconnect on
++that camera until the abandoned call has actually returned.
++"""
++
++from __future__ import annotations
++
++import threading
++import time
++from typing import Any, Callable
++
++from .devices.base import DeviceError
++
++
++class CameraGate:
++    """Serialises mutating camera calls and quarantines the ones that stick."""
++
++    def __init__(self) -> None:
++        self._lock = threading.Lock()
++        self._generation = 0
++        self._inflight: dict[str, Any] | None = None
++
++    def quarantined(self) -> str | None:
++        """Why the camera must not be commanded, or None when it is free."""
++        with self._lock:
++            flight = self._inflight
++            if flight is None or flight["done"].is_set() or not flight["abandoned"]:
++                return None
++            return str(flight.get("reason") or "a camera call is still inside the driver")
++
++    def wait_clear(self, seconds: float) -> bool:
++        """Wait until an abandoned call has returned. True when the camera is free."""
++        with self._lock:
++            flight = self._inflight
++            done = None if flight is None else flight["done"]
++        if done is not None:
++            done.wait(max(0.0, float(seconds)))
++        return self.quarantined() is None
++
++    def begin(self, kind: str) -> int:
++        with self._lock:
++            flight = self._inflight
++            if flight is not None and not flight["done"].is_set():
++                why = flight.get("reason") or f"a {flight['kind']} call"
++                raise DeviceError(
++                    f"the camera is busy with {why} and that call cannot be "
++                    "cancelled; no second camera command was sent")
++            self._generation += 1
++            token = self._generation
++            self._inflight = {
++                "generation": token,
++                "kind": kind,
++                "done": threading.Event(),
++                "abandoned": False,
++                "reason": "",
++            }
++            return token
++
++    def finish(self, token: int) -> bool:
++        """The driver call returned. False when the caller already gave up."""
++        with self._lock:
++            flight = self._inflight
++            if flight is None or flight["generation"] != token:
++                return False
++            flight["done"].set()
++            return not flight["abandoned"]
++
++    def abandon(self, token: int, reason: str) -> None:
++        with self._lock:
++            flight = self._inflight
++            if flight is None or flight["generation"] != token:
++                return
++            if flight["done"].is_set():
++                return
++            flight["abandoned"] = True
++            flight["reason"] = reason
++
++    def call(self, fn: Callable[[], Any], seconds: float, kind: str,
++             cancel: Callable[[], bool] | None = None) -> Any:
++        """Run `fn`. On timeout or cancel, leave it running and discard the result."""
++        token = self.begin(kind)
++        box: dict[str, Any] = {}
++
++        def run() -> None:
++            try:
++                box["value"] = fn()
++            except BaseException as exc:            # noqa: BLE001 - handed back or dropped
++                box["error"] = exc
++            finally:
++                box["kept"] = self.finish(token)
++
++        thread = threading.Thread(target=run, daemon=True, name=f"camera-{kind[:16]}")
++        thread.start()
++        deadline = time.monotonic() + max(0.0, float(seconds))
++        while thread.is_alive():
++            if cancel is not None and cancel():
++                self.abandon(token, f"{kind} cancelled")
++                raise DeviceError(
++                    f"{kind} cancelled. The driver call was not interrupted and "
++                    "its result will be discarded.")
++            remaining = deadline - time.monotonic()
++            if remaining <= 0:
++                self.abandon(
++                    token,
++                    f"{kind} did not answer within {float(seconds):g}s")
++                raise DeviceError(
++                    f"{kind} did not answer within {float(seconds):g}s. "
++                    "The driver call is still running and cannot be cancelled. "
++                    "No further camera command will be sent until it finishes.")
++            thread.join(min(0.25, remaining))
++        if not box.get("kept", False):
++            raise DeviceError(
++                f"{kind} finished after it was given up; the result was discarded")
++        if "error" in box:
++            raise box["error"]
++        return box.get("value")
+diff --git a/astrocontrol/camerahealth.py b/astrocontrol/camerahealth.py
+index 2bd3b2a..5d52ceb 100644
+--- a/astrocontrol/camerahealth.py
++++ b/astrocontrol/camerahealth.py
+@@ -118,6 +118,21 @@ class CameraHealth:
+                 self._log(f"not reconnecting while a frame is being read out ({reason})",
+                           "warn")
+                 return False
++            gate = getattr(self.capture, "gate", None)
++            if gate is not None and gate.quarantined():
++                grace = 5.0
++                config = getattr(self.capture, "config", None)
++                if config is not None and hasattr(config, "section"):
++                    with contextlib.suppress(Exception):
++                        raw = config.section("recovery").get("cameraQuarantineSeconds")
++                        if raw is not None:
++                            grace = float(raw)
++                if not gate.wait_clear(grace):
++                    self._log(
++                        "not reconnecting: a camera call is still inside the "
++                        "driver and cannot be cancelled ("
++                        + (gate.quarantined() or reason) + ")", "error")
++                    return False
+             if self.reconnect is None:
+                 self._log(self.plain(reason) + "; there is no remembered driver to "
+                           "reconnect it with", "error")
+@@ -244,6 +259,10 @@ class CameraWatch:
+             health = getattr(rig, "camera_health", None)
+             if health is None or health.busy or health.gave_up:
+                 continue
++            capture = getattr(rig, "capture", None)
++            blocked = getattr(capture, "blocks_recovery", None)
++            if callable(blocked) and blocked():
++                continue
+             with contextlib.suppress(Exception):
+                 if not self._idle(rig):
+                     continue
+diff --git a/astrocontrol/capture.py b/astrocontrol/capture.py
+index 24695a3..405dbc4 100644
+--- a/astrocontrol/capture.py
++++ b/astrocontrol/capture.py
+@@ -22,6 +22,7 @@ from typing import Any
+ import numpy as np
+ 
+ from . import astro
++from .cameragate import CameraGate
+ from .config import Config, data_root, effective_site
+ from .devices.base import CameraLostError, DeviceError
+ from .devices.manager import DeviceManager
+@@ -184,6 +185,9 @@ class CaptureService:
+         self._directory_override: Path | None = None
+         self._previews: OrderedDict[str, tuple[np.ndarray, int]] = OrderedDict()
+         self._start_lock = threading.Lock()
++        # One mutating camera call at a time. A timeout does not cancel the
++        # driver call; it quarantines it (0.2.53d).
++        self.gate = CameraGate()
+         # calib-layout: True when the override already names the telescope, so
+         # `session_dir` must not add the per-telescope subfolder to it.
+         self._directory_exact = False
+@@ -344,6 +348,15 @@ class CaptureService:
+     def busy(self) -> bool:
+         return self._thread is not None and self._thread.is_alive()
+ 
++    def blocks_recovery(self) -> str | None:
++        """Why a reconnect or power change must not start, or None."""
++        reason = self.gate.quarantined()
++        if reason:
++            return reason
++        if self._state in ("exposing", "downloading", "saving", "recovering") and self.busy:
++            return f"a frame is {self._state}"
++        return None
++
+     def status(self) -> dict[str, Any]:
+         elapsed = None
+         remaining = None
+@@ -618,17 +631,21 @@ class CaptureService:
+     def abort(self) -> None:
+         self._loop = False
+         self._abort.set()
+-        camera = self.manager.get("camera")
+-        if camera is not None and camera.connected:
+-            try:
+-                camera.abort_exposure()
+-            except Exception as exc:
+-                self.manager.log(f"Abort failed: {exc}", "warn")
+-                # A driver that will not even take an Abort is stuck; the
+-                # capture is not left waiting on it (0.2.52e). Its thread is
+-                # given up on and the camera is free for a reconnect.
+-                with contextlib.suppress(Exception):
+-                    self.release_stuck()
++        # An exposure or download still inside the driver cannot be aborted
++        # from here. Sending AbortExposure would only run later, on top of it.
++        stuck = self.gate.quarantined()
++        if stuck:
++            self.manager.log(
++                "Capture cancelled. AbortExposure was not sent: " + stuck, "warn")
++        else:
++            camera = self.manager.get("camera")
++            if camera is not None and camera.connected:
++                try:
++                    self.gate.call(camera.abort_exposure, 5.0, "abort")
++                except Exception as exc:
++                    self.manager.log(f"Abort failed: {exc}", "warn")
++                    with contextlib.suppress(Exception):
++                        self.release_stuck()
+         self._state = "idle"
+         self.manager.log("Capture aborted", "warn")
+ 
+@@ -654,6 +671,16 @@ class CaptureService:
+         settings = self.config.section("recovery") if hasattr(self.config, "section") else {}
+         if not settings.get("enabled", True) or not settings.get("reconnectManualCaptures", True):
+             return False
++        # One retry, and only when the failed call has actually left the driver.
++        reason = self.gate.quarantined()
++        if reason:
++            raw = settings.get("cameraQuarantineSeconds")
++            grace = 5.0 if raw is None else float(raw)
++            if not self.gate.wait_clear(grace):
++                self.manager.log(
++                    "Camera call still inside the driver; not reconnecting and "
++                    "not starting another exposure. " + reason, "error")
++                return False
+         self.manager.log(f"Camera failed ({exc}); disconnecting and reconnecting it, "
+                          "then trying the frame again", "warn")
+         self._state = "recovering"
+@@ -795,7 +822,10 @@ class CaptureService:
+             f"Exposing {exposure:g}s {frame_type}"
+             + (f" [{metadata['filter']}]" if metadata.get("filter") else ""))
+         try:
+-            camera.start_exposure(exposure, light=frame_type in LIGHT_PATH_TYPES)
++            start_budget = max(60.0, float(exposure) + 60.0)
++            self.gate.call(
++                lambda: camera.start_exposure(exposure, light=frame_type in LIGHT_PATH_TYPES),
++                start_budget, "exposure", cancel=self._abort.is_set)
+         except CameraLostError as exc:
+             # Lost between the check and the shutter: not sent, so nothing is
+             # stuck. Reconnected once here, then the frame is started again.
+@@ -809,19 +839,39 @@ class CaptureService:
+                 wanted = self._ensure_settings(camera)
+             self._exposure_started = time.time()
+             metadata["startedAt"] = self._exposure_started
+-            camera.start_exposure(exposure, light=frame_type in LIGHT_PATH_TYPES)
++            self.gate.call(
++                lambda: camera.start_exposure(exposure, light=frame_type in LIGHT_PATH_TYPES),
++                max(60.0, float(exposure) + 60.0), "exposure",
++                cancel=self._abort.is_set)
+ 
+         # Wait for the driver, with an allowance for download. A camera that
+         # has not said it is done this long after it should have is treated
+         # as failed, so the reconnect can happen instead of a wait for ever.
++        # Each ImageReady read is itself bounded: a wedged property read must
++        # not hold this loop for the driver's own three-minute COM timeout.
+         try:
+             hung = float(self.config.get("recovery", "hungSeconds", 120.0) or 120.0)
+         except Exception:                         # noqa: BLE001 - a bare config
+             hung = 120.0
++        try:
++            poll = float(self.config.get("recovery", "imageReadyTimeoutSeconds", 15.0)
++                         or 15.0)
++        except Exception:                         # noqa: BLE001 - a bare config
++            poll = 15.0
+         deadline = time.monotonic() + exposure + max(30.0, hung)
+-        while not camera.image_ready:
++        while True:
+             if self._abort.is_set():
++                self._state = "idle"
+                 return
++            try:
++                ready = bool(self.gate.call(
++                    lambda: camera.image_ready, poll, "readout",
++                    cancel=self._abort.is_set))
++            except DeviceError:
++                self._state = "idle"
++                raise
++            if ready:
++                break
+             lost = getattr(camera, "lost_reason", None)
+             if isinstance(lost, str) and lost:
+                 # A driver box closed on the camera's thread (driverdialogs):
+@@ -833,10 +883,12 @@ class CaptureService:
+                     raise CameraLostError(health.plain(lost))
+                 return self._capture_one(exposure, frame_type, again=False)
+             if time.monotonic() > deadline:
++                self._state = "idle"
+                 raise DeviceError(f"the camera has not finished its exposure "
+                                   f"{hung:g}s after it should have")
+             time.sleep(0.05)
+         if self._abort.is_set():
++            self._state = "idle"
+             return
+ 
+         # Timed from the shutter closing to the frame being on disk. This is
+@@ -854,11 +906,19 @@ class CaptureService:
+                              or 0.0)
+         except Exception:                         # noqa: BLE001 - a bare config
+             download = 120.0
+-        from .recovery import call_with_timeout
+-        frame = call_with_timeout(camera.get_image, download, "the camera download")
++        try:
++            frame = self.gate.call(camera.get_image, download, "download",
++                                   cancel=self._abort.is_set)
++        except DeviceError:
++            # Not saved, not uploaded. The driver call, if still inside the
++            # camera, is quarantined and its late pixels are discarded.
++            self._state = "idle"
++            raise
+         if self._abandoned():
++            self._state = "idle"
+             raise DeviceError("the frame was given up on while it downloaded")
+-        if frame is None or frame.size == 0:
++        if frame is None or getattr(frame, "size", 0) == 0:
++            self._state = "idle"
+             raise DeviceError("camera returned an empty frame")
+ 
+         self._state = "saving"
+diff --git a/astrocontrol/config.py b/astrocontrol/config.py
+index a1922ae..1d71082 100644
+--- a/astrocontrol/config.py
++++ b/astrocontrol/config.py
+@@ -725,6 +725,13 @@ DEFAULTS: dict[str, dict[str, Any]] = {
+         # has not returned in this long is treated as hung - 2026-10-14 02:24
+         # was a download that never came back, and nothing timed it out.
+         "downloadTimeoutSeconds": 120.0,
++        # How long one ImageReady poll may sit in the driver. A poll that
++        # overruns is quarantined; it is not cancelled, and nothing else is
++        # sent to that camera until the call returns.
++        "imageReadyTimeoutSeconds": 15.0,
++        # After a timed-out camera call, how long a reconnect may wait for
++        # that call to actually return before it refuses to touch the camera.
++        "cameraQuarantineSeconds": 5.0,
+         # Slack on top of exposure + hungSeconds + downloadTimeoutSeconds
+         # before a telescope's frame is given up on and its thread abandoned.
+         "slotGraceSeconds": 60.0,
+diff --git a/astrocontrol/rigs.py b/astrocontrol/rigs.py
+index ceff83d..311d8ef 100644
+--- a/astrocontrol/rigs.py
++++ b/astrocontrol/rigs.py
+@@ -618,41 +618,31 @@ class RigSet:
+         Recovery).  `stop` is asked between waits so a Stop press is not
+         held up by a boot; `progress` is told what is being waited for.
+         """
+-        settings = self.config.section("recovery")
++        capture = getattr(rig, "capture", None)
++        blocked = None
++        ask = getattr(capture, "blocks_recovery", None)
++        if callable(ask):
++            blocked = ask()
++        if blocked:
++            rig.manager.log(
++                "Not reconnecting the camera and not switching its power: "
++                + str(blocked), "error")
++            return {"connected": [], "failed": [str(blocked)]}
++
++        # Driver reconnect only. Cutting the camera's outlets from here raced
++        # an idle reconnect and a Stop flag that was already set, and skipped
++        # the boot wait. A person can still power-cycle from the button.
+         now = time.time()
+         recent = [t for t in self._reconnects.get(rig.id, [])
+                   if now - t < self.POWER_CYCLE_WINDOW_SECONDS]
+         self._reconnects[rig.id] = recent + [now]
+-
+-        cycle_wanted = (bool(settings.get("enabled", True))
+-                        and bool(settings.get("powerCycleCameras", True)))
+-        channels, _source = rig.power_channels(self.master.manager.get("switch")) \
+-            if cycle_wanted else ([], "none")
+-        too_soon = (now - self._cycled_at.get(self._slot(rig, "camera"), 0.0)
+-                    < self.POWER_CYCLE_MIN_GAP_SECONDS)
+-        threshold = int(settings.get("powerCycleAfterReconnects", 1) or 0)
+-        # Straight to the mains when this camera has already had its plain
+-        # reconnect(s) recently: the last time it "came back" it failed the
+-        # next frame, and the night is running out while that repeats.
+-        repeat = len(recent) >= threshold
+-        if channels and not too_soon and repeat:
+-            self._power_cycle(rig, channels, "it has been reconnected "
+-                              f"{len(recent)} time(s) in the last "
+-                              f"{self.POWER_CYCLE_WINDOW_SECONDS // 60} minutes",
+-                              stop, progress)
+-            return self._plain_reconnect(rig)
+-
+         outcome = self._plain_reconnect(rig)
+-        if "camera" in outcome["connected"] or not channels or too_soon:
+-            return outcome
+-        if stop is not None and stop():
+-            return outcome
+-        first = outcome["failed"][0] if outcome["failed"] else "it did not come back"
+-        self._power_cycle(rig, channels, f"the reconnect failed ({first})", stop, progress)
+-        again = self._plain_reconnect(rig)
+-        # Both attempts' failures are worth reading in the morning.
+-        again["failed"] = outcome["failed"] + again["failed"] if again["failed"] else []
+-        return again
++        if "camera" not in outcome["connected"]:
++            rig.manager.log(
++                "Camera reconnect failed. Its power was not cycled. "
++                + (outcome["failed"][0] if outcome["failed"] else "it did not come back"),
++                "error")
++        return outcome
+ 
+     def _plain_reconnect(self, rig: Rig) -> dict[str, list[str]]:
+         outcome = self.connect_remembered(rig, ("camera",))
+diff --git a/tools/check_camera_gate.py b/tools/check_camera_gate.py
+new file mode 100644
+index 0000000..951fc00
+--- /dev/null
++++ b/tools/check_camera_gate.py
+@@ -0,0 +1,244 @@
++"""Camera call quarantine (0.2.53d). No hardware.
++
++A timeout does not cancel a driver call. Until that call returns, recovery
++must not disconnect, power-cycle, or start another exposure, and the late
++result is not a saved frame.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import tempfile
++import threading
++import time
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(ROOT))
++TMP = Path(tempfile.mkdtemp(prefix="camgate-"))
++os.environ.setdefault("ASTRO_DATA_DIR", str(TMP / "data"))
++os.environ.setdefault("HOME", str(TMP / "home"))
++os.environ.setdefault("LOCALAPPDATA", str(TMP / "lad"))
++
++from astrocontrol.cameragate import CameraGate                 # noqa: E402
++from astrocontrol.camerahealth import CameraHealth             # noqa: E402
++from astrocontrol.devices.base import DeviceError              # noqa: E402
++
++results: list[bool] = []
++
++
++def case(name, ok, detail=""):
++    print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  - {detail}" if detail else ""))
++    results.append(bool(ok))
++    return ok
++
++
++# -- timeout leaves the call running and discards its result ---------------
++gate = CameraGate()
++started = threading.Event()
++release = threading.Event()
++
++
++def slow():
++    started.set()
++    release.wait(2.0)
++    return "pixels"
++
++
++try:
++    gate.call(slow, 0.2, "download")
++    timed = None
++except DeviceError as exc:
++    timed = str(exc)
++case("a download timeout fails closed",
++     timed and "cannot be cancelled" in timed and "download" in timed, timed)
++case("the timed-out call quarantines the camera",
++     gate.quarantined() and "download" in gate.quarantined())
++try:
++    gate.call(lambda: "second", 1.0, "exposure")
++    overlapped = False
++except DeviceError as exc:
++    overlapped = "no second camera command" in str(exc)
++case("a second exposure is not sent while the download is inside the driver",
++     overlapped)
++
++release.set()
++case("the late call can finish and clear the quarantine",
++     gate.wait_clear(2.0) and gate.quarantined() is None)
++# The caller of the timed-out call did not receive the pixels.
++case("the timed-out caller did not receive a frame", timed is not None)
++
++# -- late completion is not a successful result ----------------------------
++gate = CameraGate()
++release = threading.Event()
++holder = {}
++
++
++def late():
++    release.wait(2.0)
++    return "late-pixels"
++
++
++def runner():
++    try:
++        holder["value"] = gate.call(late, 0.15, "download")
++    except DeviceError as exc:
++        holder["error"] = str(exc)
++
++
++thread = threading.Thread(target=runner)
++thread.start()
++time.sleep(0.3)
++case("late completion is still quarantined until the driver returns",
++     gate.quarantined() is not None and "value" not in holder)
++release.set()
++thread.join(2.0)
++case("the abandoned download then leaves the driver", gate.wait_clear(2.0))
++fresh = CameraGate()
++token = fresh.begin("download")
++fresh.abandon(token, "timed out")
++case("a late driver return is discarded", fresh.finish(token) is False)
++case("after the late return the caller still has no frame",
++     "value" not in holder and "cannot be cancelled" in holder.get("error", ""),
++     holder.get("error", ""))
++
++# -- cancellation -----------------------------------------------------------
++gate = CameraGate()
++cancelled = {"on": False}
++
++
++def block():
++    time.sleep(2.0)
++    return "nope"
++
++
++def cancel():
++    return cancelled["on"]
++
++
++def run_cancel():
++    try:
++        gate.call(block, 5.0, "readout", cancel=cancel)
++    except DeviceError as exc:
++        holder_c.append(str(exc))
++
++
++holder_c: list[str] = []
++worker = threading.Thread(target=run_cancel)
++worker.start()
++time.sleep(0.1)
++cancelled["on"] = True
++worker.join(2.0)
++case("cancellation fails the frame and does not pretend the driver stopped",
++     holder_c and "cancelled" in holder_c[0] and "not interrupted" in holder_c[0],
++     str(holder_c))
++case("a cancelled call quarantines until it returns", gate.quarantined() is not None)
++case("quarantine then clears", gate.wait_clear(3.0))
++
++# -- serialization ----------------------------------------------------------
++gate = CameraGate()
++token = gate.begin("exposure")
++try:
++    gate.begin("download")
++    serial = False
++except DeviceError as exc:
++    serial = "no second camera command" in str(exc)
++gate.finish(token)
++case("two camera calls cannot be in flight together", serial)
++
++# -- reconnect is not attempted while quarantined ---------------------------
++gate = CameraGate()
++hold = threading.Event()
++
++
++def stuck():
++    hold.wait(3.0)
++
++
++def timed():
++    try:
++        gate.call(stuck, 0.1, "download")
++    except DeviceError:
++        pass
++
++
++threading.Thread(target=timed, daemon=True).start()
++time.sleep(0.25)
++
++
++class Manager:
++    def __init__(self):
++        self.lines = []
++
++    def get(self, kind):
++        return None
++
++    def log(self, message, level="info"):
++        self.lines.append((level, message))
++
++    def disconnect(self, kind):
++        self.lines.append(("disconnect", kind))
++
++
++class Capture:
++    def __init__(self):
++        self.gate = gate
++        self._state = "idle"
++
++        class Config:
++            def section(self, name):
++                return {"cameraQuarantineSeconds": 0.0}
++
++        self.config = Config()
++
++
++calls = []
++health = CameraHealth(
++    "FSQ85", Manager(),
++    reconnect=lambda stop: calls.append("reconnect") or {"connected": ["camera"], "failed": []},
++    capture=Capture())
++ok = health.heal("download timed out")
++case("reconnect is not sent while a download is still inside the driver",
++     ok is False and calls == [] and any("cannot be cancelled" in text
++                                         for level, text in health.manager.lines),
++     str(health.manager.lines))
++case("disconnect was not sent either",
++     not any(kind == "disconnect" for kind, text in health.manager.lines))
++
++# -- a failed reconnect stops; it does not keep going ----------------------
++hold.set()
++gate.wait_clear(3.0)
++health.reconnect = lambda stop: {"connected": [], "failed": ["camera: gone"]}
++ok = health.heal("still lost")
++case("three failed reconnects then a clear stop",
++     ok is False and health.state.get("state") == "dead", str(health.state))
++
++# -- 0..0 still refuses StartExposure (the existing hard guard) -------------
++from astrocontrol.devices.ascom import AscomCamera             # noqa: E402
++
++
++class LostCamera(AscomCamera):
++    def __init__(self):
++        super().__init__("ASCOM.ASICamera2.Camera", "ASI Camera (1)")
++        self._connected = True
++        self.sent = []
++
++    def probe(self):
++        return "its driver reports exposure limits of 0 to 0 s"
++
++    def _invoke(self, name, *args, **kwargs):
++        self.sent.append(name)
++
++
++camera = LostCamera()
++try:
++    camera.start_exposure(8.0, True)
++    guarded = False
++except Exception as exc:
++    guarded = "was not sent" in str(exc) and camera.sent == []
++case("0..0 exposure limits block StartExposure", guarded, str(getattr(camera, "sent", None)))
++
++print()
++print(f"{sum(results)} of {len(results)} passed")
++sys.exit(0 if all(results) else 1)
+diff --git a/tools/check_power.py b/tools/check_power.py
+index dd72def..11a42db 100644
+--- a/tools/check_power.py
++++ b/tools/check_power.py
+@@ -404,10 +404,14 @@ case("the first failure gets a plain reconnect and the power is left alone",
+      outcome["connected"] == ["camera"] and switch.log == [] and rigset.plain_calls == ["rasa1"],
+      str(switch.log))
+ 
+-# 2. The same camera again inside the window: straight to the mains.
++# 2. A second automatic reconnect does not cut power. The hand button does.
+ said = []
+-started = time.monotonic()
++del switch.log[:]
+ outcome = rigset.reconnect_camera(r1, progress=said.append)
++case("a repeated automatic reconnect does not power-cycle",
++     switch.log == [] and outcome["connected"] == ["camera"], str(switch.log))
++started = time.monotonic()
++outcome = rigset.power_cycle_camera(r1, "asked for by hand", progress=said.append)
+ elapsed = time.monotonic() - started
+ off = [(i, v) for i, v, t in switch.log if v == 0.0]
+ on = [(i, v) for i, v, t in switch.log if v == 1.0]
+@@ -418,7 +422,7 @@ case("...off for the configured time, then the boot wait",
+      1.4 <= elapsed <= 3.0 and switch.log[-1][2] - switch.log[0][2] >= 1.0, f"{elapsed:.2f}s")
+ case("...the camera is closed before the power goes and reconnected after",
+      ("info", "disconnect camera") in r1.manager.lines and outcome["connected"] == ["camera"]
+-     and rigset.plain_calls == ["rasa1", "rasa1"])
++     and rigset.plain_calls == ["rasa1", "rasa1", "rasa1"])
+ case("...the other outlets are untouched",
+      all(i in (1, 3) for i, v, t in switch.log) and switch.values[6] == 40.0)
+ case("...progress names what is being waited for",
+@@ -437,12 +441,13 @@ case("a third failure right after a cycle gets a plain reconnect, not another cy
+ # 4. A plain reconnect that fails outright goes to the mains at once.
+ rigset, switch = build()
+ r2 = rigset.rigs_by_name["rasa2"]
+-rigset.plain_outcomes = [{"connected": [], "failed": ["camera: ASIOpenCamera failed (invalid id)"]}]
++rigset.plain_outcomes = [{"connected": [], "failed": ["camera: gone"]}]
+ outcome = rigset.reconnect_camera(r2)
+-case("a reconnect that fails is followed by a power cycle and a second reconnect",
+-     rigset.plain_calls == ["rasa2", "rasa2"] and outcome["connected"] == ["camera"]
+-     and sorted(i for i, v, t in switch.log if v == 0.0) == [2, 4], str(switch.log))
+-case("...and nobody else's outlets", all(i in (2, 4) for i, v, t in switch.log))
++case("a reconnect that fails does not power-cycle",
++     switch.log == [] and outcome["failed"] == ["camera: gone"]
++     and rigset.plain_calls == ["rasa2"],
++     f"{switch.log} {outcome} {rigset.plain_calls}")
++case("...and nobody else's outlets", switch.log == [])
+ 
+ # 5. Switched off in the settings: never touched, however often it fails.
+ config.update("recovery", {"powerCycleCameras": False})
+@@ -475,7 +480,8 @@ rigset._reconnects[r1.id] = [time.time()]
+ config.update("recovery", {"powerCycleOffSeconds": 30.0, "powerCycleBootSeconds": 30.0})
+ stop_at = time.monotonic() + 0.6
+ started = time.monotonic()
+-rigset.reconnect_camera(r1, stop=lambda: time.monotonic() > stop_at)
++rigset.power_cycle_camera(r1, "asked for by hand",
++                          stop=lambda: time.monotonic() > stop_at)
+ elapsed = time.monotonic() - started
+ case("a Stop during the off wait puts the power back at once",
+      elapsed < 3.0 and switch.values[1] == 1.0 and switch.values[3] == 1.0, f"{elapsed:.2f}s")
+@@ -499,7 +505,7 @@ def set_value(index, value):
+ 
+ switch.set_value = set_value
+ try:
+-    rigset.reconnect_camera(r1)
++    rigset.power_cycle_camera(r1, "asked for by hand")
+     case("an outlet that will not come back on raises", False)
+ except DeviceError as exc:
+     case("an outlet that will not come back on raises", "could not restore power" in str(exc)
