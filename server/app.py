@@ -947,6 +947,12 @@ def _goal_keys(goals: dict[str, Any]) -> set[str]:
         if str(name).strip().lower() in collab.COLOUR_FILTERS:
             out.update(("r", "g", "b"))
         out.add(collab._key(name))
+        # And the channels a task entry by that name counts towards: a
+        # goal of "OSC" is an entry whose seconds count as OSC-RGB.
+        try:
+            out.update(collab.FilterTask.read({"filter": str(name)}).keys())
+        except Exception:  # noqa: BLE001 - a junk name is just its key
+            pass
     return out
 
 

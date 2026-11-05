@@ -69,6 +69,11 @@ class Helpers(unittest.TestCase):
         keys = self.server._goal_keys({"L": 25, "H": 10, "O": 0, "S": -1, "X": "junk"})
         self.assertEqual(keys, {collab._key("L"), collab._key("H")})
 
+    def test_colour_goal_matches_its_task_entry(self):
+        keys = self.server._goal_keys({"OSC": 35})
+        entry = collab.FilterTask.read({"filter": "OSC", "exposure": 300, "hours": 35})
+        self.assertTrue(self.server._dealable(entry, keys))
+
     def test_wanted_from_goals_ignores_allowed_without_goal(self):
         wants = collab.Requirements.read({"filters": {"L": None, "R": None, "H": 7.0,
                                                       "O": None, "S": None}})
