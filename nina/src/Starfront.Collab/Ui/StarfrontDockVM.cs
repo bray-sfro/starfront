@@ -17,6 +17,7 @@ using NINA.WPF.Base.Interfaces.ViewModel;
 using NINA.WPF.Base.ViewModel;
 using Starfront.Collab.Server;
 using Starfront.Collab.Services;
+using Starfront.Collab.Services.Stacking;
 using Starfront.Collab.Sky;
 
 namespace Starfront.Collab.Ui {
@@ -156,6 +157,16 @@ namespace Starfront.Collab.Ui {
         public AsyncRelayCommand LeaveCommand { get; }
         public AsyncRelayCommand ShowInFramingCommand { get; }
         public RelayCommand OpenFilesCommand { get; }
+        /// <summary>Whether the lights are stacked as they land, and how this telescope stands with that stack; blank when they are not.</summary>
+        public string StackingText {
+            get {
+                var enabled = Runtime.Ready && Runtime.Settings.StackingEnabled;
+                return StackingLine.Describe(Listing, enabled, enabled ? Runtime.Stacking.Links.Lookup(Listing.Id) : null, Joined);
+            }
+        }
+
+        public void RefreshStacking() => RaisePropertyChanged(nameof(StackingText));
+
         /// <summary>Where the lights go, when the collaboration collects them; blank when it does not.</summary>
         public string FilesText => Listing.CollectFiles && !string.IsNullOrEmpty(Listing.FilesUrl)
             ? "Collects the lights, flats, darks and bias: send yours from the files page."
@@ -363,8 +374,20 @@ namespace Starfront.Collab.Ui {
             PlanLines = new ObservableCollection<string>();
             Telescopes = new ObservableCollection<TelescopeRowVM>();
             Verdicts = new ObservableCollection<string>();
+            Stacking = new StackingStatusVM(Runtime.Stacking, Runtime.Settings);
             Initialize();
         }
+
+        /// <summary>The Live stacking lines.</summary>
+        public StackingStatusVM Stacking { get; }
+
+        private void OnOwnPropertyChanged(object sender, System.ComponentModel.PropertyChangedEventArgs e) {
+            if (e.PropertyName == nameof(IsVisible)) Stacking.PanelVisible(IsVisible);
+        }
+
+        private void OnStackingChanged(object sender, EventArgs e) => Dispatch.OnUi(() => {
+            foreach (var row in all) row.RefreshStacking();
+        });
 
         private void Initialize() {
             if (initialized) return;
@@ -372,6 +395,10 @@ namespace Starfront.Collab.Ui {
             Runtime.Session.Updated += OnUpdated;
             Runtime.Session.Run.PropertyChanged += OnRunChanged;
             Runtime.Settings.PropertyChanged += OnSettingsChanged;
+            Runtime.Stacking.Changed += OnStackingChanged;
+            Runtime.Stacking.Links.Changed += OnStackingChanged;
+            PropertyChanged += OnOwnPropertyChanged;
+            Stacking.PanelVisible(IsVisible);
             Plugin.ShuttingDown += Dispose;
             Rebuild();
         }
@@ -669,7 +696,11 @@ namespace Starfront.Collab.Ui {
                 Runtime.Session.Updated -= OnUpdated;
                 Runtime.Session.Run.PropertyChanged -= OnRunChanged;
                 Runtime.Settings.PropertyChanged -= OnSettingsChanged;
+                Runtime.Stacking.Changed -= OnStackingChanged;
+                Runtime.Stacking.Links.Changed -= OnStackingChanged;
             }
+            PropertyChanged -= OnOwnPropertyChanged;
+            Stacking.Dispose();
             Plugin.ShuttingDown -= Dispose;
         }
     }

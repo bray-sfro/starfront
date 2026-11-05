@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Platform-independent core: no N.I.N.A., no WPF, no Windows APIs. Builds and tests on macOS and Linux. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RootNamespace>RapidStackerCollab.Core</RootNamespace>
+    <AssemblyName>RapidStackerCollab.Core</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.10" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- Offline fallback for the alias table (see Filters/ALIASES.SOURCE.md). -->
+    <EmbeddedResource Include="Filters\aliases.json" LogicalName="RapidStackerCollab.Core.Filters.aliases.json" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="RapidStackerCollab.Core.Tests" />
+  </ItemGroup>
+</Project>

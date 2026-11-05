@@ -12,6 +12,7 @@ No test framework, for the same reason as the other checks here.
 """
 
 import json
+import math
 import os
 import socket
 import sys
@@ -71,6 +72,10 @@ PEOPLE = {
                  "member": True, "roles": []},
     "code-mallory": {"id": "1003", "username": "mallory", "global_name": "Mallory",
                      "member": False, "roles": []},
+    "code-carol": {"id": "1004", "username": "carol", "global_name": "Carol",
+                   "member": True, "roles": []},
+    "code-dave": {"id": "1005", "username": "dave", "global_name": "Dave",
+                  "member": True, "roles": []},
 }
 
 
@@ -1886,12 +1891,103 @@ case("the download page offers the newest one, with its size, and says where N.I
      "text/html" in page[1] and 'href="/download/Starfront-Setup-0.2.35.exe"' in page[0]
      and "Download Starfront 0.2.35 for Windows" in page[0] and f"{BASE}/nina" in page[0]
      and "0.2.9" not in page[0], page[1])
+case("...and says nothing of volunteer workers while no worker release is published",
+     "Lending a computer" not in page[0] and "collab-worker" not in page[0])
 for wrong in ("secrets.txt", "..%2Fcollab.sqlite", "Starfront-Setup-9.9.9.exe", "Starfront-Setup-.exe",
               "Starfront-Setup-0.2.35.exe.bak"):
     status, _ = call("GET", f"/download/{wrong}")
     if status != 404:
         break
 case("...and nothing but installers is served from the folder", status == 404, f"{wrong} -> {status}")
+
+# ============================ the worker and hub binaries (collab-worker, collab-hub)
+print("\n-- the worker and hub binaries --")
+
+
+def fetch(path):
+    """(status, headers, body) for any path, with no redirects and no exception."""
+    try:
+        with urllib.request.urlopen(f"{BASE}{path}", timeout=10) as response:
+            return response.status, response.headers, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers, exc.read()
+
+
+MANIFEST_TEXT = b'{"version": "1.2.3", "contract": "1.27.0", "assets": {}}'
+for product in ("collab-worker", "collab-hub"):
+    folder = DOWNLOAD_DIR / product
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "latest.json").write_bytes(MANIFEST_TEXT)
+    (folder / "latest.json.sig").write_bytes(b"ed25519-signature-" + product.encode())
+    (folder / f"{product}-1.2.3-linux-x64.tar.gz").write_bytes(b"\x1f\x8b" + b"tar-" + product.encode())
+    (folder / f"{product}-1.2.3-windows-x64.zip").write_bytes(b"PK\x03\x04" + b"zip-" + product.encode())
+    (folder / f"{product}-1.2.3-macos-arm64.zip").write_bytes(b"PK\x03\x04" + b"mac-" + product.encode())
+    other = "collab-hub" if product == "collab-worker" else "collab-worker"
+    prefix = f"/download/{product}"
+
+    status, headers, body = fetch(f"{prefix}/latest.json")
+    case(f"{product}: latest.json is served as JSON and never cached",
+         status == 200 and body == MANIFEST_TEXT and headers.get("Content-Type", "").startswith("application/json")
+         and headers.get("Cache-Control") == "no-cache" and headers.get("Content-Length") == str(len(MANIFEST_TEXT)),
+         f"{status} {headers.get('Content-Type')} {headers.get('Cache-Control')}")
+    status, headers, body = fetch(f"{prefix}/latest.json.sig")
+    case(f"{product}: latest.json.sig is served as bytes and never cached",
+         status == 200 and body == b"ed25519-signature-" + product.encode()
+         and headers.get("Content-Type") == "application/octet-stream"
+         and headers.get("Cache-Control") == "no-cache" and headers.get("Content-Length") == str(len(body)),
+         f"{status} {headers.get('Content-Type')} {headers.get('Cache-Control')}")
+    for archive in (f"{product}-1.2.3-linux-x64.tar.gz", f"{product}-1.2.3-windows-x64.zip",
+                    f"{product}-1.2.3-macos-arm64.zip"):
+        status, headers, body = fetch(f"{prefix}/{archive}")
+        case(f"{product}: {archive} is served as bytes, immutable for a year, named as a file",
+             status == 200 and body.endswith(product.encode())
+             and headers.get("Content-Type") == "application/octet-stream"
+             and headers.get("Cache-Control") == "public, max-age=31536000, immutable"
+             and headers.get("Content-Length") == str(len(body))
+             and archive in (headers.get("Content-Disposition") or ""),
+             f"{status} {headers.get('Content-Type')} {headers.get('Cache-Control')}")
+    for wrong in ("evil.sh", f"{product}-1.0-macos.zip", "../latest.json", "..%2Flatest.json", "%2e%2e%2flatest.json",
+                  "collab-hub-1.2.3-plan9.zip", f"{product}-1.2.3-plan9.zip", f"{product}-1.2.3-linux-x64.rar",
+                  f"{other}-1.2.3-linux-x64.tar.gz", "latest.json.bak", "latest.json%0A"):
+        status, _, _ = fetch(f"{prefix}/{wrong}")
+        if status != 404:
+            break
+    case(f"{product}: only the pattern is served; {wrong} is a 404", status == 404, f"{wrong} -> {status}")
+    # The manifest is the one thing a release may not have produced yet.
+    (folder / "latest.json").rename(folder / "latest.json.moved")
+    status, _, _ = fetch(f"{prefix}/latest.json")
+    (folder / "latest.json.moved").rename(folder / "latest.json")
+    case(f"{product}: a missing latest.json is a 404", status == 404, str(status))
+
+# The download page lists what a published manifest names, for people who
+# install by hand or want to check a hash, but only files that are really
+# there: a manifest naming an archive that was never copied up, or a name the
+# route would refuse, must not become a link to a 404. The hub's manifest
+# above names no assets, so the hub gets no heading.
+WIN_SHA = "ab" * 32
+(DOWNLOAD_DIR / "collab-worker" / "latest.json").write_text(json.dumps({
+    "version": "1.2.3", "contract": "1.27.0", "assets": {
+        "windows-x64": {"primary": {"url": "x", "size": 26, "sha256": WIN_SHA,
+                                    "filename": "collab-worker-1.2.3-windows-x64.zip"}},
+        "linux-x64": {"primary": {"url": "x", "size": 9, "sha256": "cd" * 32,
+                                  "filename": "collab-worker-1.2.4-linux-x64.tar.gz"}},
+        "macos-arm64": {"primary": {"url": "x", "size": 9, "sha256": "ef" * 32, "filename": "../evil.sh"}}}}),
+    encoding="utf-8")
+status, _, body = fetch("/download")
+page = body.decode("utf-8")
+case("the download page offers a published worker by platform, with its SHA-256",
+     status == 200 and "Lending a computer to live stacking" in page and "collab-worker 1.2.3" in page
+     and 'href="/download/collab-worker/collab-worker-1.2.3-windows-x64.zip"' in page
+     and f"SHA-256 {WIN_SHA}" in page and "Collaborations &rarr; Volunteer this machine" in page
+     and 'href="/download/collab-worker/latest.json"' in page, page[-1500:])
+case("...but not an archive missing from disk, a name the route refuses, or a hub with none",
+     "collab-worker-1.2.4" not in page and "evil.sh" not in page and "collab-hub 1.2.3" not in page
+     and 'href="/download/collab-hub/latest.json"' not in page, page[-1500:])
+(DOWNLOAD_DIR / "collab-worker" / "latest.json").write_text("{not json", encoding="utf-8")
+status, _, body = fetch("/download")
+case("...and a broken manifest leaves the page as it was, not a 500",
+     status == 200 and "Lending a computer" not in body.decode("utf-8"), str(status))
+(DOWNLOAD_DIR / "collab-worker" / "latest.json").write_bytes(MANIFEST_TEXT)
 
 # ======================================== a colour camera with a dual-band filter
 print("\n-- a colour camera with a dual-band filter --")
@@ -2030,6 +2126,95 @@ listing = next(p for p in browse["projects"] if p["id"] == FILES_PROJECT)
 case("...and the listing says so, with where to send them",
      listing["collectFiles"] is True and listing["filesUrl"].endswith(f"/files#{FILES_PROJECT}"),
      listing["filesUrl"])
+
+# ------------------------------------------- live stacking: the join code
+# A collaboration used to name the Rapid Stacker Collab project that stacks
+# its lights by a join code pasted from the Collab website. Since T706 the
+# collaboration is the only place a project is made (the author's rule): a new
+# pasted code is refused, and an old collaboration keeps the code it has,
+# read-only. The code is a credential: it is handed out only to telescopes on
+# the collaboration and to the owner's own, and never in a public read.
+print("\n-- live stacking: the join code --")
+status, answer = call("POST", "/api/v1/projects", {
+    "name": "Orion, live-stacked", "region": {"ra": 84.0, "dec": 0.0,
+                                               "width": 16.0, "height": 8.0},
+    "requirements": {"filters": {"Ha": 3.0}}, "goals": {"Ha": 10.0},
+    "stackingJoinCode": " h4rt 92bk-wnpc "}, token=BOB2)
+case("a new collaboration with a pasted join code is refused, and says what to do instead",
+     status == 400 and "no longer taken" in answer.get("detail", "")
+     and "Link your Rapid Stacker Collab account" in answer.get("detail", ""), str(answer)[:200])
+status, answer = call("POST", "/api/v1/projects", {
+    "name": "typo", "region": {"ra": 84.0, "dec": 0.0, "width": 16.0, "height": 8.0},
+    "stackingJoinCode": "H4RT-92BK-WNP1"}, token=BOB2)
+case("a code that cannot be real is refused", status == 400 and "twelve characters" in answer["detail"],
+     str(answer)[:200])
+status, answer = call("POST", "/api/v1/projects", {
+    "name": "short", "region": {"ra": 84.0, "dec": 0.0, "width": 16.0, "height": 8.0},
+    "stackingJoinCode": "H4RT-92BK"}, token=BOB2)
+case("...and so is one that is too short", status == 400)
+# An old collaboration, as one made before T706 is stored: the pasted code in
+# the payload, both ways.
+status, made = call("POST", "/api/v1/projects", {
+    "name": "Orion, live-stacked", "region": {"ra": 84.0, "dec": 0.0,
+                                               "width": 16.0, "height": 8.0},
+    "requirements": {"filters": {"Ha": 3.0}}, "goals": {"Ha": 10.0},
+    "stacking": {"backend": ""}}, token=BOB2)
+STACKED = made["project"]["id"]
+from server import app as server_app_                              # noqa: E402
+_legacy = dict(server_app_.store.project(STACKED)["payload"])
+_legacy.update(stackingJoinCode="H4RT-92BK-WNPC", stacking={"backend": "cloud", "joinCode": "H4RT-92BK-WNPC",
+                                                             "apiBase": "", "hubId": "", "visibility": ""})
+server_app_.store.set_project(STACKED, _legacy)
+case("(setup) an old collaboration carries a pasted code",
+     server_app_._stacking_of(server_app_.store.project(STACKED)["payload"])["joinCode"] == "H4RT-92BK-WNPC")
+_, public_read = call("GET", f"/api/v1/projects/{STACKED}")
+_, public_list = call("GET", "/api/v1/projects")
+case("the code is in no public read: neither the project nor the list carries it (T706)",
+     "H4RT-92BK-WNPC" not in json.dumps(public_read) and "H4RT-92BK-WNPC" not in json.dumps(public_list)
+     and "stacking" in public_read["project"]["payload"], str(public_read["project"]["payload"].get("stacking")))
+
+_, bobs = call("POST", "/api/v1/agents", {"name": "Bob's rig"}, token=BOB2)
+_, browse = call("GET", "/api/v1/agent/projects", token=bobs["token"])
+listing = next(p for p in browse["projects"] if p["id"] == STACKED)
+case("the owner's own telescope is handed the code without joining",
+     listing["stackingLinked"] is True and listing["stackingJoinCode"] == "H4RT-92BK-WNPC",
+     str(listing.get("stackingJoinCode")))
+_, browse = call("GET", "/api/v1/agent/projects", token=AGENT_TOKEN)
+listing = next(p for p in browse["projects"] if p["id"] == STACKED)
+case("a telescope that is only browsing learns that the lights are stacked, not the code",
+     listing["stackingLinked"] is True and listing["stackingJoinCode"] == "",
+     str(listing.get("stackingJoinCode")))
+STACKER_TOKEN, _ = enrol("stacker", 389.0, 9576, 6388, 6.0)
+status, _ = call("POST", f"/api/v1/agent/projects/{STACKED}/join", {}, token=STACKER_TOKEN)
+_, browse = call("GET", "/api/v1/agent/projects", token=STACKER_TOKEN)
+listing = next(p for p in browse["projects"] if p["id"] == STACKED)
+case("a telescope on the collaboration is handed the code",
+     status == 200 and listing["stackingJoinCode"] == "H4RT-92BK-WNPC",
+     f"join {status}, code {listing.get('stackingJoinCode')!r}")
+_, browse = call("GET", "/api/v1/agent/projects", token=AGENT_TOKEN)
+listing = next(p for p in browse["projects"] if p["id"] == FILES_PROJECT)
+case("a collaboration without one says so", listing["stackingLinked"] is False
+     and listing["stackingJoinCode"] == "" and listing["stacking"]["state"] == "")
+
+status, changed = call("PUT", f"/api/v1/projects/{STACKED}", {"notes": "still stacked"}, token=BOB2)
+case("an edit that leaves the code out leaves it alone",
+     status == 200 and changed["project"]["payload"]["stackingJoinCode"] == "H4RT-92BK-WNPC")
+status, changed = call("PUT", f"/api/v1/projects/{STACKED}", {"stackingJoinCode": "h4rt 92bk wnpc"}, token=BOB2)
+case("...one that sends the same code back (a plugin's Edit form) changes nothing",
+     status == 200 and changed["project"]["payload"]["stackingJoinCode"] == "H4RT-92BK-WNPC")
+status, answer = call("PUT", f"/api/v1/projects/{STACKED}", {"stackingJoinCode": "wnpc-h4rt-92bk"}, token=BOB2)
+case("...one that sends a different code is refused: the old link is read-only (T706)",
+     status == 400 and "no longer taken" in answer.get("detail", ""), str(answer)[:160])
+status, _ = call("PUT", f"/api/v1/projects/{STACKED}", {"stackingJoinCode": "nope"}, token=BOB2)
+_, browse = call("GET", "/api/v1/agent/projects", token=STACKER_TOKEN)
+listing = next(p for p in browse["projects"] if p["id"] == STACKED)
+case("...a bad one is refused and the old one stands",
+     status == 400 and listing["stackingJoinCode"] == "H4RT-92BK-WNPC")
+status, changed = call("PUT", f"/api/v1/projects/{STACKED}", {"stackingJoinCode": ""}, token=BOB2)
+_, browse = call("GET", "/api/v1/agent/projects", token=STACKER_TOKEN)
+listing = next(p for p in browse["projects"] if p["id"] == STACKED)
+case("...and a blank one clears it", status == 200 and changed["project"]["payload"]["stackingJoinCode"] == ""
+     and listing["stackingLinked"] is False and listing["stackingJoinCode"] == "")
 
 status, answer, _ = raw("PUT", f"/api/v1/projects/{FILES_PROJECT}/files/M31_Ha_001.fits", FITS,
                         {"Authorization": f"Bearer {ALICE}", "Content-Length": str(len(FITS))})
@@ -2176,6 +2361,3051 @@ case("the files page is served", status == 200 and b"Starfront files" in page)
 status, _, _ = raw("POST", "/files/signout", b"", {"Cookie": jar})
 status, info, _ = raw("GET", "/api/v1/files/projects", None, {"Cookie": jar})
 case("signing out on the page forgets the cookie's token", not info["signedIn"])
+
+# ------------------------------------------- live stacking: hubs
+print("\n-- live stacking: hubs --")
+from server import hubs as hubs_module                           # noqa: E402
+
+status, _ = call("POST", "/api/v1/hubs", {"name": "x"})
+case("registering a hub needs somebody signed in", status == 401)
+status, _ = call("POST", "/api/v1/hubs", {"name": "x"}, token=AGENT_TOKEN)
+case("...and a telescope's token is not a person", status == 401)
+status, reg = call("POST", "/api/v1/hubs",
+                   {"name": "Eddie's hub", "lanUrl": "http://10.0.0.5:8790"}, token=BOB3)
+HUB, HTOK, HSEC = reg.get("hubId"), reg.get("hubToken", ""), reg.get("grantSecret", "")
+case("a person registers a hub and gets an id, a token and a secret once",
+     status == 200 and HUB and HTOK.startswith("sfh_") and len(HTOK) == 68
+     and len(HSEC) == 43, str(reg)[:120])
+status, bad = call("POST", "/api/v1/hubs", {"name": "", "lanUrl": "x"}, token=BOB3)
+case("a nameless hub is refused", status == 400)
+status, bad = call("POST", "/api/v1/hubs", {"name": "h", "lanUrl": "ftp://x"}, token=BOB3)
+case("...and so is a lanUrl that is not http(s)", status == 400)
+status, listed = call("GET", "/api/v1/hubs", token=BOB3)
+case("the owner lists their hub",
+     status == 200 and [h["id"] for h in listed["hubs"]] == [HUB]
+     and listed["hubs"][0]["lanUrl"] == "http://10.0.0.5:8790")
+case("...and the list never carries the token or the secret",
+     HTOK not in json.dumps(listed) and HSEC not in json.dumps(listed)
+     and not any(k in listed["hubs"][0] for k in ("token", "grant_secret", "grantSecret", "hubToken")))
+case("only a hash of the token is stored",
+     server_app.store.hub(HUB)["token"] == hubs_module.hash_token(HTOK) != HTOK
+     and server_app.store.hub(HUB)["grant_secret"] == HSEC)
+status, other = call("GET", "/api/v1/hubs", token=ALICE)
+case("another person does not see it", status == 200 and other["hubs"] == [])
+status, _ = call("DELETE", f"/api/v1/hubs/{HUB}", token=ALICE)
+case("...and cannot revoke it", status == 404)
+status, _ = call("PUT", f"/api/v1/hubs/{HUB}/coordinators", {"coordinators": ["1001"]}, token=ALICE)
+case("...or change its coordinators", status == 404)
+
+status, _ = call("POST", f"/api/v1/hubs/{HUB}/heartbeat", {"workers": 2}, token=HTOK)
+case("a heartbeat on the hub's token is taken", status == 200)
+status, _ = call("POST", f"/api/v1/hubs/{HUB}/heartbeat", {"workers": 2}, token="sfh_" + "0" * 64)
+case("...a wrong token is refused", status == 401)
+status, _ = call("POST", f"/api/v1/hubs/{HUB}/heartbeat", {"workers": 2}, token=BOB3)
+case("...and so is a person's token", status == 401)
+status, listed = call("GET", "/api/v1/hubs", token=BOB3)
+case("the heartbeat's status and time are kept",
+     listed["hubs"][0]["status"] == {"workers": 2} and listed["hubs"][0]["seen"] > 0)
+
+status, got = call("PUT", f"/api/v1/hubs/{HUB}/coordinators",
+                   {"coordinators": ["1001", "1001", "1002"]}, token=BOB3)
+case("the owner sets the coordinators list (deduplicated, owner implied)",
+     status == 200 and got["allowedCoordinators"] == ["1001"], str(got))
+status, _ = call("PUT", f"/api/v1/hubs/{HUB}/coordinators", {"coordinators": "1001"}, token=BOB3)
+case("...a list that is not a list is refused", status == 400)
+_, listed = call("GET", "/api/v1/hubs", token=BOB3)
+case("...and the hub reports it", listed["hubs"][0]["allowedCoordinators"] == ["1001"])
+
+# The change feed: pull answers what came after `since`, and waits when
+# there is nothing.
+s1 = server_app.store.append_change(HUB, "project", "prj_a")
+s2 = server_app.store.append_change(HUB, "member", "prj_a/u1")
+server_app.store.append_change("hub_elsewhere", "project", "prj_z")
+status, got = call("GET", f"/api/v1/hubs/{HUB}/pull?since=0", token=HTOK)
+case("pull returns this hub's changes, in order, and the new seq",
+     status == 200 and [c["seq"] for c in got["changes"]] == [s1, s2] and got["seq"] == s2
+     and got["changes"][0]["kind"] == "project" and got["changes"][0]["key"] == "prj_a", str(got)[:200])
+status, got = call("GET", f"/api/v1/hubs/{HUB}/pull?since={s1}", token=HTOK)
+case("...only those after `since`", [c["seq"] for c in got["changes"]] == [s2])
+began = time.time()
+status, got = call("GET", f"/api/v1/hubs/{HUB}/pull?since={s2}&wait=1", token=HTOK)
+case("with nothing new it waits, then answers empty at the same seq",
+     status == 200 and got == {"changes": [], "seq": s2} and 0.8 < time.time() - began < 3,
+     f"{time.time() - began:.1f}s")
+late = []
+threading.Timer(0.6, lambda: late.append(server_app.store.append_change(HUB, "rig", "u1/r1"))).start()
+began = time.time()
+status, got = call("GET", f"/api/v1/hubs/{HUB}/pull?since={s2}", token=HTOK)
+case("...and a change arriving meanwhile ends the wait early",
+     status == 200 and late and got["seq"] == late[0] and time.time() - began < 5,
+     f"{time.time() - began:.1f}s")
+began = time.time()
+status, _ = call("GET", "/api/v1/hubs/other/pull?since=0", token=HTOK)
+case("a hub cannot pull another hub's id", status == 401)
+status, _ = call("GET", f"/api/v1/hubs/{HUB}/pull?since=0", token=BOB3)
+case("...nor a person pull on the hub's behalf", status == 401)
+case("pull recorded the hub's cursor", server_app.store.hub(HUB)["cursor"] >= s2)
+
+# Grants.
+NOW = 1_800_000_000
+hub_row = server_app.store.hub(HUB)
+grant = hubs_module.mint_grant(hub_row, "1001", "Alice", "agent_1", "prj_a", NOW)
+claims = hubs_module.verify_grant(grant, HSEC, NOW + 10)
+case("a grant starts sfg_ and round-trips",
+     grant.startswith("sfg_") and claims and claims["hub"] == HUB and claims["sub"] == "1001"
+     and claims["name"] == "Alice" and claims["agent"] == "agent_1"
+     and claims["project"] == "prj_a" and claims["v"] == 1
+     and claims["exp"] == claims["iat"] + 86400 == NOW + 86400, str(claims))
+payload, signature = grant[4:].split(".")
+import base64                                                    # noqa: E402
+
+
+def b64d(text):
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+def b64e(data):
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+forged = dict(json.loads(b64d(payload)), sub="1002")
+tampered = "sfg_" + b64e(json.dumps(forged, separators=(",", ":")).encode()) + "." + signature
+case("a tampered payload is refused", hubs_module.verify_grant(tampered, HSEC, NOW + 10) is None)
+flipped = signature[:-2] + ("AA" if signature[-2:] != "AA" else "BB")
+case("a tampered signature is refused",
+     hubs_module.verify_grant(f"sfg_{payload}.{flipped}", HSEC, NOW + 10) is None)
+case("an expired grant is refused (past the leeway)",
+     hubs_module.verify_grant(grant, HSEC, NOW + 86400 + 301) is None)
+case("...but a few minutes of clock difference is forgiven",
+     hubs_module.verify_grant(grant, HSEC, NOW + 86400 + 200) is not None
+     and hubs_module.verify_grant(grant, HSEC, NOW - 200) is not None
+     and hubs_module.verify_grant(grant, HSEC, NOW - 301) is None)
+status, reg_b = call("POST", "/api/v1/hubs", {"name": "Hub B"}, token=BOB3)
+case("hub A's grant fails under hub B's secret",
+     hubs_module.verify_grant(grant, reg_b["grantSecret"], NOW + 10) is None)
+case("garbage is refused without raising",
+     all(hubs_module.verify_grant(junk, HSEC, NOW) is None
+         for junk in ("", "sfg_", "sfg_.", "sfg_abc.def", "rscu_x", "sfg_" + payload, "sfg_!!.!!")))
+
+status, _ = call("DELETE", f"/api/v1/hubs/{HUB}", token=BOB3)
+case("the owner revokes the hub", status == 200)
+status, _ = call("POST", f"/api/v1/hubs/{HUB}/heartbeat", {}, token=HTOK)
+case("...and its token stops working", status == 401)
+_, listed = call("GET", "/api/v1/hubs", token=BOB3)
+case("...and it is gone from the list", [h["name"] for h in listed["hubs"]] == ["Hub B"])
+
+# ------------------------------------------- live stacking: the project binding
+# A collaboration is stacked on the cloud (a join code) or on a hub. Binding
+# one to a hub mints the stacking project the hub will serve, tells the hub,
+# and puts a `stacking` block (with a grant, held to the join code's secrecy
+# rule) in the listing. The old fields have to keep working for 1.0.0.33.
+print("\n-- live stacking: the project binding --")
+import re as _re                                                  # noqa: E402
+from server.stack import defaults as stack_defaults               # noqa: E402
+
+REGION = {"ra": 84.0, "dec": 0.0, "width": 16.0, "height": 8.0}
+_, _, _, polled = sign_in("code-bob")
+BOBH = polled["token"]
+_, _, _, polled = sign_in("code-carol")
+CAROL = polled["token"]
+_, _, _, polled = sign_in("code-alice")
+ALICE = polled["token"]
+status, reg_h = call("POST", "/api/v1/hubs", {"name": "Bind hub", "lanUrl": "http://10.0.0.7:8790"},
+                     token=BOBH)
+BH, BHSEC, BHTOK = reg_h["hubId"], reg_h["grantSecret"], reg_h["hubToken"]
+call("PUT", f"/api/v1/hubs/{BH}/coordinators", {"coordinators": ["1004"]}, token=BOBH)
+_, pulled = call("GET", f"/api/v1/hubs/{BH}/pull?since=0&wait=0", token=BHTOK)
+SINCE = pulled["seq"]
+case("a new hub's feed is empty", pulled["changes"] == [])
+
+
+def project_in_listing(token, project_id):
+    _, browse = call("GET", "/api/v1/agent/projects", token=token)
+    return next(p for p in browse["projects"] if p["id"] == project_id)
+
+
+# Cloud, in the new form, with a pasted code: refused since T706 (the server
+# makes the Collab project). An old collaboration's code is kept both ways.
+status, answer = call("POST", "/api/v1/projects", {
+    "name": "Cloud stacked", "region": REGION, "requirements": {"filters": {"Ha": 3.0}},
+    "stacking": {"backend": "cloud", "joinCode": " h4rt 92bk-wnpc "}}, token=BOBH)
+case("stacking.backend=cloud with a pasted join code is refused (T706)",
+     status == 400 and "no longer taken" in answer.get("detail", ""), str(answer)[:160])
+status, made = call("POST", "/api/v1/projects", {
+    "name": "Cloud stacked", "region": REGION, "requirements": {"filters": {"Ha": 3.0}},
+    "stacking": {"backend": ""}}, token=BOBH)
+CLOUD = made["project"]["id"]
+payload = dict(made["project"]["payload"])
+payload.update(stackingJoinCode="H4RT-92BK-WNPC", stacking={"backend": "cloud", "joinCode": "H4RT-92BK-WNPC",
+                                                             "apiBase": "", "hubId": "", "visibility": ""})
+server_app.store.set_project(CLOUD, payload)
+status, answer = call("POST", "/api/v1/projects", {
+    "name": "no code", "region": REGION, "stacking": {"backend": "cloud"}}, token=BOBH)
+case("...the cloud without a linked Collab account is refused, and says to link it",
+     status == 400 and "link" in answer.get("detail", ""), str(answer)[:160])
+status, answer = call("POST", "/api/v1/projects", {
+    "name": "bad code", "region": REGION,
+    "stacking": {"backend": "cloud", "joinCode": "H4RT-92BK-WNP1"}}, token=BOBH)
+case("...and so is one that cannot be real", status == 400)
+status, answer = call("POST", "/api/v1/projects", {
+    "name": "bad backend", "region": REGION, "stacking": {"backend": "ftp"}}, token=BOBH)
+case("...and an unknown backend", status == 422)
+case("a cloud collaboration has no stacking project row", server_app.store.stack_project_of(CLOUD) is None)
+
+# An old payload, with only stackingJoinCode, reads as cloud.
+case("_stacking_of reads a payload with only stackingJoinCode as cloud",
+     server_app._stacking_of({"stackingJoinCode": "H4RT-92BK-WNPC"})
+     == {"backend": "cloud", "joinCode": "H4RT-92BK-WNPC", "apiBase": "", "hubId": "", "visibility": ""})
+case("...and one with nothing as unbound", server_app._stacking_of({})["backend"] == ""
+     and server_app._stacking_of({"stackingJoinCode": ""})["backend"] == "")
+listing = project_in_listing(bobs_token := call("POST", "/api/v1/agents", {"name": "Bob bind rig"}, token=BOBH)[1]["token"], CLOUD)
+case("the listing keeps stackingLinked and stackingJoinCode and says cloud in the block",
+     listing["stackingLinked"] is True and listing["stackingJoinCode"] == "H4RT-92BK-WNPC"
+     and listing["stacking"]["backend"] == "cloud" and listing["stacking"]["grant"] == ""
+     and listing["stacking"]["collabProjectId"] == "", str(listing["stacking"]))
+case("...an old pasted code is ready to join, and not one this server made",
+     listing["stacking"]["state"] == "ready" and listing["stacking"]["managed"] is False
+     and listing["stacking"]["problem"] == "", str(listing["stacking"]))
+
+# Bind to a hub: as its owner, then as a listed coordinator, then as someone else.
+status, made = call("POST", "/api/v1/projects", {
+    "name": "Orion Hub Wide!", "region": REGION, "notes": "hub stacked",
+    "requirements": {"filters": {"Ha": 3.0, "OIII": 3.0}},
+    "stacking": {"backend": "hub", "hubId": BH}}, token=BOBH)
+HUBP = made["project"]["id"]
+row = server_app.store.stack_project_of(HUBP) or {}
+doc = row.get("doc") or {}
+case("the hub's owner binds a collaboration to it", status == 200 and row, str(made)[:200])
+case("...the stacking project id is prj_ + 20 lower-case Crockford characters",
+     _re.fullmatch(r"prj_[0-9a-hjkmnp-tv-z]{20}", row.get("project_id", "")) is not None,
+     row.get("project_id", ""))
+case("...the slug is made from the name and fits the contract",
+     row.get("slug") == "orion-hub-wide" and _re.fullmatch(r"[a-z0-9]+(-[a-z0-9]+)*", row["slug"]),
+     row.get("slug", ""))
+case("...the join code is twelve characters as XXXX-XXXX-XXXX and a real one",
+     _re.fullmatch(r"[2-9A-HJKMNP-Z]{4}-[2-9A-HJKMNP-Z]{4}-[2-9A-HJKMNP-Z]{4}", row.get("join_code", "")) is not None
+     and server_app._stacking_join_code(row["join_code"]) == row["join_code"], row.get("join_code", ""))
+case("...unlisted by default, open, approval open, bound to the hub",
+     doc.get("visibility") == "unlisted" and doc.get("status") == "open"
+     and doc.get("approval") == "open" and row.get("hub") == BH, str(doc)[:200])
+case("...the document is a Project record: ids, filters, palette, grid, policy, licence",
+     doc.get("project_id") == row["project_id"] and doc.get("slug") == row["slug"]
+     and doc.get("name") == "Orion Hub Wide!" and doc.get("filters") == ["HA", "OIII"]
+     and doc.get("palette") == "HOO" and doc.get("licence") == "members_only"
+     and doc.get("rotation_from_first_light") is True
+     and doc.get("policy") == stack_defaults.POLICY, str(doc)[:300])
+grid = doc.get("grid") or {}
+case("...the grid is the region's centre and size in the contract's limits",
+     grid.get("center_ra_deg") == 84.0 and grid.get("center_dec_deg") == 0.0
+     and 64 <= grid.get("width_px", 0) <= 12000 and 64 <= grid.get("height_px", 0) <= 12000
+     and 0.1 <= grid.get("scale_arcsec_px", 0) <= 20
+     and abs(grid["width_px"] * grid["scale_arcsec_px"] / 3600.0 - 16.0) < 0.05
+     and abs(grid["height_px"] * grid["scale_arcsec_px"] / 3600.0 - 8.0) < 0.05, str(grid))
+_, pulled = call("GET", f"/api/v1/hubs/{BH}/pull?since={SINCE}&wait=0", token=BHTOK)
+case("...and a project change for it is in the hub's feed",
+     [(c["kind"], c["key"]) for c in pulled["changes"]] == [("project", row["project_id"])],
+     str(pulled["changes"]))
+SINCE = pulled["seq"]
+status, second = call("POST", "/api/v1/projects", {
+    "name": "Orion Hub Wide!", "region": REGION,
+    "stacking": {"backend": "hub", "hubId": BH, "visibility": "public"}}, token=BOBH)
+other_row = server_app.store.stack_project_of(second["project"]["id"]) or {}
+case("a second collaboration of the same name gets its own unique slug and join code",
+     status == 200 and other_row.get("slug") == "orion-hub-wide-2"
+     and other_row["join_code"] != row["join_code"]
+     and other_row["doc"]["visibility"] == "public")
+
+# A mosaic is stacked on a grid its panels frame, not one the first light
+# moves. On 2026-11-04 M81_M82 (a 2 x 2 mosaic, FRA600 with its camera at
+# 268 degrees) had the region's placeholder with rotation_from_first_light,
+# the first light (panel 1) moved the grid's centre onto itself, and panel 2's
+# clear frames fell 90 % off it: refused pointing_off_target.
+M81_REGION = {"ra": 148.94167, "dec": 69.32278, "width": 1.06, "height": 1.08, "rotation": 5.06}
+status, made = call("POST", "/api/v1/projects", {
+    "name": "M81 mosaic", "region": M81_REGION, "kind": "mosaic",
+    "requirements": {"filters": {"L": None}}, "stacking": {"backend": "hub", "hubId": BH}}, token=BOBH)
+M81P = made["project"]["id"]
+m81_doc = (server_app.store.stack_project_of(M81P) or {}).get("doc") or {}
+case("a mosaic nobody has joined is stacked on the region's placeholder, framed by the first light",
+     status == 200 and m81_doc.get("rotation_from_first_light") is True
+     and m81_doc.get("grid", {}).get("center_ra_deg") == 148.94167, str(m81_doc.get("grid")))
+_, fra = call("POST", "/api/v1/agents", {"name": "FRA600"}, token=BOBH)
+call("POST", "/api/v1/agent/hello", {
+    "protocol": collab.PROTOCOL,
+    "profile": {"name": "FRA600", "focalLength": 600.0, "pixelSize": 2.9, "sensorWidth": 3840,
+                "sensorHeight": 2160, "binning": 1, "filters": {"Lum": None},
+                "channels": {"Lum": ["L"]}, "rotation": 268.18, "client": "nina"}}, token=fra["token"])
+status, m81_join = call("POST", f"/api/v1/agent/projects/{M81P}/join", {}, token=fra["token"])
+m81_cells = m81_join.get("task", {}).get("cells") or []
+m81_doc = server_app.store.stack_project_of(M81P)["doc"]
+m81_grid = m81_doc.get("grid") or {}
+m81_scale = 206.265 * 2.9 / 600.0
+
+
+def _on_m81_grid(ra, dec):
+    """A sky position's offset from the M81 grid's centre, in its pixels."""
+    dx, dy = stack_defaults._offsets(*stack_defaults._to_plane(
+        m81_grid["center_ra_deg"], m81_grid["center_dec_deg"], ra, dec), m81_grid["rotation_deg"])
+    return dx * 3600.0 / m81_grid["scale_arcsec_px"], dy * 3600.0 / m81_grid["scale_arcsec_px"]
+
+
+m81_inside = []
+for cell in m81_cells:
+    cx, cy = _on_m81_grid(cell["ra"], cell["dec"])
+    m81_inside.append(abs(cx) + 3840 / 2 <= m81_grid.get("width_px", 0) / 2
+                      and abs(cy) + 2160 / 2 <= m81_grid.get("height_px", 0) / 2)
+case("once a rig joins, the grid is framed by its panels and no longer by the first light",
+     status == 200 and len(m81_cells) == 4 and "rotation_from_first_light" not in m81_doc,
+     f"{len(m81_cells)} cells, {m81_doc.get('rotation_from_first_light')}")
+case("...every panel lies wholly on it",
+     m81_inside == [True] * 4, f"{m81_inside} {m81_grid}")
+case("...centred on the mosaic, not on one panel",
+     abs(m81_grid.get("center_ra_deg", 0) - 148.94) < 0.02
+     and abs(m81_grid.get("center_dec_deg", 0) - 69.32) < 0.02, str(m81_grid))
+case("...turned to the camera, at its scale, about 2.1 x 1.2 degrees",
+     m81_grid.get("rotation_deg") == 88.18 and abs(m81_grid.get("scale_arcsec_px", 0) - m81_scale) < 1e-3
+     and 7400 < m81_grid.get("width_px", 0) < 7800 and 4200 < m81_grid.get("height_px", 0) < 4500,
+     str(m81_grid))
+_, pulled = call("GET", f"/api/v1/hubs/{BH}/pull?since={SINCE}&wait=0", token=BHTOK)
+case("...and the hub is told", any(c["key"] == m81_doc["project_id"] for c in pulled["changes"]),
+     str(pulled["changes"]))
+SINCE = pulled["seq"]
+_, again = call("GET", "/api/v1/agent/task?night=2026-11-04", token=fra["token"])
+_, pulled = call("GET", f"/api/v1/hubs/{BH}/pull?since={SINCE}&wait=0", token=BHTOK)
+case("...a poll with nothing moved sends the hub nothing",
+     not any(c["key"] == m81_doc["project_id"] for c in pulled["changes"]), str(pulled["changes"]))
+SINCE = pulled["seq"]
+def _cell_gap(cells):
+    """The sky distance between the first two cells of a column, in degrees."""
+    a, b = cells[0], cells[1]
+    dx = (b["ra"] - a["ra"]) * math.cos(math.radians((a["dec"] + b["dec"]) / 2.0))
+    return math.hypot(dx, b["dec"] - a["dec"])
+
+
+# The overlap between panels is the collaboration's to choose. It was a fixed
+# 10 %, which on M81_M82 (2026-11-04) left the panels about 0.1 degrees of
+# shared sky to match their brightness by.
+m81_gap10 = _cell_gap(m81_cells)
+status, _ = call("PUT", f"/api/v1/projects/{M81P}", {"overlap": 20}, token=BOBH)
+_, tonight = call("GET", "/api/v1/agent/task?night=2026-11-04", token=fra["token"])
+still = next(t for t in tonight["tasks"] if t["project"] == M81P)
+case("a panel overlap of 10 % is what a collaboration that says nothing gets",
+     abs(m81_gap10 - 1.0633 * 0.9) < 0.01, f"{m81_gap10:.3f} degrees")
+case("editing the overlap leaves a night already dealt alone",
+     status == 200 and _cell_gap(still["cells"]) == m81_gap10 and still.get("tiledOverlap") in (None, 0.1),
+     f"{_cell_gap(still['cells']):.3f} {still.get('tiledOverlap')}")
+_, next_night = call("GET", "/api/v1/agent/task?night=2026-11-05", token=fra["token"])
+recut = next(t for t in next_night["tasks"] if t["project"] == M81P)
+case("...and the next night's cells are cut 20 % apart",
+     abs(_cell_gap(recut["cells"]) - 1.0633 * 0.8) < 0.01 and recut.get("tiledOverlap") == 0.2,
+     f"{_cell_gap(recut['cells']):.3f} degrees, {recut.get('tiledOverlap')}")
+m81_regrid = server_app.store.stack_project_of(M81P)["doc"]["grid"]
+case("...and the stacking grid follows the new panels, still centred on the mosaic",
+     m81_regrid != m81_grid and abs(m81_regrid["center_dec_deg"] - 69.32) < 0.02
+     and abs(m81_regrid["center_ra_deg"] - 148.94) < 0.02,
+     f"{len(recut['cells'])} cells, {m81_regrid}")
+status, made = call("POST", "/api/v1/projects", {
+    "name": "Wide overlap", "region": M81_REGION, "kind": "mosaic", "overlap": 20,
+    "requirements": {"filters": {"L": None}}}, token=BOBH)
+case("a collaboration can be started with its overlap",
+     status == 200 and server_app.store.project(made["project"]["id"])["payload"].get("overlap") == 20.0,
+     str(made)[:160])
+status, _ = call("POST", "/api/v1/projects", {
+    "name": "Too much", "region": M81_REGION, "overlap": 60}, token=BOBH)
+case("...of at most 50 %", status == 422, str(status))
+
+case("a mosaic grid wider than the contract's 12 000 px is coarsened to fit, not cut",
+     (lambda g: g["width_px"] <= 12000 and g["height_px"] <= 12000
+      and g["width_px"] * g["scale_arcsec_px"] / 3600.0 > 6.0)(stack_defaults.mosaic_grid(
+          [{"ra": 84.0 + i * 1.0, "dec": 0.0, "width": 1.06, "height": 0.6, "rotation": 0.0}
+           for i in range(6)], 1.0)))
+case("...and a mosaic with no camera known keeps the placeholder",
+     stack_defaults.mosaic_grid([], 1.0) is None
+     and stack_defaults.mosaic_grid([{"ra": 1.0, "dec": 1.0, "width": 1.0, "height": 1.0}], 0.0) is None)
+
+status, made = call("POST", "/api/v1/projects", {
+    "name": "Coordinator's", "region": REGION, "requirements": {"filters": {"Ha": 3.0}},
+    "stacking": {"backend": "hub", "hubId": BH}}, token=CAROL)
+COORD = made["project"]["id"]
+case("a coordinator the owner listed may bind to the hub too",
+     status == 200 and (server_app.store.stack_project_of(COORD) or {}).get("hub") == BH, str(made)[:160])
+status, answer = call("POST", "/api/v1/projects", {
+    "name": "Not allowed", "region": REGION, "stacking": {"backend": "hub", "hubId": BH}},
+    token=ALICE)
+case("anybody else is refused, as 403, and nothing is made",
+     status == 403 and server_app.store._one("SELECT 1 AS x FROM projects WHERE name = ?", "Not allowed") is None,
+     f"{status} {answer}")
+status, answer = call("POST", "/api/v1/projects", {
+    "name": "No such hub", "region": REGION, "stacking": {"backend": "hub", "hubId": "hub_nope"}},
+    token=BOBH)
+case("...and so is a hub that does not exist", status == 403)
+status, _ = call("POST", "/api/v1/projects", {
+    "name": "No hub id", "region": REGION, "stacking": {"backend": "hub"}}, token=BOBH)
+case("...or a hub binding that names none", status == 403)
+call("PUT", f"/api/v1/hubs/{BH}/coordinators", {"coordinators": []}, token=BOBH)
+status, _ = call("PUT", f"/api/v1/projects/{CLOUD}", {"stacking": {"backend": "hub", "hubId": BH}},
+                 token=BOBH)
+case("an edit may move a collaboration onto a hub its owner owns", status == 200
+     and (server_app.store.stack_project_of(CLOUD) or {}).get("hub") == BH)
+call("PUT", f"/api/v1/hubs/{BH}/coordinators", {"coordinators": ["1004"]}, token=BOBH)
+payload = server_app.store.project(CLOUD)["payload"]
+case("...which clears the cloud join code, both ways",
+     payload["stackingJoinCode"] == "" and payload["stacking"]["backend"] == "hub")
+
+# The listing: who is handed the grant.
+OWNER_RIG = call("POST", "/api/v1/agents", {"name": "Bob's hub rig"}, token=BOBH)[1]["token"]
+JOINED_RIG, JOINED_ID = enrol("hub joiner", 389.0, 9576, 6388, 6.0)
+status, _ = call("POST", f"/api/v1/agent/projects/{HUBP}/join", {}, token=JOINED_RIG)
+case("a telescope joins the hub-backed collaboration", status == 200)
+wanted_id = row["project_id"]
+mine_l = project_in_listing(OWNER_RIG, HUBP)["stacking"]
+joined_l = project_in_listing(JOINED_RIG, HUBP)["stacking"]
+third_l = project_in_listing(AGENT_TOKEN, HUBP)["stacking"]
+case("the listing's block names the hub and where its front door is",
+     mine_l["backend"] == "hub" and mine_l["hubId"] == BH and mine_l["hubName"] == "Bind hub"
+     and mine_l["hubLanUrl"] == "http://10.0.0.7:8790" and mine_l["collabProjectId"] == wanted_id
+     and mine_l["apiBase"] == BASE + "/stack/api/", str(mine_l))
+case("...the owner's own telescope is handed a grant without joining", mine_l["grant"].startswith("sfg_"))
+case("...a joined telescope is handed one", joined_l["grant"].startswith("sfg_"))
+case("...a third telescope, only browsing, gets the block and an empty grant",
+     third_l["backend"] == "hub" and third_l["collabProjectId"] == wanted_id and third_l["grant"] == "",
+     str(third_l))
+case("the owner's telescope is told the stacking project's visibility, for the Edit form",
+     mine_l["visibility"] == "unlisted", str(mine_l))
+case("...as is a joined telescope, as it is handed the grant", joined_l["visibility"] == "unlisted", str(joined_l))
+case("...a browsing telescope is not (no grant, no visibility)", third_l["visibility"] == "", str(third_l))
+def collab_id_of(sf_id):
+    row = server_app.store._one("SELECT collab_user_id FROM stack_identities WHERE user_id = ?", sf_id)
+    return row["collab_user_id"] if row else None
+
+
+claims = hubs_module.verify_grant(mine_l["grant"], BHSEC)
+case("the owner's grant verifies with the hub's secret and names the project and the person",
+     claims and claims["hub"] == BH and claims["project"] == wanted_id
+     and claims["sub"] == collab_id_of("1002") and claims["name"] == "Bob", str(claims))
+# The hub keys members by collab user id and has no way to map a Starfront id,
+# so a grant that named Bob's Discord id was "not a member" straight to the hub.
+case("...by collab user id, never the Starfront id the hub cannot map",
+     claims and claims["sub"] not in ("1002", "") and len(claims["sub"]) == 36, str(claims))
+claims = hubs_module.verify_grant(joined_l["grant"], BHSEC)
+case("...a joined one names its telescope and the project",
+     claims and claims["agent"] == JOINED_ID and claims["project"] == wanted_id
+     and claims["sub"] == collab_id_of(JOINED_ID), str(claims))
+old_style = hubs_module.mint_grant(server_app.store.hub(BH), "1002", "Bob", OWNER_RIG, wanted_id)
+_, as_new = call("GET", "/stack/api/auth/me", token=mine_l["grant"])
+_, as_old = call("GET", "/stack/api/auth/me", token=old_style)
+case("a grant minted before (Starfront id in sub) is still the same person at the front door",
+     (as_new.get("user") or {}).get("user_id") == (as_old.get("user") or {}).get("user_id") == collab_id_of("1002"),
+     f"{as_new} {as_old}")
+case("...and neither verifies under another hub's secret",
+     hubs_module.verify_grant(mine_l["grant"], reg_b["grantSecret"]) is None
+     and hubs_module.verify_grant(joined_l["grant"], reg_b["grantSecret"]) is None)
+old_view = project_in_listing(OWNER_RIG, HUBP)
+case("the old fields are as today: a hub project carries no join code for old plugins",
+     old_view["stackingLinked"] is False and old_view["stackingJoinCode"] == "")
+
+# Editing keeps the document in step; an old-form edit leaves a hub binding alone.
+status, _ = call("PUT", f"/api/v1/projects/{HUBP}", {"stackingJoinCode": ""}, token=BOBH)
+case("a blank stackingJoinCode from an old plugin does not unbind a hub project",
+     status == 200 and server_app._stacking_of(server_app.store.project(HUBP)["payload"])["backend"] == "hub")
+_, pulled = call("GET", f"/api/v1/hubs/{BH}/pull?since={SINCE}&wait=0", token=BHTOK)
+SINCE = pulled["seq"]
+status, _ = call("PUT", f"/api/v1/projects/{HUBP}", {"name": "Orion Renamed"}, token=BOBH)
+doc = server_app.store.stack_project_of(HUBP)["doc"]
+_, pulled = call("GET", f"/api/v1/hubs/{BH}/pull?since={SINCE}&wait=0", token=BHTOK)
+case("renaming a collaboration renames the stacking project and tells the hub",
+     doc["name"] == "Orion Renamed" and doc["slug"] == "orion-hub-wide"
+     and any(c["key"] == wanted_id for c in pulled["changes"]), str(pulled["changes"]))
+SINCE = pulled["seq"]
+
+# The backend cannot change once a frame exists.
+server_app.store._run("INSERT INTO stack_frames (frame_id, project_id) VALUES ('frm_t403', ?)", wanted_id)
+status, answer = call("PUT", f"/api/v1/projects/{HUBP}", {"stacking": {"backend": ""}}, token=BOBH)
+case("with a frame stacked, unbinding is refused as a conflict", status == 409, f"{status} {answer}")
+status, answer = call("PUT", f"/api/v1/projects/{HUBP}", {"stacking": {
+    "backend": "hub", "hubId": reg_b["hubId"]}}, token=BOBH)
+case("...and so is moving it to another hub", status == 409, f"{status} {answer}")
+status, _ = call("PUT", f"/api/v1/projects/{HUBP}", {"stacking": {"backend": "hub", "hubId": BH},
+                                                     "notes": "still here"}, token=BOBH)
+case("...while an edit that keeps the binding goes through", status == 200)
+server_app.store._run("DELETE FROM stack_frames WHERE frame_id = 'frm_t403'")
+
+# Unbinding closes, never deletes.
+status, _ = call("PUT", f"/api/v1/projects/{HUBP}", {"stacking": {"backend": ""}}, token=BOBH)
+row = server_app.store.stack_project_of(HUBP) or {}
+_, pulled = call("GET", f"/api/v1/hubs/{BH}/pull?since={SINCE}&wait=0", token=BHTOK)
+case("unbinding marks the stacking project closed, keeps the row, and tells the hub",
+     status == 200 and row.get("doc", {}).get("status") == "closed"
+     and any(c["key"] == wanted_id for c in pulled["changes"]), str(row.get("doc", {}).get("status")))
+listing = project_in_listing(OWNER_RIG, HUBP)
+case("...and the listing no longer stacks it or hands out a grant",
+     listing["stacking"]["backend"] == "" and listing["stacking"]["grant"] == ""
+     and listing["stackingLinked"] is False)
+status, _ = call("PUT", f"/api/v1/projects/{HUBP}", {"stacking": {"backend": "hub", "hubId": BH}}, token=BOBH)
+again = server_app.store.stack_project_of(HUBP)
+case("binding it again reopens the same stacking project",
+     status == 200 and again["project_id"] == wanted_id and again["join_code"] == row["join_code"]
+     and again["doc"]["status"] == "open")
+
+# The policy defaults are the contract's own, when the contract is at hand.
+spec = None
+for candidate in (ROOT.parent / "Rust" / "rapid-stacker-collab", ROOT.parent.parent / "Rust" / "rapid-stacker-collab",
+                  ROOT.parent / "rapid-stacker-collab", ROOT / "nina" / "docs" / "api" / ".."):
+    found = candidate / "docs" / "api" / "openapi.yaml" if candidate.name != ".." else candidate / "openapi.yaml"
+    if found.is_file():
+        spec = found
+        break
+try:
+    import yaml as _yaml
+except ImportError:
+    _yaml = None
+if spec is None or _yaml is None:
+    print("SKIP  policy defaults against openapi.yaml: "
+          + ("PyYAML is not installed" if spec else "no openapi.yaml beside this repository"))
+else:
+    schemas = _yaml.safe_load(spec.read_text(encoding="utf-8"))["components"]["schemas"]
+    contract = {key: value["default"] for key, value in schemas["Policy"]["properties"].items()
+                if "default" in value}
+    case("server/stack/defaults.py POLICY equals the contract's Policy defaults",
+         contract == stack_defaults.POLICY,
+         str({k: (contract.get(k), stack_defaults.POLICY.get(k))
+              for k in set(contract) | set(stack_defaults.POLICY)
+              if contract.get(k) != stack_defaults.POLICY.get(k)}))
+    filters_enum = tuple(schemas["CanonicalFilter"]["enum"])
+    case("...and CANONICAL_FILTERS equals the contract's CanonicalFilter",
+         filters_enum == stack_defaults.CANONICAL_FILTERS, str(filters_enum))
+
+# ------------------------------------------- live stacking: front door
+# The hub-backed project's door, in the Collab contract's envelope: grants for
+# auth, projects, membership, rigs, and no 403/404 anywhere under /stack/api.
+print("\n-- live stacking: front door --")
+import subprocess as _sp                                          # noqa: E402
+import uuid as _uuid                                              # noqa: E402
+from server.stack import envelope as stack_envelope               # noqa: E402
+from server.stack import header as stack_header                   # noqa: E402
+from server.stack import rigs as stack_rigs                       # noqa: E402
+
+API = "/stack/api"
+OWNER_GRANT = mine_l["grant"]
+JOINED_GRANT = joined_l["grant"]
+SECOND_ID = second["project"]["id"]
+SECOND_GRANT = project_in_listing(OWNER_RIG, SECOND_ID)["stacking"]["grant"]
+FD = server_app.store.stack_project_of(HUBP)
+FD_ID, FD_SLUG, FD_CODE = FD["project_id"], FD["slug"], FD["join_code"]
+_, pulled = call("GET", f"/api/v1/hubs/{BH}/pull?since=0&wait=0", token=BHTOK)
+FEED0 = pulled["seq"]
+
+# What the contract says, when it is at hand.
+rsc = None
+for candidate in (ROOT.parent / "Rust" / "rapid-stacker-collab", ROOT.parent.parent / "Rust" / "rapid-stacker-collab",
+                  ROOT.parent / "rapid-stacker-collab"):
+    if (candidate / "docs" / "api" / "openapi.yaml").exists():
+        rsc = candidate
+        break
+schemas = {}
+if rsc is not None and _yaml is not None:
+    contract_doc = _yaml.safe_load((rsc / "docs" / "api" / "openapi.yaml").read_text(encoding="utf-8"))
+    schemas = contract_doc["components"]["schemas"]
+else:
+    print("SKIP  front door against openapi.yaml: "
+          + ("PyYAML is not installed" if rsc else "no Rapid Stacker Collab beside this repository"))
+
+
+def resolve_ref(node):
+    while isinstance(node, dict) and "$ref" in node:
+        node = schemas[node["$ref"].rsplit("/", 1)[1]]
+    return node
+
+
+def problems(value, node, path="$"):
+    """A small required/type/enum/const/properties/additionalProperties check."""
+    node = resolve_ref(node)
+    found = []
+    if "oneOf" in node:
+        if not any(not problems(value, option, path) for option in node["oneOf"]):
+            found.append(f"{path}: matches none of oneOf")
+        return found
+    kinds = node.get("type")
+    kinds = [kinds] if isinstance(kinds, str) else (kinds or [])
+    pytypes = {"string": str, "integer": int, "number": (int, float), "boolean": bool,
+               "array": list, "object": dict, "null": type(None)}
+    if kinds and not any(isinstance(value, pytypes[k]) and not (k in ("integer", "number") and isinstance(value, bool))
+                         for k in kinds):
+        return [f"{path}: {type(value).__name__} is not {kinds}"]
+    if "const" in node and value != node["const"]:
+        found.append(f"{path}: not {node['const']!r}")
+    if "enum" in node and value not in node["enum"]:
+        found.append(f"{path}: {value!r} not in enum")
+    if isinstance(value, str) and "pattern" in node and not _re.search(node["pattern"], value):
+        found.append(f"{path}: {value!r} fails pattern")
+    if isinstance(value, dict):
+        props = node.get("properties", {})
+        for key in node.get("required", []):
+            if key not in value:
+                found.append(f"{path}.{key}: missing")
+        for key, item in value.items():
+            if key in props:
+                found += problems(item, props[key], f"{path}.{key}")
+            elif node.get("additionalProperties") is False:
+                found.append(f"{path}.{key}: not in the schema")
+    if isinstance(value, list) and "items" in node:
+        for i, item in enumerate(value):
+            found += problems(item, node["items"], f"{path}[{i}]")
+    return found
+
+
+def conforms(name, body):
+    return (not schemas) or not problems(body, {"$ref": f"#/components/schemas/{name}"})
+
+
+def why(name, body):
+    return "; ".join(problems(body, {"$ref": f"#/components/schemas/{name}"}))[:300] if schemas else ""
+
+
+def front(method, path, body=None, token=None):
+    return call(method, API + path, body, token=token)
+
+
+# -- the envelope table and the allow-list against the contract
+if schemas:
+    import re as _re2
+    text = schemas["ErrorCode"]["description"]
+    table = {m.group(1): int(m.group(2)) for m in _re2.finditer(r"- `(\w+)` \((\d+)\)", text)}
+    case("envelope.ERROR_STATUS equals the contract's ErrorCode table",
+         table == stack_envelope.ERROR_STATUS,
+         str({k for k in set(table) | set(stack_envelope.ERROR_STATUS)
+              if table.get(k) != stack_envelope.ERROR_STATUS.get(k)}))
+    case("...and no code of the table is a 403 or 404",
+         not {403, 404} & set(stack_envelope.ERROR_STATUS.values()))
+    initheader = schemas["InitHeader"]["properties"]
+    kind_of = {"string": "str", "number": "num", "integer": "int"}
+    same = set(initheader) == set(stack_header.ALLOWED) and all(
+        stack_header.ALLOWED[k][0] == ("numstr" if isinstance(v["type"], list) else kind_of[v["type"]])
+        for k, v in initheader.items())
+    case("header.ALLOWED equals the contract's InitHeader allow-list", same,
+         str(set(initheader) ^ set(stack_header.ALLOWED)))
+
+# -- header allow-list
+case("an allowed header passes", stack_header.check({"FILTER": "Ha", "EXPTIME": 300.0, "XBINNING": 1,
+                                                    "RA": "05 35 17", "DEC": -5.4}) is not None)
+for card in ("SITELAT", "SITELONG", "SITEELEV", "OBSERVER", "HISTORY"):
+    try:
+        stack_header.check({"FILTER": "Ha", card: "x"})
+        refused = ""
+    except stack_envelope.ApiError as exc:
+        refused = f"{exc.code} {exc.status} {exc.extra['errors'][0]['field']}"
+    case(f"header: {card} is refused with header_rejected", refused == f"header_rejected 400 header.{card}", refused)
+case("header: a location card is never kept from a file's header",
+     stack_header.without_location({"SITELAT": 1, "OBSERVER": "me", "FILTER": "Ha"}) == {"FILTER": "Ha"})
+try:
+    stack_header.check({"EXPTIME": "long"})
+    wrong = ""
+except stack_envelope.ApiError as exc:
+    wrong = exc.code
+case("header: a value of the wrong type is validation_failed", wrong == "validation_failed", wrong)
+
+# -- authentication
+status, got = front("GET", "/rigs")
+case("no credential: 401 not_authenticated in the envelope",
+     status == 401 and got.get("ok") is False and got.get("code") == "not_authenticated", f"{status} {got}")
+tampered = OWNER_GRANT[:-3] + ("AAA" if OWNER_GRANT[-3:] != "AAA" else "BBB")
+status, got = front("GET", f"/projects/{FD_ID}/membership", token=tampered)
+case("a tampered grant: 401 token_invalid", status == 401 and got.get("code") == "token_invalid", f"{status} {got}")
+status, got = front("GET", "/rigs", token="rscu_" + "0" * 64)
+case("a token of another kind: 401 token_invalid", status == 401 and got.get("code") == "token_invalid", f"{status} {got}")
+other_secret = hubs_module.mint_grant({"id": BH, "grant_secret": reg_b["grantSecret"]}, "1002", "Bob", "x", FD_ID)
+status, got = front("GET", "/rigs", token=other_secret)
+case("a grant signed with another hub's secret: 401 token_invalid",
+     status == 401 and got.get("code") == "token_invalid", f"{status} {got}")
+old_grant = hubs_module.mint_grant({"id": BH, "grant_secret": BHSEC}, "1002", "Bob", "x", FD_ID, time.time() - 3 * 86400)
+status, got = front("GET", "/rigs", token=old_grant)
+case("an expired grant: 401 token_invalid", status == 401 and got.get("code") == "token_invalid", f"{status} {got}")
+status, got = front("GET", f"/projects/{FD_ID}/membership", token=SECOND_GRANT)
+case("a grant for another project: 401 token_scope",
+     status == 401 and got.get("code") == "token_scope", f"{status} {got}")
+status, got = front("POST", f"/projects/{FD_ID}/join", {"display_name": "Zed", "accepted_terms_version": "x"}, token=SECOND_GRANT)
+case("...on a write too", status == 401 and got.get("code") == "token_scope", f"{status} {got}")
+
+# -- the envelope for what is not there
+status, got = front("GET", "/nope")
+case("an unknown path answers the envelope, not 403 or 404",
+     status not in (403, 404) and got.get("ok") is False and got.get("code") in stack_envelope.ERROR_STATUS
+     and status == stack_envelope.ERROR_STATUS[got["code"]], f"{status} {got}")
+for path in ("/auth/me", f"/projects/{FD_ID}/masters"):
+    status, got = front("GET", path)
+    case(f"{path.rsplit('/', 1)[-1]} without a credential is the envelope",
+         status not in (403, 404) and got.get("ok") is False and "code" in got, f"{status} {got}")
+status, got = front("DELETE", "/rigs")
+case("a method not allowed is the envelope too", status not in (403, 404, 405) and got.get("ok") is False, f"{status} {got}")
+
+# -- resolve-join-code
+status, got = front("POST", "/projects/resolve-join-code", {"code": FD_CODE.lower().replace("-", " ")}, token=OWNER_GRANT)
+case("a grant resolves the join code, in any case and spacing",
+     status == 200 and got.get("ok") is True and got["project"]["project_id"] == FD_ID
+     and got["terms_version"] and got["already_member"] is False, f"{status} {str(got)[:200]}")
+case("...the response validates against ResolveJoinCodeResponse", conforms("ResolveJoinCodeResponse", got), why("ResolveJoinCodeResponse", got))
+status, got = front("POST", "/projects/resolve-join-code", {"code": "H4RT-92BK-WNPC"}, token=OWNER_GRANT)
+case("an unknown code: 400 invalid_code", status == 400 and got.get("code") == "invalid_code", f"{status} {got}")
+status, got = front("POST", "/projects/resolve-join-code", {}, token=OWNER_GRANT)
+case("a missing code: 400 invalid_request", status == 400 and got.get("code") == "invalid_request", f"{status} {got}")
+status, got, _ = raw("POST", API + "/projects/resolve-join-code", data=b"{not json",
+                     headers={"Content-Type": "application/json", "Authorization": f"Bearer {OWNER_GRANT}"})
+case("a body that is not JSON: 400 invalid_request", status == 400 and got.get("code") == "invalid_request", f"{status} {got}")
+
+# -- projects, by id and by slug
+status, by_id = front("GET", f"/projects/{FD_ID}", token=OWNER_GRANT)
+status2, by_slug = front("GET", f"/projects/{FD_SLUG}", token=OWNER_GRANT)
+case("the project reads by id and by slug", status == status2 == 200
+     and by_id["project"]["project_id"] == FD_ID == by_slug["project"]["project_id"]
+     and by_id["project"]["slug"] == FD_SLUG, f"{status} {status2}")
+case("...and validates against ProjectResponse", conforms("ProjectResponse", by_id), why("ProjectResponse", by_id))
+case("...with the placeholder grid, the filters and no membership yet",
+     by_id["project"]["grid"]["width_px"] >= 64 and by_id["project"]["filters"] == ["HA", "OIII"]
+     and by_id["project"]["my_membership"] is None and by_id["project"]["owner_name"] == "Bob")
+status, got = front("GET", "/projects/prj_zzzzzzzzzzzzzzzzzzzz", token=OWNER_GRANT)
+case("an unknown project: 400 not_found", status == 400 and got.get("code") == "not_found", f"{status} {got}")
+status, got = front("GET", f"/projects/{FD_SLUG}")
+case("an unlisted project reads without a credential", status == 200 and got["project"]["project_id"] == FD_ID, f"{status} {got}")
+
+# -- joining
+body = {"code": "", "display_name": "Bobby", "accepted_terms_version": "2020-01-01",
+        "filter_mapping": [{"raw": "Ha 7nm", "canonical": "HA"}]}
+status, got = front("POST", f"/projects/{FD_ID}/join", body, token=OWNER_GRANT)
+case("joining on stale terms: 409 terms_outdated with the current version",
+     status == 409 and got.get("code") == "terms_outdated" and got.get("terms_version"), f"{status} {got}")
+body["accepted_terms_version"] = by_id["project"]["terms_version"]
+status, got = front("POST", f"/projects/{FD_ID}/join", dict(body, code="WNPC-WNPC-WNPC"), token=OWNER_GRANT)
+case("a non-empty code that is not the project's: 400 invalid_code",
+     status == 400 and got.get("code") == "invalid_code", f"{status} {got}")
+status, got = front("POST", f"/projects/{FD_ID}/join", dict(body, filter_mapping=[{"raw": "x", "canonical": "NOPE"}]), token=OWNER_GRANT)
+case("a filter mapping outside the canonical filters: 400 validation_failed",
+     status == 400 and got.get("code") == "validation_failed" and got.get("errors"), f"{status} {got}")
+status, got = front("POST", f"/projects/{FD_ID}/join", {"display_name": "Bobby"}, token=OWNER_GRANT)
+case("a body missing the terms version: 400 invalid_request", status == 400 and got.get("code") == "invalid_request", f"{status} {got}")
+status, got = front("POST", f"/projects/{FD_ID}/join", body, token=OWNER_GRANT)
+member = got.get("membership") or {}
+case("an empty code joins on a grant for the project, active under approval open",
+     status == 200 and member.get("status") == "active" and member.get("role") == "contributor"
+     and member.get("display_name") == "Bobby" and member.get("filter_mapping") == body["filter_mapping"], f"{status} {str(got)[:200]}")
+case("...the response validates against JoinResponse", conforms("JoinResponse", got), why("JoinResponse", got))
+OWNER_UID = member.get("user_id", "")
+case("...the user id is a UUID v4 that is not the Starfront id",
+     _re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", OWNER_UID) is not None
+     and OWNER_UID != "1002")
+case("...recorded in stack_identities, once",
+     (server_app.store._one("SELECT collab_user_id FROM stack_identities WHERE user_id = '1002'") or {}).get("collab_user_id") == OWNER_UID)
+status, got = front("POST", f"/projects/{FD_ID}/join", body, token=OWNER_GRANT)
+case("joining twice: 409 already_member", status == 409 and got.get("code") == "already_member", f"{status} {got}")
+status, got = front("POST", f"/projects/{FD_ID}/join", dict(body, display_name="  BOBBY ", code=FD_CODE.lower()), token=JOINED_GRANT)
+case("a second person with the same display name (any case): 409 display_name_taken",
+     status == 409 and got.get("code") == "display_name_taken", f"{status} {got}")
+status, got = front("POST", f"/projects/{FD_ID}/join", dict(body, display_name="Joiner", code=FD_CODE.lower()), token=JOINED_GRANT)
+case("...who joins under another name with the real code (lower case)",
+     status == 200 and got["membership"]["display_name"] == "Joiner"
+     and got["membership"]["user_id"] != OWNER_UID, f"{status} {got}")
+JOINER_UID = got["membership"]["user_id"]
+
+# -- membership
+status, got = front("GET", f"/projects/{FD_ID}/membership", token=OWNER_GRANT)
+case("the membership reads back", status == 200 and got["membership"]["user_id"] == OWNER_UID
+     and got["membership"]["usage"]["frames_used"] == 0 and conforms("MembershipResponse", got), f"{status} {why('MembershipResponse', got)}")
+status, got = front("PUT", f"/projects/{FD_ID}/membership", {"display_name": "Robert", "country": "GB",
+                    "allow_owner_raw_download": True,
+                    "filter_mapping": [{"raw": "Oiii", "canonical": "OIII"}, {"raw": "Dark", "canonical": "SKIP"}]}, token=OWNER_GRANT)
+case("...updates (name, country, opt-in, mapping)", status == 200 and got["membership"]["display_name"] == "Robert"
+     and got["membership"]["country"] == "GB" and got["membership"]["allow_owner_raw_download"] is True
+     and len(got["membership"]["filter_mapping"]) == 2 and conforms("MembershipResponse", got), f"{status} {str(got)[:200]}")
+status, got = front("PUT", f"/projects/{FD_ID}/membership", {"display_name": "joiner"}, token=OWNER_GRANT)
+case("...and a name another member has is 409 display_name_taken", status == 409 and got.get("code") == "display_name_taken", f"{status} {got}")
+status, got = front("PUT", f"/projects/{FD_ID}/membership", {"display_name": 5}, token=OWNER_GRANT)
+case("...and a bad body is 400 invalid_request", status == 400 and got.get("code") == "invalid_request", f"{status} {got}")
+status, got = front("GET", f"/projects/{FD_ID}", token=OWNER_GRANT)
+case("the project now shows the caller's membership and the member count",
+     got["project"]["my_membership"]["display_name"] == "Robert" and got["project"]["counts"]["member_count"] == 2
+     and conforms("ProjectResponse", got), why("ProjectResponse", got))
+NOBODY = hubs_module.mint_grant({"id": BH, "grant_secret": BHSEC}, "9999", "Nobody", "x", FD_ID)
+status, got = front("GET", f"/projects/{FD_ID}/membership", token=NOBODY)
+case("a grant for the project whose holder has not joined: 401 not_member",
+     status == 401 and got.get("code") == "not_member", f"{status} {got}")
+
+# -- a browser session reads, and cannot write
+server_app.store.add_web_token("web-front-door", "1002")
+request = urllib.request.Request(f"{BASE}{API}/projects/{FD_ID}/membership", headers={"Cookie": "starfront_web=web-front-door"})
+with urllib.request.urlopen(request, timeout=10) as response:
+    cookie_read = json.loads(response.read())
+case("the starfront_web cookie reads the same membership", cookie_read["membership"]["user_id"] == OWNER_UID, str(cookie_read)[:200])
+status, got, _ = raw("PUT", API + f"/projects/{FD_ID}/membership", data=b'{"country": "FR"}',
+                     headers={"Content-Type": "application/json", "Cookie": "starfront_web=web-front-door"})
+case("...but a write on the cookie alone is refused in the envelope", status == 401 and got.get("code") == "not_authenticated", f"{status} {got}")
+status, got, _ = raw("GET", API + "/rigs", headers={"Cookie": "starfront_web=unknown"})
+case("...and an unknown session is 401 session_expired", status == 401 and got.get("code") == "session_expired", f"{status} {got}")
+
+# -- the dashboard's two reads: who am I, and my projects with the hub's heartbeat
+def with_cookie(path, cookie):
+    return raw("GET", API + path, headers={"Cookie": f"starfront_web={cookie}"})
+
+
+status, got, _ = raw("GET", API + "/auth/me")
+case("auth/me without a cookie is 401 not_authenticated in the envelope",
+     status == 401 and got.get("ok") is False and got.get("code") == "not_authenticated", f"{status} {got}")
+status, me_body, _ = with_cookie("/auth/me", "web-front-door")
+case("auth/me with a signed-in cookie names the collab user id and the display name",
+     status == 200 and me_body.get("ok") is True and me_body["user"] == {"user_id": OWNER_UID, "display_name": "Bob"},
+     f"{status} {me_body}")
+case("...and no Discord id is anywhere in the body", "1002" not in json.dumps(me_body), json.dumps(me_body))
+status, got, _ = with_cookie("/auth/me", "unknown")
+case("auth/me with an unknown cookie is 401 session_expired", status == 401 and got.get("code") == "session_expired", f"{status} {got}")
+status, got = front("GET", "/auth/me", token=OWNER_GRANT)
+case("auth/me also answers a grant, with the same collab id", status == 200 and got["user"]["user_id"] == OWNER_UID, f"{status} {got}")
+
+call("POST", f"/api/v1/hubs/{BH}/heartbeat", {"workers": 3}, token=BHTOK)
+status, mine_p, _ = with_cookie("/projects?scope=mine", "web-front-door")
+mine_ids = [p["project_id"] for p in mine_p.get("projects", [])]
+case("projects?scope=mine lists the signed-in user's project with their membership",
+     status == 200 and mine_ids == [FD_ID] and mine_p["projects"][0]["my_membership"]["display_name"] == "Robert"
+     and mine_p["projects"][0]["slug"] == FD_SLUG, f"{status} {mine_ids}")
+hub_state = mine_p["projects"][0].get("stacked_by") or {}
+case("...with the hub that stacks it, its workers and when it was last heard",
+     hub_state.get("hub_name") == "Bind hub" and hub_state.get("workers") == 3 and hub_state.get("online") is True
+     and str(hub_state.get("last_seen", "")).endswith("Z"), str(hub_state))
+case("...and neither the join code nor a Discord id", "join_code" not in mine_p["projects"][0]
+     and '"1002"' not in json.dumps(mine_p), "")
+server_app.store.add_web_token("web-front-door-nobody", "1001")
+status, none_p, _ = with_cookie("/projects?scope=mine", "web-front-door-nobody")
+case("another signed-in user, in no project, gets an empty list", status == 200 and none_p["projects"] == [], f"{status} {none_p}")
+status, got, _ = raw("GET", API + "/projects?scope=mine")
+case("projects?scope=mine without a cookie is 401", status == 401 and got.get("code") == "not_authenticated", f"{status} {got}")
+status, got, _ = raw("GET", API + "/projects?scope=bogus")
+case("...and an unknown scope is 400 validation_failed", status == 400 and got.get("code") == "validation_failed", f"{status} {got}")
+
+# -- rigs
+RIG = {"camera": "ASI2600MM Pro ", "telescope": "RedCat 51", "focal_length_mm": 250.4,
+       "pixel_size_um": 3.76, "binning": 1, "name": "Wide rig"}
+status, got = front("POST", "/rigs", RIG, token=OWNER_GRANT)
+rig = got.get("rig") or {}
+case("a rig is upserted, confirmed, with its pixel scale", status == 200 and rig.get("confirmed") is True
+     and rig.get("osc") is False and rig.get("name") == "Wide rig" and rig.get("pixel_scale_arcsec") == 3.0973
+     and conforms("RigResponse", got), f"{status} {why('RigResponse', got)} {rig}")
+want = stack_rigs.rig_id_of(stack_rigs.fingerprint("asi2600mm pro", "redcat 51", 250, 3.8, 1, False))
+case("...its rig_id is the fingerprint's first 12 hex characters", rig.get("rig_id") == want, f"{rig.get('rig_id')} {want}")
+# The fingerprint against Rapid Stacker Collab's own code, when node and the file are at hand.
+js = rsc / "backend" / "lambdas" / "shared" / "rigs.js" if rsc else None
+node_ok = False
+if js is not None and js.exists():
+    probe = ("const ids=require('" + str(js.parent / "ids.js") + "');"
+             "const src=require('fs').readFileSync('" + str(js) + "','utf8');"
+             "const m={exports:{}};const crypto=require('crypto');"
+             "const fn=new Function('require','module','exports',src.replace(/require\\(\"\\.\\/ddb\"\\)/,'{}'));"
+             "fn(p=>p==='./ids'?ids:require(p),m,m.exports);"
+             "const cases=JSON.parse(process.argv[1]);"
+             "console.log(JSON.stringify(cases.map(c=>m.exports.fingerprint(c))));")
+    vectors = [dict(camera="ASI2600MM Pro ", telescope="RedCat 51", focal_length_mm=250.4, pixel_size_um=3.76, binning=1, osc=False),
+               dict(camera="IMX571", telescope=" Esprit 100", focal_length_mm=550.5, pixel_size_um=3.75, binning=2, osc=True),
+               dict(camera="QHY268C", telescope="X", focal_length_mm=1000, pixel_size_um=2.25, binning=1, osc=True),
+               dict(camera="A", telescope="B", focal_length_mm=0.5, pixel_size_um=4.65, binning=3, osc=False)]
+    try:
+        out = _sp.run(["node", "-e", probe, json.dumps(vectors)], capture_output=True, text=True, timeout=30,
+                      env={**os.environ, "NODE_PATH": str(rsc / "backend" / "node_modules")})
+        theirs = json.loads(out.stdout) if out.returncode == 0 else None
+    except (OSError, ValueError, _sp.TimeoutExpired):
+        theirs = None
+    if theirs is None:
+        print("SKIP  rig fingerprint against rigs.js: it could not be run here")
+    else:
+        mine_fp = [stack_rigs.fingerprint(v["camera"], v["telescope"], v["focal_length_mm"], v["pixel_size_um"],
+                                          v["binning"], v["osc"]) for v in vectors]
+        case("the rig fingerprint equals Rapid Stacker Collab's rigs.js on four vectors", mine_fp == theirs, f"{mine_fp} {theirs}")
+else:
+    print("SKIP  rig fingerprint against rigs.js: no Rapid Stacker Collab beside this repository")
+status, again = front("POST", "/rigs", dict(RIG, camera="asi2600mm pro", name="Renamed"), token=OWNER_GRANT)
+case("the same tuple upserts the same rig (idempotent, case-insensitive), renaming it",
+     again["rig"]["rig_id"] == rig["rig_id"] and again["rig"]["name"] == "Renamed"
+     and again["rig"]["created_at"] == rig["created_at"], str(again)[:200])
+status, got = front("POST", "/rigs", dict(RIG, bayer_pattern="RGGB", width_px=6248, height_px=4176), token=OWNER_GRANT)
+case("a bayer pattern makes it a different, OSC rig", got["rig"]["osc"] is True and got["rig"]["rig_id"] != rig["rig_id"]
+     and got["rig"]["width_px"] == 6248 and conforms("RigResponse", got), f"{status} {why('RigResponse', got)}")
+status, got = front("POST", "/rigs", dict(RIG, binning=0), token=OWNER_GRANT)
+case("a bad rig body is validation_failed", status == 400 and got.get("code") == "validation_failed", f"{status} {got}")
+status, got = front("POST", "/rigs", {"camera": "x"}, token=OWNER_GRANT)
+case("...or invalid_request when a field is missing", status == 400 and got.get("code") == "invalid_request", f"{status} {got}")
+status, got = front("GET", "/rigs", token=OWNER_GRANT)
+case("rigs list, oldest first, validating against RigListResponse",
+     status == 200 and len(got["rigs"]) == 2 and got["rigs"][0]["rig_id"] == rig["rig_id"]
+     and conforms("RigListResponse", got), f"{status} {why('RigListResponse', got)}")
+status, got = front("GET", "/rigs", token=JOINED_GRANT)
+case("...and are the caller's own", status == 200 and got["rigs"] == [])
+status, got = front("PATCH", f"/rigs/{rig['rig_id']}", {"name": "Final", "confirmed": False}, token=OWNER_GRANT)
+case("a rig is patched (name, confirmed)", status == 200 and got["rig"]["name"] == "Final"
+     and got["rig"]["confirmed"] is False and conforms("RigResponse", got), f"{status} {got}")
+status, got = front("PATCH", f"/rigs/{rig['rig_id']}", {"name": "  "}, token=OWNER_GRANT)
+case("...a blank name is validation_failed", status == 400 and got.get("code") == "validation_failed", f"{status} {got}")
+status, got = front("PATCH", "/rigs/rig_000000000000", {"name": "x"}, token=OWNER_GRANT)
+case("...a rig that is not yours is 400 not_found", status == 400 and got.get("code") == "not_found", f"{status} {got}")
+status, got = front("PATCH", f"/rigs/{rig['rig_id']}", {"name": "Hijack"}, token=JOINED_GRANT)
+case("...another person cannot patch it", status == 400 and got.get("code") == "not_found", f"{status} {got}")
+
+# -- the hub hears of it, and never learns a Starfront id
+_, pulled = call("GET", f"/api/v1/hubs/{BH}/pull?since={FEED0}&wait=0", token=BHTOK)
+members = [c["key"] for c in pulled["changes"] if c["kind"] == "member"]
+rigs_seen = [c["key"] for c in pulled["changes"] if c["kind"] == "rig"]
+case("each membership write is a member row in the feed, key project_id/user_id",
+     members.count(f"{FD_ID}/{OWNER_UID}") == 2 and members.count(f"{FD_ID}/{JOINER_UID}") == 1, str(members))
+case("each rig write is a rig row, key user_id/rig_id",
+     rigs_seen.count(f"{OWNER_UID}/{rig['rig_id']}") >= 3 and all(k.split("/")[0] in (OWNER_UID,) for k in rigs_seen), str(rigs_seen))
+everything = json.dumps([by_id, member, cookie_read, pulled]) + json.dumps(
+    [server_app.store._all("SELECT * FROM stack_members"), server_app.store._all("SELECT * FROM stack_rigs")])
+case("no Starfront or Discord id appears in a response, a member row, a rig row or the feed",
+     not any(f'"{sid}"' in everything or f"/{sid}\"" in everything or f'{sid}/' in everything
+             for sid in ("1002", JOINED_ID)), "")
+
+# ------------------------------------------- live stacking: frames
+# Frame upload on the front door: multipart onto this server's disk, the part
+# PUT at /stack/s3/{upload_id}/{n}, complete, the lists, withdraw, and the rig
+# library (decision D001: this server's library serves hub projects only).
+print("\n-- live stacking: frames --")
+import hashlib as _hl                                             # noqa: E402
+import random as _random                                          # noqa: E402
+import urllib.parse as _up                                        # noqa: E402
+from concurrent.futures import ThreadPoolExecutor as _Pool        # noqa: E402
+from server import files as _files_mod                            # noqa: E402
+from server.stack import frames as stack_frames                   # noqa: E402
+
+RELAY = DATA / "stack" / "relay"
+PART = stack_frames.PART_SIZE
+FRONT = server_app.STACK_FRONT.state
+
+
+def fits_bytes(size, seed):
+    rnd = _random.Random(seed)
+    head = b"SIMPLE  =                    T / conforms to FITS standard".ljust(80)
+    return (head + rnd.randbytes(max(0, size - 80)))[:size]
+
+
+def put_part(url, data):
+    """A part PUT as the plugin sends it: the body only, a Content-Length, no Authorization."""
+    request = urllib.request.Request(url, data=data, method="PUT")
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            return response.status, response.headers, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers, exc.read()
+    except (urllib.error.URLError, ConnectionError):      # the server answered early and closed
+        return 0, {}, b""
+
+
+def header_for(**more):
+    return {"IMAGETYP": "Light", "FILTER": "Ha", "EXPTIME": 300.0, "XBINNING": 1, "YBINNING": 1,
+            "INSTRUME": "ASI2600MM Pro", "TELESCOP": "RedCat 51", "FOCALLEN": 250.4, "XPIXSZ": 3.76,
+            "DATE-OBS": "2026-10-20T22:00:00.000", "OBJECT": "M33", "NAXIS1": 6248, "NAXIS2": 4176, **more}
+
+
+def init_for(data, name="frame.fits", token=None, header=None, project=None, **more):
+    return front("POST", f"/projects/{project or FD_ID}/frames/init", {
+        "sha256": _hl.sha256(data).hexdigest(), "size": len(data), "filename": name,
+        "header": header if header is not None else header_for(), "stripped": True, **more},
+        token=token or OWNER_GRANT)
+
+
+def etag_list(sent):
+    return [{"part_number": n, "etag": e} for n, e in sorted(sent.items())]
+
+
+def set_role(user_id, role):
+    row = server_app.store._one("SELECT doc FROM stack_members WHERE project_id = ? AND user_id = ?", FD_ID, user_id)
+    doc = json.loads(row["doc"])
+    doc["role"] = role
+    server_app.store._run("UPDATE stack_members SET doc = ? WHERE project_id = ? AND user_id = ?",
+                          json.dumps(doc), FD_ID, user_id)
+
+
+def feed_since(seq):
+    return call("GET", f"/api/v1/hubs/{BH}/pull?since={seq}&wait=0", token=BHTOK)[1]
+
+
+FEED1 = feed_since(0)["seq"]
+
+# -- A: three parts, out of order, with a resume in the middle
+DATA_A = fits_bytes(2 * PART + 1000, 1)
+status, init_a = init_for(DATA_A, "M33_Ha_0001.fits")
+up_a = init_a.get("upload") or {}
+case("init answers a multipart upload of 16 MiB parts, three of them, with absolute part URLs on the public origin",
+     status == 200 and init_a.get("status") == "uploading" and init_a.get("resumed") is False
+     and up_a.get("type") == "multipart" and up_a.get("part_size") == PART and up_a.get("part_count") == 3
+     and [p["url"] for p in up_a["part_urls"]] == [f"{BASE}/stack/s3/{up_a['upload_id']}/{n}" for n in (1, 2, 3)]
+     and [p["size"] for p in up_a["part_urls"]] == [PART, PART, 1000] and up_a["completed_parts"] == []
+     and conforms("FrameInitResponse", init_a), f"{status} {why('FrameInitResponse', init_a)} {str(init_a)[:200]}")
+case("...the upload id is 32 random bytes in hex and the frame is a lower-case ULID",
+     _re.fullmatch(r"[0-9a-f]{64}", up_a.get("upload_id", "")) is not None
+     and _re.fullmatch(r"frm_[0-9a-hjkmnp-tv-z]{26}", init_a.get("frame_id", "")) is not None)
+case("...a light is filed under its filter, resolved through the member's mapping or the alias table",
+     init_a.get("filter") == "HA" and init_a["resolution"]["canonical"] == "HA"
+     and init_a["resolution"]["source"] in ("contributor_mapping", "alias_table", "pattern") and init_a.get("frame_type") == "light")
+FA = init_a["frame_id"]
+urls_a = {p["part_number"]: p["url"] for p in up_a["part_urls"]}
+sent_a = {}
+status, headers, _ = put_part(urls_a[3], DATA_A[2 * PART:])
+sent_a[3] = headers.get("ETag", "")
+case("a part PUT answers 200 with the quoted MD5 of the part as its ETag",
+     status == 200 and sent_a[3] == '"' + _hl.md5(DATA_A[2 * PART:]).hexdigest() + '"', str(status))
+status, headers, _ = put_part(urls_a[1], DATA_A[:PART])
+sent_a[1] = headers.get("ETag", "")
+case("...parts may arrive in any order (3 before 1)", status == 200 and sent_a[1] == '"' + _hl.md5(DATA_A[:PART]).hexdigest() + '"')
+status, got = front("POST", f"/projects/{FD_ID}/frames/{FA}/complete", {"etags": etag_list(sent_a)}, token=OWNER_GRANT)
+case("complete with a part missing: 409 upload_incomplete listing it",
+     status == 409 and got.get("code") == "upload_incomplete" and got.get("outstanding_parts") == [2], f"{status} {got}")
+status, again_a = init_for(DATA_A, "M33_Ha_0001.fits")
+case("init again with the same hash resumes: the same frame, completed parts, URLs for the rest only",
+     status == 200 and again_a.get("resumed") is True and again_a["frame_id"] == FA
+     and [p["part_number"] for p in again_a["upload"]["completed_parts"]] == [1, 3]
+     and again_a["upload"]["completed_parts"][0]["etag"] == sent_a[1]
+     and [p["part_number"] for p in again_a["upload"]["part_urls"]] == [2]
+     and again_a["upload"]["upload_id"] == up_a["upload_id"] and conforms("FrameInitResponse", again_a),
+     f"{status} {why('FrameInitResponse', again_a)} {str(again_a)[:300]}")
+status2, got2 = front("POST", f"/projects/{FD_ID}/frames/init", {
+    "sha256": _hl.sha256(DATA_A).hexdigest(), "size": len(DATA_A) + 1, "filename": "M33_Ha_0001.fits",
+    "header": header_for(), "stripped": True}, token=OWNER_GRANT)
+case("the same hash with another size is not a resume: 400 validation_failed",
+     status2 == 400 and got2.get("code") == "validation_failed", f"{status2} {got2}")
+bad_wrong_size = put_part(urls_a[2], DATA_A[PART:PART + 1000])
+case("a part of the wrong size is refused (400)", bad_wrong_size[0] == 400, str(bad_wrong_size[0]))
+case("a part number outside the upload is refused (400)",
+     put_part(f"{BASE}/stack/s3/{up_a['upload_id']}/9", b"x")[0] == 400 and put_part(f"{BASE}/stack/s3/{up_a['upload_id']}/0", b"x")[0] == 400)
+before = sorted(str(p) for p in RELAY.rglob("*"))
+stray = put_part(f"{BASE}/stack/s3/{'ab' * 32}/1", b"x" * 10)
+case("a stray PUT to an unknown upload id is refused (403) and writes nothing",
+     stray[0] == 403 and sorted(str(p) for p in RELAY.rglob("*")) == before, str(stray[0]))
+case("...and so is one whose id is not even an upload id", put_part(f"{BASE}/stack/s3/nonsense/1", b"x")[0] == 403)
+status, headers, _ = put_part(urls_a[2], DATA_A[PART:2 * PART])
+sent_a[2] = headers.get("ETag", "")
+case("the missing part arrives", status == 200)
+wrong = etag_list(sent_a)
+wrong[0] = {"part_number": 1, "etag": '"' + "0" * 32 + '"'}
+status, got = front("POST", f"/projects/{FD_ID}/frames/{FA}/complete", {"etags": wrong}, token=OWNER_GRANT)
+case("complete with a wrong ETag: 400 bad_etags", status == 400 and got.get("code") == "bad_etags", f"{status} {got}")
+status, got = front("POST", f"/projects/{FD_ID}/frames/{FA}/complete",
+                    {"etags": etag_list(sent_a) + [{"part_number": 2, "etag": sent_a[2]}]}, token=OWNER_GRANT)
+case("...a part listed twice: 400 bad_etags", status == 400 and got.get("code") == "bad_etags", f"{status} {got}")
+status, got = front("POST", f"/projects/{FD_ID}/frames/{FA}/complete", {"etags": etag_list(sent_a) + [{"part_number": 4, "etag": "x"}]}, token=OWNER_GRANT)
+case("...a part beyond the count: 400 bad_etags", status == 400 and got.get("code") == "bad_etags", f"{status} {got}")
+status, got = front("POST", f"/projects/{FD_ID}/frames/{FA}/complete", {"etags": []}, token=OWNER_GRANT)
+case("...an empty list: 400 invalid_request", status == 400 and got.get("code") == "invalid_request", f"{status} {got}")
+status, got = front("POST", f"/projects/{FD_ID}/frames/{FA}/complete", {"etags": etag_list(sent_a)}, token=JOINED_GRANT)
+case("another member cannot complete it: 400 not_found", status == 400 and got.get("code") == "not_found", f"{status} {got}")
+status, got = front("POST", f"/projects/{FD_ID}/frames/{FA}/complete", {"etags": [{"part_number": n, "etag": e.strip('"')} for n, e in sorted(sent_a.items())]}, token=OWNER_GRANT)
+case("complete accepts ETags with or without their quotes, assembles the file: status uploaded",
+     status == 200 and got.get("status") == "uploaded" and got.get("already_complete") is False
+     and conforms("FrameCompleteResponse", got), f"{status} {why('FrameCompleteResponse', got)} {got}")
+stored_a = list(RELAY.glob(f"{FD_ID}/*/{FA}.fits"))
+case("...the bytes sit under relay/{project}/{collab user}/{frame_id}.fits, identical to what was sent",
+     len(stored_a) == 1 and stored_a[0].read_bytes() == DATA_A and stored_a[0].parent.name == OWNER_UID
+     and not list(RELAY.glob(f"{FD_ID}/*/{FA}.fits.part")), str(stored_a))
+status, got = front("POST", f"/projects/{FD_ID}/frames/{FA}/complete", {"etags": etag_list(sent_a)}, token=OWNER_GRANT)
+case("complete again is idempotent: already_complete", status == 200 and got.get("already_complete") is True and got.get("status") == "uploaded")
+rows = [c for c in feed_since(FEED1)["changes"] if c["kind"] == "frame"]
+case("the hub's feed carries a frame row, key project_id/frame_id, once",
+     [c["key"] for c in rows] == [f"{FD_ID}/{FA}"], str(rows))
+status, _, _ = put_part(urls_a[1], DATA_A[:100])
+case("a part PUT to a completed upload is refused (403)", status == 403, str(status))
+status, got = init_for(DATA_A, "M33_Ha_0001.fits")
+case("init with the hash of an uploaded frame: 409 duplicate, with the caller's existing_frame",
+     status == 409 and got.get("code") == "duplicate" and got.get("status") == "uploaded"
+     and got.get("existing_frame", {}).get("frame_id") == FA and conforms("ErrorResponse", got), f"{status} {got}")
+status, got = init_for(DATA_A, "M33_Ha_0001.fits", token=JOINED_GRANT)
+case("...another member sees 409 duplicate without existing_frame",
+     status == 409 and got.get("code") == "duplicate" and "existing_frame" not in got, f"{status} {got}")
+
+# -- B: the plugin's byte layout (UploadEngine): four parts in parallel, no Authorization, quoted ETags back
+DATA_B = fits_bytes(3 * PART + 12345, 2)
+status, init_b = init_for(DATA_B, "M33_Ha_0002.fits")
+up_b = init_b["upload"]
+todo = sorted(up_b["part_urls"], key=lambda p: p["part_number"])
+
+
+def plugin_part(p):
+    offset = (p["part_number"] - 1) * up_b["part_size"]       # UploadEngine: (PartNumber - 1) * PartSize
+    status_, headers_, _ = put_part(p["url"], DATA_B[offset:offset + p["size"]])
+    return p["part_number"], status_, headers_.get("ETag")
+
+
+with _Pool(4) as pool:
+    part_results = list(pool.map(plugin_part, todo))
+case("the plugin's layout: parts at (n-1)*part_size, 4 in parallel, each answered with a quoted ETag",
+     len(part_results) == 4 and all(s == 200 and e and e.startswith('"') and e.endswith('"') for _, s, e in part_results), str(part_results))
+status, got = front("POST", f"/projects/{FD_ID}/frames/{init_b['frame_id']}/complete",
+                    {"etags": etag_list({n: e for n, _, e in part_results})}, token=OWNER_GRANT)
+stored_b = list(RELAY.glob(f"{FD_ID}/*/{init_b['frame_id']}.fits"))
+case("...completes with the ETags exactly as the PUTs returned them; the file is byte-identical",
+     status == 200 and got.get("status") == "uploaded" and len(stored_b) == 1 and stored_b[0].read_bytes() == DATA_B,
+     f"{status} {got}")
+
+# -- C: refusals
+DATA_C = b"this is not a FITS file at all " * 40
+status, init_c = init_for(DATA_C, "notfits.fits")
+put_part(init_c["upload"]["part_urls"][0]["url"], DATA_C)
+sent_c = {1: '"' + _hl.md5(DATA_C).hexdigest() + '"'}
+status, got = front("POST", f"/projects/{FD_ID}/frames/{init_c['frame_id']}/complete", {"etags": etag_list(sent_c)}, token=OWNER_GRANT)
+case("bytes that do not start like a FITS file are refused at complete (400 validation_failed)",
+     status == 400 and got.get("code") == "validation_failed" and conforms("ErrorResponse", got), f"{status} {got}")
+status, got = front("GET", f"/projects/{FD_ID}/frames/{init_c['frame_id']}", token=OWNER_GRANT)
+case("...and the frame is gone, its file with it",
+     got.get("code") == "not_found" and not list(RELAY.glob(f"{FD_ID}/*/{init_c['frame_id']}*")), f"{status} {got}")
+DATA_X = b"XISF0100" + b"\0" * 200
+status, init_x = init_for(DATA_X, "scan.xisf")
+put_part(init_x["upload"]["part_urls"][0]["url"], DATA_X)
+status, got = front("POST", f"/projects/{FD_ID}/frames/{init_x['frame_id']}/complete",
+                    {"etags": etag_list({1: '"' + _hl.md5(DATA_X).hexdigest() + '"'})}, token=OWNER_GRANT)
+case("an XISF file passes its magic check", status == 200 and got.get("status") == "uploaded", f"{status} {got}")
+DATA_T = fits_bytes(5000, 3)
+status, init_t = init_for(DATA_T, "short.fits")
+put_part(init_t["upload"]["part_urls"][0]["url"], DATA_T)
+for part_file in RELAY.glob(f"{FD_ID}/*/{init_t['frame_id']}.fits.part"):
+    part_file.write_bytes(part_file.read_bytes()[:4000])
+status, got = front("POST", f"/projects/{FD_ID}/frames/{init_t['frame_id']}/complete",
+                    {"etags": etag_list({1: '"' + _hl.md5(DATA_T).hexdigest() + '"'})}, token=OWNER_GRANT)
+case("a stored file that is not the declared size: 409 size_mismatch, and the frame is removed",
+     status == 409 and got.get("code") == "size_mismatch"
+     and front("GET", f"/projects/{FD_ID}/frames/{init_t['frame_id']}", token=OWNER_GRANT)[1].get("code") == "not_found", f"{status} {got}")
+status, got = init_for(fits_bytes(100, 4), header=dict(header_for(), SITELAT=51.5))
+case("a header with SITELAT is refused: 400 header_rejected, the card not echoed back",
+     status == 400 and got.get("code") == "header_rejected" and "51.5" not in json.dumps(got), f"{status} {got}")
+status, got = init_for(fits_bytes(100, 5), header=header_for(IMAGETYP="Snapshot"))
+case("an IMAGETYP that is no frame type: 400 unsupported_frame_type", status == 400 and got.get("code") == "unsupported_frame_type", f"{status} {got}")
+status, got = init_for(fits_bytes(100, 6), header=header_for(EXPTIME=1.0))
+case("a light under the project's minimum exposure: 409 policy_violation (below_min_exposure)",
+     status == 409 and got.get("code") == "policy_violation" and got.get("reason") == "below_min_exposure", f"{status} {got}")
+status, got = front("POST", f"/projects/{FD_ID}/frames/init", {"sha256": "zz", "size": 0, "filename": "x.txt", "header": {}}, token=OWNER_GRANT)
+case("a bad init body: 400 validation_failed with errors", status == 400 and got.get("code") == "validation_failed" and got.get("errors"), f"{status} {got}")
+status, got = front("POST", f"/projects/{FD_ID}/frames/init", {"sha256": "0" * 64, "size": 600 * 1024 * 1024, "filename": "x.fits", "header": {}}, token=OWNER_GRANT)
+case("a frame over 512 MiB: 400 frame_too_large", status == 400 and got.get("code") == "frame_too_large", f"{status} {got}")
+status, got = init_for(fits_bytes(100, 7), token=SECOND_GRANT)
+case("a grant for another project is token_scope", status == 401 and got.get("code") == "token_scope", f"{status} {got}")
+status, got = call("POST", f"{API}/projects/{FD_ID}/frames/init", {}, token=None)
+case("no credential: 401 not_authenticated", status == 401 and got.get("code") == "not_authenticated")
+
+# -- D: the quotas
+DATA_D = fits_bytes(70000, 8)
+status, init_d = init_for(DATA_D, "d.fits")
+saved_floor = _files_mod.KEEP_FREE
+_files_mod.KEEP_FREE = 1 << 60
+try:
+    status, got = init_for(fits_bytes(5000, 9), "e.fits")
+    case("below the volume's KEEP_FREE floor: 429 quota_exceeded", status == 429 and got.get("code") == "quota_exceeded"
+         and got.get("quota") and conforms("ErrorResponse", got), f"{status} {got}")
+    status, got = init_for(DATA_D, "d.fits")
+    case("...but a resumed upload already holds its room: it still resumes", status == 200 and got.get("resumed") is True, f"{status} {got}")
+finally:
+    _files_mod.KEEP_FREE = saved_floor
+
+
+def set_quotas(**changes):
+    row = server_app.store.stack_project(FD_ID)
+    doc = row["doc"]
+    doc["quotas"] = {**doc["quotas"], **changes}
+    server_app.store.set_stack_project(FD_ID, row["hub"], doc)
+
+
+used = server_app.store._one("SELECT COUNT(*) AS n, SUM(size) AS b FROM stack_frames WHERE project_id = ? AND user_id = ?"
+                             " AND status NOT IN ('withdrawn', 'rejected')", FD_ID, OWNER_UID)
+set_quotas(contributor_max_frames=used["n"])
+status, got = init_for(fits_bytes(5000, 10), "f.fits")
+case("the per-contributor frame limit: 429 quota_exceeded, quota contributor_frames",
+     status == 429 and got.get("quota") == "contributor_frames", f"{status} {got}")
+set_quotas(contributor_max_frames=2000, contributor_max_bytes=used["b"] + 100)
+status, got = init_for(fits_bytes(5000, 11), "g.fits")
+case("the per-contributor byte limit: 429, quota contributor_bytes", status == 429 and got.get("quota") == "contributor_bytes", f"{status} {got}")
+set_quotas(contributor_max_bytes=60 * 1000 ** 3, project_max_bytes=used["b"] + 100)
+status, got = init_for(fits_bytes(5000, 12), "h.fits")
+case("the per-project byte limit: 429, quota project_bytes", status == 429 and got.get("quota") == "project_bytes", f"{status} {got}")
+set_quotas(project_max_bytes=2 * 1000 ** 4)
+status, got = init_for(fits_bytes(5000, 13), "i.fits")
+case("...and the limits lifted, the same init is taken", status == 200, f"{status} {got}")
+FI = got["frame_id"]
+status, got = front("GET", f"/projects/{FD_ID}/membership", token=OWNER_GRANT)
+case("membership usage counts frames still uploading", got["membership"]["usage"]["frames_used"] >= 4, str(got["membership"]["usage"]))
+
+# -- E: get, list
+status, got = front("GET", f"/projects/{FD_ID}/frames/{FA}", token=OWNER_GRANT)
+case("frames/{id} returns the frame (uploaded, no verdict yet), validating against FrameResponse",
+     status == 200 and got["frame"]["status"] == "uploaded" and got["frame"]["filter"] == "HA"
+     and got["frame"]["reject_reason"] is None and got["frame"]["sha256"] == _hl.sha256(DATA_A).hexdigest()
+     and conforms("FrameResponse", got), f"{status} {why('FrameResponse', got)}")
+status, got = front("GET", f"/projects/{FD_ID}/frames/{FA}", token=JOINED_GRANT)
+case("a contributor cannot read another's frame: 400 not_found", status == 400 and got.get("code") == "not_found")
+status, got = front("GET", f"/projects/{FD_ID}/frames/frm_nonsense", token=OWNER_GRANT)
+case("a malformed frame id: 400 not_found", status == 400 and got.get("code") == "not_found")
+status, got = front("GET", f"/projects/{FD_ID}/frames?mine=1", token=OWNER_GRANT)
+ids_mine = [f["frame_id"] for f in got.get("frames", [])]
+case("the list is the caller's own, newest first, validating against FrameListResponse",
+     status == 200 and ids_mine == sorted(ids_mine, reverse=True) and FA in ids_mine and conforms("FrameListResponse", got)
+     and all("contributor" not in f for f in got["frames"]), f"{status} {why('FrameListResponse', got)}")
+status, got = front("GET", f"/projects/{FD_ID}/frames", token=JOINED_GRANT)
+case("a contributor's list is forced to their own (none yet)", status == 200 and got["frames"] == [])
+status, got = front("GET", f"/projects/{FD_ID}/frames?status=uploaded&limit=1", token=OWNER_GRANT)
+case("status filter and paging: one frame and a cursor", len(got["frames"]) == 1 and got["next_cursor"]
+     and got["frames"][0]["status"] == "uploaded", str(got)[:200])
+status, page2 = front("GET", f"/projects/{FD_ID}/frames?status=uploaded&limit=1&cursor={got['next_cursor']}", token=OWNER_GRANT)
+case("...the cursor leads to the next, older one", page2["frames"] and page2["frames"][0]["frame_id"] < got["frames"][0]["frame_id"])
+status, got = front("GET", f"/projects/{FD_ID}/frames?contributor=Bobby", token=JOINED_GRANT)
+case("another member's frames by name need a maintainer: 401 not_maintainer", status == 401 and got.get("code") == "not_maintainer", f"{status} {got}")
+status, got = front("GET", f"/projects/{FD_ID}/frames?limit=0", token=OWNER_GRANT)
+case("limit 0: 400 validation_failed", status == 400 and got.get("code") == "validation_failed")
+status, got = front("GET", f"/projects/{FD_ID}/frames?filter=HA", token=OWNER_GRANT)
+case("the filter filter", got["frames"] and all(f["filter"] == "HA" for f in got["frames"]))
+OWNER_NAME = server_app.store._one("SELECT doc FROM stack_members WHERE project_id = ? AND user_id = ?", FD_ID, OWNER_UID)
+OWNER_NAME = json.loads(OWNER_NAME["doc"])["display_name"]
+set_role(JOINER_UID, "maintainer")
+try:
+    status, got = front("GET", f"/projects/{FD_ID}/frames", token=JOINED_GRANT)
+    case("a maintainer sees everyone's frames, naming the contributor by display name",
+         status == 200 and got["frames"] and all(f.get("contributor") == OWNER_NAME for f in got["frames"])
+         and conforms("FrameListResponse", got), f"{status} {str(got)[:300]}")
+    status, got = front("GET", f"/projects/{FD_ID}/frames?contributor={OWNER_NAME.upper()}", token=JOINED_GRANT)
+    case("...?contributor=<display name> pages through one member's frames (any case)",
+         status == 200 and len(got["frames"]) >= 2, f"{status} {got}")
+    status, got = front("GET", f"/projects/{FD_ID}/frames?contributor=nobody", token=JOINED_GRANT)
+    case("...an unknown name gives an empty list", status == 200 and got["frames"] == [])
+    status, got = front("GET", f"/projects/{FD_ID}/frames?mine=1", token=JOINED_GRANT)
+    case("...mine=1 still means their own", got["frames"] == [])
+    status, got = front("GET", f"/projects/{FD_ID}/frames/{FA}", token=JOINED_GRANT)
+    case("...and reads any frame", status == 200 and got["frame"]["frame_id"] == FA)
+finally:
+    set_role(JOINER_UID, "contributor")
+
+# -- F: withdraw
+status, got = front("POST", f"/projects/{FD_ID}/frames/{FI}/withdraw", token=JOINED_GRANT)
+case("another contributor cannot withdraw it: 400 not_found", status == 400 and got.get("code") == "not_found")
+status, got = front("POST", f"/projects/{FD_ID}/frames/{FI}/withdraw", token=OWNER_GRANT)
+case("withdrawing an uploading frame aborts it: withdrawn, file and parts gone, validating against WithdrawResponse",
+     status == 200 and got.get("status") == "withdrawn" and conforms("WithdrawResponse", got)
+     and not list(RELAY.glob(f"{FD_ID}/*/{FI}*")), f"{status} {why('WithdrawResponse', got)}")
+status, got = front("POST", f"/projects/{FD_ID}/frames/{FI}/withdraw", token=OWNER_GRANT)
+case("...and it is idempotent", status == 200 and got.get("status") == "withdrawn")
+status, got = init_for(fits_bytes(5000, 13), "i.fits")
+case("...a withdrawn frame no longer blocks its hash", status == 200 and got["frame_id"] != FI and got["resumed"] is False)
+FEED2 = feed_since(0)["seq"]
+status, got = front("POST", f"/projects/{FD_ID}/frames/{init_b['frame_id']}/withdraw", token=OWNER_GRANT)
+case("withdrawing an uploaded frame: withdrawn, raw deleted after seven days",
+     status == 200 and got["status"] == "withdrawn" and got["raw_delete_after"] > time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() + 6 * 86400))
+     and got["raw_delete_after"] < time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() + 8 * 86400)), f"{status} {got}")
+case("...and the hub is told (a frame row)",
+     [c["key"] for c in feed_since(FEED2)["changes"] if c["kind"] == "frame"] == [f"{FD_ID}/{init_b['frame_id']}"])
+status, got = front("GET", f"/projects/{FD_ID}/frames/{init_b['frame_id']}", token=OWNER_GRANT)
+case("...the frame reads back withdrawn", got["frame"]["status"] == "withdrawn")
+status, got = front("POST", f"/projects/{FD_ID}/frames/{init_b['frame_id']}/complete", {"etags": etag_list(sent_a)}, token=OWNER_GRANT)
+case("completing a withdrawn frame: 409 frame_state", status == 409 and got.get("code") == "frame_state" and got.get("status") == "withdrawn", f"{status} {got}")
+set_role(JOINER_UID, "maintainer")
+status, got = front("POST", f"/projects/{FD_ID}/frames/{FA}/withdraw", token=JOINED_GRANT)
+set_role(JOINER_UID, "contributor")
+case("a maintainer may withdraw anyone's frame", status == 200 and got["status"] == "withdrawn", f"{status} {got}")
+
+# -- G: the sweep of expired uploads
+DATA_S = fits_bytes(9000, 14)
+status, init_s = init_for(DATA_S, "s.fits")
+put_part(init_s["upload"]["part_urls"][0]["url"], DATA_S)
+case("an upload in progress holds a partial file", len(list(RELAY.glob(f"{FD_ID}/*/{init_s['frame_id']}.fits.part"))) == 1)
+case("a sweep now leaves it alone", FRONT.frames.sweep() == 0)
+case("a sweep four days later aborts it: row, parts and file gone",
+     FRONT.frames.sweep(time.time() + 4 * 86400) >= 1
+     and front("GET", f"/projects/{FD_ID}/frames/{init_s['frame_id']}", token=OWNER_GRANT)[1].get("code") == "not_found"
+     and not list(RELAY.glob(f"{FD_ID}/*/{init_s['frame_id']}*"))
+     and not server_app.store._all("SELECT 1 FROM stack_parts WHERE upload_id = ?", init_s["upload"]["upload_id"]))
+case("the sweep thread is installed", any(t.name == "stack-sweep" for t in threading.enumerate()))
+
+# -- H: the rig library (D001: this server's library serves hub projects only)
+RID = rig["rig_id"]
+LIB = f"/rigs/{RID}/library"
+
+
+def lib_header(**more):
+    return {"IMAGETYP": "Dark", "EXPTIME": 300.0, "GAIN": 100, "OFFSET": 50, "XBINNING": 1, "SET-TEMP": -10.0,
+            "INSTRUME": "ASI2600MM Pro", "DATE-OBS": "2026-10-19T10:00:00.000", "NAXIS1": 6248, "NAXIS2": 4176, **more}
+
+
+def lib_init(data, name="dark.fits", token=OWNER_GRANT, rig_id=RID, **changes):
+    body = {"sha256": _hl.sha256(data).hexdigest(), "size": len(data), "filename": name,
+            "header": lib_header(), "stripped": True}
+    body.update(changes)
+    return front("POST", f"/rigs/{rig_id}/library/frames/init", body, token=token)
+
+
+status, got = front("GET", LIB, token=OWNER_GRANT)
+case("an empty library: usage, no frames, no masters, validating against LibraryResponse",
+     status == 200 and got["frames"] == [] and got["masters"] == [] and got["built_at"] is None
+     and got["usage"] == {"bytes_used": 0, "frames_used": 0, "max_bytes": 30 * 1024 ** 3, "max_frames": 1500}
+     and conforms("LibraryResponse", got), f"{status} {why('LibraryResponse', got)}")
+status, got = front("GET", LIB, token=JOINED_GRANT)
+case("a rig that is not yours: 400 not_found", status == 400 and got.get("code") == "not_found")
+DATA_L = fits_bytes(20000, 20)
+status, got = lib_init(DATA_L, stripped=False)
+case("a library frame must be stripped: 400 strip_required", status == 400 and got.get("code") == "strip_required", f"{status} {got}")
+status, got = lib_init(DATA_L, header=lib_header(SITELAT=1))
+case("...a location card: 400 header_rejected", status == 400 and got.get("code") == "header_rejected")
+status, got = lib_init(DATA_L, header=lib_header(IMAGETYP="Light"))
+case("...a light: 400 unsupported_frame_type", status == 400 and got.get("code") == "unsupported_frame_type", f"{status} {got}")
+status, got = lib_init(DATA_L, header=lib_header(IMAGETYP="Flat"))
+case("...a flat never comes from the library: 400 unsupported_frame_type", status == 400 and got.get("code") == "unsupported_frame_type")
+status, got = lib_init(DATA_L, header=lib_header(INSTRUME="Other camera"))
+case("...a header naming another camera: 400 validation_failed", status == 400 and got.get("code") == "validation_failed")
+status, got = lib_init(DATA_L, header=lib_header(XBINNING=2))
+case("...another binning: 400 validation_failed", status == 400 and got.get("code") == "validation_failed")
+status, got = lib_init(DATA_L)
+lib_up = got.get("upload") or {}
+case("library init: a multipart upload, status uploading, the rig and a dark, validating against LibraryFrameInitResponse",
+     status == 200 and got.get("status") == "uploading" and got.get("frame_type") == "dark" and got.get("rig_id") == RID
+     and lib_up.get("part_count") == 1 and conforms("LibraryFrameInitResponse", got), f"{status} {why('LibraryFrameInitResponse', got)} {str(got)[:200]}")
+LF = got["frame_id"]
+status, headers, _ = put_part(lib_up["part_urls"][0]["url"], DATA_L)
+case("library part URLs are absolute on the public origin too",
+     all(p["url"].startswith(BASE + "/stack/s3/") for p in lib_up["part_urls"]))
+case("a library part PUT is the same route", status == 200 and headers.get("ETag") == '"' + _hl.md5(DATA_L).hexdigest() + '"')
+status, got = lib_init(DATA_L)
+case("library init again resumes", status == 200 and got.get("resumed") is True and got["frame_id"] == LF
+     and [p["part_number"] for p in got["upload"]["completed_parts"]] == [1] and got["upload"]["part_urls"] == [])
+status, got = front("POST", f"{LIB}/frames/{LF}/complete", {"etags": [{"part_number": 1, "etag": "x"}]}, token=OWNER_GRANT)
+case("library complete with a wrong ETag: 400 bad_etags", status == 400 and got.get("code") == "bad_etags")
+status, got = front("POST", f"{LIB}/frames/{LF}/complete", {"etags": [{"part_number": 1, "etag": headers["ETag"]}]}, token=JOINED_GRANT)
+case("...another user cannot complete it (400 not_found)", status == 400 and got.get("code") == "not_found")
+status, got = front("POST", f"{LIB}/frames/{LF}/complete", {"etags": [{"part_number": 1, "etag": headers["ETag"]}]}, token=OWNER_GRANT)
+case("library complete: ready, validating against LibraryFrameCompleteResponse",
+     status == 200 and got.get("status") == "ready" and got.get("already_complete") is False
+     and conforms("LibraryFrameCompleteResponse", got), f"{status} {why('LibraryFrameCompleteResponse', got)}")
+lib_files = list(RELAY.glob(f"lib/{OWNER_UID}/{RID}/{LF}.fits"))
+case("...the file sits under relay/lib/{collab user}/{rig}/", len(lib_files) == 1 and lib_files[0].read_bytes() == DATA_L)
+status, got = front("POST", f"{LIB}/frames/{LF}/complete", {"etags": [{"part_number": 1, "etag": headers["ETag"]}]}, token=OWNER_GRANT)
+case("...and complete again is already_complete", got.get("already_complete") is True and got.get("status") == "ready")
+status, got = lib_init(DATA_L)
+case("the same hash again: 409 duplicate (no existing_frame)", status == 409 and got.get("code") == "duplicate" and "existing_frame" not in got)
+status, got = front("GET", LIB, token=OWNER_GRANT)
+lf = (got.get("frames") or [{}])[0]
+case("the library lists it with its settings, and the usage counts it",
+     status == 200 and lf.get("frame_id") == LF and lf.get("status") == "ready" and lf.get("exposure_s") == 300.0
+     and lf.get("gain") == 100 and lf.get("binning") == 1 and lf.get("set_temp_c") == -10.0
+     and got["usage"]["frames_used"] == 1 and got["usage"]["bytes_used"] == len(DATA_L) and conforms("LibraryResponse", got),
+     f"{status} {why('LibraryResponse', got)} {got}")
+case("the hub is told of the library frame (kind library, key user/rig/frame)",
+     f"{OWNER_UID}/{RID}/{LF}" in [c["key"] for c in feed_since(FEED2)["changes"] if c["kind"] == "library"])
+DATA_L2 = fits_bytes(300, 21)
+status, got = lib_init(DATA_L2, "bias.fits", header=lib_header(IMAGETYP="Bias", EXPTIME=0.0))
+LF2 = got["frame_id"]
+status, got = front("POST", f"{LIB}/frames/{LF2}/withdraw", token=OWNER_GRANT)
+case("withdrawing an uploading library frame aborts it", status == 200 and got["status"] == "withdrawn"
+     and conforms("WithdrawResponse", got) and not list(RELAY.glob(f"lib/*/*/{LF2}*")))
+status, got = front("POST", f"{LIB}/frames/{LF}/withdraw", token=OWNER_GRANT)
+case("withdrawing a ready one: withdrawn, and the usage is released",
+     status == 200 and got["status"] == "withdrawn" and front("GET", LIB, token=OWNER_GRANT)[1]["usage"]["frames_used"] == 0)
+status, got = front("POST", f"{LIB}/frames/{LF}/withdraw", token=OWNER_GRANT)
+case("...idempotent", status == 200 and got["status"] == "withdrawn")
+status, got = front("POST", f"{LIB}/frames/{LF}/withdraw", token=JOINED_GRANT)
+case("...another user cannot (400 not_found)", status == 400 and got.get("code") == "not_found")
+status, got = front("GET", LIB, token=OWNER_GRANT)
+case("the library no longer lists a withdrawn frame", all(f["frame_id"] != LF for f in got["frames"]))
+DATA_L3 = fits_bytes(400, 22)
+status, got = lib_init(DATA_L3, "old.fits")
+LF3 = got["frame_id"]
+case("a library frame upload also expires after three days (swept)",
+     FRONT.library.sweep() == 0 and FRONT.library.sweep(time.time() + 4 * 86400) == 1
+     and server_app.store._one("SELECT 1 AS x FROM stack_library WHERE frame_id = ?", LF3) is None)
+
+# -- the hub's view never carries a Starfront id
+disk = " ".join(str(p) for p in RELAY.rglob("*"))
+everything = json.dumps([server_app.store._all("SELECT * FROM stack_frames"), server_app.store._all("SELECT * FROM stack_library"),
+                         feed_since(FEED1)["changes"]]) + disk
+case("no Starfront or Discord id appears in a frame row, a library row, a relay path or the feed",
+     not any(f'"{sid}"' in everything or f"/{sid}/" in everything for sid in ("1002", JOINED_ID)), "")
+
+# ------------------------------------------- live stacking: relay
+# What the hub fetches: its projects' uploaded frames, ranged bytes, ack, and
+# the deletion of relay copies (server/stack/relay.py).
+print("\n-- live stacking: relay --")
+
+BHB, BHBTOK = reg_b["hubId"], reg_b["hubToken"]
+KEEP_ENV = "STARFRONT_STACK_RELAY_KEEP_DAYS"
+
+
+def raw_call(method, path, token=None, headers=None):
+    request = urllib.request.Request(f"{BASE}{path}", method=method,
+                                     headers={**({"Authorization": f"Bearer {token}"} if token else {}), **(headers or {})})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.status, response.headers, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers, exc.read()
+
+
+def upload_frame(data, name):
+    status, got = init_for(data, name)
+    assert status == 200, got
+    etags = {}
+    for part in got["upload"]["part_urls"]:
+        n = part["part_number"]
+        lo = (n - 1) * PART
+        etags[n] = put_part(part["url"], data[lo:lo + part["size"]])[1].get("ETag", "")
+    status, done = front("POST", f"/projects/{FD_ID}/frames/{got['frame_id']}/complete",
+                         {"etags": etag_list(etags)}, token=OWNER_GRANT)
+    assert status == 200, done
+    return got["frame_id"]
+
+
+def listed(hub=BH, tok=BHTOK, query="state=uploaded&limit=500"):
+    status, got = call("GET", f"/api/v1/hubs/{hub}/frames?{query}", token=tok)
+    return status, got.get("frames", [])
+
+
+def relay_path(frame_id):
+    return RELAY / server_app.store._one("SELECT path FROM stack_frames WHERE frame_id = ?", frame_id)["path"]
+
+
+def ack(frame_id, data, hub=BH, tok=BHTOK, kind=""):
+    return call("POST", f"/api/v1/hubs/{hub}/frames/{frame_id}/ack{kind}", {"sha256": _hl.sha256(data).hexdigest()}, token=tok)
+
+
+def collected_names():
+    return [f["name"] for f in call("GET", f"/api/v1/projects/{HUBP}/files", token=BOBH)[1]["files"]]
+
+
+os.environ.pop(KEEP_ENV, None)
+DATA_B = fits_bytes(2 * PART + 1000, 40)       # three parts, so a range can cross a boundary
+FB = upload_frame(DATA_B, "relay_big.fits")
+status, mine_list = listed()
+ours = [f for f in mine_list if f["project_id"] == FD_ID]
+case("a hub lists uploaded frames of its projects, oldest first",
+     status == 200 and ours and len(ours) == len(mine_list)
+     and [f["frame_id"] for f in mine_list] == [r["frame_id"] for r in server_app.store._all(
+         "SELECT frame_id FROM stack_frames WHERE status = 'uploaded' AND project_id = ? ORDER BY received, frame_id", FD_ID)],
+     f"{status} {len(mine_list)}")
+rec = next((f for f in mine_list if f["frame_id"] == FB), {})
+case("...each record has the contract's fields plus the user, header, stripped and rig",
+     all(k in rec for k in ("frame_id", "project_id", "user_id", "filter", "size", "sha256", "filename", "header",
+                            "uploaded_at", "rig_id", "stripped", "frame_type"))
+     and rec["user_id"] == OWNER_UID and rec["sha256"] == _hl.sha256(DATA_B).hexdigest()
+     and rec["header"].get("FILTER") == "Ha" and rec["stripped"] is True, str(rec)[:300])
+status, other = listed(BHB, BHBTOK)
+case("another hub's token lists none of them", status == 200 and other == [])
+case("a hub token only speaks for its own hub id: 401", listed(BH, BHBTOK)[0] == 401)
+case("another hub's bytes request: 404", raw_call("GET", f"/api/v1/hubs/{BHB}/frames/{FB}/bytes", BHBTOK)[0] == 404)
+case("bytes without a token: 401", raw_call("GET", f"/api/v1/hubs/{BH}/frames/{FB}/bytes")[0] == 401)
+status, headers, body = raw_call("GET", f"/api/v1/hubs/{BH}/frames/{FB}/bytes", BHTOK, {"Range": "bytes=0-99"})
+case("bytes with Range: bytes=0-99 answer 206 with Content-Range and the right slice",
+     status == 206 and body == DATA_B[:100] and headers.get("Content-Range") == f"bytes 0-99/{len(DATA_B)}",
+     f"{status} {headers.get('Content-Range')} {len(body)}")
+status, headers, body = raw_call("GET", f"/api/v1/hubs/{BH}/frames/{FB}/bytes", BHTOK, {"Range": f"bytes={PART - 5}-{PART + 4}"})
+case("...a slice across a part boundary is right too", status == 206 and body == DATA_B[PART - 5:PART + 5])
+status, headers, body = raw_call("GET", f"/api/v1/hubs/{BH}/frames/{FB}/bytes", BHTOK, {"Range": f"bytes={len(DATA_B) - 10}-"})
+case("...and an open-ended range reaches the end", status == 206 and body == DATA_B[-10:])
+status, headers, body = raw_call("GET", f"/api/v1/hubs/{BH}/frames/{FB}/bytes", BHTOK)
+case("the full download matches the sha256", status == 200 and _hl.sha256(body).hexdigest() == rec["sha256"])
+status, got = call("POST", f"/api/v1/hubs/{BH}/frames/{FB}/ack", {"sha256": "0" * 64}, token=BHTOK)
+case("ack with a wrong sha256: 409, still listed", status == 409 and any(f["frame_id"] == FB for f in listed()[1]))
+case("another hub cannot ack it: 404", ack(FB, DATA_B, BHB, BHBTOK)[0] == 404)
+before = feed_since(0)["seq"]
+status, got = ack(FB, DATA_B)
+row_a = server_app.store._one("SELECT * FROM stack_frames WHERE frame_id = ?", FB)
+case("ack with the right sha256: relayed (a timestamp), no longer listed, no feed row",
+     status == 200 and row_a["relayed"] > 0 and all(f["frame_id"] != FB for f in listed()[1])
+     and feed_since(0)["seq"] == before, f"{status} {got}")
+case("...the bytes are still there (default keep is seven days) and a repeated ack is fine",
+     (RELAY / row_a["path"]).is_file() and ack(FB, DATA_B)[0] == 200)
+
+# -- retention
+case("retention: a sweep now (seven days kept) deletes nothing of the relayed frame",
+     FRONT.relay.sweep() == 0 and (RELAY / row_a["path"]).is_file())
+case("...at eight days it is deleted, the row stays with its status",
+     FRONT.relay.sweep(time.time() + 8 * 86400) >= 1 and not (RELAY / row_a["path"]).exists()
+     and server_app.store._one("SELECT status FROM stack_frames WHERE frame_id = ?", FB)["status"] == "uploaded")
+case("...and its bytes are 404 afterwards", raw_call("GET", f"/api/v1/hubs/{BH}/frames/{FB}/bytes", BHTOK)[0] == 404)
+DATA_R = fits_bytes(5000, 31)
+FR = upload_frame(DATA_R, "keep0.fits")
+p_r = relay_path(FR)
+os.environ[KEEP_ENV] = "0"
+case("KEEP_DAYS=0: a sweep leaves an unrelayed frame alone and it is listed",
+     any(f["frame_id"] == FR for f in listed()[1]) and FRONT.relay.sweep() == 0 and p_r.is_file())
+os.environ.pop(KEEP_ENV)
+DATA_R2 = fits_bytes(5000, 32)
+FR2 = upload_frame(DATA_R2, "keep0b.fits")
+ack(FR2, DATA_R2)
+p_r2 = relay_path(FR2)
+os.environ[KEEP_ENV] = "0"
+case("KEEP_DAYS=0: the next sweep deletes a relayed frame's bytes and keeps its row",
+     p_r2.is_file() and FRONT.relay.sweep() == 1 and not p_r2.exists()
+     and server_app.store._one("SELECT status FROM stack_frames WHERE frame_id = ?", FR2) is not None)
+DATA_R3 = fits_bytes(5000, 33)
+FR3 = upload_frame(DATA_R3, "keep0c.fits")
+p_r3 = relay_path(FR3)
+ack(FR3, DATA_R3)
+case("...and with KEEP_DAYS=0 the ack itself deletes them", not p_r3.exists())
+os.environ.pop(KEEP_ENV)
+status, got = front("POST", f"/projects/{FD_ID}/frames/{FR}/withdraw", token=OWNER_GRANT)
+case("a withdrawn frame is no longer listed to the hub, and its bytes are refused",
+     status == 200 and all(f["frame_id"] != FR for f in listed()[1])
+     and raw_call("GET", f"/api/v1/hubs/{BH}/frames/{FR}/bytes", BHTOK)[0] == 404)
+case("...its bytes stay until raw_delete_after, then the sweep deletes them (row kept)",
+     p_r.is_file() and FRONT.relay.sweep() == 0 and FRONT.relay.sweep(time.time() + 8 * 86400) >= 1
+     and not p_r.exists() and server_app.store._one("SELECT status FROM stack_frames WHERE frame_id = ?", FR)["status"] == "withdrawn")
+
+# -- collectFiles
+call("PUT", f"/api/v1/projects/{HUBP}", {"collectFiles": True}, token=BOBH)
+DATA_C = fits_bytes(6000, 34)
+FC = upload_frame(DATA_C, "collect_Ha.fits")
+p_c = relay_path(FC)
+case("a collectFiles project's frame appears in /files at upload completion", "collect_Ha.fits" in collected_names(),
+     str(collected_names()))
+collected = list(Path(server_app.FILES_DIR).glob(f"{HUBP}/*/lights/collect_Ha.fits"))
+case("...as a file in the files layout holding the same bytes", len(collected) == 1 and collected[0].read_bytes() == DATA_C)
+ack(FC, DATA_C)
+os.environ[KEEP_ENV] = "0"
+FRONT.relay.sweep()
+os.environ.pop(KEEP_ENV)
+case("the relay copy is deleted but the collected file survives",
+     not p_c.exists() and collected[0].read_bytes() == DATA_C and collected_names().count("collect_Ha.fits") == 1)
+call("PUT", f"/api/v1/projects/{HUBP}", {"collectFiles": False}, token=BOBH)
+DATA_N = fits_bytes(3000, 35)
+FN = upload_frame(DATA_N, "not_collected.fits")
+case("a project that does not collect puts nothing in /files", "not_collected.fits" not in collected_names())
+call("PUT", f"/api/v1/projects/{HUBP}", {"collectFiles": True}, token=BOBH)
+ack(FN, DATA_N)
+case("...but one collecting from later on gets it at the ack", "not_collected.fits" in collected_names())
+
+# -- library frames
+DATA_LL = fits_bytes(7000, 36)
+status, got = lib_init(DATA_LL, "dark_relay.fits")
+LL = got["frame_id"]
+etag = put_part(got["upload"]["part_urls"][0]["url"], DATA_LL)[1]["ETag"]
+front("POST", f"{LIB}/frames/{LL}/complete", {"etags": [{"part_number": 1, "etag": etag}]}, token=OWNER_GRANT)
+status, libs = listed(query="kind=library")
+lrec = next((f for f in libs if f["frame_id"] == LL), {})
+case("library frames are listed with kind=library: owner, rig, sha256, header, and not among the project frames",
+     status == 200 and lrec.get("user_id") == OWNER_UID and lrec.get("rig_id") == RID
+     and lrec.get("sha256") == _hl.sha256(DATA_LL).hexdigest() and lrec.get("header", {}).get("IMAGETYP") == "Dark"
+     and all(f["frame_id"] != LL for f in listed()[1]), str(libs)[:300])
+case("...another hub (no project of that owner) sees none and gets 404 on the bytes",
+     listed(BHB, BHBTOK, "kind=library")[1] == []
+     and raw_call("GET", f"/api/v1/hubs/{BHB}/frames/{LL}/bytes?kind=library", BHBTOK)[0] == 404)
+status, headers, body = raw_call("GET", f"/api/v1/hubs/{BH}/frames/{LL}/bytes?kind=library", BHTOK, {"Range": "bytes=10-19"})
+case("...ranged bytes work for them", status == 206 and body == DATA_LL[10:20])
+case("a wrong sha256 on a library ack: 409",
+     call("POST", f"/api/v1/hubs/{BH}/frames/{LL}/ack?kind=library", {"sha256": "1" * 64}, token=BHTOK)[0] == 409)
+status, _ = ack(LL, DATA_LL, kind="?kind=library")
+case("a right one: relayed, no longer listed", status == 200 and all(f["frame_id"] != LL for f in listed(query="kind=library")[1]))
+p_l = RELAY / server_app.store._one("SELECT path FROM stack_library WHERE frame_id = ?", LL)["path"]
+case("...its bytes go after the keep period and the row stays",
+     p_l.is_file() and FRONT.relay.sweep() == 0 and FRONT.relay.sweep(time.time() + 8 * 86400) >= 1
+     and not p_l.exists() and server_app.store._one("SELECT 1 AS x FROM stack_library WHERE frame_id = ?", LL) is not None)
+
+# ------------------------------------------- live stacking: the schema
+print("\n-- live stacking: hub and stacking tables --")
+import sqlite3                                                   # noqa: E402
+from server import store as store_module                         # noqa: E402
+
+STACK_TABLES = {"hubs", "stack_projects", "stack_members", "stack_rigs",
+                "stack_frames", "stack_parts", "stack_library", "stack_changes",
+                "stack_identities", "stack_notified"}
+
+
+def tables_of(path):
+    link = sqlite3.connect(str(path))
+    try:
+        return {row[0] for row in link.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    finally:
+        link.close()
+
+
+fresh_path = Path(tempfile.mkdtemp()) / "fresh.db"
+fresh = store_module.Store(fresh_path)
+case("a fresh database has every hub and stacking table",
+     STACK_TABLES <= tables_of(fresh_path), str(STACK_TABLES - tables_of(fresh_path)))
+
+# A database from before this change: today's schema without the new tables,
+# holding a row that must survive being opened by the new code.
+old_path = Path(tempfile.mkdtemp()) / "old.db"
+link = sqlite3.connect(str(old_path))
+link.executescript(store_module.SCHEMA.split("-- Live stacking")[0])
+link.execute("INSERT INTO agents (id, token, name, created) VALUES"
+             " ('a1', 't1', 'Old rig', 1)")
+link.commit()
+case("the test's pre-change database really lacks the new tables",
+     not (STACK_TABLES & tables_of(old_path)))
+link.close()
+old = store_module.Store(old_path)
+case("opening a pre-change database adds the tables",
+     STACK_TABLES <= tables_of(old_path))
+case("...and keeps what was in it", (old.agent("a1") or {}).get("name") == "Old rig")
+old.close()
+again = store_module.Store(old_path)
+case("opening it a second time is harmless", (again.agent("a1") or {}).get("name") == "Old rig")
+again.close()
+
+made_hub = fresh.add_hub("hub_1", "u1", "Eddie's hub", "sfh_tok", "secret", "http://10.0.0.5:8790")
+case("a hub can be stored and read back",
+     made_hub["name"] == "Eddie's hub" and made_hub["status"] == {}
+     and fresh.hub("hub_1")["grant_secret"] == "secret" and fresh.hub("nope") is None)
+seqs = [fresh.append_change("hub_1", "project", "prj_a"),
+        fresh.append_change("hub_1", "member", "prj_a/u1"),
+        fresh.append_change("hub_2", "project", "prj_b")]
+case("stack_changes.seq only ever increases", seqs == sorted(set(seqs)) and seqs[0] >= 1, str(seqs))
+fresh._run("DELETE FROM stack_changes")
+case("...and is not reused after the rows are pruned", fresh.append_change("hub_1", "project", "x") > seqs[-1])
+fresh.close()
+
+# ------------------------------------------- the progress pages under /stack/
+print("\n-- the progress pages: routes, CSP, public artefacts --")
+
+
+def raw_get(path, method="GET"):
+    """(status, headers, body) without following redirects or raising."""
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):
+            return None
+    opener = urllib.request.build_opener(NoRedirect)
+    request = urllib.request.Request(f"{BASE}{path}", method=method)
+    try:
+        with opener.open(request, timeout=10) as response:
+            return response.status, response.headers, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers, exc.read()
+
+
+CSP_WANTED = ("default-src 'self'; script-src 'self'; style-src 'self'; "
+              "style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; "
+              "connect-src 'self'; frame-ancestors 'none'")
+for label, page, marker in (
+        ("the project page", "/stack/p/horsehead-sho", b"project-body"),
+        ("a filter page", "/stack/p/horsehead-sho/filter/HA@osc", b"filter-body"),
+        ("a filter page with an escaped stream key", "/stack/p/horsehead-sho/filter/HA%40osc", b"filter-body"),
+        ("the combined page", "/stack/p/horsehead-sho/combined", b"combined-body"),
+        ("the dashboard", "/stack/dashboard", b"dashboard-body")):
+    status, headers, body = raw_get(page)
+    case(f"{label} is HTML with the CSP",
+         status == 200 and headers.get("Content-Type", "").startswith("text/html")
+         and marker in body and headers.get("Content-Security-Policy") == CSP_WANTED
+         and headers.get("X-Content-Type-Options") == "nosniff",
+         f"{status} {headers.get('Content-Type')}")
+status, headers, _ = raw_get("/files/signin?next=/stack/dashboard")
+login_code = (headers.get("Location") or "").rpartition("code=")[2]
+case("/files/signin?next= returns to the dashboard after sign-in",
+     status == 303 and (server_app.store.login(login_code) or {}).get("back") == "/stack/dashboard", str(headers.get("Location")))
+for bad_next in ("//evil.example/x", "https://evil.example/", "/download", "/stack/../etc", "/stack\\x"):
+    status, headers, _ = raw_get("/files/signin?next=" + urllib.parse.quote(bad_next, safe=""))
+    code_ = (headers.get("Location") or "").rpartition("code=")[2]
+    case(f"...a next of {bad_next!r} falls back to /files", (server_app.store.login(code_) or {}).get("back") == "/files")
+status, headers, _ = raw_get("/stack/p/x")
+case("a slug that cannot exist is a 404 (still under the CSP)",
+     status == 404 and headers.get("Content-Security-Policy") == CSP_WANTED)
+status, headers, body = raw_get("/stack/js/pages/project.js")
+case("a page script is served as a script under the CSP",
+     status == 200 and b"parseProjectPath" in body and "javascript" in headers.get("Content-Type", "")
+     and headers.get("Content-Security-Policy") == CSP_WANTED, headers.get("Content-Type", ""))
+status, headers, body = raw_get("/stack/js/site-config.js")
+case("site-config.js points the pages at /stack/api and /stack/public",
+     status == 200 and b'"/stack/api"' in body and b'"/stack/public"' in body)
+status, headers, _ = raw_get("/stack/css/tokens.css")
+case("a stylesheet is served as CSS", status == 200 and "text/css" in headers.get("Content-Type", ""))
+status, headers, _ = raw_get("/stack/")
+case("/stack/ redirects somewhere useful", status == 302 and headers.get("Location", "").startswith("/"),
+     str(headers.get("Location")))
+
+PUB = DATA / "stack" / "public" / "prj_x"
+(PUB / "deepzoom" / "HA" / "g000001" / "image_files" / "0").mkdir(parents=True)
+(PUB / "HA" / "gold").mkdir(parents=True)
+(PUB / "status.json").write_text('{"schema_version": 1}')
+PNG = b"\x89PNG\r\n\x1a\n" + b"\0" * 16
+(PUB / "HA" / "gold" / "latest.png").write_bytes(PNG)
+(PUB / "deepzoom" / "HA" / "g000001" / "image.dzi").write_text("<Image/>")
+(PUB / "deepzoom" / "HA" / "g000001" / "image_files" / "0" / "0_0.jpg").write_bytes(b"\xff\xd8\xff")
+(DATA / "stack" / "secret.txt").write_text("not for the web")
+
+status, headers, body = raw_get("/stack/public/prj_x/status.json")
+case("a pushed status.json is served as JSON for a minute",
+     status == 200 and json.loads(body) == {"schema_version": 1}
+     and headers.get("Content-Type", "").startswith("application/json")
+     and headers.get("Cache-Control") == "public, max-age=60", str(headers.get("Cache-Control")))
+case("...under the CSP and nosniff", headers.get("Content-Security-Policy") == CSP_WANTED
+     and headers.get("X-Content-Type-Options") == "nosniff")
+status, headers, body = raw_get("/stack/public/prj_x/HA/gold/latest.png")
+case("a preview PNG is served as image/png for a minute",
+     status == 200 and body == PNG and headers.get("Content-Type") == "image/png"
+     and headers.get("Cache-Control") == "public, max-age=60")
+status, headers, body = raw_get("/stack/public/prj_x/deepzoom/HA/g000001/image_files/0/0_0.jpg")
+case("a deep-zoom tile is image/jpeg and immutable",
+     status == 200 and headers.get("Content-Type") == "image/jpeg"
+     and headers.get("Cache-Control") == "public, max-age=31536000, immutable")
+status, headers, _ = raw_get("/stack/public/prj_x/deepzoom/HA/g000001/image.dzi")
+case("...and its descriptor is XML and immutable",
+     status == 200 and headers.get("Content-Type") == "application/xml"
+     and "immutable" in headers.get("Cache-Control", ""))
+status, _, _ = raw_get("/stack/public/prj_x/HA/gold/latest.png", method="HEAD")
+case("HEAD works on a public file", status == 200)
+status, _, _ = raw_get("/stack/public/prj_x/missing.json")
+case("a missing public file is a 404", status == 404)
+status, _, _ = raw_get("/stack/public/prj_nobody/status.json")
+case("...and so is a project that has pushed nothing", status == 404)
+for label, bad in (("a dot-dot path", "/stack/public/prj_x/../secret.txt"),
+                   ("an encoded dot-dot", "/stack/public/prj_x/%2e%2e/secret.txt"),
+                   ("a dot-dot inside the folder", "/stack/public/prj_x/HA/../../secret.txt"),
+                   ("an encoded slash", "/stack/public/prj_x/..%2fsecret.txt"),
+                   ("a doubled slash (an absolute path)", "/stack/public/prj_x//etc/hosts"),
+                   ("a backslash", "/stack/public/prj_x/..%5csecret.txt"),
+                   ("a dot-dot as the project", "/stack/public/../secret.txt"),
+                   ("an encoded dot-dot as the project", "/stack/public/%2e%2e/secret.txt")):
+    status, _, body = raw_get(bad)
+    case(f"{label} is refused", status in (400, 404) and b"not for the web" not in body, str(status))
+
+status, headers, _ = raw_get("/download")
+case("/download is untouched: no CSP header", "Content-Security-Policy" not in headers
+     and status in (200, 404))
+status, headers, _ = raw_get("/sky")
+case("/sky has none either", "Content-Security-Policy" not in headers)
+status, headers, _ = raw_get("/api/v1/health")
+case("...nor does the API", "Content-Security-Policy" not in headers)
+
+# ------------------------------------------- live stacking: Discord notifications
+print("\n-- live stacking: Discord notifications --")
+import http.server                                                 # noqa: E402
+from server import notify as notify_module                         # noqa: E402
+from server.stack.projects import terms_version                   # noqa: E402
+
+REAL_POST = notify_module._post
+POSTS = []                 # (url, content) the fake poster was given
+MODE = {"fail": ""}        # "" | "raise" | "hang"
+
+
+def fake_post(url, content):
+    if MODE["fail"] == "raise":
+        raise OSError("connection refused")
+    if MODE["fail"] == "hang":
+        time.sleep(3)
+    POSTS.append((url, content))
+
+
+notify_module._post = fake_post     # nothing below may reach discord.com
+HOOK = "https://discord.com/api/webhooks/1234567890/tok_en-ABC"
+SFP = server_app.store.stack_project(FD_ID)["sf_project"]
+COLLAB = lambda: server_app.store.project(SFP)                     # noqa: E731
+
+for url, want in [(HOOK, True), ("", True), ("https://discordapp.com/api/webhooks/1/x", True),
+                  ("http://discord.com/api/webhooks/1/x", False),
+                  ("https://discord.com.evil.example/api/webhooks/1/x", False),
+                  ("https://evil.example/api/webhooks/1/x", False),
+                  ("https://discord.com/api/webhooks/abc/x", False),
+                  ("https://discord.com/api/webhooks/1/x?wait=true", False)]:
+    case(f"the webhook check: {url or 'blank'!r} is {'accepted' if want else 'refused'}",
+         notify_module.webhook_ok(url) is want)
+
+status, got = call("PUT", f"/api/v1/projects/{HUBP}", {"discordWebhookUrl": HOOK}, token=CAROL)
+case("a coordinator who does not own the collaboration cannot set the webhook",
+     status == 403 and COLLAB()["payload"].get("discordWebhookUrl") != HOOK, f"{status} {got}")
+status, got = call("PUT", f"/api/v1/projects/{HUBP}", {"discordWebhookUrl": "http://discord.com/api/webhooks/1/x"}, token=BOBH)
+case("the owner's webhook that is not Discord's: 400", status == 400, f"{status} {got}")
+status, got = call("PUT", f"/api/v1/projects/{HUBP}", {"discordWebhookUrl": HOOK}, token=BOBH)
+case("the owner saves a Discord webhook", status == 200 and COLLAB()["payload"].get("discordWebhookUrl") == HOOK,
+     f"{status} {str(got)[:120]}")
+status, got = call("PUT", f"/api/v1/projects/{HUBP}", {"notes": "Hub notes"}, token=BOBH)
+case("...and a later edit that leaves it out keeps it",
+     status == 200 and COLLAB()["payload"].get("discordWebhookUrl") == HOOK)
+status, got = call("POST", "/api/v1/projects", {"name": "Notify Create", "region": REGION,
+                   "discordWebhookUrl": "https://evil.example/x"}, token=BOBH)
+case("a bad webhook on a new collaboration: 400, nothing made", status == 400, f"{status} {got}")
+status, got = call("POST", "/api/v1/projects", {"name": "Notify Create", "region": REGION,
+                   "discordWebhookUrl": HOOK}, token=BOBH)
+CREATED = (got.get("project") or {}).get("id", "")
+case("a webhook given on a new collaboration is saved",
+     status == 200 and server_app.store.project(CREATED)["payload"].get("discordWebhookUrl") == HOOK)
+
+# Hidden from everybody but the owner: listings, reads, agents, the front door.
+status, listed = call("GET", "/api/v1/projects")
+case("the public project list has no webhook", status == 200 and HOOK not in json.dumps(listed)
+     and "discordWebhookUrl" not in json.dumps(listed))
+status, read = call("GET", f"/api/v1/projects/{HUBP}")
+case("a public read of the project has no webhook", status == 200 and "discordWebhookUrl" not in json.dumps(read))
+status, agent_list = call("GET", "/api/v1/agent/projects", token=OWNER_RIG)
+case("an agent listing (the owner's telescope too) has no webhook",
+     status == 200 and HOOK not in json.dumps(agent_list) and "discordWebhookUrl" not in json.dumps(agent_list))
+status, got = front("GET", f"/projects/{FD_ID}", token=OWNER_GRANT)
+case("the front door has no webhook, for the owner's grant either",
+     status == 200 and "discordWebhookUrl" not in json.dumps(got) and HOOK not in json.dumps(got))
+case("nor does the stacking project row",
+     HOOK not in json.dumps(server_app.store.stack_project(FD_ID)))
+
+# Joins: a new active membership posts once; a re-join and a retry post nothing.
+def joiner(sub, name):
+    return hubs_module.mint_grant({"id": BH, "grant_secret": BHSEC}, sub, name, "agent-x", FD_ID)
+
+
+JOIN_BODY = {"accepted_terms_version": terms_version()}
+POSTS.clear()
+status, got = front("POST", f"/projects/{FD_ID}/join", dict(JOIN_BODY, display_name="Notify One"),
+                    token=joiner("n-1", "Notify One"))
+notify_module.drain()
+MEMBER_ONE = (got.get("membership") or {}).get("user_id", "")
+case("a new member joins (200, active)", status == 200 and got["membership"]["status"] == "active", f"{status} {got}")
+case("the join posts once, to the webhook, with the display name",
+     POSTS == [(HOOK, f"Notify One joined {COLLAB()['name']} live stacking.")], str(POSTS))
+status, got = front("POST", f"/projects/{FD_ID}/join", dict(JOIN_BODY, display_name="Notify One"),
+                    token=joiner("n-1", "Notify One"))
+notify_module.drain()
+case("a second join of the same member is refused and posts nothing",
+     status == 409 and len(POSTS) == 1, f"{status} {got} {len(POSTS)}")
+notify_module.notify_member_joined(server_app.store, COLLAB(), "Notify One", member_id=MEMBER_ONE)
+notify_module.drain()
+case("a retried notification for that member posts nothing", len(POSTS) == 1)
+claims = server_app.store._one("SELECT COUNT(*) AS n FROM stack_notified WHERE project_id = ? AND event = 'member_joined'", SFP)
+case("the join is recorded once in stack_notified", claims and claims["n"] == 1, str(claims))
+
+# A webhook that hangs, or errors, never holds up or breaks the join.
+MODE["fail"] = "hang"
+started = time.time()
+status, got = front("POST", f"/projects/{FD_ID}/join", dict(JOIN_BODY, display_name="Notify Two"),
+                     token=joiner("n-2", "Notify Two"))
+took = time.time() - started
+case("a webhook that hangs does not hold up the join", status == 200 and took < 2.0, f"{status} {took:.2f}s")
+notify_module.drain()
+MODE["fail"] = ""
+case("...and the hung post still lands once it returns", POSTS[-1][1].startswith("Notify Two joined"), str(POSTS[-1:]))
+MODE["fail"] = "raise"
+status, got = front("POST", f"/projects/{FD_ID}/join", dict(JOIN_BODY, display_name="Notify Three"),
+                     token=joiner("n-3", "Notify Three"))
+notify_module.drain()
+MODE["fail"] = ""
+case("a webhook that errors does not break the join", status == 200 and got.get("ok") is True, f"{status} {got}")
+case("...and a failed post is not sent again", not any("Notify Three" in c for _, c in POSTS))
+
+# The real poster, against a local HTTP server: the body, the timeout and the errors.
+LOCAL_HITS = []
+
+
+class Local(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_POST(self):
+        size = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(size)
+        if self.path == "/hang":
+            time.sleep(8)
+            return
+        LOCAL_HITS.append((self.path, self.headers.get("Content-Type"), body))
+        self.send_response(500 if self.path == "/err" else 204)
+        self.end_headers()
+
+
+local_port = free_port()
+local = http.server.ThreadingHTTPServer(("127.0.0.1", local_port), Local)
+threading.Thread(target=local.serve_forever, daemon=True).start()
+LOCAL = f"http://127.0.0.1:{local_port}"
+notify_module._post = REAL_POST
+try:
+    REAL_POST(f"{LOCAL}/ok", "hello")
+    case("the poster sends {\"content\": ...} as JSON",
+         LOCAL_HITS and LOCAL_HITS[-1][1] == "application/json"
+         and json.loads(LOCAL_HITS[-1][2])["content"] == "hello", str(LOCAL_HITS[-1:]))
+    try:
+        REAL_POST(f"{LOCAL}/err", "x")
+        raised = False
+    except Exception:
+        raised = True
+    case("the poster raises on a 500 (and the caller swallows it)", raised)
+    started = time.time()
+    notify_module._deliver(f"{LOCAL}/hang", "x")
+    case("a hung webhook is given up after the 5 s timeout, without raising",
+         4.5 <= time.time() - started < 7.5, f"{time.time() - started:.2f}s")
+finally:
+    notify_module._post = fake_post
+    local.shutdown()
+
+# Gold integrations: once per (project, stream, gold_seq).
+POSTS.clear()
+notify_module.notify_gold_published(server_app.store, COLLAB(), "Ha", 3, 12.4, 4)
+notify_module.notify_gold_published(server_app.store, COLLAB(), "Ha", 3, 12.4, 4)
+notify_module.drain()
+case("a gold integration posts its message once",
+     POSTS == [(HOOK, "Gold integration 3 published for Ha: 12.4 h from 4 contributors.")], str(POSTS))
+notify_module.notify_gold_published(server_app.store, COLLAB(), "Ha", 4, 12.4, 4)
+notify_module.notify_gold_published(server_app.store, COLLAB(), "OIII", 3, 2.0, 1)
+notify_module.drain()
+case("a new gold_seq or stream is a new post", len(POSTS) == 3 and POSTS[-1][1].endswith("from 1 contributor."), str(POSTS))
+notify_module.notify_gold_published(server_app.store, {"id": "prj_nohook", "name": "Quiet", "payload": {}},
+                                    "Ha", 1, 1.0, 1)
+notify_module.drain()
+quiet = server_app.store._one("SELECT COUNT(*) AS n FROM stack_notified WHERE project_id = 'prj_nohook'")
+case("a collaboration with no webhook posts nothing and claims nothing", len(POSTS) == 3 and quiet["n"] == 0)
+
+# ------------------------------------------- live stacking: hub records
+# The full member and rig rows a hub reads for the keys in its feed
+# (server/stack/records.py), and the removal that reaches it.
+print("\n-- live stacking: hub records --")
+LEAVER_RIG, LEAVER_ID = enrol("records leaver", 389.0, 9576, 6388, 6.0)
+status, leaver_join = call("POST", f"/api/v1/agent/projects/{HUBP}/join", {}, token=LEAVER_RIG)
+LEAVER_GRANT = project_in_listing(LEAVER_RIG, HUBP)["stacking"]["grant"]
+status, got = front("GET", f"/projects/{FD_ID}", token=LEAVER_GRANT)
+terms_now = got["project"]["terms_version"]
+status, got = front("POST", f"/projects/{FD_ID}/join", {"display_name": "Leaver", "accepted_terms_version": terms_now,
+                    "filter_mapping": [{"raw": "Ha 7nm", "canonical": "HA"}], "code": FD_CODE.lower()}, token=LEAVER_GRANT)
+LEAVER_UID = (got.get("membership") or {}).get("user_id", "")
+status, got = front("POST", "/rigs", {"camera": "ASI294MC", "telescope": "RedCat 51", "focal_length_mm": 250,
+                    "pixel_size_um": 4.63, "binning": 1, "bayer_pattern": "RGGB"}, token=LEAVER_GRANT)
+LEAVER_RIGID = (got.get("rig") or {}).get("rig_id", "")
+case("setup: a second member with a rig, joined on the hub's project", bool(LEAVER_UID and LEAVER_RIGID), str(got)[:160])
+
+REC = f"/api/v1/hubs/{BH}/records"
+status, got = call("GET", f"{REC}/member/{FD_ID}/{LEAVER_UID}", token=BHTOK)
+case("a hub reads a member record: collab id, display name, role, status, mapping, terms, joined_at",
+     status == 200 and got.get("user_id") == LEAVER_UID and got.get("display_name") == "Leaver"
+     and got.get("role") == "contributor" and got.get("status") == "active"
+     and got.get("filter_mapping") == [{"raw": "Ha 7nm", "canonical": "HA"}]
+     and got.get("accepted_terms_version") == terms_now and got.get("joined_at"), f"{status} {got}")
+status, got = call("GET", f"{REC}/member/{FD_ID}/no-such-user", token=BHTOK)
+case("an unknown member is 404 with a plain detail", status == 404 and set(got) == {"detail"}, f"{status} {got}")
+status, got = call("GET", f"{REC}/member/prj_unbound00000000000/{LEAVER_UID}", token=BHTOK)
+case("a project that is not this hub's is 404", status == 404, f"{status} {got}")
+status, got = call("GET", f"/api/v1/hubs/{BHB}/records/member/{FD_ID}/{LEAVER_UID}", token=BHBTOK)
+case("another hub's token reads nothing of this hub's members", status == 404, f"{status} {got}")
+status, got = call("GET", f"{REC}/member/{FD_ID}/{LEAVER_UID}", token=BHBTOK)
+case("...and is refused on this hub's path", status == 401, f"{status} {got}")
+status, got = call("GET", f"{REC}/member/{FD_ID}/{LEAVER_UID}")
+case("no token is 401", status == 401, f"{status}")
+
+status, got = call("GET", f"{REC}/rig/{LEAVER_UID}/{LEAVER_RIGID}", token=BHTOK)
+case("a hub reads a member's rig",
+     status == 200 and got.get("rig_id") == LEAVER_RIGID and got.get("user_id") == LEAVER_UID
+     and got.get("camera") == "ASI294MC" and got.get("osc") is True and got.get("bayer_pattern") == "RGGB", f"{status} {got}")
+status, got = call("GET", f"/api/v1/hubs/{BHB}/records/rig/{LEAVER_UID}/{LEAVER_RIGID}", token=BHBTOK)
+case("another hub cannot read it", status == 404, f"{status} {got}")
+STRANGER = "00000000-0000-4000-8000-000000000001"
+server_app.store._run("INSERT INTO stack_rigs (user_id, rig_id, doc) VALUES (?, 'rig_000000000000', ?)",
+                      STRANGER, json.dumps({"rig_id": "rig_000000000000", "name": "x", "camera": "c", "telescope": "t",
+                                            "focal_length_mm": 1, "pixel_size_um": 1, "binning": 1, "created_at": "2026-01-01T00:00:00.000Z"}))
+status, got = call("GET", f"{REC}/rig/{STRANGER}/rig_000000000000", token=BHTOK)
+case("a rig whose owner is no member of the hub's projects is 404", status == 404, f"{status} {got}")
+
+status, got = call("POST", f"{REC}/batch", {"member": [[FD_ID, LEAVER_UID], [FD_ID, "nope"], ["prj_unbound00000000000", LEAVER_UID]],
+                                            "rig": [[LEAVER_UID, LEAVER_RIGID], [STRANGER, "rig_000000000000"]]}, token=BHTOK)
+case("the batch answers what it can and lists the rest as missing",
+     status == 200 and [m["user_id"] for m in got.get("member", [])] == [LEAVER_UID]
+     and [r["rig_id"] for r in got.get("rig", [])] == [LEAVER_RIGID] and len(got.get("missing", [])) == 3
+     and {"kind": "member", "key": f"{FD_ID}/nope"} in got["missing"], f"{status} {got}")
+status, got = call("POST", f"{REC}/batch", {"member": [[FD_ID, f"u{i}"] for i in range(201)]}, token=BHTOK)
+case("a batch over 200 keys is 400", status == 400 and set(got) == {"detail"}, f"{status} {str(got)[:100]}")
+status, got = call("POST", f"{REC}/batch", {"member": [["only-one"]]}, token=BHTOK)
+case("a malformed batch is 400", status == 400, f"{status}")
+status, got = call("POST", f"{REC}/batch", {"member": []}, token=BHBTOK)
+case("a batch with another hub's token is 401", status == 401, f"{status}")
+
+bodies = json.dumps([call("GET", f"{REC}/member/{FD_ID}/{LEAVER_UID}", token=BHTOK)[1],
+                     call("GET", f"{REC}/rig/{LEAVER_UID}/{LEAVER_RIGID}", token=BHTOK)[1],
+                     call("POST", f"{REC}/batch", {"member": [[FD_ID, LEAVER_UID]], "rig": [[LEAVER_UID, LEAVER_RIGID]]}, token=BHTOK)[1]])
+case("no Starfront or Discord id appears in any record body",
+     LEAVER_ID not in bodies and not any(sid in bodies for sid in ("1002", JOINED_ID)), "")
+
+before = feed_since(0)["seq"]
+task = (leaver_join.get("task") or {})
+status, _ = call("POST", f"/api/v1/agent/task/{task.get('id')}", {"state": "declined"}, token=LEAVER_RIG)
+rows = [r for r in feed_since(before)["changes"] if r["kind"] == "member"]
+case("a telescope leaving the collaboration appends a member feed row", status == 200
+     and [r["key"] for r in rows] == [f"{FD_ID}/{LEAVER_UID}"], f"{status} {rows}")
+status, got = call("GET", f"{REC}/member/{FD_ID}/{LEAVER_UID}", token=BHTOK)
+case("...and the record answers status removed, still with the real name",
+     status == 200 and got.get("status") == "removed" and got.get("display_name") == "Leaver" and got.get("removed_at"), f"{status} {got}")
+status, got = call("GET", f"{REC}/rig/{LEAVER_UID}/{LEAVER_RIGID}", token=BHTOK)
+case("...and its rig is no longer the hub's to read", status == 404, f"{status} {got}")
+before = feed_since(0)["seq"]
+status, _ = call("POST", f"/api/v1/agent/task/{task.get('id')}", {"state": "declined"}, token=LEAVER_RIG)
+case("declining again changes nothing", status == 200 and not [r for r in feed_since(before)["changes"] if r["kind"] == "member"])
+
+# Joining again undoes the Leave. On 2026-10-28 one press of the dock's Leave
+# took the backyard rig off the Bubble Nebula for good: it could not rejoin
+# (membership_removed) and a hand upload was refused (not_member).
+before = feed_since(0)["seq"]
+status, rejoin = call("POST", f"/api/v1/agent/projects/{HUBP}/join", {}, token=LEAVER_RIG)
+rows = [r for r in feed_since(before)["changes"] if r["kind"] == "member"]
+case("a telescope that left joins the collaboration again and the hub is told",
+     status == 200 and [r["key"] for r in rows] == [f"{FD_ID}/{LEAVER_UID}"], f"{status} {rows}")
+status, got = call("GET", f"{REC}/member/{FD_ID}/{LEAVER_UID}", token=BHTOK)
+case("...its stacking membership is active again, with no removal left on it",
+     status == 200 and got.get("status") == "active" and got.get("display_name") == "Leaver"
+     and not any(got.get(k) for k in ("removed_at", "removed_by", "frames_disposition")), f"{status} {got}")
+status, got = call("GET", f"{REC}/rig/{LEAVER_UID}/{LEAVER_RIGID}", token=BHTOK)
+case("...its rig is the hub's to read again", status == 200 and got.get("rig_id") == LEAVER_RIGID, f"{status} {got}")
+status, got = front("GET", f"/projects/{FD_ID}", token=project_in_listing(LEAVER_RIG, HUBP)["stacking"]["grant"])
+case("...and the front door treats it as a member again (its frames would be taken)",
+     status == 200 and (got["project"].get("my_membership") or {}).get("status") == "active", f"{status} {got}")
+
+
+def stacking_member_doc():
+    return json.loads(server_app.store._one("SELECT doc FROM stack_members WHERE project_id = ? AND user_id = ?",
+                                            FD_ID, LEAVER_UID)["doc"])
+
+
+def set_stacking_member_doc(doc):
+    server_app.store._run("UPDATE stack_members SET doc = ? WHERE project_id = ? AND user_id = ?",
+                          json.dumps(doc), FD_ID, LEAVER_UID)
+
+
+# A member still waiting for approval who leaves and comes back is waiting again, not let in.
+doc = stacking_member_doc()
+doc["status"] = "pending"
+set_stacking_member_doc(doc)
+status, _ = call("POST", f"/api/v1/agent/task/{(rejoin.get('task') or {}).get('id')}", {"state": "declined"}, token=LEAVER_RIG)
+status, rejoin = call("POST", f"/api/v1/agent/projects/{HUBP}/join", {}, token=LEAVER_RIG)
+status, got = call("GET", f"{REC}/member/{FD_ID}/{LEAVER_UID}", token=BHTOK)
+case("a pending member who leaves and joins again is pending again", got.get("status") == "pending", f"{got}")
+
+# Any removal but the telescope's own is final: joining the collaboration again does not undo it.
+status, _ = call("POST", f"/api/v1/agent/task/{(rejoin.get('task') or {}).get('id')}", {"state": "declined"}, token=LEAVER_RIG)
+doc = stacking_member_doc()
+doc["removed_by"] = "00000000-0000-4000-8000-0000000000aa"   # an owner's id, as the contract records it
+set_stacking_member_doc(doc)
+before = feed_since(0)["seq"]
+status, rejoin = call("POST", f"/api/v1/agent/projects/{HUBP}/join", {}, token=LEAVER_RIG)
+status, got = call("GET", f"{REC}/member/{FD_ID}/{LEAVER_UID}", token=BHTOK)
+case("a removal that was not the telescope's own stays: joining again leaves it removed",
+     got.get("status") == "removed" and not [r for r in feed_since(before)["changes"] if r["kind"] == "member"],
+     f"{got}")
+
+# The member is the person, not one telescope. On 2026-10-28 the owner's
+# StellaLyra re-dealt its share (Leave, then Join four seconds later) while
+# their backyard rig still held one, and the owner's member was removed.
+PAIR_A, PAIR_A_ID = enrol("pair stellalyra", 800.0, 6248, 4176, 6.0)
+PAIR_B, PAIR_B_ID = enrol("pair backyard", 600.0, 3840, 2160, 6.0)
+server_app.store._run("UPDATE agents SET owner_id = ? WHERE id IN (?, ?)", "1777", PAIR_A_ID, PAIR_B_ID)
+status, a_join = call("POST", f"/api/v1/agent/projects/{HUBP}/join", {}, token=PAIR_A)
+status, b_join = call("POST", f"/api/v1/agent/projects/{HUBP}/join", {}, token=PAIR_B)
+PAIR_GRANT = project_in_listing(PAIR_B, HUBP)["stacking"]["grant"]
+status, got = front("POST", f"/projects/{FD_ID}/join", {"display_name": "Pair Owner", "accepted_terms_version": terms_now},
+                    token=PAIR_GRANT)
+PAIR_UID = (got.get("membership") or {}).get("user_id", "")
+case("a person with two telescopes on a hub collaboration is one member", status == 200 and PAIR_UID, f"{status} {got}")
+
+
+def pair_status():
+    return call("GET", f"{REC}/member/{FD_ID}/{PAIR_UID}", token=BHTOK)[1].get("status")
+
+
+before = feed_since(0)["seq"]
+status, _ = call("POST", f"/api/v1/agent/task/{(a_join.get('task') or {}).get('id')}", {"state": "declined"}, token=PAIR_A)
+case("one of a person's telescopes leaving, while the other is still on, leaves them a member",
+     status == 200 and pair_status() == "active"
+     and not [r for r in feed_since(before)["changes"] if r["kind"] == "member"], pair_status())
+
+# The state the old rule left on 2026-10-28: removed by a telescope while the
+# person was still on the collaboration. Pressing Join on a telescope that still
+# holds its share (the dock's "Already on ...") gives the membership back.
+doc = json.loads(server_app.store._one("SELECT doc FROM stack_members WHERE project_id = ? AND user_id = ?",
+                                       FD_ID, PAIR_UID)["doc"])
+doc.update(status="removed", removed_by="telescope", removed_at="2026-10-28T04:07:02.126Z", frames_disposition="keep")
+server_app.store._run("UPDATE stack_members SET doc = ? WHERE project_id = ? AND user_id = ?",
+                      json.dumps(doc), FD_ID, PAIR_UID)
+status, again = call("POST", f"/api/v1/agent/projects/{HUBP}/join", {}, token=PAIR_B)
+case("joining again with a telescope still on the project gives back a membership a leave took",
+     status == 200 and again.get("alreadyJoined") and pair_status() == "active", f"{status} {pair_status()}")
+
+status, _ = call("POST", f"/api/v1/agent/task/{(b_join.get('task') or {}).get('id')}", {"state": "declined"}, token=PAIR_B)
+case("the last of a person's telescopes leaving does take the membership", pair_status() == "removed", pair_status())
+
+# ------------------------------------------- live stacking: push
+print("\n-- live stacking: push --")
+import io as _io                                                   # noqa: E402
+import secrets                                                     # noqa: E402
+import tarfile as _tar                                             # noqa: E402
+
+POSTS.clear()
+
+
+def multipart(parts):
+    """[(name, bytes)] as multipart/form-data; the `records` part is JSON."""
+    boundary = "----t407" + secrets.token_hex(8)
+    body = b""
+    for name, data in parts:
+        body += (f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"; filename="{name.rsplit("/", 1)[-1]}"\r\n'
+                 f'Content-Type: application/octet-stream\r\n\r\n').encode() + data + b"\r\n"
+    return boundary, body + f"--{boundary}--\r\n".encode()
+
+
+def push(records, files=(), token=None, hub=None):
+    parts = [("records", json.dumps(records).encode()), *files]
+    boundary, body = multipart(parts)
+    request = urllib.request.Request(
+        f"{BASE}/api/v1/hubs/{hub or BH}/push", data=body, method="POST",
+        headers={"Authorization": f"Bearer {token or BHTOK}",
+                 "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read() or b"{}")
+
+
+def tar_of(members):
+    buf = _io.BytesIO()
+    with _tar.open(fileobj=buf, mode="w") as t:
+        for name, data in members:
+            info = _tar.TarInfo(name)
+            info.size = len(data)
+            t.addfile(info, _io.BytesIO(data))
+    return buf.getvalue()
+
+
+def tree(root):
+    return sorted((str(p.relative_to(root)), p.stat().st_mtime_ns) for p in root.rglob("*") if p.is_file())
+
+
+PUBDIR = DATA / "stack" / "public"
+GRID = {"width_px": 6400, "height_px": 4400, "scale_arcsec_px": 1.5, "ra_deg": 84.0, "dec_deg": 0.0}
+PUSH_FRAME = "frm_" + "0" * 20 + "pvshts"        # an uploaded frame of the owner's, to give a verdict
+server_app.store._run("INSERT INTO stack_frames (frame_id, project_id, user_id, status, size, sha256, doc) VALUES (?, ?, ?, 'uploaded', 10, ?, ?)",
+                      PUSH_FRAME, FD_ID, OWNER_UID, "ab" * 32, json.dumps({**json.loads(server_app.store._one("SELECT doc FROM stack_frames WHERE frame_id = ?", FA)["doc"]),
+                                  "filename": "p.fits"}))
+SECOND_PID = server_app.store.stack_project_of(SECOND_ID)["project_id"]
+STATUS_DOC = {"schema_version": 1, "generated_at": "2026-10-22T01:00:00Z", "access": "public",
+              "totals": {"frames_accepted": 7, "integration_s": 2100.0, "last_update": "2026-10-22T01:00:00Z"},
+              "streams": [], "timeline": []}
+DZ = tar_of([("HA/g000003/image.dzi", b"<Image/>"), ("HA/g000003/image_files/0/0_0.jpg", b"\xff\xd8\xff\xd9")])
+MASTER_REC = {"stream_key": "HA", "gold_seq": 3, "format": "fits", "integration_s": 2100.0, "frames": 7,
+              "sessions": 2, "contributors": 2, "licence": "members_only", "created_at": "2026-10-22T01:00:00Z"}
+RECORDS = {
+    "frames": [{"frame_id": PUSH_FRAME, "project_id": FD_ID, "status": "rejected", "reject_reason": "fwhm_too_high",
+                "reject_detail": "FWHM 6.1 px", "metrics": {"fwhm_arcsec": 6.1, "n_stars": 120},
+                "integration_s": 0, "verdict_at": "2026-10-22T00:10:00.000Z"}],
+    "projects": [{"project_id": FD_ID, "grid": GRID, "grid_rev": 2}],
+    "streams": [{"project_id": FD_ID, "stream_key": "HA", "gold_seq": 3, "gold_published_at": "2026-10-22T01:00:00Z",
+                 "stats": {"frames_accepted": 7, "integration_s": 2100.0, "contributors": 2}}],
+    "events": [{"project_id": FD_ID, "event_id": "evt_0123456789abcdefghjkmnpqrs", "ts": "2026-10-22T01:00:00Z",
+                "type": "gold_published", "text": "Gold 3 published for HA", "stream_key": "HA"},
+               {"project_id": FD_ID, "ts": "2026-10-22T00:30:00Z", "type": "frames_accepted",
+                "text": "7 frames accepted", "count": 7}],
+}
+FILES = [("status.json", json.dumps(STATUS_DOC).encode()), ("HA/gold/latest.png", PNG),
+         ("masters/HA_g000003_fits.json", json.dumps(MASTER_REC).encode()),
+         ("masters/HA_g000003_fits.fits", b"SIMPLE  = T" + b"\0" * 50), ("deepzoom.tar", DZ)]
+
+status, got = push(RECORDS, FILES, token="sfh_" + "0" * 64)
+case("a push with an unknown hub token is 401", status == 401, str(status))
+status, got = push(RECORDS, FILES, hub="hub_other", token=BHTOK)
+case("a push to another hub's id is 401", status == 401, str(status))
+status, got = push(RECORDS, FILES)
+case("a push of records, status.json, a PNG, masters and a deep-zoom tar is accepted",
+     status == 200 and got["ok"] and got["files"]["written"] == 6 and got["frames"]["merged"] == 1
+     and got["projects"] == 1 and got["streams"] == 1 and got["events"] == 2, f"{status} {got}")
+status, headers, body = raw_get(f"/stack/public/{FD_ID}/status.json")
+case("status.json is served with the 60 s cache",
+     status == 200 and json.loads(body) == STATUS_DOC and headers.get("Cache-Control") == "public, max-age=60")
+status, headers, body = raw_get(f"/stack/public/{FD_ID}/HA/gold/latest.png")
+case("the PNG is served as image/png", status == 200 and body == PNG and headers.get("Content-Type") == "image/png")
+status, headers, body = raw_get(f"/stack/public/{FD_ID}/deepzoom/HA/g000003/image_files/0/0_0.jpg")
+case("a deep-zoom tile from the tar is served immutable",
+     status == 200 and headers.get("Cache-Control") == "public, max-age=31536000, immutable")
+status, _, _ = raw_get(f"/stack/public/{FD_ID}/masters/HA_g000003_fits.fits")
+case("masters are not served by the open route", status == 404, str(status))
+case("no temp file is left behind", not [p for p in (PUBDIR / FD_ID).rglob("*") if p.name.endswith(".tmp")])
+
+status, got = front("GET", f"/projects/{FD_ID}/frames/{PUSH_FRAME}", token=OWNER_GRANT)
+case("the verdict shows in the frame (status, reason, detail, metrics)",
+     status == 200 and got["frame"]["status"] == "rejected" and got["frame"]["reject_reason"] == "fwhm_too_high"
+     and got["frame"]["reject_detail"] == "FWHM 6.1 px" and got["frame"]["metrics"]["n_stars"] == 120
+     and conforms("FrameResponse", got), f"{status} {why('FrameResponse', got)}")
+status, got = front("GET", f"/projects/{FD_ID}/frames?mine=1&status=rejected", token=OWNER_GRANT)
+case("...and in frames?mine=1", status == 200 and any(f["frame_id"] == PUSH_FRAME for f in got["frames"]))
+status, got = front("GET", f"/projects/{FD_ID}", token=OWNER_GRANT)
+case("the project carries the pushed grid and the counts from status.json",
+     got["project"]["grid"] == GRID and got["project"]["counts"]["frames_accepted"] == 7
+     and got["project"]["counts"]["integration_s"] == 2100.0, str(got["project"].get("counts")))
+case("the grid_rev is kept", server_app.store.stack_project(FD_ID)["doc"]["grid_rev"] == 2)
+
+case("the gold was announced once", POSTS == [(HOOK, "Gold integration 3 published for HA: 0.6 h from 2 contributors.")], str(POSTS))
+before, rev_before = tree(PUBDIR / FD_ID), server_app.store.stack_project(FD_ID)["rev"]
+frame_rev = server_app.store._one("SELECT rev FROM stack_frames WHERE frame_id = ?", PUSH_FRAME)["rev"]
+status, got = push(RECORDS, FILES)
+notify_module.drain()
+case("the same push again writes nothing and changes nothing",
+     status == 200 and got["files"]["written"] == 0 and got["frames"] == {"merged": 0, "unchanged": 1, "skipped": 0}
+     and got["projects"] == got["streams"] == got["events"] == 0
+     and tree(PUBDIR / FD_ID) == before
+     and server_app.store.stack_project(FD_ID)["rev"] == rev_before
+     and server_app.store._one("SELECT rev FROM stack_frames WHERE frame_id = ?", PUSH_FRAME)["rev"] == frame_rev, str(got))
+case("...and pushing the same gold twice notified once", len(POSTS) == 1, str(POSTS))
+RECORDS2 = json.loads(json.dumps(RECORDS))
+RECORDS2["streams"][0]["gold_seq"] = 4
+push(RECORDS2, [])
+notify_module.drain()
+case("a higher gold_seq notifies again", len(POSTS) == 2 and "Gold integration 4 published for HA" in POSTS[-1][1], str(POSTS))
+RECORDS2["streams"][0]["gold_seq"] = 3
+push(RECORDS2, [])
+notify_module.drain()
+case("a lower gold_seq arriving late changes and announces nothing",
+     len(POSTS) == 2 and server_app.store.stack_project(FD_ID)["doc"]["streams"]["HA"]["gold_seq"] == 4)
+stale = json.loads(json.dumps(RECORDS))
+stale["frames"][0].update(status="accepted", reject_reason=None, verdict_at="2026-10-22T00:00:00.000Z")
+status, got = push(stale, [])
+case("an older verdict does not overwrite a newer one", got["frames"]["skipped"] == 1
+     and server_app.store._one("SELECT status FROM stack_frames WHERE frame_id = ?", PUSH_FRAME)["status"] == "rejected")
+
+status, got = front("GET", f"/projects/{FD_ID}/status", token=OWNER_GRANT)
+case("projects/{p}/status answers {ok, status_doc}",
+     status == 200 and got["ok"] is True and got["status_doc"] == STATUS_DOC and set(got) == {"ok", "status_doc"}, f"{status} {got}")
+status, got = front("GET", f"/projects/{FD_ID}/status")
+case("...readable without a credential for an unlisted project", status == 200 and got["ok"])
+status, got = front("GET", f"/projects/{SECOND_PID}/status", token=SECOND_GRANT)
+case("...and a project with no status document is 400 not_found", status == 400 and got["code"] == "not_found", f"{status} {got}")
+status, got = front("GET", f"/projects/{FD_ID}/masters", token=OWNER_GRANT)
+case("the masters list answers the contract shape, one entry for the pushed fits",
+     status == 200 and conforms("MasterListResponse", got) and len(got["masters"]) == 1
+     and got["masters"][0]["stream_key"] == "HA" and got["masters"][0]["gold_seq"] == 3
+     and got["masters"][0]["size_bytes"] == 61
+     and got["masters"][0]["url"].endswith(f"/stack/api/projects/{FD_ID}/masters/HA_g000003_fits.fits"),
+     f"{status} {why('MasterListResponse', got)}")
+link = got["masters"][0]["url"].replace(BASE, "")
+request = urllib.request.Request(BASE + link, headers={"Authorization": f"Bearer {OWNER_GRANT}"})
+with urllib.request.urlopen(request, timeout=10) as response:
+    data = response.read()
+case("a member downloads the master through the gated link", data.startswith(b"SIMPLE"), str(len(data)))
+status, got = front("GET", f"/projects/{FD_ID}/masters")
+case("the masters list needs a member (401 not_authenticated)", status == 401 and got["code"] == "not_authenticated")
+try:
+    urllib.request.urlopen(BASE + link, timeout=10)
+    case("...and so does the file", False)
+except urllib.error.HTTPError as exc:
+    case("...and so does the file", exc.code == 401, str(exc.code))
+status, got = front("GET", f"/projects/{FD_ID}/events?limit=1", token=OWNER_GRANT)
+case("events: newest first, paged, contract shape",
+     status == 200 and conforms("EventListResponse", got) and [e["type"] for e in got["events"]] == ["gold_published"]
+     and got["next_cursor"], f"{status} {why('EventListResponse', got)}")
+status, got2 = front("GET", f"/projects/{FD_ID}/events?limit=1&cursor={got['next_cursor']}", token=OWNER_GRANT)
+case("...the second page ends it", status == 200 and [e["type"] for e in got2["events"]] == ["frames_accepted"]
+     and got2["next_cursor"] is None and conforms("EventListResponse", got2))
+status, got = front("GET", f"/projects/{SECOND_PID}/events", token=SECOND_GRANT)
+case("a project with no events answers an empty list", status == 200 and got["events"] == [] and got["next_cursor"] is None, f"{status} {got}")
+status, got = front("GET", f"/projects/{FD_ID}/mosaic", token=OWNER_GRANT)
+case("mosaic answers null for a single field, in the contract shape",
+     status == 200 and got["mosaic"] is None and conforms("MosaicResponse", got))
+
+# Refusals: nothing may be written.
+OTHER = "hub_" + secrets.token_hex(8)
+server_app.store.add_hub(OTHER, "1002", "Other hub", "0" * 64, "AAAA", "")
+server_app.store.add_stack_project("prj_otherhub", "col_otherhub", OTHER, "other-hub-x", "ABCD-2345-EFGH", {"name": "Other"})
+snapshot = tree(PUBDIR)
+status, got = push({"frames": [], "projects": [{"project_id": "prj_otherhub", "grid": GRID, "grid_rev": 1}], "streams": []},
+                   [("status.json", b"{}")])
+case("a push for another hub's project is 409", status == 409, f"{status} {got}")
+status, got = push({"projects": [{"project_id": FD_ID, "grid": GRID, "grid_rev": 9}]},
+                   [("prj_otherhub/status.json", b"{}")])
+case("...also through a file part's project prefix, with the rest of the push unwritten",
+     status == 409 and server_app.store.stack_project(FD_ID)["doc"]["grid_rev"] == 2 and tree(PUBDIR) == snapshot)
+status, got = push({"projects": [{"project_id": "prj_nosuchproject", "grid": GRID, "grid_rev": 1}]})
+case("...and for a project that does not exist", status == 409)
+for label, name in (("a dot-dot part name", "../escape.json"), ("a nested dot-dot", "HA/../../escape.json"),
+                    ("an absolute part name", "/abs.json"), ("a backslash", "a\\b.json"),
+                    ("a part of a kind not accepted", "run.sh"), ("a deep masters path", "masters/x/y.fits"),
+                    ("a dot file", ".hidden.json")):
+    status, got = push({"projects": [{"project_id": FD_ID, "grid": GRID, "grid_rev": 9}]}, [(name, b"{}"), ("ok.json", b"{}")])
+    case(f"{label} is refused with nothing written", status == 400 and tree(PUBDIR) == snapshot
+         and server_app.store.stack_project(FD_ID)["doc"]["grid_rev"] == 2 and not (DATA / "stack" / "escape.json").exists(), f"{status} {got}")
+for label, members in (("a ../ tar member", [("../../escape.json", b"{}")]),
+                       ("a tar member that is absolute", [("/etc/x.json", b"{}")]),
+                       ("a tar member with a backslash", [("a\\b.json", b"{}")])):
+    status, got = push({"projects": [{"project_id": FD_ID, "grid": GRID, "grid_rev": 9}]}, [(f"{FD_ID}/deepzoom.tar", tar_of(members))])
+    case(f"{label} is refused with nothing written", status == 400 and tree(PUBDIR) == snapshot, f"{status} {got}")
+buf = _io.BytesIO()
+with _tar.open(fileobj=buf, mode="w") as t:
+    link_info = _tar.TarInfo("HA/link.json")
+    link_info.type, link_info.linkname = _tar.SYMTYPE, "../../../etc/passwd"
+    t.addfile(link_info)
+status, got = push({}, [(f"{FD_ID}/deepzoom.tar", buf.getvalue())])
+case("a tar symlink member is refused", status == 400 and tree(PUBDIR) == snapshot, f"{status} {got}")
+status, got = push({}, [(f"{FD_ID}/deepzoom.tar", b"not a tar at all")])
+case("a deepzoom.tar that is not a tar is refused", status == 400)
+outside = DATA / "stack" / "outside"
+outside.mkdir(exist_ok=True)
+(PUBDIR / FD_ID / "linked").symlink_to(outside, target_is_directory=True)
+status, got = push({}, [(f"{FD_ID}/linked/x.json", b"{}")])
+case("a path through a symlink inside the project is refused",
+     status == 400 and not (outside / "x.json").exists(), f"{status} {got}")
+(PUBDIR / FD_ID / "linked").unlink()
+status, got = push({"frames": [{"frame_id": "nope", "project_id": FD_ID, "status": "accepted", "verdict_at": "2026-10-22T00:00:00Z"}]})
+case("a malformed frame record is 400", status == 400)
+status, got = push({"bogus": []})
+case("an unknown records key is 400", status == 400)
+
+os.environ["STARFRONT_STACK_HUB_BUDGET_GB"] = "0.000002"       # about 2 kB
+status, got = push({}, [(f"{FD_ID}/big/a.png", b"\0" * 5000)])
+case("over the hub's byte budget is 429, with nothing written", status == 429 and tree(PUBDIR) == snapshot, f"{status} {got}")
+status, got = push({}, [(f"{FD_ID}/{n}", d) for n, d in FILES])
+case("...while a re-push that adds nothing is still fine", status == 200, f"{status} {got}")
+del os.environ["STARFRONT_STACK_HUB_BUDGET_GB"]
+status, got = push({}, [(f"{FD_ID}/big/a.png", b"\0" * 5000)])
+case("...and the default budget lets it in", status == 200 and (PUBDIR / FD_ID / "big" / "a.png").is_file(), f"{status} {got}")
+
+# ------------------------------------------- live stacking: a streamed master (T421)
+print("\n-- live stacking: a streamed master --")
+import hashlib as _hashlib                                         # noqa: E402
+import http.client as _hc                                          # noqa: E402
+from urllib.parse import urlsplit as _urlsplit                     # noqa: E402
+
+
+def put_master(project, name, chunks, sha=None, length=True, token=None, hub=None):
+    """PUT a master in pieces; `chunks` is a list of bytes (a generator would do)."""
+    total = sum(len(c) for c in chunks)
+    parts = _urlsplit(BASE)
+    conn = _hc.HTTPConnection(parts.hostname, parts.port, timeout=120)
+    headers = {"Authorization": f"Bearer {token or BHTOK}", "Content-Type": "application/octet-stream"}
+    if sha is not None:
+        headers["X-Content-SHA256"] = sha
+    if length:
+        headers["Content-Length"] = str(total)
+    try:
+        conn.request("PUT", f"/api/v1/hubs/{hub or BH}/push/{project}/masters/{name}", body=iter(chunks),
+                     headers=headers, encode_chunked=not length)
+        response = conn.getresponse()
+        raw = response.read()
+        return response.status, (json.loads(raw) if raw[:1] == b"{" else raw)
+    finally:
+        conn.close()
+
+
+BIG_PIECE = os.urandom(1 << 20)
+BIG = [BIG_PIECE] * 40                                              # 40 MiB, made here, never committed
+BIG_SHA = _hashlib.sha256(BIG_PIECE * 40).hexdigest()
+BIG_REC = {**MASTER_REC, "gold_seq": 4, "format": "xisf", "file": "HA_g000004_xisf.xisf"}
+MASTERS = PUBDIR / FD_ID / "masters"
+
+status, got = push({}, [(f"{FD_ID}/masters/HA_g000004_xisf.json", json.dumps(BIG_REC).encode())])
+case("the record of a big master goes by the multipart push", status == 200, f"{status} {got}")
+status, got = front("GET", f"/projects/{FD_ID}/masters", token=OWNER_GRANT)
+case("...and with no data file beside it the list holds only the earlier master",
+     status == 200 and [m["gold_seq"] for m in got["masters"]] == [3], str(got))
+
+status, got = put_master(FD_ID, "HA_g000004_xisf.xisf", BIG, sha=BIG_SHA, length=False)
+case("a master without Content-Length is 411", status == 411, f"{status} {got}")
+status, got = put_master(FD_ID, "HA_g000004_xisf.xisf", [b"x" * 100])
+case("a master without X-Content-SHA256 is 400", status == 400, f"{status} {got}")
+status, got = put_master(FD_ID, "HA_g000004_xisf.xisf", [b"x" * 100], sha="0" * 64, token="sfh_" + "0" * 64)
+case("a master with an unknown hub token is 401", status == 401, f"{status} {got}")
+status, got = put_master("prj_otherhub", "HA_g000004_xisf.xisf", [b"x" * 100], sha="0" * 64)
+case("a master for another hub's project is 409", status == 409, f"{status} {got}")
+for bad in ("..%2Fx.fits", "a%2Fb.fits", ".hidden.fits", "run.sh", "x.json", "x.png"):
+    status, got = put_master(FD_ID, bad, [b"x" * 100], sha="0" * 64)
+    case(f"the master name {bad!r} is refused", status in (400, 404, 422) and status != 200, f"{status}")
+status, got = put_master(FD_ID, "HA_g000004_xisf.xisf", [b"x" * 100], sha="0" * 64)
+case("a wrong digest is 422 and nothing is kept (no file, no temp file)",
+     status == 422 and not (MASTERS / "HA_g000004_xisf.xisf").exists()
+     and not [q for q in MASTERS.iterdir() if q.name.endswith(".tmp")], f"{status} {got}")
+status, got = put_master(FD_ID, "HA_g000004_xisf.xisf", BIG, sha="f" * 64)
+case("...also for a 40 MiB body", status == 422 and not (MASTERS / "HA_g000004_xisf.xisf").exists()
+     and not [q for q in MASTERS.iterdir() if q.name.endswith(".tmp")], f"{status} {got}")
+
+os.environ["STARFRONT_STACK_HUB_BUDGET_GB"] = "0.01"             # about 10 MB: less than the master
+status, got = put_master(FD_ID, "HA_g000004_xisf.xisf", BIG, sha=BIG_SHA)
+case("a master that would pass the hub's byte budget is 429, nothing kept",
+     status == 429 and not (MASTERS / "HA_g000004_xisf.xisf").exists(), f"{status} {got}")
+del os.environ["STARFRONT_STACK_HUB_BUDGET_GB"]
+
+status, got = put_master(FD_ID, "HA_g000004_xisf.xisf", BIG, sha=BIG_SHA)
+case("a 40 MiB master streams in", status == 200 and got["ok"] and got["written"] is True
+     and (MASTERS / "HA_g000004_xisf.xisf").stat().st_size == 40 << 20, f"{status} {got}")
+case("...with no temp file left", not [q for q in MASTERS.iterdir() if q.name.endswith(".tmp")])
+status, got = front("GET", f"/projects/{FD_ID}/masters", token=OWNER_GRANT)
+big = [m for m in (got.get("masters") or []) if m.get("gold_seq") == 4]
+case("...and a member's masters list now holds it",
+     status == 200 and conforms("MasterListResponse", got) and len(big) == 1
+     and big[0]["size_bytes"] == 40 << 20 and big[0]["format"] == "xisf"
+     and big[0]["url"].endswith(f"/masters/HA_g000004_xisf.xisf"), f"{status} {why('MasterListResponse', got)}")
+status, got = front("GET", f"/projects/{FD_ID}/masters", token=SECOND_GRANT)
+case("...and a non-member does not get the list", status in (401, 400) and not got.get("masters"), f"{status} {got}")
+status, _, _ = raw_get(f"/stack/public/{FD_ID}/masters/HA_g000004_xisf.xisf")
+case("...nor the file from the open route", status == 404, str(status))
+before = (MASTERS / "HA_g000004_xisf.xisf").stat().st_mtime_ns
+status, got = put_master(FD_ID, "HA_g000004_xisf.xisf", BIG, sha=BIG_SHA)
+case("the same master again is a 200 that rewrites nothing",
+     status == 200 and got["written"] is False and (MASTERS / "HA_g000004_xisf.xisf").stat().st_mtime_ns == before,
+     f"{status} {got}")
+
+# ------------------------------------------- live stacking: deleting a hub-backed collaboration (T704, D004)
+# Delete files a 7-day restorable deletion: the doc is `deleted`, the hub is told,
+# joins and uploads are 409 project_deleted; restore works inside the window; the
+# sweep after it removes this project's relay bytes (keeping rows, status.json and
+# masters); the owner removes the kept results explicitly.
+print("\n-- live stacking: deleting a hub-backed collaboration --")
+from server.stack import deletion as stack_deletion               # noqa: E402
+
+DEL_PUB = PUBDIR / FD_ID
+DEL_PUB.mkdir(parents=True, exist_ok=True)
+(DEL_PUB / "status.json").write_text(json.dumps({"schema": 1, "kept": True}))
+(DEL_PUB / "masters").mkdir(exist_ok=True)
+(DEL_PUB / "masters" / "kept_master.json").write_text("{}")
+DEL_DATA = fits_bytes(PART + 500, 77)
+DEL_FRAME = upload_frame(DEL_DATA, "to_be_purged.fits")
+DEL_ROWS = server_app.store._one("SELECT COUNT(*) AS n FROM stack_frames WHERE project_id = ?", FD_ID)["n"]
+case("(setup) the relay holds a frame of the project", relay_path(DEL_FRAME).is_file())
+DEL_FEED = feed_since(0)["seq"]
+
+
+def stack_doc():
+    return server_app.store.stack_project(FD_ID)["doc"]
+
+
+def collab_status():
+    return server_app.store.project(HUBP)["status"]
+
+
+was_status, was_collab = stack_doc()["status"], collab_status()
+status, got = call("DELETE", f"/api/v1/projects/{HUBP}", token=CAROL)
+case("a person who did not start the collaboration cannot delete it: 403",
+     status == 403 and stack_doc()["status"] == was_status, f"{status} {got}")
+status, got = call("DELETE", f"/api/v1/projects/{HUBP}")
+case("deleting without signing in is refused", status in (401, 403), str(status))
+_, plain = call("POST", "/api/v1/projects", {"name": "Plain one", "region": REGION,
+                                          "requirements": {"filters": {"Ha": 3.0}},
+                                          "stacking": {"backend": ""}}, token=BOBH)
+status, got = call("DELETE", f"/api/v1/projects/{plain['project']['id']}", token=BOBH)
+case("a collaboration not stacked on a hub is not deleted this way: 400", status == 400, f"{status} {got}")
+
+now = time.time()
+status, got = call("DELETE", f"/api/v1/projects/{HUBP}", token=BOBH)
+d = stack_doc()
+case("the owner deletes it: the stacking doc is deleted with deleted_at, delete_after (+7 days) and deleted_by",
+     status == 200 and d["status"] == "deleted" and d["deleted_by"] and d["deleted_by_role"] == "owner"
+     and abs(stack_deletion.epoch(d["delete_after"]) - (now + 7 * 86400)) < 60
+     and abs(stack_deletion.epoch(d["deleted_at"]) - now) < 60, f"{status} {got} {d}")
+case("...the collaboration itself is closed, so it leaves everybody's list", collab_status() == "closed")
+changes = [c for c in feed_since(DEL_FEED)["changes"] if c["kind"] == "project" and c["key"] == FD_ID]
+case("...and a project row is in the hub's feed", len(changes) == 1, str(changes))
+status, got = call("DELETE", f"/api/v1/projects/{HUBP}", token=BOBH)
+case("deleting it again: 409", status == 409, f"{status} {got}")
+status, got = call("PUT", f"/api/v1/projects/{HUBP}", {"notes": "x"}, token=BOBH)
+case("a deleted collaboration cannot be edited: 409", status == 409, f"{status} {got}")
+
+status, got = init_for(fits_bytes(5000, 78))
+case("an upload to the deleted project is 409 project_deleted",
+     status == 409 and got.get("code") == "project_deleted", f"{status} {got}")
+status, got = front("POST", f"/projects/{FD_ID}/join", {"display_name": "Late Comer", "accepted_terms_version": "2026-10-13-draft"},
+                    token=OWNER_GRANT)
+case("a join is 409 project_deleted", status == 409 and got.get("code") == "project_deleted", f"{status} {got}")
+status, got = front("GET", f"/projects/{FD_ID}", token=OWNER_GRANT)
+case("a member still reads it: status deleted with delete_after and deleted_at, results kept",
+     status == 200 and got["project"]["status"] == "deleted" and got["project"].get("delete_after") == d["delete_after"]
+     and got["project"].get("deleted_at") and got["project"].get("results_kept") is True, f"{status} {got}")
+
+status, got = call("POST", f"/api/v1/projects/{HUBP}/restore", token=CAROL)
+case("restoring is the owner's: 403 for someone else", status == 403, f"{status} {got}")
+before_restore = feed_since(0)["seq"]
+status, got = call("POST", f"/api/v1/projects/{HUBP}/restore", token=BOBH)
+d = stack_doc()
+case("the owner restores it within the window: back to what it was, nothing of the deletion left",
+     status == 200 and d["status"] == was_status and collab_status() == was_collab
+     and not any(k in d for k in ("deleted_at", "delete_after", "deleted_by", "status_before_delete")), f"{status} {got} {d}")
+case("...with another project row in the hub's feed",
+     [c for c in feed_since(before_restore)["changes"] if c["kind"] == "project" and c["key"] == FD_ID] != [])
+status, got = init_for(fits_bytes(5000, 79))
+case("...and uploads work again", status == 200, f"{status} {got}")
+status, got = call("POST", f"/api/v1/projects/{HUBP}/restore", token=BOBH)
+case("restoring what is not deleted: 409", status == 409, f"{status} {got}")
+
+status, got = call("DELETE", f"/api/v1/projects/{HUBP}", token=BOBH)
+status_w, got_w = call("DELETE", f"/api/v1/projects/{HUBP}/stack/results", token=BOBH)
+case("the kept results cannot be removed inside the window: 409", status_w == 409
+     and (DEL_PUB / "status.json").is_file(), f"{status_w} {got_w}")
+status_s = server_app.STACK_RELAY.sweep()
+case("the sweep inside the window removes nothing of the project",
+     relay_path(DEL_FRAME).is_file() and not stack_doc().get("relay_purged_at"), str(status_s))
+
+# Past the window: the sweep purges the relay bytes.
+d = stack_doc()
+d["delete_after"] = stack_deletion.stamp(time.time() - 60)
+server_app.store.set_stack_project(FD_ID, server_app.store.stack_project(FD_ID)["hub"], d)
+status, got = call("POST", f"/api/v1/projects/{HUBP}/restore", token=BOBH)
+case("after the window a restore is refused with a clear message",
+     status == 409 and "window ended" in got.get("detail", "") and d["delete_after"][:10] in got["detail"], f"{status} {got}")
+DEL_ROWS = server_app.store._one("SELECT COUNT(*) AS n FROM stack_frames WHERE project_id = ?", FD_ID)["n"]
+DATA_DL = fits_bytes(6000, 81)
+status, got = lib_init(DATA_DL, "dark_purge.fits")
+DEL_LIB = got["frame_id"]
+etag = put_part(got["upload"]["part_urls"][0]["url"], DATA_DL)[1]["ETag"]
+front("POST", f"{LIB}/frames/{DEL_LIB}/complete", {"etags": [{"part_number": 1, "etag": etag}]}, token=OWNER_GRANT)
+LIB_FILES = [RELAY / server_app.store._one("SELECT path FROM stack_library WHERE frame_id = ?", DEL_LIB)["path"]]
+case("(setup) the owner has a library frame on the relay", LIB_FILES[0].is_file())
+OTHER_LIVE = server_app.store._all(
+    "SELECT m.project_id FROM stack_members m JOIN stack_projects p ON p.project_id = m.project_id"
+    " WHERE m.user_id = ? AND m.project_id <> ? AND p.hub <> ''", OWNER_UID, FD_ID)
+case("a library frame of someone still in another live hub project is not this project's alone (when they are)",
+     not OTHER_LIVE or DEL_LIB not in stack_deletion.library_only_for(
+         server_app.store, server_app.store.stack_project(FD_ID)), str(OTHER_LIVE))
+for o in OTHER_LIVE:
+    server_app.store._run("UPDATE stack_members SET doc = json_set(doc, '$.status', 'removed')"
+                          " WHERE project_id = ? AND user_id = ?", o["project_id"], OWNER_UID)
+case("...and it is once they are in no other", DEL_LIB in stack_deletion.library_only_for(
+    server_app.store, server_app.store.stack_project(FD_ID)))
+LIB_ROWS = server_app.store._one("SELECT COUNT(*) AS n FROM stack_library")["n"]
+FRAME_FILES = [relay_path(r["frame_id"]) for r in server_app.store._all(
+    "SELECT frame_id FROM stack_frames WHERE project_id = ? AND path <> ''", FD_ID)]
+case("(setup) there are relay files to purge", DEL_FRAME in [r["frame_id"] for r in server_app.store._all(
+    "SELECT frame_id FROM stack_frames WHERE project_id = ?", FD_ID)] and any(p.is_file() for p in FRAME_FILES))
+server_app.STACK_RELAY.sweep()
+case("the sweep after the window deletes the project's relay bytes, and the library frames only it owned",
+     not any(p.is_file() for p in FRAME_FILES + LIB_FILES), str([str(p) for p in FRAME_FILES if p.is_file()]))
+case("...keeps every frame row (marked relay_deleted)",
+     server_app.store._one("SELECT COUNT(*) AS n FROM stack_frames WHERE project_id = ?", FD_ID)["n"] == DEL_ROWS
+     and json.loads(server_app.store._one("SELECT doc FROM stack_frames WHERE frame_id = ?", DEL_FRAME)["doc"]).get("relay_deleted")
+     and all(server_app.store._one("SELECT 1 AS x FROM stack_library WHERE path = ?", p.relative_to(RELAY).as_posix()) for p in LIB_FILES))
+case("...and the library rows", server_app.store._one("SELECT COUNT(*) AS n FROM stack_library")["n"] == LIB_ROWS)
+case("...keeps status.json and masters/ (D004)",
+     (DEL_PUB / "status.json").is_file() and (DEL_PUB / "masters" / "kept_master.json").is_file())
+case("...and records that the relay was purged", bool(stack_doc().get("relay_purged_at")))
+status, _, body = raw_get(f"/stack/public/{FD_ID}/status.json")
+case("...so the project page's status.json is still served", status == 200 and b"kept" in body, str(status))
+status, got = front("GET", f"/projects/{FD_ID}", token=OWNER_GRANT)
+case("...and the project still reads, as deleted with its results kept",
+     status == 200 and got["project"]["status"] == "deleted" and got["project"]["results_kept"] is True)
+server_app.STACK_RELAY.sweep()
+case("a second sweep is quiet", server_app.STACK_RELAY.purge_deleted(time.time()) == 0)
+
+status, got = call("DELETE", f"/api/v1/projects/{HUBP}/stack/results", token=CAROL)
+case("a person who is not the owner cannot remove the kept results: 403",
+     status == 403 and (DEL_PUB / "status.json").is_file(), f"{status} {got}")
+status, got = call("DELETE", f"/api/v1/projects/{HUBP}/stack/results", token=BOBH)
+case("the owner removes the kept results: the public folder is gone",
+     status == 200 and not DEL_PUB.exists() and stack_doc().get("results_removed_at"), f"{status} {got}")
+status, got = front("GET", f"/projects/{FD_ID}", token=OWNER_GRANT)
+case("...and the project says the results are no longer kept",
+     status == 200 and got["project"]["results_kept"] is False, f"{status} {got}")
+status, _, _ = raw_get(f"/stack/public/{FD_ID}/status.json")
+case("...status.json is 404", status == 404, str(status))
+
+
+# ------------------------------------- live stacking: it flows down from the collaboration
+# T706, the author's rule (2026-10-22): the Starfront collaboration is the only
+# place a project is made, and everything the stacking engine needs flows down
+# from it. Stacking is on by default; every edit reaches the stacking project
+# and the hub's feed; nothing about a project can be changed on /stack/api; and
+# a cloud project is made and kept in step by this server through the Collab
+# API (checked against Rapid Stacker Collab's local stack when it is at hand).
+print("\n-- live stacking: it flows down from the collaboration (T706) --")
+_, _, _, polled = sign_in("code-dave")
+DAVE = polled["token"]
+_, _, _, polled = sign_in("code-bob")
+BOBF = polled["token"]
+_, _, _, polled = sign_in("code-carol")
+CAROLF = polled["token"]
+
+
+def binding_of(project_id):
+    return server_app._stacking_of(server_app.store.project(project_id)["payload"])
+
+
+# -- 1. on by default
+status, opts = call("GET", "/api/v1/stacking", token=DAVE)
+case("a person with no hub and no Collab link is told stacking is off by default",
+     status == 200 and opts["default"]["backend"] == "" and opts["hubs"] == []
+     and opts["cloud"]["linked"] is False, str(opts)[:200])
+status, made = call("POST", "/api/v1/projects", {"name": "Dave plain", "region": REGION}, token=DAVE)
+case("...and a collaboration they start is not stacked", status == 200
+     and binding_of(made["project"]["id"])["backend"] == "", str(made)[:160])
+status, opts = call("GET", "/api/v1/stacking", token=BOBF)
+BOB_HUBS = [h["id"] for h in server_app.store.hubs_of("1002")]
+case("a hub owner's default is one of their own hubs, named",
+     status == 200 and opts["default"]["backend"] == "hub" and opts["default"]["hubId"] in BOB_HUBS
+     and opts["default"]["hubName"] and all(h["role"] == "owner" for h in opts["hubs"]), str(opts)[:240])
+BOB_DEFAULT = opts["default"]["hubId"]
+status, made = call("POST", "/api/v1/projects", {
+    "name": "Default Bound", "region": REGION, "requirements": {"filters": {"Ha": 3.0}}}, token=BOBF)
+DEF_P = made["project"]["id"]
+row = server_app.store.stack_project_of(DEF_P) or {}
+case("a collaboration started with nothing said is bound to that hub, with its stacking project made",
+     status == 200 and binding_of(DEF_P)["backend"] == "hub" and binding_of(DEF_P)["hubId"] == BOB_DEFAULT
+     and row.get("hub") == BOB_DEFAULT and row["doc"]["visibility"] == "unlisted", str(binding_of(DEF_P)))
+status, made = call("POST", "/api/v1/projects", {
+    "name": "Plugin form", "region": REGION, "stackingJoinCode": ""}, token=BOBF)
+case("...as is one from a plugin's form (a blank stackingJoinCode)",
+     status == 200 and binding_of(made["project"]["id"])["backend"] == "hub")
+status, made = call("POST", "/api/v1/projects", {
+    "name": "Off on purpose", "region": REGION, "stacking": {"backend": ""}}, token=BOBF)
+case("...while {backend: ''} turns it off", status == 200 and binding_of(made["project"]["id"])["backend"] == ""
+     and server_app.store.stack_project_of(made["project"]["id"]) is None)
+status, opts = call("GET", "/api/v1/stacking", token=CAROLF)
+case("a coordinator the owner listed on one hub sees it (role coordinator) as the default",
+     status == 200 and opts["default"] == {"backend": "hub", "hubId": BH, "hubName": "Bind hub"}
+     and [h["role"] for h in opts["hubs"]] == ["coordinator"], str(opts)[:240])
+status, made = call("POST", "/api/v1/projects", {"name": "Carol default", "region": REGION}, token=CAROLF)
+case("...and a collaboration they start is bound to it",
+     status == 200 and binding_of(made["project"]["id"])["hubId"] == BH)
+
+# -- 2. every field flows down (hub)
+FLOW_REQ = {"filters": {"Ha": 3.0, "OIII": 3.0, "OSC-RGB": None, "OSC-Ha+OIII": None},
+            "acceptColour": True, "acceptOscRgb": True, "acceptOscNarrowband": True,
+            "minExposure": 30, "requireCalibrated": True, "maxHfr": 4.0, "maxGuideRms": 1.0}
+status, made = call("POST", "/api/v1/projects", {
+    "name": "Flow Down", "region": REGION, "notes": "first notes", "requirements": FLOW_REQ,
+    "stacking": {"backend": "hub", "hubId": BH}}, token=BOBF)
+FLOW = made["project"]["id"]
+FLOW_ID = server_app.store.stack_project_of(FLOW)["project_id"]
+
+
+def flow_doc():
+    return server_app.store.stack_project_of(FLOW)["doc"]
+
+
+d = flow_doc()
+case("the requirements become the stacking project's filters: Ha, OIII, a colour camera's OSC and DUO",
+     d["filters"] == ["HA", "OIII", "OSC", "DUO"] and d["palette"] == "HOO", str(d["filters"]))
+case("...and its policy: colour cameras taken, calibrated only, the shortest sub, a star-size cap",
+     d["policy"]["osc_allowed"] is True and d["policy"]["calibration"] == "required"
+     and d["policy"]["min_exposure_s"] == 30 and d["policy"]["max_fwhm_arcsec"] == 8.0
+     and set(d["policy"]) == set(stack_defaults.POLICY), str(d["policy"]))
+case("...the rest of the policy stays the contract's defaults (guiding has no policy field)",
+     all(d["policy"][k] == v for k, v in stack_defaults.POLICY.items()
+         if k not in ("osc_allowed", "calibration", "min_exposure_s", "max_fwhm_arcsec")))
+case("a policy for a collaboration that takes no colour data keeps osc_allowed off and lists no OSC",
+     server_app._stack_fields("x", "", {"requirements": {"filters": {"Ha": 3.0, "OSC-RGB": None},
+                                                         "acceptColour": False}}, {})["policy"]["osc_allowed"] is False
+     and server_app._stack_fields("x", "", {"requirements": {"filters": {"Ha": 3.0, "OSC-RGB": None},
+                                                             "acceptColour": False}}, {})["filters"] == ["HA"])
+case("...nor for one that lists only mono filters (Starfront's own rule: an OSC band must be listed)",
+     server_app._stack_fields("x", "", {"requirements": {"filters": {"Ha": 3.0}}}, {})["policy"]["osc_allowed"] is False)
+case("...and a star-size limit never tightens the contract's FWHM cap",
+     server_app._policy_for({"maxHfr": 1.5}, [])["max_fwhm_arcsec"] == 6
+     and server_app._policy_for({"maxHfr": 30}, [])["max_fwhm_arcsec"] == 20.0)
+FLOW_SEQ = call("GET", f"/api/v1/hubs/{BH}/pull?since=0&wait=0", token=BHTOK)[1]["seq"]
+
+
+def hub_told():
+    global FLOW_SEQ
+    got = call("GET", f"/api/v1/hubs/{BH}/pull?since={FLOW_SEQ}&wait=0", token=BHTOK)[1]
+    FLOW_SEQ = got["seq"]
+    return any(c["kind"] == "project" and c["key"] == FLOW_ID for c in got["changes"])
+
+
+HUB_GRANT = hubs_module.mint_grant(server_app.store.hub(BH), "hub-sync:" + BH, "Hub sync", "", FLOW_ID)
+
+
+def hub_view():
+    """What the hub reads on a `project` row: GET /stack/api/projects/{p} with its own grant."""
+    return front("GET", f"/projects/{FLOW_ID}", token=HUB_GRANT)[1]["project"]
+
+
+EDITS = [
+    ("the name", {"name": "Flow Renamed"}, lambda p: p["name"] == "Flow Renamed" and p["target_name"] == "Flow Renamed"),
+    ("the notes", {"notes": "second notes"}, lambda p: p["description"] == "second notes"),
+    ("the region", {"region": {"ra": 120.0, "dec": 20.0, "width": 4.0, "height": 2.0}},
+     lambda p: p["grid"]["center_ra_deg"] == 120.0 and p["grid"]["center_dec_deg"] == 20.0),
+    ("the filters", {"requirements": {**FLOW_REQ, "filters": {"R": None, "G": None, "B": None}}},
+     lambda p: p["filters"] == ["R", "G", "B"] and p["palette"] == "RGB" and p["policy"]["osc_allowed"] is False),
+    ("the requirements", {"requirements": {"filters": {"Ha": 3.0}, "minExposure": 120}},
+     lambda p: p["policy"]["min_exposure_s"] == 120 and p["policy"]["calibration"] == "preferred"),
+    ("the visibility", {"stacking": {"backend": "hub", "hubId": BH, "visibility": "private"}},
+     lambda p: p["visibility"] == "private"),
+    ("closing it", {"status": "closed"}, lambda p: p["status"] == "closed"),
+    ("reopening it", {"status": "open"}, lambda p: p["status"] == "open"),
+]
+for what, change, seen in EDITS:
+    status, _ = call("PUT", f"/api/v1/projects/{FLOW}", change, token=BOBF)
+    view = hub_view()
+    case(f"editing {what} reaches the stacking project, the hub's feed and what the hub reads",
+         status == 200 and seen(view) and hub_told(), f"{status} {str(view)[:200]}")
+status, _ = call("PUT", f"/api/v1/projects/{FLOW}", {"goals": {"Ha": 20.0}}, token=BOBF)
+case("an edit the stacking project has no field for does not trouble the hub", status == 200 and not hub_told())
+
+# -- 3. /stack/api cannot change a project
+OWNER_FLOW_GRANT = project_in_listing(OWNER_RIG, FLOW)["stacking"]["grant"]
+case("a hub-bound collaboration is listed ready to join, with no problem to report",
+     project_in_listing(OWNER_RIG, FLOW)["stacking"]["state"] == "ready"
+     and project_in_listing(OWNER_RIG, FLOW)["stacking"]["problem"] == "")
+status, joined = front("POST", f"/projects/{FLOW_ID}/join", {
+    "display_name": "Bob Flow", "accepted_terms_version": "2026-10-13-draft"}, token=OWNER_FLOW_GRANT)
+case("(setup) the owner's telescope joins the stacking project with its grant", status == 200, f"{status} {joined}")
+before = flow_doc()
+ATTEMPTS = [("PUT", f"/projects/{FLOW_ID}", {"name": "Hijacked", "visibility": "public"}),
+            ("PATCH", f"/projects/{FLOW_ID}", {"name": "Hijacked"}),
+            ("DELETE", f"/projects/{FLOW_ID}", None),
+            ("POST", "/projects", {"slug": "second-project", "name": "Second", "filters": ["HA"],
+                                   "owner_display_name": "Bob"}),
+            ("POST", f"/projects/{FLOW_ID}/delete", {"confirm_slug": before["slug"]}),
+            ("POST", f"/projects/{FLOW_ID}/restore", {}),
+            ("POST", f"/projects/{FLOW_ID}/rotate-join-code", {}),
+            ("PUT", f"/projects/{FLOW_ID}/mosaic", {}),
+            ("PUT", f"/projects/{FLOW_ID}/members/{joined['membership']['user_id']}", {"role": "owner"}),
+            ("DELETE", f"/projects/{FLOW_ID}/members/{joined['membership']['user_id']}", None),
+            ("PUT", f"/projects/{FLOW_ID}/filters/mapping", {"filter_mapping": []}),
+            ("POST", f"/projects/{FLOW_ID}/gold", {})]
+refused = []
+for method, path, body in ATTEMPTS:
+    status, got = front(method, path, body, token=OWNER_FLOW_GRANT)
+    if 200 <= status < 300:
+        refused.append(f"{method} {path} -> {status}")
+after = flow_doc()
+case("no /stack/api route creates, edits, deletes or re-keys a project, even for its owner's grant",
+     not refused and {k: v for k, v in after.items() if k != "updated_at"}
+     == {k: v for k, v in before.items() if k != "updated_at"}, "; ".join(refused))
+status, got = front("PUT", f"/projects/{FLOW_ID}/membership", {"role": "owner", "status": "active"},
+                    token=OWNER_FLOW_GRANT)
+case("a member's own membership cannot raise its role or status",
+     status == 400 and got.get("code") == "validation_failed", f"{status} {got}")
+status, got = front("PUT", f"/projects/{FLOW_ID}/membership", {"display_name": "Bob Flowing"},
+                    token=OWNER_FLOW_GRANT)
+others = server_app.store._all("SELECT doc FROM stack_members WHERE project_id = ? AND user_id <> ?",
+                               FLOW_ID, joined["membership"]["user_id"])
+case("...and what it may change touches only its own row",
+     status == 200 and got["membership"]["display_name"] == "Bob Flowing"
+     and all("Bob Flowing" not in r["doc"] for r in others), f"{status} {got}")
+
+# -- 4. the cloud, through the Collab API
+import subprocess as _sp2                                         # noqa: E402
+RSC_DIR = None
+# RSC_DIR, when set, is the only place looked (set it to an empty folder to run
+# the cloud path against the stand-in below even with a checkout beside this one).
+for candidate in ([Path(os.environ["RSC_DIR"])] if os.environ.get("RSC_DIR") else [
+        ROOT.parent / "Rust" / "rapid-stacker-collab", ROOT.parent.parent / "Rust" / "rapid-stacker-collab"]):
+    if (candidate / "backend" / "local" / "server.mjs").is_file():
+        RSC_DIR = candidate
+        break
+STACK_PROC, RSC = None, ""
+if RSC_DIR is not None:
+    import shutil as _shutil
+    if _shutil.which("node"):
+        STACK_PROC = _sp2.Popen(["node", str(RSC_DIR / "backend" / "local" / "server.mjs"), "--port", "0",
+                                 "--quiet", "--exit-on-stdin-close"], stdin=_sp2.PIPE, stdout=_sp2.PIPE,
+                                stderr=_sp2.PIPE, text=True)
+        first = STACK_PROC.stdout.readline()
+        found = _re.search(r"(http://127\.0\.0\.1:\d+)", first or "")
+        if found:
+            RSC = found.group(1)
+        else:
+            reason = (STACK_PROC.stderr.read() or "").strip().splitlines()
+            print("NOTE  the cloud path: Rapid Stacker Collab's local stack did not start ("
+                  + (next((l for l in reason if l.startswith("Error")), reason[-1] if reason else "no output"))[:160]
+                  + "); set RSC_DIR to a checkout with backend/node_modules and no lambdas/*/node_modules")
+            STACK_PROC = None
+    else:
+        print("NOTE  the cloud path: node is not installed")
+else:
+    print("NOTE  the cloud path: no rapid-stacker-collab checkout (in RSC_DIR, or beside this repository)")
+
+
+# A stand-in for Rapid Stacker Collab's API, for where its local stack cannot
+# run. Why: that stack is a private repository run with node, so CI (which
+# checks out only this one) printed SKIP for the whole cloud path and never ran
+# it; a change that broke making the Collab project from a collaboration would
+# have gone green. The stand-in answers exactly the calls server/stack/cloud.py
+# makes, with the contract's shapes and codes (docs/api/openapi.yaml 1.30.1:
+# MeResponse, CreateProjectRequest and UpdateProjectRequest refuse unknown
+# fields, draft->open<->paused, a token may not delete or restore). The real
+# stack is still preferred when it is at hand, and then this is not started.
+from http.server import BaseHTTPRequestHandler as _BHRH, ThreadingHTTPServer as _THS  # noqa: E402
+
+_FAKE_CREATE = {"slug", "name", "target_name", "description", "visibility", "licence", "palette", "filters",
+                "grid", "rotation_from_first_light", "policy", "notify", "owner_display_name", "owner_country"}
+_FAKE_UPDATE = {"name", "target_name", "description", "visibility", "licence", "palette", "filters", "grid",
+                "rotation_from_first_light", "policy", "notify", "status", "reprepare_rejected"}
+_FAKE_MOVES = {("draft", "open"), ("open", "paused"), ("paused", "open"), ("open", "closed"),
+               ("paused", "closed")}
+
+
+class _FakeCollab:
+    def __init__(self):
+        self.tokens, self.projects, self.lock = {}, {}, threading.Lock()
+
+    def mint(self, name, scopes):
+        token = "rscu_" + os.urandom(32).hex()
+        self.tokens[token] = {"user_id": _uuid.uuid4().hex, "name": name, "scopes": list(scopes)}
+        return token
+
+    def find(self, key):
+        return self.projects.get(key) or next((p for p in self.projects.values() if p["slug"] == key), None)
+
+    def code(self):
+        letters = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+        raw = "".join(letters[b % len(letters)] for b in os.urandom(12))
+        return f"{raw[:4]}-{raw[4:8]}-{raw[8:]}"
+
+    def answer(self, method, path, who, body):
+        """(status, body) for one call; `who` is the token's user or None."""
+        def err(status, code, message=""):
+            return status, {"ok": False, "code": code, "message": message or code}
+        if who is None:
+            return err(401, "unauthorized")
+        if path == "/auth/me" and method == "GET":
+            return 200, {"ok": True, "auth": "token", "scopes": who["scopes"], "expires_at": "2027-11-01T00:00:00Z",
+                         "user": {"user_id": who["user_id"], "name": who["name"]}}
+        if "projects:manage" not in who["scopes"] and method != "GET":
+            return err(403, "token_scope")
+        if path == "/projects" and method == "POST":
+            if set(body) - _FAKE_CREATE or not {"slug", "name", "filters", "owner_display_name"} <= set(body):
+                return err(400, "validation_failed")
+            if any(p["slug"] == body["slug"] for p in self.projects.values()):
+                return err(409, "slug_taken")
+            pid = "prj_" + _uuid.uuid4().hex[:20]
+            project = {k: v for k, v in body.items() if k not in ("owner_display_name", "owner_country")}
+            project.update(project_id=pid, status="draft", join_code=self.code(), owner=who["user_id"],
+                           visibility=body.get("visibility", "unlisted"))
+            self.projects[pid] = project
+            return 201, {"ok": True, "project": self.view(project, who)}
+        parts = path.strip("/").split("/")
+        if len(parts) < 2 or parts[0] != "projects":
+            return err(404, "not_found")
+        project = self.find(parts[1])
+        if project is None:
+            return err(404, "not_found")
+        if len(parts) == 3 and parts[2] in ("delete", "restore") and method == "POST":
+            return err(401, "session_required", "Only a signed-in browser may do this.")
+        if len(parts) != 2:
+            return err(404, "not_found")
+        if method == "GET":
+            return 200, {"ok": True, "project": self.view(project, who)}
+        if method != "PUT":
+            return err(405, "method_not_allowed")
+        if project["owner"] != who["user_id"]:
+            return err(403, "forbidden")
+        if set(body) - _FAKE_UPDATE:
+            return err(400, "validation_failed")
+        if "status" in body and body["status"] != project["status"] and \
+                (project["status"], body["status"]) not in _FAKE_MOVES:
+            return err(409, "invalid_transition")
+        project.update(body)
+        return 200, {"ok": True, "project": self.view(project, who)}
+
+    def view(self, project, who):
+        out = {k: v for k, v in project.items() if k != "owner"}
+        out["my_membership"] = {"role": "owner"} if project["owner"] == who["user_id"] else None
+        if project["owner"] != who["user_id"]:
+            out.pop("join_code", None)
+        return out
+
+
+FAKE_COLLAB, FAKE_SERVER = None, None
+if not RSC:
+    FAKE_COLLAB = _FakeCollab()
+
+    class _FakeHandler(_BHRH):
+        def log_message(self, *args):
+            pass
+
+        def _serve(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}") if length else {}
+            except ValueError:
+                body = None
+            auth = self.headers.get("Authorization") or ""
+            who = FAKE_COLLAB.tokens.get(auth[7:]) if auth.startswith("Bearer ") else None
+            path = self.path.split("?")[0]
+            if not path.startswith("/api/") or not isinstance(body, dict):
+                status, out = 400, {"ok": False, "code": "invalid_request", "message": "bad request"}
+            else:
+                with FAKE_COLLAB.lock:
+                    status, out = FAKE_COLLAB.answer(self.command, path[4:], who, body)
+            data = json.dumps(out).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        do_GET = do_POST = do_PUT = do_DELETE = _serve
+
+    FAKE_SERVER = _THS(("127.0.0.1", 0), _FakeHandler)
+    threading.Thread(target=FAKE_SERVER.serve_forever, daemon=True).start()
+    RSC = f"http://127.0.0.1:{FAKE_SERVER.server_address[1]}"
+    print("NOTE  the cloud path runs against the stand-in for Rapid Stacker Collab's API "
+          "(this check's _FakeCollab), not its local stack")
+
+
+def rsc(method, path, body=None, token=None, cookie=None):
+    headers = {"Content-Type": "application/json", "Origin": RSC}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if cookie:
+        headers["Cookie"] = cookie
+    request = urllib.request.Request(RSC + "/api" + path, method=method, headers=headers,
+                                     data=None if body is None else json.dumps(body).encode())
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, json.loads(response.read() or b"{}"), response.headers
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read() or b"{}"), exc.headers
+
+
+def collab_account(name, email, scopes):
+    if FAKE_COLLAB is not None:
+        return FAKE_COLLAB.mint(name, scopes)
+    rsc("POST", "/auth/register", {"name": name, "email": email, "password": "correct horse battery staple"})
+    mail = json.loads(urllib.request.urlopen(f"{RSC}/_local/mail?to={email}", timeout=10).read())
+    link = next(l for m in mail["messages"] for l in m["links"] if "verify-email" in l)
+    rsc("POST", "/auth/verify-email", {"token": _re.search(r"token=([0-9a-f]{64})", link).group(1)})
+    _, _, headers = rsc("POST", "/auth/login", {"email": email, "password": "correct horse battery staple"})
+    cookie = headers["Set-Cookie"].split(";")[0]
+    return rsc("POST", "/tokens", {"name": "Starfront", "scopes": scopes}, cookie=cookie)[1]["token"]
+
+
+if RSC:
+    CTOKEN = collab_account("Dave", "dave@example.test", ["projects:manage", "projects:read"])
+    READ_ONLY = collab_account("Dave R", "dave.r@example.test", ["projects:read"])
+
+    def remote(project_id):
+        return rsc("GET", f"/projects/{project_id}", token=CTOKEN)[1].get("project") or {}
+
+    def cloud_row(sf):
+        return server_app.CLOUD.row(sf)
+
+    status, got = call("PUT", "/api/v1/stacking/cloud", {"token": "rscu_nope", "apiBase": RSC + "/api"}, token=DAVE)
+    case("cloud link: something that is not a Collab token is refused", status == 400, f"{status} {got}")
+    status, got = call("PUT", "/api/v1/stacking/cloud", {"token": READ_ONLY, "apiBase": RSC + "/api"}, token=DAVE)
+    case("...and so is a token without projects:manage, saying how to make one",
+         status == 400 and "projects:manage" in got.get("detail", ""), f"{status} {got}")
+    status, got = call("PUT", "/api/v1/stacking/cloud", {"token": CTOKEN, "apiBase": RSC + "/api"}, token=DAVE)
+    case("a token with projects:manage links the account (checked with the service)",
+         status == 200 and got["cloud"]["linked"] is True and got["cloud"]["user"] == "Dave"
+         and CTOKEN not in json.dumps(got), f"{status} {got}")
+    stored = server_app.store._one("SELECT token FROM stack_cloud_links WHERE person = '1005'")["token"]
+    case("...kept sealed on the server (the server has a key), never as typed",
+         stored.startswith("v1:") and CTOKEN not in stored and got["cloud"]["sealed"] is True, stored[:12])
+    _, opts = call("GET", "/api/v1/stacking", token=DAVE)
+    case("with no hub, a linked person's default is the cloud", opts["default"]["backend"] == "cloud"
+         and CTOKEN not in json.dumps(opts))
+
+    status, made = call("POST", "/api/v1/projects", {
+        "name": "Cloud Flow", "region": REGION, "notes": "cloud notes",
+        "requirements": {"filters": {"Ha": 3.0, "OIII": 3.0, "OSC-RGB": None}, "minExposure": 60}}, token=DAVE)
+    CF = made["project"]["id"]
+    row = cloud_row(CF)
+    rp = remote(row["project_id"]) if row and row["project_id"] else {}
+    fields = server_app._stack_fields("Cloud Flow", "Dave", server_app.store.project(CF)["payload"],
+                                      binding_of(CF))
+    case("a collaboration started with nothing said is stacked on the cloud: the server made the Collab project",
+         status == 200 and server_app._is_managed(binding_of(CF)) and row["doc"]["state"] == "ok"
+         and row["project_id"].startswith("prj_") and rp.get("status") == "open", str(row)[:300])
+    case("...with exactly the fields a hub project gets: name, notes, filters, palette, visibility, policy",
+         rp.get("name") == "Cloud Flow" and rp.get("description") == "cloud notes"
+         and sorted(rp.get("filters", [])) == ["HA", "OIII", "OSC"] and rp.get("palette") == "HOO"
+         and rp.get("visibility") == "unlisted" and rp.get("policy") == fields["policy"]  # (a set there: sorted)
+         and rp["policy"]["osc_allowed"] is True and rp["policy"]["min_exposure_s"] == 60, str(rp)[:400])
+    case("...framed by the region until the first light (rotation_from_first_light)",
+         rp.get("grid", {}).get("center_ra_deg") == 84.0 and rp.get("rotation_from_first_light") is True)
+    case("...and its join code is kept with it, not in the collaboration's payload",
+         _re.fullmatch(r"[2-9A-HJKMNP-Z]{4}-[2-9A-HJKMNP-Z]{4}-[2-9A-HJKMNP-Z]{4}", row["join_code"])
+         and row["join_code"] not in json.dumps(server_app.store.project(CF)["payload"]))
+    DAVE_RIG = call("POST", "/api/v1/agents", {"name": "Dave's rig"}, token=DAVE)[1]["token"]
+    mine_c = project_in_listing(DAVE_RIG, CF)
+    other_c = project_in_listing(AGENT_TOKEN, CF)
+    case("the owner's telescope is handed the Collab join code, as a pasted one was; a browsing one is not",
+         mine_c["stackingJoinCode"] == row["join_code"] and mine_c["stackingLinked"] is True
+         and mine_c["stacking"]["managed"] is True and other_c["stackingJoinCode"] == "", str(mine_c["stacking"]))
+
+    status, _ = call("PUT", f"/api/v1/projects/{CF}", {
+        "name": "Cloud Renamed", "notes": "edited notes",
+        "region": {"ra": 150.0, "dec": 10.0, "width": 3.0, "height": 2.0},
+        "requirements": {"filters": {"R": None, "G": None, "B": None}, "requireCalibrated": True},
+        "stacking": {"backend": "cloud", "visibility": "private"}}, token=DAVE)
+    rp = remote(cloud_row(CF)["project_id"])
+    case("an edit of the collaboration is a projectsUpdate: name, notes, filters, policy, visibility, grid",
+         status == 200 and rp.get("name") == "Cloud Renamed" and rp.get("description") == "edited notes"
+         and sorted(rp.get("filters", [])) == ["B", "G", "R"] and rp.get("palette") == "RGB" and rp.get("visibility") == "private"
+         and rp["policy"]["calibration"] == "required" and rp["policy"]["osc_allowed"] is False
+         and rp["policy"]["min_exposure_s"] == 5 and rp["grid"]["center_ra_deg"] == 150.0, str(rp)[:400])
+    case("...the policy is sent whole (PUT replaces it): every field is the derived one",
+         rp["policy"] == server_app._stack_fields("x", "", server_app.store.project(CF)["payload"], {})["policy"])
+    status, _ = call("PUT", f"/api/v1/projects/{CF}", {"status": "closed"}, token=DAVE)
+    case("closing the collaboration pauses the Collab project (its 'closed' cannot reopen)",
+         status == 200 and remote(cloud_row(CF)["project_id"]).get("status") == "paused")
+    status, _ = call("PUT", f"/api/v1/projects/{CF}", {"status": "open"}, token=DAVE)
+    case("...and reopening it opens it again", remote(cloud_row(CF)["project_id"]).get("status") == "open")
+    status, _ = call("PUT", f"/api/v1/projects/{CF}", {"stackingJoinCode": cloud_row(CF)["join_code"]}, token=DAVE)
+    case("a plugin's Edit form sending the code back changes nothing", status == 200
+         and server_app._is_managed(binding_of(CF)))
+    status, _ = call("PUT", f"/api/v1/projects/{CF}", {"stackingJoinCode": "H4RT-92BK-WNPC"}, token=DAVE)
+    case("...a different pasted code is refused", status == 400)
+
+    # A failed call is recorded and retried by the sweep.
+    good_base = RSC + "/api"
+    server_app.store._run("UPDATE stack_cloud_links SET api_base = ? WHERE person = '1005'",
+                          f"http://127.0.0.1:{free_port()}/api")
+    status, _ = call("PUT", f"/api/v1/projects/{CF}", {"notes": "while it was down"}, token=DAVE)
+    row = cloud_row(CF)
+    status_s, seen_s = call("GET", f"/api/v1/projects/{CF}/stacking", token=DAVE)
+    case("when Collab cannot be reached the edit is saved and the failure recorded on the collaboration",
+         status == 200 and row["doc"]["state"] == "failed" and row["doc"]["attempts"] == 1
+         and row["doc"]["next_at"] > time.time() and "could not be reached" in row["doc"]["error"]
+         and seen_s["cloud"]["state"] == "failed" and seen_s["cloud"]["error"], str(row["doc"])[:200])
+    case("...the sweep does not retry before its back-off", server_app.CLOUD.sweep(time.time()) == 0
+         and cloud_row(CF)["doc"]["attempts"] == 1)
+    server_app.store._run("UPDATE stack_cloud_links SET api_base = ? WHERE person = '1005'", good_base)
+    retried = server_app.CLOUD.sweep(time.time() + 3600)
+    case("...and once it answers again the sweep's retry brings the Collab project in step",
+         retried >= 1 and cloud_row(CF)["doc"]["state"] == "ok"
+         and remote(cloud_row(CF)["project_id"]).get("description") == "while it was down", str(cloud_row(CF)["doc"])[:200])
+
+    # Deleting and restoring.
+    status, got = call("DELETE", f"/api/v1/projects/{CF}", token=DAVE)
+    row = cloud_row(CF)
+    rp = remote(row["project_id"])
+    case("deleting the collaboration files the 7-day deletion here and asks Collab to delete (confirm_slug)",
+         status == 200 and got["deletion"]["status"] == "deleted" and got["deletion"]["delete_after"]
+         and server_app.store.project(CF)["status"] == "closed", f"{status} {got}")
+    case("...the contract keeps projectsDelete for a browser session, so the project is paused and the owner told where",
+         rp.get("status") in ("paused", "deleted") and (rp.get("status") == "deleted" or (
+             row["doc"]["state"] == "needs_owner" and f"/p/{row['slug']}" in row["doc"]["error"])), str(row["doc"])[:300])
+    _, opts = call("GET", "/api/v1/stacking", token=DAVE)
+    case("...the deleted collaboration is listed for its owner, restorable, with the window",
+         any(x["id"] == CF and x["restorable"] and x["backend"] == "cloud" for x in opts["deleted"])
+         and opts["windowDays"] == 7)
+    case("...and its join code is no longer handed out", server_app.CLOUD.join_code(CF) == "")
+    status, got = call("PUT", f"/api/v1/projects/{CF}", {"notes": "x"}, token=DAVE)
+    case("...nor may it be edited while deleted: 409", status == 409)
+    status, got = call("POST", f"/api/v1/projects/{CF}/restore", token=DAVE)
+    case("restoring it reopens the collaboration and the Collab project",
+         status == 200 and server_app.store.project(CF)["status"] == "open"
+         and remote(cloud_row(CF)["project_id"]).get("status") == "open" and cloud_row(CF)["doc"]["state"] == "ok",
+         f"{status} {got}")
+
+    # Unbinding pauses it; binding again reopens the same project.
+    pid_before = cloud_row(CF)["project_id"]
+    status, _ = call("PUT", f"/api/v1/projects/{CF}", {"stacking": {"backend": ""}}, token=DAVE)
+    case("unbinding pauses the Collab project and stops handing out its code",
+         status == 200 and remote(pid_before).get("status") == "paused"
+         and project_in_listing(DAVE_RIG, CF)["stackingJoinCode"] == "")
+    status, _ = call("PUT", f"/api/v1/projects/{CF}", {"stacking": {"backend": "cloud"}}, token=DAVE)
+    case("...and binding again reopens the same one",
+         status == 200 and cloud_row(CF)["project_id"] == pid_before and remote(pid_before).get("status") == "open")
+
+    # Unlinking: nothing is lost, the next edit waits for a link.
+    call("DELETE", "/api/v1/stacking/cloud", token=DAVE)
+    status, _ = call("PUT", f"/api/v1/projects/{CF}", {"notes": "unlinked"}, token=DAVE)
+    case("with the account unlinked an edit is saved and the sync waits, recorded",
+         status == 200 and cloud_row(CF)["doc"]["state"] == "failed"
+         and cloud_row(CF)["doc"]["code"] == "not_linked")
+    call("PUT", "/api/v1/stacking/cloud", {"token": CTOKEN, "apiBase": RSC + "/api"}, token=DAVE)
+    case("...and linking again catches up at once", cloud_row(CF)["doc"]["state"] == "ok"
+         and remote(pid_before).get("description") == "unlinked")
+    # Whether a telescope can join yet. Why: while the project was being made,
+    # or after Collab refused it, the listing carried an empty code and the
+    # plugin skipped the collaboration in silence; only the owner's desktop
+    # Edit form said why. Now the listing says so, with the reason for the
+    # owner's own telescopes only.
+    server_app.store._run("UPDATE stack_cloud_links SET api_base = ? WHERE person = '1005'",
+                          f"http://127.0.0.1:{free_port()}/api")
+    status, made = call("POST", "/api/v1/projects", {
+        "name": "Cloud Waiting", "region": REGION, "requirements": {"filters": {"Ha": 3.0}}}, token=DAVE)
+    CW = made["project"]["id"]
+    mine_w, other_w = project_in_listing(DAVE_RIG, CW), project_in_listing(AGENT_TOKEN, CW)
+    case("a cloud project that could not be made is listed as failed, with no code to join",
+         status == 200 and mine_w["stacking"]["state"] == "failed" and mine_w["stackingJoinCode"] == ""
+         and mine_w["stackingLinked"] is False and other_w["stacking"]["state"] == "failed",
+         str(mine_w["stacking"]))
+    case("...the owner's telescope is told why, and nobody else's is",
+         "could not be reached" in mine_w["stacking"]["problem"] and other_w["stacking"]["problem"] == "",
+         f"{mine_w['stacking']['problem']!r} / {other_w['stacking']['problem']!r}")
+    server_app.store._run("UPDATE stack_cloud SET doc = json_set(doc, '$.state', 'pending') WHERE sf_project = ?", CW)
+    mine_w = project_in_listing(DAVE_RIG, CW)
+    case("...one still being made is listed as pending, with no reason to give",
+         mine_w["stacking"]["state"] == "pending" and mine_w["stacking"]["problem"] == "", str(mine_w["stacking"]))
+    server_app.store._run("UPDATE stack_cloud_links SET api_base = ? WHERE person = '1005'", good_base)
+    server_app.CLOUD.sweep(time.time() + 3600)
+    mine_w = project_in_listing(DAVE_RIG, CW)
+    case("...and once it is made it is ready, with the code, and stackingLinked as before",
+         mine_w["stacking"]["state"] == "ready" and mine_w["stacking"]["problem"] == ""
+         and mine_w["stackingJoinCode"] == cloud_row(CW)["join_code"] != "" and mine_w["stackingLinked"] is True,
+         str(mine_w["stacking"]))
+
+    if STACK_PROC is not None:
+        STACK_PROC.stdin.close()
+        STACK_PROC.wait(10)
+    if FAKE_SERVER is not None:
+        FAKE_SERVER.shutdown()
 
 print()
 print(f"{sum(results)}/{len(results)} passed")

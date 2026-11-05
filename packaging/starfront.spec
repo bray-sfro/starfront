@@ -30,6 +30,9 @@ hiddenimports = [
     # COM for ASCOM: pywin32's pieces that are found by name at run time.
     "win32com", "win32com.client", "pythoncom", "pywintypes", "win32timezone",
     "win32api", "win32con",
+    # The release-signature check in volunteer.py imports these inside a try.
+    "cryptography", "cryptography.exceptions",
+    "cryptography.hazmat.primitives.asymmetric.ed25519",
 ]
 hiddenimports += collect_submodules("astrocontrol")
 

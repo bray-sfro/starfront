@@ -1969,17 +1969,518 @@ Releases live in `server/nina_plugin/`; `nina/README.md` says how one is made.
 Releasing here rather than through the central manifest repository means a
 fix reaches everybody the moment it is deployed, with no review queue.
 
+**Live stacking.** A collaboration can be stacked by
+[Rapid Stacker Collab](https://collab.astro.ekeservices.com), on its cloud or
+on a hub, and a plugin with *Live stacking* turned on sends every light the
+container saves for it to that stacking project as it lands, where a worker
+folds it into the per-filter stacks. The server makes the stacking project from
+the collaboration and keeps it in step; nobody makes a second one or pastes a
+code (*The stacking project flows down from the collaboration*, below, T706).
+The decisions behind it:
+
+- **The code lives on the Starfront project, not in each telescope.** Pasting
+  it into every plugin by hand would be forgotten on half of them. It is a
+  credential, not a label: whoever holds it can join the stacking project, so
+  the server hands it only to telescopes on the collaboration and to the
+  owner's own (the owner's program fills its Edit form from that listing, and
+  an owner who could not see the code would save it away blank). Everyone else
+  is told only where the lights are stacked. Before T706 the coordinator made
+  the project on the Collab website and pasted its code here; such a code is
+  still stored canonical and keeps working, read-only, and a pasted one is no
+  longer taken.
+- **The listing says whether a telescope can join yet** (`stacking.state`:
+  `ready`, `pending`, `failed`, with the reason in `stacking.problem` for the
+  owner's own telescopes only). While the server was still making a cloud
+  project, or after Collab refused it (an expired account link, say), the
+  code was simply missing and the plugin skipped the collaboration without a
+  word; only the owner's desktop Edit form said why, so an owner who used only
+  N.I.N.A. never found out. The plugin's card now says where it is stacked and
+  how that stands.
+- **Where it is stacked is a `stacking` block, and the join code is its
+  `cloud` case.** `POST`/`PUT /api/v1/projects` take `stacking: {backend:
+  "cloud"|"hub"|"", apiBase, hubId, visibility?}`. `cloud` is the project the
+  server makes through the Collab API once the owner's account is linked; its
+  code lives with that project, not in the payload, and reaches telescopes as
+  the listing's `stackingJoinCode`, so 1.0.0.33 plugins, which know only that
+  field, keep working. An old payload with only a pasted code reads as
+  `cloud`, and that code is still written to `stackingJoinCode`. `hub` needs a hub the caller owns or is
+  listed on (`allowedCoordinators`), else 403, the answer for any action that is
+  not theirs, the same for a hub that does not exist. Binding mints the
+  stacking project the hub will serve (`prj_` and 20 lower-case Crockford
+  characters, a unique slug from the name, its own `XXXX-XXXX-XXXX` join code,
+  and a Collab `Project` record: a placeholder grid from the region with
+  `rotation_from_first_light`, the filters the collaboration asks for, the
+  contract's policy defaults from `server/stack/defaults.py`, `approval:
+  open`, and visibility `unlisted` unless the request says otherwise) and puts
+  a `project` row in the hub's pull feed; editing the collaboration keeps that
+  record in step. Setting the backend to blank closes the stacking project and
+  tells the hub; it is never deleted by this. Once a frame exists for the
+  project its backend and hub can no longer change (409), because the frames
+  would stay behind. A blank `stackingJoinCode` from an old plugin's Edit form
+  does not unbind a hub project: the listing never showed that plugin a code to
+  send back.
+- **The listing says where, and hands out the grant by the same rule.** Each
+  project in `GET /api/v1/agent/projects` gains `stacking: {backend, hubId,
+  hubName, hubLanUrl, apiBase, collabProjectId, grant}`. For a hub project
+  `apiBase` is this server's `STARFRONT_PUBLIC_URL` + `/stack/api/` and `grant`
+  is a fresh `sfg_` for that telescope's owner, but only for a telescope on the
+  collaboration or the owner's own; a browsing telescope gets the rest of the
+  block and an empty grant. `stackingLinked` and `stackingJoinCode` stay as they
+  were (the code of a `cloud` project, nothing for a hub one).
+- **The uploader is a second listener on N.I.N.A.'s image pipeline**, and finds
+  a light's collaboration exactly the way the ledger does, by the target name
+  N.I.N.A. stamped. The ledger and the reporting are untouched, and with the
+  switch off the plugin opens, hooks and connects nothing new.
+- **Only lights the container shot for a linked collaboration go, and only if
+  they were pointed at its stacking project's field.** The target name says
+  what the sequence meant to shoot, not where the telescope was; a light
+  pointed well away (farther from the field's centre than its half-diagonal
+  plus a degree, and not named after it) is one the stacking service could
+  only reject, after it had cost the person quota.
+- **Flats follow their lights.** A flat carries no target, so it goes to the
+  stacking projects that got this telescope's lights of the same filter that
+  night; an evening flat, taken before any light, waits for them until the
+  next midday. A night spent on another target keeps its flats here: sending
+  them to whichever project the last light went to calibrated nothing and
+  used up quota.
+- **Darks, bias and dark flats go to the telescope's calibration library** on
+  Rapid Stacker Collab, which calibrates its lights in every project, instead
+  of to one project; a folder of them can be kept in step with it. The old
+  switch still sends them to the project of the last light sent, for anyone
+  who turns the library off. This, the flats and the field check are ported
+  from Rapid Stacker Collab's own plugin, so the two behave alike.
+- **The plugin joins by itself, and joining accepts the stacking service's
+  terms of contribution as they stand.** The text beside the switch says so.
+  It only ever accepts the version the service has just shown it: if the terms
+  change between that and the join, the join is refused and waits for somebody
+  to read and accept them on the options page. Rapid Stacker Collab does not
+  stop a member's uploads when its terms change later, so neither does the
+  plugin.
+- **There is no "after the sequence ends" upload mode.** The plugin does not
+  follow the sequencer's state, and a mode that waited for it would wait for
+  ever; "when the camera is idle" covers the same need between frames.
+- **The upload engine is Rapid Stacker Collab's own, copied in**
+  (`nina/src/RapidStackerCollab.Core`, MPL-2.0) with its tests, rather than
+  rewritten. Its queue is SQLite, whose native library the plugin loads by full
+  path before opening it, because N.I.N.A. adds a plugin's folders to the
+  search path only once the plugin has started.
+
+## Live stacking at home
+
+A collaboration's frames can be stacked on a machine in your own house instead
+of on the cloud stack.  The collaboration server stays what it already is, a
+durable mailbox that the telescopes upload to; a **hub** on the home network
+pulls the frames down, deals them to workers, and pushes the stacks back up for
+the progress pages.  What follows is why it is built that way and what is
+built; the last list names what is still open.  The operator's guide to the hub
+is `docs/runbooks/starfront-hub.md` in the Rapid Stacker Collab repository.
+
+### The hub
+
+A hub is a `collab-hub` program running on one machine of a local network: the
+owner's Mac, or a volunteer's PC if the owner has no spare machine.  It is
+written in Rust in the Rapid Stacker Collab repository, beside the engine that
+does the stacking, because a second copy of that engine in Python would drift
+from it.  The hub holds one collaboration's state on the LAN: its database, its
+objects (previews, status, masters) and its work queue.  Workers are
+`collab-worker` programs on the same network that take jobs from the hub and
+hand the results back.
+
+The desktop program runs the hub (`astrocontrol/hub.py`).
+It writes the hub's configuration from the settings on every start, so the file
+the hub reads cannot drift from what the person set.  It runs the hub's `check`
+first and keeps the report: a hub pointed at a missing catalogue folder or a full
+disk would start, look alive, and fail on the first frame at two in the morning.
+A crash restarts the hub with back-off (1, 2, 4 ... 60 s), so a hub that dies on
+start does not spin the processor.  On a Mac the hub is kept awake with
+`caffeinate` for as long as it runs, because a sleeping hub is a hub that
+disappears from its workers in the middle of a stack.
+
+The hub itself is built (`worker/crates/hub` in Rapid Stacker Collab): the
+contract's routes over SQLite and a local object store, the queues, the
+background tasks (sweep, gold scheduler, dead-letter drain, retention, the
+free-space floor), the catalogue service and the link to this server.  It runs
+beside the cloud stack, not in place of it: a collaboration is stacked on a hub
+or on Rapid Stacker Collab's cloud, and both backends stay supported.
+
+**How to see it work on one Mac.**  `python3 tools/local_night.py` starts the
+local server (`run_local.py --lan`), a registered hub and one enrolled worker
+under one data folder, binds a throw-away collaboration to the hub, and prints
+the URLs and what the Windows PC needs (the worker enrol command and the plugin's
+server address).  `--synthetic` also uploads synthetic frames through the front
+door as a telescope would, and `--exit-when-stacked` waits for the first live
+preview, tears everything down and exits 0.  The topology it builds is the real
+one: telescope or plugin -> this server's `/stack/api` (or straight to the hub
+on the LAN) -> the hub -> workers, and the hub pushes previews back to this
+server's progress pages.
+
+### One copy of the catalogue, read by everybody
+
+The engine solves each frame against the Gaia DR3 star catalogue, using the
+frame's pointing as a hint.  The copy is the PixInsight download in XPSD form,
+about 45 GB of the 108 GB it takes up, and the engine reads a cone of it per
+project.  No ASTAP and no index files are needed.  The cone search walks every
+band file, which is the expensive part, so the arrangement is:
+
+- **One copy, on a network folder.**  The folder is the desktop setting
+  `hub.catalogueDir`, and the hub reads it as its `xpsd_dir`.  Every worker reads
+  the same folder.
+- **The hub runs each project's cone search once.**  Workers take the result and
+  never walk 45 GB over SMB themselves.
+
+The reads are safe for any number of readers: the engine opens the files for
+plain reads and seeks, with no memory mapping, no locks and no writes, so one
+read-only copy serves the whole network.  The configuration writes the folder
+under the key for the hub's own platform, because the same share is mounted
+under different paths on Windows and on macOS.
+
+The folder is **the user's own PixInsight copy, and it is never redistributed**:
+not in a release, not in an installer, not on the server.  The desktop points at
+the folder and never copies from it.
+
+### Frames: the server by default, and the hub pulls
+
+By default a telescope uploads its frames to `collab.starfront.space`, the same
+way it uploads to the cloud stack.  The server keeps the bytes until the hub has
+acknowledged them, plus a retention window.  The hub never needs an inbound
+connection: it says it is alive every minute, and long-polls the server's `pull`
+for changes, and fetches the frames it is told about.
+
+That order is deliberate, for three reasons.
+
+- **No hub owner opens a port.**  A hub behind a home router, with no fixed
+  address, works as it is.
+- **Uploads keep working while the hub sleeps.**  A telescope that uploads on a
+  night when the Mac is shut does not lose its frames; they wait on the server
+  until the hub asks for them.
+- **The LAN keeps working when the server does not.**  The hub serves its own
+  network with the grant it already holds.  Only the public pages lag.
+
+A telescope on the hub's own network does not need to go out to the server at
+all.  The plugin probes the hub's health route on the LAN (`LanProbe.cs`) and
+uploads straight to the hub only when the answer carries the same hub id as the
+link.  A frame that started on one route finishes on it, and when the probe fails
+the plugin falls back to the server.
+
+Local mode is the same picture with the server on the same Mac:
+`server/run_local.py --lan` binds the server to the LAN address, and
+nothing has to leave the house.
+
+### Deleting a hub-backed collaboration
+
+Closing a collaboration only takes it off everybody's list.  *Deleting* a
+collaboration that is stacked on a hub (`DELETE /api/v1/projects/{id}`, its
+owner or the server owner) files a **seven-day, restorable, delayed deletion**:
+the stacking project becomes `deleted` with `deleted_at`, `delete_after` and
+`deleted_by`, the collaboration is closed, and the hub is told through its
+change feed, so it stops taking frames and runs its own purge once
+`delete_after` passes.  Joins and uploads on `/stack/api` answer 409
+`project_deleted`.  `POST /api/v1/projects/{id}/restore` undoes it until
+`delete_after` and puts everything back as it was; after that it is refused
+with the date.  When the window is over the `stack-sweep` thread deletes the
+project's relay bytes (its frames, and the library frames of people who are in
+no other live hub project) and keeps the rows.  The **final masters and
+`status.json` are kept**, so the project page still opens, read-only, saying
+"deleted on the date, final results kept", until the owner removes them with
+`DELETE /api/v1/projects/{id}/stack/results` (only once the window is over).
+The desktop's Collab tab has a Delete button beside Close on every stacked
+collaboration you started, which says how long it can be restored, and lists
+deleted collaborations with a Restore button until their window ends (they
+are off every other list).
+
+### The stacking project flows down from the collaboration
+
+The author's rule (2026-10-22): **the Starfront collaboration is the only place
+a project is made.**  Everything the stacking engine needs comes from it, every
+edit reaches it, and nobody makes a second project anywhere: not on a hub, not
+on the Collab website, not by pasting a join code.  Task T706 traced each field
+through the merged system and closed the gaps it found.
+
+**On by default.**  A collaboration started without saying where it is stacked
+(the desktop form shows the choice, a plugin's form says nothing) is bound
+automatically: to a hub its owner owns (the one heard from most recently), else
+to the one hub whose owner listed them as a coordinator (D002), else to Rapid
+Stacker Collab when they have linked their Collab account, else it is not
+stacked.  `{"backend": ""}` turns it off.  The desktop's Live stacking fieldset
+shows "Live stacking: on (hub NAME)" and offers off, another hub or the cloud;
+`GET /api/v1/stacking` gives it the hubs, the default, the account link and the
+deleted collaborations.
+
+**One derivation, both backends.**  `_stack_fields` in `server/app.py` turns a
+collaboration into what the engine is told, and both the hub's document
+(`_stack_doc`) and the cloud project use it:
+
+| From the collaboration | Into the stacking project |
+|---|---|
+| name | `name`, `target_name` (the slug is made once and never changes) |
+| notes | `description` (2000 characters) |
+| region | `grid`, a placeholder with `rotation_from_first_light` until the first light frames it; after a frame the grid is the engine's. A **mosaic** with panels dealt is framed by them instead: centred on the box its panels' corners fill, turned to their camera angle, at the finest rig's scale, with a 2 % margin a side (coarsened only to keep within 12 000 px), and no `rotation_from_first_light`. The first light of a mosaic is one panel, and taking the centre from it moved M81_M82's grid onto panel 1 on 2026-11-04, so panel 2's clear frames fell 90 % off it (`pointing_off_target`). The grid follows the panels as rigs join, leave or turn, until a light locks it. The panels' overlap is the collaboration's `overlap` (percent, 0 to 50, 10 when it never said, the fixed figure before 2026-11-04); N.I.N.A. usually asks for 20, and more overlap gives the gold run's photometry and background matching more shared sky at the price of panels. A changed overlap recuts a rig's cells at its next night, not under the one in hand |
+| filters | `filters` (contract names: H -> HA, OSC-RGB -> OSC, OSC-Ha+OIII -> DUO), `palette`; a colour band whose switch is off is left out |
+| requirements | `policy`: colour taken -> `osc_allowed`; calibrated only -> `calibration: required`; shortest sub -> `min_exposure_s`; star size only raises `max_fwhm_arcsec` (to twice the HFR, at most 20); the rest are the contract's defaults |
+| who may watch | `visibility` (unlisted by default, D003) |
+| open or closed | `status`: closed on a hub, `paused` on the cloud (the contract's `closed` cannot reopen) |
+| members | a telescope on the collaboration (or the owner's) is handed the grant or join code; the person behind it is removed (`removed`, T419) only when the last share any of their telescopes holds is declined (the dock's Leave), and joining again, even on a telescope still on it, gives back the status they had; a removal no telescope made stays final (on 2026-10-28 the owner's StellaLyra re-dealt its share while their backyard rig was still on the Bubble Nebula, and the old per-telescope rule removed the owner for good: frames stopped and a hand upload was refused) |
+| deletion | the seven-day deletion above, on a hub or the cloud |
+
+Guiding, the longest sub, the Moon, altitude, Bortle and focal-length limits
+have no field in the contract's policy: the collaboration judges them per
+night before a frame is sent.
+
+**Every edit flows down.**  `PUT /api/v1/projects/{id}` re-derives the document,
+and a hub hears of it through its change feed whenever anything but
+`updated_at` moved (the hub reads the project back from the front door).
+`tools/check_server.py` edits each field in turn and checks the document, the
+feed row and what the hub reads.
+
+**Nothing is edited on the stacking side.**  `/stack/api` has no route that
+creates, edits, deletes or re-keys a project; a member's `membership` PUT
+changes only that member's own row and never its role or status; a hub's push
+changes only the grid it framed.  The hub has no project-creating route either
+(`POST /api/hub/v1/projects` is `not_found`, T303) and takes projects only from
+this server's feed.
+
+**The cloud, through the Collab API** (`server/stack/cloud.py`).  The owner
+links their Rapid Stacker Collab account once, in the desktop's Collab tab:
+an API token with `projects:manage`, which only a signed-in Collab session can
+mint (Dashboard, API tokens; the device flow never grants it).  The server
+checks it with `GET /auth/me` and keeps it per person, sealed with AES-GCM under
+`STARFRONT_CREDENTIAL_KEY` (else the admin token; with neither it is kept as
+typed and the tab says so), never listed and never sent to a telescope.
+Binding a collaboration to the cloud makes the project with `projectsCreate`
+and opens it; every edit is a `projectsUpdate` carrying the whole derived
+policy (a PUT replaces it); the join code is kept with the project and handed
+to the collaboration's telescopes as a pasted one was.  Deleting calls
+`projectsDelete` (`confirm_slug`, delayed); the contract (1.28.0) keeps that
+for a browser session, so with a token the project is paused instead and the
+collaboration says where to finish.  A failed call is recorded on the
+collaboration and retried by the `stack-sweep` thread with back-off; a create
+whose answer was lost is looked up by its slug before it is tried again.
+
+**Old pasted codes.**  A collaboration that was given a pasted join code keeps
+it, read-only: an edit may send it back or clear it, and the desktop offers to
+have the server make a project instead.  A new pasted code is refused with the
+way to link the account.  Join codes are no longer in the open project reads
+(`GET /api/v1/projects`), which had been showing them to anyone.
+
+What T706 leaves for the author: `projectsDelete` and `projectsRestore` accept
+only a browser session, so the server cannot finish a cloud deletion itself
+(a contract change to accept a `projects:manage` token would make the existing
+call succeed); Collab tokens last at most 365 days, after which the
+collaboration shows the failure until the account is linked again.
+
+### Grants: one secret per hub
+
+A hub is registered once, by its owner, from the desktop.  The server gives it
+two secrets, shown once and kept by the hub in a `0600` file:
+
+- a **hub token** (`sfh_` plus 64 hex characters), which the hub presents on
+  every call.  Only its SHA-256 is kept on the server.
+- a **grant secret** (32 random bytes).  The server signs a *grant* with it: a
+  short-lived `sfg_` token that names one person, one telescope and one project,
+  valid for a day.  The hub checks the signature with the same secret, offline.
+
+The grant secret is **per hub**, so a compromised hub can forge grants only for
+itself.  A secret shared by all hubs would let one stolen copy speak for every
+hub.  The grant is signed rather than checked with the server on each call
+because a hub behind a NAT must keep serving its LAN when the server is
+unreachable.
+
+Joining a hub project does **not** need a Rapid Stacker Collab sign-in.  The
+collaboration already decides who may join, on Starfront, so the plugin joins with
+the grant alone.  Collab sign-in is needed only for a cloud link.
+
+Who may bind a collaboration to a hub (decision **D002**): the hub's owner, and
+the coordinators the owner has listed on the hub's `allowedCoordinators`.
+Anybody else gets a 403.  A hub is somebody's machine, and binding a
+collaboration to it sends that collaboration's frames there, so the owner
+decides who may do that.
+
+A hub-backed project is **unlisted** by default (decision **D003**).  It has an
+address, and it is not on any public list.  Listing a project is a second,
+separate decision, and the collaboration has already decided who joins.
+
+Calibration (decision **D001**): each backend keeps its own calibration
+library.  A telescope's darks, bias and flats for a hub live apart from its
+cloud library, so an outage on one side cannot change which darks the other
+side's stacks use.  A rig-scoped call goes to the backend the rig mostly uses,
+the plugin's default backend.  The rig id is kept per backend so the two do not
+overwrite each other (T607): the cloud uses the telescope profile's own, and a hub
+link has its own, shared by the links to the same hub.
+
+### Volunteers
+
+A volunteer's PC is a worker, and the desktop's volunteer installer does the
+work: it fetches the signed worker build, checks it, unpacks it, enrols it with a
+code from the hub's admin surface, and installs it as a background service.
+
+**Installs are verified, and refused until a key exists.**  The release manifest
+(`latest.json`) is signed with Ed25519 over its exact bytes, and the signature
+sits beside it as `latest.json.sig`.  The manifest records each archive's size
+and SHA-256, so the archive is bound to the signature.  Both checks run before
+anything is unpacked, and a version that is not newer, or a contract below the
+hub's minimum, is refused.  The desktop uses the `cryptography` package when it
+is installed, and otherwise `astrocontrol/ed25519_verify.py`, a pure-Python
+verifier checked against the RFC 8032 vectors.  A missing wheel never turns into
+installing without checking.
+
+The public key is embedded in `volunteer.py` (since 2026-10-28; the private
+half is kept offline by the author).  A build carrying the placeholder instead
+refuses every install and update with "no release signing key configured", so an
+unsigned worker is never run.  The hub's own binary
+goes through the same checks, from the server's `download/collab-hub/`.
+
+**Where a release comes from.**  The worker's manifest is tried from the
+Volunteer page's manifest URL if one is set, then the hub's mirror, then the
+Starfront server, and last the public release: first Rapid Stacker Collab's
+own downloads (`https://collab.astro.ekeservices.com/downloads/`), then the
+GitHub release on Starfront's own repository (one release per product, tagged
+`collab-worker` and `collab-hub`), which carried 0.1.0 first and stays as a
+mirror.  Neither address ever moves.  The hub's own manifest is tried from the
+server, then the same two.  Every source passes the same signature check, so a
+source adds no trust; the public release is there so that a server which does
+not carry the binaries, a home lab's or a new one's, still lets its volunteers
+install.  It lives with Rapid Stacker Collab because the programs are
+Collab's, and so that the address does not depend on which repository
+Starfront lives in.  The manifests name their archives relative to themselves,
+so the same signed files serve from every one of these places.  The programs
+are proprietary (they contain Rapid Stacker Collab and rapid-stacker), free to
+use with Starfront; Starfront's MPL-2.0 does not cover them.
+
+**The Windows worker is a logon task, not a service** (`collab-worker service
+install`, T207).  It runs
+in the volunteer's own session, so it can read the mapped drive that the catalogue
+folder is on, with the credentials that mapping already uses.  A Windows service
+runs as another account, which normally cannot see the user's mapped drives, and
+would need its own password to reach a network share.  An `--as-service` option
+exists for a machine whose administrator wants a real service.
+
+**When a volunteer's machine pauses.**  The desktop writes the settings: pause
+while sequencing, the work window, the idle policy, the scratch folder and its
+cap.  A blank scratch folder or a cap of 0 keeps what `collab-worker enrol`
+chose; the worker will not start without both, and the desktop once deleted
+them, so every install with the defaults failed after spending its code.  The
+sequencer holds a busy file for exactly as long as a night is being
+imaged, and clears it on every way a night can end, including an exception.  It
+is not held while a loop waits for dusk, so a sequence armed in the afternoon
+does not idle the volunteers all day.  The worker reads the busy file and the
+work window and does not take jobs while they say no (T206); a job already in
+hand is finished, and the heartbeat says why the worker is busy.  Pausing while
+N.I.N.A. is open is the worker's `pause_while_nina` key, which the desktop
+writes with the other settings.
+
+**What a volunteer's machine sees.**  Other people's frames, and only as far as
+the frame itself allows.
+
+- **No observer location.**  The plugin's FITS stripper removes `SITELAT`,
+  `SITELONG`, `SITEELEV` and `OBSERVER` before upload (on by default), and the
+  server refuses a frame whose header carries them (`header.py`, an allow-list).
+  A frame that comes through the plugin does not reach a volunteer with a
+  location in it.
+- **Scratch only while the job runs.**  A frame is in the worker's scratch folder
+  while it is being stacked, and is collected afterwards.  The scratch folder has
+  a cap; `collab-worker enrol` proposes half of the free space up to 200 GB, and
+  refuses (before it spends the code) when that is under 20 GB.
+
+**Power.**  A sleeping volunteer simply misses messages; they become visible to
+another worker, and the hub's sweep (every five minutes) resends what a crash or
+a lost send left behind.
+
+### Transport and licences
+
+**No TLS on the LAN by default** (decision **D006**).  The bearer token is the
+secret, and raw subs on a home network are not confidential, so the hub writes
+no TLS table.  A pinned self-signed certificate (`--tls`) is an option.  A hub
+reachable beyond the LAN belongs behind a reverse proxy, not on a bare port.
+
+**The progress pages are MPL-2.0** (decision **D007**).  The pages under
+`server/web/stack/` were ported from Rapid Stacker Collab's website and are
+released inside Starfront under the Mozilla Public License 2.0, with a header in
+every file that names the origin.  The vendored OpenSeadragon keeps its own
+BSD-3-Clause licence, listed in `server/web/stack/NOTICE.txt`.  The hub and the
+worker stay in the Rapid Stacker Collab repository and are not MPL.
+
+**Deleting a hub-backed collaboration** (decision **D004**, built: see the
+section above).  Deleting files a restorable deletion on the hub that lasts
+seven days.  After that, the raw subs and the server's relay copy are purged.  The final masters and
+`status.json` are kept, for the hub's backup and the project page, until the owner
+removes them.  A week is long enough to undo a mistake, and the masters are what
+the collaboration produced.
+
+### What is built, and what is not
+
+Built and merged (the final state of the distributed-stacking plan, T001 to
+T706, except where the last list says otherwise):
+
+- **The hub**, in Rapid Stacker Collab (`worker/crates/hub`, `collab-hub`):
+  `check`, `run`, `token`, `enrol-code`, `backup` and `simulate`; the contract's
+  worker and contributor routes over SQLite and a local object store; the queues;
+  the catalogue service (each project's cone search once); the background tasks;
+  worker enrolment and the fleet view; and the link to this server (heartbeat,
+  change feed, frame relay, verdicts and previews pushed back, streamed masters).
+  Projects reach it only from this server's feed.
+- **The worker**: hub mode in `collab-worker` (it reproduces the simulator's
+  stacks bit for bit over a hub), `enrol`, `service install` as a logon task or
+  unit, the busy-file, work-window and N.I.N.A. gates, the contract handshake
+  (exit 3 on a mismatch), and `self-update` against a signed manifest.
+- **The desktop** (`astrocontrol/hub.py`, `astrocontrol/volunteer.py`): the hub
+  supervisor and its install, registration, enrol codes and fleet in the Collab
+  tab; the volunteer installer with the signature check; the Live stacking
+  fieldset; Delete and Restore.
+- **This server**: hub registration, heartbeat, the change feed and grants
+  (`server/hubs.py`); the front door at `/stack/api` (projects, join, frames,
+  calibration library, status, events, masters, mosaic, "my projects"); the
+  frame relay and acknowledgements, record reads for members and rigs, push
+  ingestion including streamed masters (`server/stack/`); the progress pages and
+  dashboard (`server/web/stack/`); the stacking project derived from the
+  collaboration, the cloud link through the Collab API, and the seven-day
+  deletion.  `server/README.md` lists the routes.
+- **The plugin**: the routing client (hub or cloud by project), the LAN
+  short-cut, joining a hub project without a Collab sign-in, and a hub's 401
+  clearing only its own link's grant.
+- **Checks**: `tools/check_hub.py`, `check_volunteer.py`, `check_stack_relay.py`
+  (the whole server loop against a fake hub), `check_csp.py` and the server
+  checks run in CI (`.github/workflows/python-checks.yml`); `tools/local_night.py`
+  brings the real programs up together.
+
+Still open:
+
+- **Updates are by hand.**  The first signed release (worker and hub 0.1.0,
+  2026-10-28) is published as the GitHub releases above, but nothing checks
+  for a newer one by itself: a volunteer presses Update, or runs
+  `collab-worker self-update`, which also tries the public release last
+  (Collab's downloads, then GitHub, from worker 0.1.1; 0.1.0 tries neither).
+  0.1.1 is built for that but not yet signed or published, and nothing is in
+  Collab's downloads yet, so for now the desktop falls through to GitHub.  The hub does not yet mirror the worker's manifest
+  (`/hub/v1/worker-manifest` answers 400), so a volunteer falls through to the
+  server and then GitHub.
+- **A real night.**  Nothing here has been run from N.I.N.A. on the Windows PC
+  against a real hub, and two real workers have not drained a hub on the home
+  network (T208, T705).  `tools/local_night.py` is the way to start.
+- **Real catalogue data through a standalone hub** (T310) and the hub checklist
+  in N.I.N.A. (T606) are not done.
+- **TLS** on the hub is not built (decision D006): plain HTTP on a trusted LAN.
+- **Collab's `projectsDelete` and `projectsRestore`** accept only a browser
+  session, so a cloud-backed collaboration is paused instead of deleted.
+- A deletion's purge on the hub follows `delete_after` by up to a day, because
+  the retention loop runs daily.
+
 ## Layout
 
 ```
 run.py                     entry point (window, browser or server)
 Starfront.pyw           double-clickable launcher, no console
 server/                    the collaboration server (its own README)
+  hubs.py                  hubs: registration, heartbeat, the change feed, grants
+  stack/                   live stacking's front door, at /stack/api
+  web/stack/               the progress pages (MPL-2.0, see NOTICE.txt)
 astrocontrol/
   collab.py                what a project, task and contribution are - imported
                            by both sides, so the rules cannot drift apart
   collabclient.py          this telescope's half: ask, hold, report
   collabadmin.py           the coordinator's half: enrol, delegate, overrule
+  hub.py                   the collab-hub program on this machine: config, check, run
+  volunteer.py             volunteering this machine: a verified install of the worker
+  ed25519_verify.py        the signature check when `cryptography` is not installed
   desktop.py               the application window, menu bar and native dialogs
   main.py                  HTTP + WebSocket API, serves the UI
   equipment.py             telescopes and saved equipment profiles, on disk
@@ -2006,6 +2507,13 @@ astrocontrol/
     render.py              statistics, auto-stretch, preview rendering
     stars.py               star detection and the half-flux diameter
   web/                     the UI (no build step, no framework)
+tools/                     checks, run as python tools/check_<name>.py
+  check_settings.py        the hub and volunteer settings survive a round trip
+  check_hub.py             the hub supervisor, against a fake collab-hub
+  check_volunteer.py       the installer, against a fake signed manifest
+  check_csp.py             the progress pages carry no inline script or style
+  check_stack_relay.py     the server's whole hub loop, against a fake hub
+  local_night.py           the server, a hub and a worker together, on this Mac
 ```
 
 Three design decisions worth knowing about:
@@ -2182,6 +2690,37 @@ GET  /api/images/{id}/download
 
 Driver failures come back as HTTP 400 with the driver's own message, which the UI
 shows as a toast.
+
+### The server: hubs (live stacking)
+
+A hub is a `collab-hub` on somebody's own network. It cannot be reached from the
+server, so it makes every call. People call with their normal sign-in token; the
+hub calls with its own `sfh_` token.
+
+```
+POST   /api/v1/hubs                      {name, lanUrl?} -> {hubId, hubToken, grantSecret}
+                                         anyone who may start a collaboration; token and secret shown once
+GET    /api/v1/hubs                      my hubs (never the token or the secret)
+DELETE /api/v1/hubs/{id}                 revoke: the owner only; the hub's token stops working
+PUT    /api/v1/hubs/{id}/coordinators    {coordinators: [userId, ...]} - who besides the owner
+                                         may bind collaborations to this hub (owner only)
+POST   /api/v1/hubs/{id}/heartbeat       hub token; the hub's status JSON, every ~60 s
+GET    /api/v1/hubs/{id}/pull            hub token; ?since=N&wait=S (S up to 20): long-polls for
+                                         changes after seq N -> {changes: [{seq, kind, key, at}], seq}
+```
+
+Only a SHA-256 of the hub token is stored. A hub's `pull` is answered as soon as
+there is a change after `since`, or empty after `wait` seconds (default 20) with
+`seq` unchanged; the hub asks again from the `seq` it was given. Any other hub id,
+a person's token or a telescope's token is a 401.
+
+The grant secret is 32 random bytes, base64url. It lets the server sign, and the
+hub verify offline, a *grant*: `sfg_` + base64url(JSON `{v:1, hub, sub, name,
+agent, project, iat, exp}`, with `exp = iat + 86400`) + `.` +
+base64url(HMAC-SHA256 over that first base64url text, keyed with the 32 decoded
+bytes). A grant is accepted within five minutes either side of its lifetime, for
+clocks that disagree. Grants are handed out in the project listing, not by a
+route of their own.
 
 ---
 

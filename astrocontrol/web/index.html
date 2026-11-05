@@ -1466,6 +1466,72 @@
             <div id="colPFilters"></div>
             <button class="btn small" id="btnColAddFilter">Add a filter</button>
 
+            <fieldset class="col-stacking" id="colStacking">
+              <legend>Live stacking</legend>
+              <p class="small" id="stkSummary" role="status">Live stacking: off</p>
+              <p class="small muted">
+                Stacking follows this collaboration: it is on by default where
+                you have somewhere to stack, and its name, notes, region,
+                filters, requirements and who may watch reach the stacking
+                project every time you save here. Nothing is made or changed
+                anywhere else. Only telescopes on it are given the join code
+                or the hub's grant.
+              </p>
+              <div class="row gap">
+                <label class="inline"><input type="radio" name="stkBackend"
+                       id="stkNone" value="" checked> Off</label>
+                <label class="inline" title="Rapid Stacker Collab's service: this server makes the project there and keeps it in step, with your linked account"><input type="radio" name="stkBackend"
+                       id="stkCloud" value="cloud"> Rapid Stacker Collab (cloud)</label>
+                <label class="inline" title="A live stacking hub: yours, or one whose owner listed you as a coordinator"><input type="radio" name="stkBackend"
+                       id="stkHub" value="hub"> A hub</label>
+              </div>
+              <div id="stkCodeBox" hidden>
+                <label title="Made on the Collab website before the server made them itself; kept as it is">Pasted join code (kept)
+                  <input type="text" id="stkJoinCode" readonly spellcheck="false" autocomplete="off"></label>
+                <label class="inline"><input type="checkbox" id="stkConvert"> Let this server make and keep a
+                  Rapid Stacker Collab project for it instead</label>
+              </div>
+              <div id="stkHubBox" hidden>
+                <div class="row gap">
+                  <select id="stkHubPick" class="grow" title="The hubs you may bind a collaboration to"></select>
+                  <button class="btn small" id="btnStkHubs" title="Ask the server again">Reload</button>
+                </div>
+                <div class="small muted" id="stkHubNote"></div>
+              </div>
+              <div class="row gap" id="stkVisBox" hidden>
+                <label class="inline">Who can watch the stack
+                  <select id="stkVisibility">
+                    <option value="unlisted">Unlisted (anyone with the link)</option>
+                    <option value="public">Public (listed)</option>
+                    <option value="private">Private (members only)</option>
+                  </select></label>
+              </div>
+              <div class="small" id="stkMsg" role="status"></div>
+              <div class="small" id="stkState"></div>
+              <details class="fold" id="stkCloudFold">
+                <summary>Rapid Stacker Collab account</summary>
+                <p class="small" id="stkCloudLinkText"></p>
+                <ol class="small muted">
+                  <li>Sign in at Rapid Stacker Collab and open your Dashboard.</li>
+                  <li>Under API tokens, create a token named Starfront, tick
+                    Manage projects (projects:manage) and Read projects, and
+                    choose how long it lasts (up to 365 days).</li>
+                  <li>Copy the token (it starts rscu_ and is shown once) and
+                    paste it here. It is kept on the Starfront server, sealed,
+                    and never sent to a telescope.</li>
+                </ol>
+                <div class="row gap">
+                  <input type="password" id="stkCloudToken" class="grow" autocomplete="off"
+                         spellcheck="false" placeholder="rscu_…" title="A Rapid Stacker Collab API token with projects:manage">
+                  <button class="btn small primary" id="btnStkCloudLink">Link</button>
+                  <button class="btn small ghost danger" id="btnStkCloudUnlink" hidden>Unlink</button>
+                </div>
+                <label class="small">Service address
+                  <input type="text" id="stkCloudBase" spellcheck="false"
+                         placeholder="https://collab.astro.ekeservices.com/api"></label>
+              </details>
+            </fieldset>
+
             <details class="fold">
               <summary>What you will accept</summary>
               <p class="small muted">
@@ -1524,10 +1590,11 @@
                          style="width: 64px" placeholder="any"></label>
               </div>
               <p class="small muted">
-                A colour camera shoots broadband RGB whatever is in front of it,
-                so it has nothing to give a narrowband project and nothing usable
-                on a bright night. To take its data, list a filter named
-                <b>RGB</b> above.
+                A colour camera's data is its own band, kept apart from the mono
+                channels: <b>OSC-RGB</b> for its broadband, <b>OSC-Ha+OIII</b>
+                through a dual-band filter. Each box above adds its band to the
+                filters, where you give it hours wanted; untick both and colour
+                cameras are turned away.
               </p>
             </details>
 
@@ -1549,8 +1616,151 @@
         <div id="colBrowse">
           <p class="small muted">Set a server above, then refresh.</p>
         </div>
+        <div class="col-deleted" id="colDeleted" hidden></div>
 
         <div id="colTask"></div>
+
+        <!-- ------------------------------------- 3. a live stacking hub -->
+        <details class="fold" id="hubFold">
+          <summary>Live stacking hub (run one on this computer)</summary>
+          <div class="plan-box">
+            <p class="small muted">
+              A hub stacks the lights of collaborations you bind to it, on this
+              computer and its catalogue, and serves the result through the
+              Starfront server. Volunteers' computers can lend it their idle time.
+            </p>
+            <div class="row gap">
+              <span class="pill" id="hubPill"><span class="dot"></span><span id="hubPillText">off</span></span>
+              <span class="small muted mono" id="hubUrlText"></span>
+              <span class="spacer"></span>
+              <label class="inline"><input type="checkbox" id="hubEnabled"> Run the hub</label>
+              <label class="inline" title="Start the hub whenever this program starts"><input type="checkbox" id="hubAutoStart"> Start with this program</label>
+            </div>
+            <div class="grid-2">
+              <label>Hub data folder
+                <span class="row gap">
+                  <input type="text" id="hubDataRoot" class="grow" spellcheck="false" placeholder="blank: inside this program's data">
+                  <button class="btn small" id="btnHubDataBrowse">Browse</button>
+                </span>
+              </label>
+              <label title="Your own copy of the star catalogue the stacker plate-solves against. The hub never changes it.">Catalogue folder
+                <span class="row gap">
+                  <input type="text" id="hubCatalogue" class="grow" spellcheck="false" placeholder="folder with the catalogue">
+                  <button class="btn small" id="btnHubCatBrowse">Browse</button>
+                </span>
+              </label>
+              <label>Bind address
+                <input type="text" id="hubBind" spellcheck="false" placeholder="0.0.0.0:8787">
+              </label>
+              <label title="How other computers reach this hub, like http://192.168.1.20:8787">Public URL
+                <input type="text" id="hubPublicUrl" spellcheck="false" placeholder="http://this-computer.local:8787">
+              </label>
+            </div>
+            <div class="row gap" style="margin-top: 6px">
+              <button class="btn small" id="btnHubSave">Save settings</button>
+              <button class="btn small" id="btnHubInstall" title="Download the hub program, verify its signature and install it">Install hub</button>
+              <button class="btn small" id="btnHubCheck">Check</button>
+              <button class="btn small primary" id="btnHubStart">Start</button>
+              <button class="btn small" id="btnHubStop">Stop</button>
+            </div>
+            <div id="hubInstallBox" hidden>
+              <div class="progress"><div class="progress-fill" id="hubInstallBar"></div></div>
+              <div class="small" id="hubInstallText"></div>
+            </div>
+            <div class="small" id="hubMsg" role="status"></div>
+            <pre class="mono small col-pre" id="hubCheckReport" hidden></pre>
+
+            <h4>Starfront registration</h4>
+            <div class="row gap">
+              <input type="text" id="hubRegName" class="grow" spellcheck="false" placeholder="a name for this hub, like Garden observatory">
+              <button class="btn small" id="btnHubRegister">Register with Starfront</button>
+            </div>
+            <div class="small muted" id="hubRegText"></div>
+
+            <h4>Let a computer help</h4>
+            <div class="row gap">
+              <button class="btn small" id="btnHubEnrol">New enrol code</button>
+              <span class="small muted">A one-time code a volunteer types to join this hub.</span>
+            </div>
+            <div class="col-enrol" id="hubEnrolBox" hidden>
+              <span class="col-enrol-code mono" id="hubEnrolCode"></span>
+              <button class="btn small" id="btnHubEnrolCopy">Copy</button>
+              <span class="small muted" id="hubEnrolExpiry"></span>
+            </div>
+
+            <h4>Fleet</h4>
+            <div id="hubFleet"><p class="small muted">The hub is not running.</p></div>
+
+            <h4>Log</h4>
+            <div class="row gap">
+              <button class="btn small" id="btnHubLog">Refresh log</button>
+            </div>
+            <pre class="mono small col-pre" id="hubLog"></pre>
+          </div>
+        </details>
+
+        <!-- ------------------------------------- 4. volunteer this machine -->
+        <details class="fold" id="volFold">
+          <summary>Volunteer this machine</summary>
+          <div class="plan-box">
+            <p class="small">
+              A volunteer machine stacks other people's frames for a hub while
+              this one is idle. It sees the frames with their location headers
+              stripped, keeps them in its scratch folder only while they are
+              being stacked, and sends the result back. It never sees who took
+              them or where.
+            </p>
+            <div class="row gap">
+              <span class="pill" id="volPill"><span class="dot"></span><span id="volPillText">not installed</span></span>
+              <span class="small muted mono" id="volStatusText"></span>
+            </div>
+            <div class="grid-2">
+              <label>Hub address
+                <input type="text" id="volHubUrl" spellcheck="false" placeholder="http://192.168.1.20:8787">
+              </label>
+              <label>Enrol code (from the hub's owner)
+                <input type="text" id="volCode" spellcheck="false" autocomplete="off" placeholder="one-time code">
+              </label>
+            </div>
+            <label class="inline" id="volLocalBox" hidden title="Use the hub running on this computer"><input type="checkbox" id="volLocalHub"> Use this machine's hub</label>
+            <div class="row gap" style="margin-top: 6px">
+              <button class="btn small primary" id="btnVolInstall">Install</button>
+              <button class="btn small" id="btnVolUpdate">Update</button>
+              <button class="btn small" id="btnVolUninstall">Uninstall</button>
+              <button class="btn small" id="btnVolStart">Start</button>
+              <button class="btn small" id="btnVolStop">Stop</button>
+            </div>
+            <div id="volProgressBox" hidden>
+              <div class="progress"><div class="progress-fill" id="volProgressBar"></div></div>
+              <div class="small" id="volProgressText"></div>
+            </div>
+            <div class="small" id="volMsg" role="status"></div>
+
+            <h4>When it may work</h4>
+            <div class="row gap">
+              <label class="inline"><input type="checkbox" id="volWhenIdle"> Only when this computer is idle</label>
+              <label class="inline"><input type="checkbox" id="volPauseSeq"> Pause while Starfront is imaging</label>
+              <label class="inline"><input type="checkbox" id="volPauseNina"> Pause while N.I.N.A. is open</label>
+            </div>
+            <div class="grid-2">
+              <label title="Local time, like 22:00-06:00. Blank for any time.">Work window
+                <input type="text" id="volWindow" spellcheck="false" placeholder="22:00-06:00">
+              </label>
+              <label>Scratch folder
+                <span class="row gap">
+                  <input type="text" id="volScratch" class="grow" spellcheck="false" placeholder="blank: inside the worker's folder">
+                  <button class="btn small" id="btnVolScratchBrowse">Browse</button>
+                </span>
+              </label>
+              <label title="0 means no cap">Scratch cap (GB)
+                <input type="number" id="volCap" min="0" step="1">
+              </label>
+            </div>
+            <div class="row gap" style="margin-top: 6px">
+              <button class="btn small" id="btnVolSave">Save</button>
+            </div>
+          </div>
+        </details>
       </div>
     </div>
   </section>
@@ -3171,7 +3381,7 @@
 <script src="plan.js?v=64"></script>
 <script src="surveytab.js?v=62"></script>
 <script src="calibrate.js?v=62"></script>
-<script src="collab.js?v=73"></script>
+<script src="collab.js?v=74"></script>
 <script src="allsky.js?v=62"></script>
 <script src="wizard.js?v=66"></script>
 </body>

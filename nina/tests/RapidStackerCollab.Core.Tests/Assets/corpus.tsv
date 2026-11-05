@@ -1,0 +1,627 @@
+# Shared conformance vector for collab-filters (plan section 5.4). One row per normalisation.
+# Every port (Rust, the backend's Node port, the plugin's C# port) must reproduce columns 7-12 from columns 1-6.
+# Column format is documented in docs/filters.md ("The corpus"); in short:
+#   raw          the FILTER header value. `@absent` = header card absent; empty = present but blank. Not trimmed.
+#   bayer        1 if the frame has a BAYERPAT header, else 0
+#   declared     comma-separated canonical identifiers the project declares, or `-` for none
+#                (photometric = declares any of U,V,I,Z,Y)
+#   filename     the frame's file name for the step-8 fallback, or `-`
+#   override     canonical the project override map gives for exactly this raw string, or `-`
+#   contributor  canonical the contributor mapping gives for exactly this raw string, or `-`
+#   canonical    expected canonical identifier (UNKNOWN = quarantine)
+#   step         expected deciding step: override contributor alias empty pattern single-letter sensor filename quarantine
+#   confidence   expected confidence: exact pattern inferred user
+#   bandwidth_nm expected bandwidth in nm, or `-`
+#   vendor       expected vendor id, or `-`
+#   ambiguous    1 if the result is flagged ambiguous, else 0
+#   source       `pl` = distinct FILTER values from the author's Photon Ledger index; `seed` = equipment knowledge
+raw	bayer	declared	filename	override	contributor	canonical	step	confidence	bandwidth_nm	vendor	ambiguous	source
+Ha	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+HA	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+ha	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+hA	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+H-alpha	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+H-Alpha	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+Halpha	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+H alpha	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+H_alpha	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+Hα	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+HΑ	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+Hα 3nm	0	-	-	-	-	HA	alias	exact	3	-	0	seed
+Ha 3nm	0	-	-	-	-	HA	alias	exact	3	-	0	seed
+Ha 5nm	0	-	-	-	-	HA	alias	exact	5	-	0	seed
+Ha 6nm	0	-	-	-	-	HA	alias	exact	6	-	0	seed
+Ha 6.5nm	0	-	-	-	-	HA	alias	exact	6.5	-	0	seed
+Ha 7nm	0	-	-	-	-	HA	alias	exact	7	-	0	seed
+Ha 12nm	0	-	-	-	-	HA	alias	exact	12	-	0	seed
+Ha_7nm	0	-	-	-	-	HA	alias	exact	7	-	0	seed
+Ha7nm	0	-	-	-	-	HA	alias	exact	7	-	0	seed
+Ha (7nm)	0	-	-	-	-	HA	alias	exact	7	-	0	seed
+H-alpha 3nm	0	-	-	-	-	HA	alias	exact	3	-	0	seed
+Hydrogen	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+Hydrogen Alpha	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+Hydrogen-alpha	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+HII	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+H2	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+Baader H-alpha 6.5nm	0	-	-	-	-	HA	alias	exact	6.5	baader	0	seed
+Baader Ha 7nm	0	-	-	-	-	HA	alias	exact	7	baader	0	seed
+Astrodon Ha 5nm	0	-	-	-	-	HA	alias	exact	5	astrodon	0	seed
+Astrodon 3nm Ha	0	-	-	-	-	HA	alias	exact	3	astrodon	0	seed
+Antlia 3nm Ha	0	-	-	-	-	HA	alias	exact	3	antlia	0	seed
+Antlia Ha 4.5nm	0	-	-	-	-	HA	alias	exact	4.5	antlia	0	seed
+Chroma Ha 3nm	0	-	-	-	-	HA	alias	exact	3	chroma	0	seed
+Chroma HA 5nm	0	-	-	-	-	HA	alias	exact	5	chroma	0	seed
+Optolong Ha 7nm	0	-	-	-	-	HA	alias	exact	7	optolong	0	seed
+ZWO Ha 7nm	0	-	-	-	-	HA	alias	exact	7	zwo	0	seed
+Astronomik Ha 6nm	0	-	-	-	-	HA	alias	exact	6	astronomik	0	seed
+Altair Ha 7nm	0	-	-	-	-	HA	alias	exact	7	altair	0	seed
+SVBony Ha 7nm	0	-	-	-	-	HA	alias	exact	7	svbony	0	seed
+Player One Ha 3nm	0	-	-	-	-	HA	alias	exact	3	playerone	0	seed
+Ha 656nm	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+Ha 656.3nm	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+Ha filter	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+H-alpha Filter 7nm	0	-	-	-	-	HA	alias	exact	7	-	0	seed
+Hα-7nm	0	-	-	-	-	HA	alias	exact	7	-	0	seed
+H-a	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+Hydrogen alpha line	0	-	-	-	-	HA	pattern	pattern	-	-	0	seed
+Halpha line	0	-	-	-	-	HA	pattern	pattern	-	-	0	seed
+  Ha  	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+Ｈａ	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+Ha, 7nm	0	-	-	-	-	HA	alias	exact	7	-	0	seed
+[Ha]	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+Ha 36mm	0	-	-	-	-	HA	alias	exact	-	-	0	seed
+Ha 6,5nm	0	-	-	-	-	HA	alias	exact	6.5	-	0	seed
+Hα 6.5 nm	0	-	-	-	-	HA	alias	exact	6.5	-	0	seed
+H alpha 3 nm	0	-	-	-	-	HA	alias	exact	3	-	0	seed
+H-ALPHA 5NM	0	-	-	-	-	HA	alias	exact	5	-	0	seed
+Ha 5nm 656nm	0	-	-	-	-	HA	alias	exact	5	-	0	seed
+Hydrogen Alpha 7nm	0	-	-	-	-	HA	alias	exact	7	-	0	seed
+H 7nm	0	-	-	-	-	HA	pattern	pattern	7	-	0	seed
+h 3nm	0	-	-	-	-	HA	pattern	pattern	3	-	0	seed
+Astronomik H 6nm	0	-	-	-	-	HA	pattern	pattern	6	astronomik	0	seed
+H	0	HA,OIII,SII	-	-	-	HA	single-letter	inferred	-	-	0	pl
+h	0	HA,OIII,SII	-	-	-	HA	single-letter	inferred	-	-	0	seed
+Ha	0	HA,OIII,SII	-	-	-	HA	alias	exact	-	-	0	pl
+H	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+h	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+H	0	HA,L,R,G,B,HA,OIII,SII,CLEAR	-	-	-	HA	single-letter	inferred	-	-	0	seed
+OIII	0	-	-	-	-	OIII	alias	exact	-	-	0	seed
+Oiii	0	-	-	-	-	OIII	alias	exact	-	-	0	pl
+oiii	0	-	-	-	-	OIII	alias	exact	-	-	0	seed
+O3	0	-	-	-	-	OIII	alias	exact	-	-	0	seed
+O-III	0	-	-	-	-	OIII	alias	exact	-	-	0	seed
+O III	0	-	-	-	-	OIII	alias	exact	-	-	0	seed
+O_III	0	-	-	-	-	OIII	alias	exact	-	-	0	seed
+[OIII]	0	-	-	-	-	OIII	alias	exact	-	-	0	seed
+Oii	0	-	-	-	-	OIII	alias	exact	-	-	0	pl
+OII	0	-	-	-	-	OIII	alias	exact	-	-	0	seed
+Oii 3nm	0	-	-	-	-	OIII	alias	exact	3	-	0	seed
+OIII 3nm	0	-	-	-	-	OIII	alias	exact	3	-	0	seed
+OIII 6.5nm	0	-	-	-	-	OIII	alias	exact	6.5	-	0	seed
+O3 7nm	0	-	-	-	-	OIII	alias	exact	7	-	0	seed
+Oxygen	0	-	-	-	-	OIII	alias	exact	-	-	0	seed
+Oxygen III	0	-	-	-	-	OIII	alias	exact	-	-	0	seed
+Oxygen-III	0	-	-	-	-	OIII	alias	exact	-	-	0	seed
+Oxygen 3	0	-	-	-	-	OIII	pattern	pattern	-	-	0	seed
+Baader OIII 8.5nm	0	-	-	-	-	OIII	alias	exact	8.5	baader	0	seed
+Chroma OIII 3nm	0	-	-	-	-	OIII	alias	exact	3	chroma	0	seed
+Antlia OIII 3nm	0	-	-	-	-	OIII	alias	exact	3	antlia	0	seed
+Astrodon OIII 3nm	0	-	-	-	-	OIII	alias	exact	3	astrodon	0	seed
+Astrodon 3nm OIII	0	-	-	-	-	OIII	alias	exact	3	astrodon	0	seed
+Optolong OIII 6.5nm	0	-	-	-	-	OIII	alias	exact	6.5	optolong	0	seed
+ZWO OIII 7nm	0	-	-	-	-	OIII	alias	exact	7	zwo	0	seed
+Astronomik OIII 6nm	0	-	-	-	-	OIII	alias	exact	6	astronomik	0	seed
+Altair OIII 7nm	0	-	-	-	-	OIII	alias	exact	7	altair	0	seed
+SVBony OIII 7nm	0	-	-	-	-	OIII	alias	exact	7	svbony	0	seed
+Player One OIII 3nm	0	-	-	-	-	OIII	alias	exact	3	playerone	0	seed
+OIII 500nm	0	-	-	-	-	OIII	alias	exact	-	-	0	seed
+O 3nm	0	-	-	-	-	OIII	pattern	pattern	3	-	0	seed
+O 7nm	0	-	-	-	-	OIII	pattern	pattern	7	-	0	seed
+OIII filter	0	-	-	-	-	OIII	alias	exact	-	-	0	seed
+OⅢ	0	-	-	-	-	OIII	alias	exact	-	-	0	seed
+Ｏｉｉｉ	0	-	-	-	-	OIII	alias	exact	-	-	0	seed
+O-III 12nm	0	-	-	-	-	OIII	alias	exact	12	-	0	seed
+OIII (3nm)	0	-	-	-	-	OIII	alias	exact	3	-	0	seed
+OIII_5nm	0	-	-	-	-	OIII	alias	exact	5	-	0	seed
+Oxygen III 5nm	0	-	-	-	-	OIII	alias	exact	5	-	0	seed
+Oiii 4.5nm	0	-	-	-	-	OIII	alias	exact	4.5	-	0	seed
+[OIII] 8.5nm	0	-	-	-	-	OIII	alias	exact	8.5	-	0	seed
+O	0	HA,OIII,SII	-	-	-	OIII	single-letter	inferred	-	-	0	pl
+O	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+SII	0	-	-	-	-	SII	alias	exact	-	-	0	seed
+Sii	0	-	-	-	-	SII	alias	exact	-	-	0	pl
+sii	0	-	-	-	-	SII	alias	exact	-	-	0	seed
+S2	0	-	-	-	-	SII	alias	exact	-	-	0	seed
+S II	0	-	-	-	-	SII	alias	exact	-	-	0	seed
+S-II	0	-	-	-	-	SII	alias	exact	-	-	0	seed
+[SII]	0	-	-	-	-	SII	alias	exact	-	-	0	seed
+Si	0	-	-	-	-	SII	alias	exact	-	-	0	pl
+SI	0	-	-	-	-	SII	alias	exact	-	-	0	seed
+Sulfur	0	-	-	-	-	SII	alias	exact	-	-	0	seed
+Sulphur	0	-	-	-	-	SII	alias	exact	-	-	0	seed
+Sulfur II	0	-	-	-	-	SII	alias	exact	-	-	0	seed
+Sulphur-II	0	-	-	-	-	SII	alias	exact	-	-	0	seed
+SII 3nm	0	-	-	-	-	SII	alias	exact	3	-	0	seed
+SII 6.5nm	0	-	-	-	-	SII	alias	exact	6.5	-	0	seed
+SII 12nm	0	-	-	-	-	SII	alias	exact	12	-	0	seed
+Baader SII 8nm	0	-	-	-	-	SII	alias	exact	8	baader	0	seed
+Antlia 3nm SII	0	-	-	-	-	SII	alias	exact	3	antlia	0	seed
+Antlia SII 4.5nm	0	-	-	-	-	SII	alias	exact	4.5	antlia	0	seed
+Chroma SII 3nm	0	-	-	-	-	SII	alias	exact	3	chroma	0	seed
+Astrodon SII 5nm	0	-	-	-	-	SII	alias	exact	5	astrodon	0	seed
+Optolong SII 7nm	0	-	-	-	-	SII	alias	exact	7	optolong	0	seed
+ZWO SII 7nm	0	-	-	-	-	SII	alias	exact	7	zwo	0	seed
+Astronomik SII 6nm	0	-	-	-	-	SII	alias	exact	6	astronomik	0	seed
+Altair SII 7nm	0	-	-	-	-	SII	alias	exact	7	altair	0	seed
+SVBony SII 7nm	0	-	-	-	-	SII	alias	exact	7	svbony	0	seed
+Player One SII 3nm	0	-	-	-	-	SII	alias	exact	3	playerone	0	seed
+S 3nm	0	-	-	-	-	SII	pattern	pattern	3	-	0	seed
+S₂	0	-	-	-	-	SII	alias	exact	-	-	0	seed
+S 7nm	0	-	-	-	-	SII	pattern	pattern	7	-	0	seed
+Sulphur II 5nm	0	-	-	-	-	SII	alias	exact	5	-	0	seed
+SII_3nm	0	-	-	-	-	SII	alias	exact	3	-	0	seed
+Sii (6nm)	0	-	-	-	-	SII	alias	exact	6	-	0	seed
+SII filter	0	-	-	-	-	SII	alias	exact	-	-	0	seed
+S	0	HA,OIII,SII	-	-	-	SII	single-letter	inferred	-	-	0	pl
+S	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Hb	0	-	-	-	-	HB	alias	exact	-	-	0	seed
+HB	0	-	-	-	-	HB	alias	exact	-	-	0	seed
+hb	0	-	-	-	-	HB	alias	exact	-	-	0	seed
+Hβ	0	-	-	-	-	HB	alias	exact	-	-	0	seed
+H-beta	0	-	-	-	-	HB	alias	exact	-	-	0	seed
+Hbeta	0	-	-	-	-	HB	alias	exact	-	-	0	seed
+H beta	0	-	-	-	-	HB	alias	exact	-	-	0	seed
+Hydrogen Beta	0	-	-	-	-	HB	alias	exact	-	-	0	seed
+Hydrogen-beta	0	-	-	-	-	HB	alias	exact	-	-	0	seed
+Hβ 8nm	0	-	-	-	-	HB	alias	exact	8	-	0	seed
+H-beta 8.5nm	0	-	-	-	-	HB	alias	exact	8.5	-	0	seed
+Baader H-beta 8.5nm	0	-	-	-	-	HB	alias	exact	8.5	baader	0	seed
+Astronomik H-beta 12nm	0	-	-	-	-	HB	alias	exact	12	astronomik	0	seed
+Hβ 486nm	0	-	-	-	-	HB	alias	exact	-	-	0	seed
+Hb 10nm	0	-	-	-	-	HB	alias	exact	10	-	0	seed
+NII	0	-	-	-	-	NII	alias	exact	-	-	0	seed
+Nii	0	-	-	-	-	NII	alias	exact	-	-	0	seed
+nii	0	-	-	-	-	NII	alias	exact	-	-	0	seed
+N2	0	-	-	-	-	NII	alias	exact	-	-	0	seed
+N II	0	-	-	-	-	NII	alias	exact	-	-	0	seed
+N-II	0	-	-	-	-	NII	alias	exact	-	-	0	seed
+[NII]	0	-	-	-	-	NII	alias	exact	-	-	0	seed
+Nitrogen	0	-	-	-	-	NII	alias	exact	-	-	0	seed
+Nitrogen II	0	-	-	-	-	NII	alias	exact	-	-	0	seed
+NII 3nm	0	-	-	-	-	NII	alias	exact	3	-	0	seed
+Astrodon NII 3nm	0	-	-	-	-	NII	alias	exact	3	astrodon	0	seed
+Antlia NII 3nm	0	-	-	-	-	NII	alias	exact	3	antlia	0	seed
+N 3nm	0	-	-	-	-	NII	pattern	pattern	3	-	0	seed
+N2 6.5nm	0	-	-	-	-	NII	alias	exact	6.5	-	0	seed
+Luminance	0	-	-	-	-	L	alias	exact	-	-	0	seed
+Lum	0	-	-	-	-	L	alias	exact	-	-	0	pl
+Lumi	0	-	-	-	-	L	alias	exact	-	-	0	seed
+LUM	0	-	-	-	-	L	alias	exact	-	-	0	seed
+luminance	0	-	-	-	-	L	alias	exact	-	-	0	seed
+Luminosity	0	-	-	-	-	L	alias	exact	-	-	0	seed
+Luminence	0	-	-	-	-	L	alias	exact	-	-	0	seed
+Luminanz	0	-	-	-	-	L	alias	exact	-	-	0	seed
+Luminancia	0	-	-	-	-	L	alias	exact	-	-	0	seed
+Luminanza	0	-	-	-	-	L	alias	exact	-	-	0	seed
+Luminosité	0	-	-	-	-	L	alias	exact	-	-	0	seed
+L-Pro	0	-	-	-	-	L	alias	exact	-	optolong	0	seed
+Optolong L-Pro	0	-	-	-	-	L	alias	exact	-	optolong	0	seed
+Astronomik L-2	0	-	-	-	-	L	alias	exact	-	astronomik	0	seed
+Astronomik L-1 UV-IR Block	0	-	-	-	-	L	pattern	pattern	-	astronomik	0	seed
+UV/IR Cut	0	-	-	-	-	L	alias	exact	-	-	0	seed
+UV-IR	0	-	-	-	-	L	alias	exact	-	-	0	seed
+UVIR	0	-	-	-	-	L	alias	exact	-	-	0	pl
+UV IR Block	0	-	-	-	-	L	alias	exact	-	-	0	seed
+IR Cut	0	-	-	-	-	L	alias	exact	-	-	0	seed
+IRCut	0	-	-	-	-	L	alias	exact	-	-	0	seed
+IR-Cut	0	-	-	-	-	L	alias	exact	-	-	0	seed
+IRCUT	0	-	-	-	-	L	alias	exact	-	-	0	pl
+IR Block	0	-	-	-	-	L	alias	exact	-	-	0	seed
+UV/IR Block	0	-	-	-	-	L	alias	exact	-	-	0	seed
+Clear with IR cut	0	-	-	-	-	L	pattern	pattern	-	-	0	seed
+Clear IR cut	0	-	-	-	-	L	pattern	pattern	-	-	0	seed
+LRGB-L	0	-	-	-	-	L	pattern	pattern	-	-	0	seed
+LRGB L	0	-	-	-	-	L	pattern	pattern	-	-	0	seed
+Luminance (UV/IR)	0	-	-	-	-	L	pattern	pattern	-	-	0	seed
+Luminance IR Cut	0	-	-	-	-	L	pattern	pattern	-	-	0	seed
+Astrodon Gen2 E-Series Luminance	0	-	-	-	-	L	alias	exact	-	astrodon	0	seed
+Baader Luminance	0	-	-	-	-	L	alias	exact	-	baader	0	seed
+Baader UV/IR Cut	0	-	-	-	-	L	alias	exact	-	baader	0	seed
+Chroma Luminance	0	-	-	-	-	L	alias	exact	-	chroma	0	seed
+Optolong Luminance	0	-	-	-	-	L	alias	exact	-	optolong	0	seed
+Altair UV/IR cut	0	-	-	-	-	L	alias	exact	-	altair	0	seed
+Lum 400-700nm	0	-	-	-	-	L	alias	exact	-	-	0	seed
+UV/IR Cut 400-700nm	0	-	-	-	-	L	alias	exact	-	-	0	seed
+LP	0	-	-	-	-	L	alias	exact	-	-	0	pl
+Light Pollution	0	-	-	-	-	L	alias	exact	-	-	0	seed
+CLS	0	-	-	-	-	L	alias	exact	-	astronomik	0	seed
+CLS CCD	0	-	-	-	-	L	alias	exact	-	astronomik	0	seed
+LPS	0	-	-	-	-	L	alias	exact	-	idas	0	seed
+IDAS LPS-D1	0	-	-	-	-	L	alias	exact	-	idas	0	seed
+IDAS LPS-P2	0	-	-	-	-	L	alias	exact	-	idas	0	seed
+Astrodon Luminance	0	-	-	-	-	L	alias	exact	-	astrodon	0	seed
+ZWO Luminance	0	-	-	-	-	L	alias	exact	-	zwo	0	seed
+Antlia Luminance	0	-	-	-	-	L	alias	exact	-	antlia	0	seed
+SVBony UV/IR Cut	0	-	-	-	-	L	alias	exact	-	svbony	0	seed
+Luminance Filter	0	-	-	-	-	L	alias	exact	-	-	0	seed
+Lum filter	0	-	-	-	-	L	alias	exact	-	-	0	seed
+L	0	L,R,G,B	-	-	-	L	single-letter	inferred	-	-	0	pl
+l	0	L,R,G,B	-	-	-	L	single-letter	inferred	-	-	0	seed
+ZWO L	0	L,R,G,B	-	-	-	L	single-letter	inferred	-	zwo	0	seed
+Optolong L	0	L,R,G,B	-	-	-	L	single-letter	inferred	-	optolong	0	seed
+Baader L	0	L,R,G,B	-	-	-	L	single-letter	inferred	-	baader	0	seed
+Astrodon L	0	L,R,G,B	-	-	-	L	single-letter	inferred	-	astrodon	0	seed
+L	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Baader L	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	baader	0	seed
+Red	0	-	-	-	-	R	alias	exact	-	-	0	pl
+red	0	-	-	-	-	R	alias	exact	-	-	0	seed
+RED	0	-	-	-	-	R	alias	exact	-	-	0	seed
+Rouge	0	-	-	-	-	R	alias	exact	-	-	0	seed
+Rot	0	-	-	-	-	R	alias	exact	-	-	0	seed
+Rojo	0	-	-	-	-	R	alias	exact	-	-	0	seed
+Rosso	0	-	-	-	-	R	alias	exact	-	-	0	seed
+Red Filter	0	-	-	-	-	R	alias	exact	-	-	0	seed
+Astrodon Red	0	-	-	-	-	R	alias	exact	-	astrodon	0	seed
+Baader Red	0	-	-	-	-	R	alias	exact	-	baader	0	seed
+Optolong Red	0	-	-	-	-	R	alias	exact	-	optolong	0	seed
+Chroma Red	0	-	-	-	-	R	alias	exact	-	chroma	0	seed
+ZWO Red	0	-	-	-	-	R	alias	exact	-	zwo	0	seed
+Altair Red	0	-	-	-	-	R	alias	exact	-	altair	0	seed
+LRGB-R	0	-	-	-	-	R	pattern	pattern	-	-	0	seed
+LRGB Red	0	-	-	-	-	R	pattern	pattern	-	-	0	seed
+Antlia Red	0	-	-	-	-	R	alias	exact	-	antlia	0	seed
+Red 2in	0	-	-	-	-	R	alias	exact	-	-	0	seed
+Red 36mm	0	-	-	-	-	R	alias	exact	-	-	0	seed
+SVBony Red	0	-	-	-	-	R	alias	exact	-	svbony	0	seed
+R	0	L,R,G,B	-	-	-	R	single-letter	inferred	-	-	0	pl
+r	0	L,R,G,B	-	-	-	R	single-letter	inferred	-	-	0	seed
+Johnson R	0	L,R,G,B	-	-	-	R	single-letter	inferred	-	-	0	seed
+Cousins R	0	L,R,G,B	-	-	-	R	single-letter	inferred	-	-	0	seed
+Bessell R	0	L,R,G,B	-	-	-	R	single-letter	inferred	-	-	0	seed
+Astrodon R	0	L,R,G,B	-	-	-	R	single-letter	inferred	-	astrodon	0	seed
+r'	0	L,R,G,I,Z,U,V,IR,UV	-	-	-	R	single-letter	inferred	-	-	0	seed
+Sloan r	0	L,R,G,I,Z,U,V,IR,UV	-	-	-	R	single-letter	inferred	-	-	0	seed
+SDSS r	0	L,R,G,I,Z,U,V,IR,UV	-	-	-	R	single-letter	inferred	-	-	0	seed
+r′	0	L,R,G,I,Z,U,V,IR,UV	-	-	-	R	single-letter	inferred	-	-	0	seed
+r'	0	R,G,B	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Sloan r	0	R,G,B	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+R	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Green	0	-	-	-	-	G	alias	exact	-	-	0	pl
+green	0	-	-	-	-	G	alias	exact	-	-	0	seed
+GREEN	0	-	-	-	-	G	alias	exact	-	-	0	seed
+Vert	0	-	-	-	-	G	alias	exact	-	-	0	seed
+Grün	0	-	-	-	-	G	alias	exact	-	-	0	seed
+Gruen	0	-	-	-	-	G	alias	exact	-	-	0	seed
+Verde	0	-	-	-	-	G	alias	exact	-	-	0	seed
+Green Filter	0	-	-	-	-	G	alias	exact	-	-	0	seed
+Astrodon Green	0	-	-	-	-	G	alias	exact	-	astrodon	0	seed
+Baader Green	0	-	-	-	-	G	alias	exact	-	baader	0	seed
+Optolong Green	0	-	-	-	-	G	alias	exact	-	optolong	0	seed
+Chroma Green	0	-	-	-	-	G	alias	exact	-	chroma	0	seed
+ZWO Green	0	-	-	-	-	G	alias	exact	-	zwo	0	seed
+Altair Green	0	-	-	-	-	G	alias	exact	-	altair	0	seed
+LRGB-G	0	-	-	-	-	G	pattern	pattern	-	-	0	seed
+LRGB Green	0	-	-	-	-	G	pattern	pattern	-	-	0	seed
+Antlia Green	0	-	-	-	-	G	alias	exact	-	antlia	0	seed
+SVBony Green	0	-	-	-	-	G	alias	exact	-	svbony	0	seed
+G	0	L,R,G,B	-	-	-	G	single-letter	inferred	-	-	0	pl
+g	0	L,R,G,B	-	-	-	G	single-letter	inferred	-	-	0	seed
+g'	0	L,R,G,I,Z,U,V,IR,UV	-	-	-	G	single-letter	inferred	-	-	0	seed
+Sloan g	0	L,R,G,I,Z,U,V,IR,UV	-	-	-	G	single-letter	inferred	-	-	0	seed
+SDSS g	0	L,R,G,I,Z,U,V,IR,UV	-	-	-	G	single-letter	inferred	-	-	0	seed
+G	0	L,R,G,I,Z,U,V,IR,UV	-	-	-	UNKNOWN	quarantine	inferred	-	-	1	seed
+g	0	L,R,G,I,Z,U,V,IR,UV	-	-	-	UNKNOWN	quarantine	inferred	-	-	1	seed
+G	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Blue	0	-	-	-	-	B	alias	exact	-	-	0	pl
+blue	0	-	-	-	-	B	alias	exact	-	-	0	seed
+BLUE	0	-	-	-	-	B	alias	exact	-	-	0	seed
+Bleu	0	-	-	-	-	B	alias	exact	-	-	0	seed
+Blau	0	-	-	-	-	B	alias	exact	-	-	0	seed
+Azul	0	-	-	-	-	B	alias	exact	-	-	0	seed
+Blu	0	-	-	-	-	B	alias	exact	-	-	0	seed
+Blue Filter	0	-	-	-	-	B	alias	exact	-	-	0	seed
+Astrodon Blue	0	-	-	-	-	B	alias	exact	-	astrodon	0	seed
+Baader Blue	0	-	-	-	-	B	alias	exact	-	baader	0	seed
+Optolong Blue	0	-	-	-	-	B	alias	exact	-	optolong	0	seed
+Chroma Blue	0	-	-	-	-	B	alias	exact	-	chroma	0	seed
+ZWO Blue	0	-	-	-	-	B	alias	exact	-	zwo	0	seed
+Altair Blue	0	-	-	-	-	B	alias	exact	-	altair	0	seed
+LRGB-B	0	-	-	-	-	B	pattern	pattern	-	-	0	seed
+LRGB Blue	0	-	-	-	-	B	pattern	pattern	-	-	0	seed
+Antlia Blue	0	-	-	-	-	B	alias	exact	-	antlia	0	seed
+SVBony Blue	0	-	-	-	-	B	alias	exact	-	svbony	0	seed
+B	0	L,R,G,B	-	-	-	B	single-letter	inferred	-	-	0	pl
+b	0	L,R,G,B	-	-	-	B	single-letter	inferred	-	-	0	seed
+Johnson B	0	L,R,G,B	-	-	-	B	single-letter	inferred	-	-	0	seed
+Bessell B	0	L,R,G,B	-	-	-	B	single-letter	inferred	-	-	0	seed
+B	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Clear	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+CLEAR	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+clear	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+None	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+NONE	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+Empty	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+No Filter	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+NoFilter	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+No filter	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+Open	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+Glass	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+Clear Glass	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+Unfiltered	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+Transparent	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+Blank	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+Empty Slot	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+Vide	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+Clair	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+Sans filtre	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+Kein Filter	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+Ohne Filter	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+Sin filtro	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+Senza filtro	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+Open Position	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+Clear Filter	0	-	-	-	-	CLEAR	alias	exact	-	-	0	seed
+No Filter Installed	0	-	-	-	-	CLEAR	pattern	pattern	-	-	0	seed
+Without filter	0	-	-	-	-	CLEAR	pattern	pattern	-	-	0	seed
+Clear Position	0	-	-	-	-	CLEAR	pattern	pattern	-	-	0	seed
+Open Hole	0	-	-	-	-	CLEAR	pattern	pattern	-	-	0	seed
+	0	-	-	-	-	CLEAR	empty	inferred	-	-	0	seed
+-	0	-	-	-	-	CLEAR	empty	inferred	-	-	0	seed
+—	0	-	-	-	-	CLEAR	empty	inferred	-	-	0	seed
+  	0	-	-	-	-	CLEAR	empty	inferred	-	-	0	seed
+C	0	CLEAR,L	-	-	-	CLEAR	single-letter	inferred	-	-	0	seed
+c	0	CLEAR,L	-	-	-	CLEAR	single-letter	inferred	-	-	0	seed
+C	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Dual Band	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Dualband	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Dual-Band	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Duo Band	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Duoband	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Duo-Narrowband	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Dual Narrowband	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Dual Narrow Band	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Dual Band Pass	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Duo	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Dual	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Tri-Band	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Triband	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Tri Band	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Triple Band	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Quad Band	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Quadband	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Quad-Band	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Multi Band	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Multiband	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+L-eNhance	0	-	-	-	-	DUO	alias	exact	-	optolong	0	seed
+L-eXtreme	0	-	-	-	-	DUO	alias	exact	-	optolong	0	seed
+L-Ultimate	0	-	-	-	-	DUO	alias	exact	-	optolong	0	seed
+Optolong L-eNhance	0	-	-	-	-	DUO	alias	exact	-	optolong	0	seed
+Optolong L-eXtreme	0	-	-	-	-	DUO	alias	exact	-	optolong	0	seed
+L-eXtreme 7nm	0	-	-	-	-	DUO	alias	exact	7	optolong	0	seed
+L-eNhance 2in	0	-	-	-	-	DUO	alias	exact	-	optolong	0	seed
+L-Quad Enhance	0	-	-	-	-	DUO	alias	exact	-	optolong	0	seed
+UHC	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+UHC-S	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Optolong UHC	0	-	-	-	-	DUO	alias	exact	-	optolong	0	seed
+ALP-T	0	-	-	-	-	DUO	alias	exact	-	antlia	0	seed
+Antlia ALP-T 5nm	0	-	-	-	-	DUO	alias	exact	5	antlia	0	seed
+Antlia ALP-T 3nm	0	-	-	-	-	DUO	alias	exact	3	antlia	0	seed
+ALP-T Dual Band	0	-	-	-	-	DUO	alias	exact	-	antlia	0	seed
+Triad	0	-	-	-	-	DUO	alias	exact	-	antlia	0	seed
+Antlia Triad Ultra	0	-	-	-	-	DUO	alias	exact	-	antlia	0	seed
+Quad Band Ultra	0	-	-	-	-	DUO	alias	exact	-	antlia	0	seed
+NBZ	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+NBX	0	-	-	-	-	DUO	alias	exact	-	idas	0	seed
+IDAS NBX	0	-	-	-	-	DUO	alias	exact	-	idas	0	seed
+SV220	0	-	-	-	-	DUO	alias	exact	-	svbony	0	seed
+SVBony SV220	0	-	-	-	-	DUO	alias	exact	-	svbony	0	seed
+STC Duo-Narrowband	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+STC Astro-Multispectra	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+ZWO Duo-Band	0	-	-	-	-	DUO	alias	exact	-	zwo	0	seed
+ZWO Dual Band	0	-	-	-	-	DUO	alias	exact	-	zwo	0	seed
+Altair Dual Band	0	-	-	-	-	DUO	alias	exact	-	altair	0	seed
+Altair Tri-Band	0	-	-	-	-	DUO	alias	exact	-	altair	0	seed
+Altair Quad-Band	0	-	-	-	-	DUO	alias	exact	-	altair	0	seed
+Player One Duo-Band	0	-	-	-	-	DUO	alias	exact	-	playerone	0	seed
+Player One Quad-Band	0	-	-	-	-	DUO	alias	exact	-	playerone	0	seed
+SVBony Dual Band	0	-	-	-	-	DUO	alias	exact	-	svbony	0	seed
+HaOIII	0	-	-	-	-	DUO	pattern	pattern	-	-	0	seed
+Ha+OIII	0	-	-	-	-	DUO	pattern	pattern	-	-	0	seed
+Ha/OIII	0	-	-	-	-	DUO	pattern	pattern	-	-	0	seed
+Ha-OIII	0	-	-	-	-	DUO	pattern	pattern	-	-	0	seed
+Ha & OIII	0	-	-	-	-	DUO	pattern	pattern	-	-	0	seed
+SII+OIII	0	-	-	-	-	DUO	pattern	pattern	-	-	0	seed
+SII/OIII	0	-	-	-	-	DUO	pattern	pattern	-	-	0	seed
+OIII/Ha	0	-	-	-	-	DUO	pattern	pattern	-	-	0	seed
+O3+Ha	0	-	-	-	-	DUO	pattern	pattern	-	-	0	seed
+HaOIIISII	0	-	-	-	-	DUO	pattern	pattern	-	-	0	seed
+Dual Band 7nm	0	-	-	-	-	DUO	alias	exact	7	-	0	seed
+Duo-Band 12nm	0	-	-	-	-	DUO	alias	exact	12	-	0	seed
+2-band	0	-	-	-	-	DUO	pattern	pattern	-	-	0	seed
+Tri-band 7nm	0	-	-	-	-	DUO	alias	exact	7	-	0	seed
+Quadband 5nm	0	-	-	-	-	DUO	alias	exact	5	-	0	seed
+Duo narrowband	0	-	-	-	-	DUO	alias	exact	-	-	0	seed
+ColorMagic_E2	1	-	-	-	-	DUO	alias	exact	-	askar	0	pl
+ColorMagic_E1	1	-	-	-	-	DUO	alias	exact	-	askar	0	pl
+CM_E2	1	-	-	-	-	DUO	alias	exact	-	askar	0	pl
+ColorMagic_D1	0	-	-	-	-	DUO	alias	exact	-	askar	0	seed
+ColorMagic_D2	0	-	-	-	-	DUO	alias	exact	-	askar	0	seed
+CM_E1	0	-	-	-	-	DUO	alias	exact	-	askar	0	seed
+Askar ColorMagic D1	0	-	-	-	-	DUO	alias	exact	-	askar	0	seed
+OSC	0	-	-	-	-	OSC	alias	exact	-	-	0	seed
+One Shot Color	0	-	-	-	-	OSC	alias	exact	-	-	0	seed
+One Shot Colour	0	-	-	-	-	OSC	alias	exact	-	-	0	seed
+CFA	0	-	-	-	-	OSC	alias	exact	-	-	0	seed
+Bayer	0	-	-	-	-	OSC	alias	exact	-	-	0	seed
+L	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+Lum	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+Luminance	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+Clear	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+None	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+Empty	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+No Filter	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+IRCUT	1	-	-	-	-	OSC	sensor	inferred	-	-	0	pl
+LP	1	-	-	-	-	OSC	sensor	inferred	-	-	0	pl
+UVIR	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+UV/IR cut	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+Light Pollution	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+CLS	1	-	-	-	-	OSC	sensor	inferred	-	astronomik	0	seed
+L-Pro	1	-	-	-	-	OSC	sensor	inferred	-	optolong	0	seed
+Clear Glass	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+Open	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+LRGB-L	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+—	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+-	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+IR Cut	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+Optolong L-Pro	1	-	-	-	-	OSC	sensor	inferred	-	optolong	0	seed
+Astronomik CLS	1	-	-	-	-	OSC	sensor	inferred	-	astronomik	0	seed
+Unfiltered	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+L	1	L,R,G,B	-	-	-	OSC	sensor	inferred	-	-	0	seed
+C	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+l	1	-	-	-	-	OSC	sensor	inferred	-	-	0	seed
+L-eXtreme	1	-	-	-	-	DUO	alias	exact	-	optolong	0	seed
+L-eNhance	1	-	-	-	-	DUO	alias	exact	-	optolong	0	seed
+Dual Band	1	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Duo	1	-	-	-	-	DUO	alias	exact	-	-	0	seed
+ALP-T	1	-	-	-	-	DUO	alias	exact	-	antlia	0	seed
+UHC	1	-	-	-	-	DUO	alias	exact	-	-	0	seed
+Ha	1	-	-	-	-	HA	alias	exact	-	-	0	seed
+Ha 7nm	1	-	-	-	-	HA	alias	exact	7	-	0	seed
+OIII	1	-	-	-	-	OIII	alias	exact	-	-	0	seed
+Red	1	-	-	-	-	R	alias	exact	-	-	0	seed
+Slot 4	1	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+IR	0	IR,L	-	-	-	IR	alias	exact	-	-	0	seed
+IR Pass	0	IR,L	-	-	-	IR	alias	exact	-	-	0	seed
+IR-Pass	0	IR,L	-	-	-	IR	alias	exact	-	-	0	seed
+Infrared	0	IR,L	-	-	-	IR	alias	exact	-	-	0	seed
+Near Infrared	0	IR,L	-	-	-	IR	alias	exact	-	-	0	seed
+NIR	0	IR,L	-	-	-	IR	alias	exact	-	-	0	seed
+IR685	0	IR,L	-	-	-	IR	pattern	pattern	-	-	0	seed
+IR 742	0	IR,L	-	-	-	IR	pattern	pattern	-	-	0	seed
+IR742	0	IR,L	-	-	-	IR	pattern	pattern	-	-	0	seed
+IR850	0	IR,L	-	-	-	IR	pattern	pattern	-	-	0	seed
+IR 1000	0	IR,L	-	-	-	IR	pattern	pattern	-	-	0	seed
+IR-pass 850	0	IR,L	-	-	-	IR	pattern	pattern	-	-	0	seed
+Baader IR-Pass 685nm	0	IR,L	-	-	-	IR	alias	exact	-	baader	0	seed
+IR pass 742	0	IR,L	-	-	-	IR	pattern	pattern	-	-	0	seed
+IR	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+IR742	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+UV	0	UV,L	-	-	-	UV	alias	exact	-	-	0	seed
+UV Pass	0	UV,L	-	-	-	UV	alias	exact	-	-	0	seed
+Ultraviolet	0	UV,L	-	-	-	UV	alias	exact	-	-	0	seed
+UV-Pass	0	UV,L	-	-	-	UV	alias	exact	-	-	0	seed
+UV	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+U-band	0	U,V,L	-	-	-	U	alias	exact	-	-	0	seed
+U band	0	U,V,L	-	-	-	U	alias	exact	-	-	0	seed
+Bessell U	0	U,V,L	-	-	-	U	single-letter	inferred	-	-	0	seed
+Johnson U	0	U,V,L	-	-	-	U	single-letter	inferred	-	-	0	seed
+U	0	U,V,L	-	-	-	U	single-letter	inferred	-	-	0	seed
+u'	0	U,V,L	-	-	-	U	single-letter	inferred	-	-	0	seed
+Sloan u	0	U,V,L	-	-	-	U	single-letter	inferred	-	-	0	seed
+V-band	0	U,V,L	-	-	-	V	alias	exact	-	-	0	seed
+V band	0	U,V,L	-	-	-	V	alias	exact	-	-	0	seed
+Johnson V	0	U,V,L	-	-	-	V	single-letter	inferred	-	-	0	seed
+Bessell V	0	U,V,L	-	-	-	V	single-letter	inferred	-	-	0	seed
+V	0	U,V,L	-	-	-	V	single-letter	inferred	-	-	0	seed
+Astrodon Photometric V	0	U,V,L	-	-	-	V	single-letter	inferred	-	astrodon	0	seed
+I-band	0	I,L	-	-	-	I	alias	exact	-	-	0	seed
+I band	0	I,L	-	-	-	I	alias	exact	-	-	0	seed
+Cousins I	0	I,L	-	-	-	I	single-letter	inferred	-	-	0	seed
+I	0	I,L	-	-	-	I	single-letter	inferred	-	-	0	seed
+Bessell I	0	I,L	-	-	-	I	single-letter	inferred	-	-	0	seed
+i'	0	L,R,G,I,Z,U,V,IR,UV	-	-	-	I	single-letter	inferred	-	-	0	seed
+Sloan i	0	L,R,G,I,Z,U,V,IR,UV	-	-	-	I	single-letter	inferred	-	-	0	seed
+SDSS i	0	L,R,G,I,Z,U,V,IR,UV	-	-	-	I	single-letter	inferred	-	-	0	seed
+Z-band	0	Z,L,I	-	-	-	Z	alias	exact	-	-	0	seed
+Z band	0	Z,L,I	-	-	-	Z	alias	exact	-	-	0	seed
+Z	0	Z,L,I	-	-	-	Z	single-letter	inferred	-	-	0	seed
+Sloan z	0	Z,L,I	-	-	-	Z	single-letter	inferred	-	-	0	seed
+z'	0	Z,L,I	-	-	-	Z	single-letter	inferred	-	-	0	seed
+Y-band	0	Y,L	-	-	-	Y	alias	exact	-	-	0	seed
+Y band	0	Y,L	-	-	-	Y	alias	exact	-	-	0	seed
+Y	0	Y,L	-	-	-	Y	single-letter	inferred	-	-	0	seed
+V band	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Y	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+U	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Slot 0	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	pl
+Slot 1	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Slot 4	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	pl
+Slot 7	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Filter 1	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Filter 2	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Filter 8	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Position 1	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Pos 3	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Position 6	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Unknown	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Narrowband	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Narrow band	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Triple	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Custom	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+XYZ	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Test	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Filter	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Baader	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	baader	0	seed
+7nm	0	-	-	-	-	UNKNOWN	quarantine	inferred	7	-	0	seed
+Mystery 5nm	0	-	-	-	-	UNKNOWN	quarantine	inferred	5	-	0	seed
+Astrodon Mystery	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	astrodon	0	seed
+AAA	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+1	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+2	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+3	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+4	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+5	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Filter Wheel	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Spectral	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+CH4	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Methane CH4 889	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Na D	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Sodium	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Wheel pos 2	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Backup	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Unnamed	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+???	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+ZWO	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	zwo	0	seed
+Optolong	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	optolong	0	seed
+Astrodon 5nm	0	-	-	-	-	UNKNOWN	quarantine	inferred	5	astrodon	0	seed
+Slot 3 Ha?	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+H-OIII-SII	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+SHO	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+HOO	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+LRGB	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+RGB	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Colour	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Mono	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Photometric	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Extra	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Reserved	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Filter A	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Filter B	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+Narrowband 7nm	0	-	-	-	-	UNKNOWN	quarantine	inferred	7	-	0	seed
+@absent	0	L,R,G,B,HA,OIII,SII,HB,NII,CLEAR,DUO,OSC,IR,UV,U,V,I,Z,Y,UNKNOWN	2025-01-01_19-27-10_Si_-9.90_300.00s_0000.fits	-	-	SII	filename	inferred	-	-	0	seed
+@absent	0	L,R,G,B,HA,OIII,SII,HB,NII,CLEAR,DUO,OSC,IR,UV,U,V,I,Z,Y,UNKNOWN	2025-01-31_07-46-05_Lum_9.60_0.03s_0000.fits	-	-	L	filename	inferred	-	-	0	seed
+@absent	0	-	Light_M42_Ha_300s_0001.fit	-	-	HA	filename	inferred	-	-	0	seed
+@absent	0	-	Light_M42_Ha_7nm_300s_0001.fit	-	-	HA	filename	inferred	7	-	0	seed
+@absent	0	-	/data/M42/Light_M42_H-alpha_300s_0001.fit	-	-	HA	filename	inferred	-	-	0	seed
+@absent	0	-	C:\data\M42\Light_M42_OIII_300s_0001.fit	-	-	OIII	filename	inferred	-	-	0	seed
+@absent	0	L,R,G,B	M31_R_120s_0007.fits	-	-	R	filename	inferred	-	-	0	seed
+@absent	0	-	M31_R_120s_0007.fits	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+@absent	0	-	NGC7000_Sii_600s.fits	-	-	SII	filename	inferred	-	-	0	seed
+@absent	0	-	NGC7000_Oii_600s.fits	-	-	OIII	filename	inferred	-	-	0	seed
+@absent	0	-	IC1396_Lum_180s.xisf	-	-	L	filename	inferred	-	-	0	seed
+@absent	0	-	m81_Red_120s.fit	-	-	R	filename	inferred	-	-	0	seed
+@absent	0	-	noise.fits	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+@absent	0	-	Light_Target_300s_0001.fit	-	-	UNKNOWN	quarantine	inferred	-	-	0	seed
+@absent	0	-	M42_ALP-T_300s.fit	-	-	DUO	filename	inferred	-	antlia	0	seed
+	0	-	Light_M42_Ha_300s.fit	-	-	HA	filename	inferred	-	-	0	seed
+Red	0	-	Light_M42_Ha_300s.fit	-	-	R	alias	exact	-	-	0	seed
+@absent	1	-	-	-	-	OSC	sensor	inferred	-	-	0	pl
+@absent	0	-	-	-	-	UNKNOWN	quarantine	inferred	-	-	0	pl
+@absent	1	-	x_Ha_x.fits	-	-	OSC	sensor	inferred	-	-	0	seed
+XYZ	0	-	-	HA	-	HA	override	user	-	-	0	seed
+Slot 4	0	-	-	-	SII	SII	contributor	user	-	-	0	seed
+Ha	0	-	-	OIII	-	OIII	override	user	-	-	0	seed
+Ha	0	-	-	-	SII	SII	contributor	user	-	-	0	seed
+Lum	1	-	-	L	-	L	override	user	-	-	0	seed
+Custom 1	0	-	-	L	HA	L	override	user	-	-	0	seed
+Custom 1	0	-	-	-	HA	HA	contributor	user	-	-	0	seed

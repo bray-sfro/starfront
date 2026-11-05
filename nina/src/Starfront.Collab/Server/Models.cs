@@ -116,6 +116,31 @@ namespace Starfront.Collab.Server {
         [JsonProperty("thinnest")] public double Thinnest { get; set; }
     }
 
+    /// <summary>Where a collaboration's lights are stacked, as the server lists it: Rapid Stacker Collab in the cloud, or a hub on the owner's network.</summary>
+    public class StackingBinding {
+        public const string Cloud = "cloud";
+        public const string Hub = "hub";
+
+        /// <summary>"cloud", "hub", or blank when the collaboration is not stacked.</summary>
+        [JsonProperty("backend")] public string Backend { get; set; } = "";
+        [JsonProperty("hubId")] public string HubId { get; set; } = "";
+        [JsonProperty("hubName")] public string HubName { get; set; } = "";
+        /// <summary>The hub's address on its own network, for the LAN short-cut; blank when it has none.</summary>
+        [JsonProperty("hubLanUrl")] public string HubLanUrl { get; set; } = "";
+        [JsonProperty("apiBase")] public string ApiBase { get; set; } = "";
+        [JsonProperty("collabProjectId")] public string CollabProjectId { get; set; } = "";
+        /// <summary>The token that lets this telescope upload to the hub (hub projects only).</summary>
+        [JsonProperty("grant")] public string Grant { get; set; } = "";
+        /// <summary>A cloud project the Starfront server made from the collaboration and keeps in step (T706); false for an old pasted join code.</summary>
+        [JsonProperty("managed")] public bool Managed { get; set; }
+        /// <summary>"ready" (a telescope on it can join), "pending" (the cloud project is still being made), "failed" (making it failed and is retried), or blank (not stacked, or a server that predates it). Shown, never routed on.</summary>
+        [JsonProperty("state")] public string State { get; set; } = "";
+        /// <summary>Why it failed; only the owner's own telescopes are told, blank for everyone else.</summary>
+        [JsonProperty("problem")] public string Problem { get; set; } = "";
+        /// <summary>The join code of a cloud project; not sent by the server inside the binding, filled in for old servers.</summary>
+        [JsonIgnore] public string JoinCode { get; set; } = "";
+    }
+
     /// <summary>An open collaboration as the server lists it for this telescope.</summary>
     public class ProjectListing {
         [JsonProperty("id")] public string Id { get; set; } = "";
@@ -130,7 +155,14 @@ namespace Starfront.Collab.Server {
         [JsonProperty("notes")] public string Notes { get; set; } = "";
         /// <summary>Whether the lights are collected on the server for the coordinator to stack, and where to send them.</summary>
         [JsonProperty("collectFiles")] public bool CollectFiles { get; set; }
+        /// <summary>The panel overlap a mosaic is cut with, in percent (the server's 10 when it never said).</summary>
+        [JsonProperty("overlap")] public double Overlap { get; set; } = 10.0;
         [JsonProperty("filesUrl")] public string FilesUrl { get; set; } = "";
+        /// <summary>Whether the lights are stacked as they land by Rapid Stacker Collab, and the code that gets this telescope into that project (handed to telescopes on the collaboration and to the owner's own; blank to the rest).</summary>
+        [JsonProperty("stackingLinked")] public bool StackingLinked { get; set; }
+        [JsonProperty("stackingJoinCode")] public string StackingJoinCode { get; set; } = "";
+        /// <summary>Where the lights are stacked; null from servers that predate per-project backends (see <see cref="EffectiveStacking"/>).</summary>
+        [JsonProperty("stacking")] public StackingBinding Stacking { get; set; }
         [JsonProperty("compatibility")] public Compatibility Compatibility { get; set; } = new();
         [JsonProperty("joined")] public bool Joined { get; set; }
         [JsonProperty("collected")] public Dictionary<string, double> Collected { get; set; } = new();
@@ -138,6 +170,19 @@ namespace Starfront.Collab.Server {
         [JsonProperty("participants")] public int Participants { get; set; }
         [JsonProperty("participantsOnline")] public int ParticipantsOnline { get; set; }
         [JsonProperty("participantNames")] public List<string> ParticipantNames { get; set; } = new();
+
+        /// <summary>
+        /// The binding to act on: the server's, or for an old server that only
+        /// sends a join code, a cloud binding carrying it. Never null; its
+        /// <c>Backend</c> is blank when the collaboration is not stacked.
+        /// </summary>
+        public StackingBinding EffectiveStacking() {
+            if (Stacking != null) return Stacking;
+            var code = StackingJoinCode ?? "";
+            return code.Length > 0
+                ? new StackingBinding { Backend = StackingBinding.Cloud, JoinCode = code }
+                : new StackingBinding();
+        }
     }
 
     public class TelescopePresence {

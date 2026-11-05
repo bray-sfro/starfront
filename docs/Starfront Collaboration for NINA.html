@@ -27,7 +27,7 @@
 </head>
 <body>
 <h1>Starfront Collaboration for N.I.N.A.</h1>
-<p class="sub">How to take part in a Starfront collaboration from N.I.N.A. with the Starfront plugin. For plugin 1.0.0.31, October 2026.</p>
+<p class="sub">How to take part in a Starfront collaboration from N.I.N.A. with the Starfront plugin. For plugin 1.0.0.32, October 2026.</p>
 
 <ol class="toc">
   <li>Before you start</li>
@@ -38,6 +38,7 @@
   <li>Start your own collaboration</li>
   <li>Put it in your sequence</li>
   <li>What happens during the night</li>
+  <li>Live stacking (optional)</li>
   <li>Checking on it, and when something is wrong</li>
   <li>Questions people ask</li>
 </ol>
@@ -135,6 +136,7 @@
   <li><b>Colour cameras.</b> Two boxes say whether the collaboration takes OSC broadband (OSC-RGB) and OSC narrowband (OSC-Ha+OIII). Ticking one puts that band among the filters wanted, with its own hours, kept apart from the mono channels in the depth map and the progress.</li>
   <li><b>Rules</b> are all optional: focal length and exposure ranges, the largest star size and guiding error a sub may have, how bright the Moon may be and how far away, the lowest altitude, the darkest Bortle class a contributing sky must have, the fewest frames a telescope is dealt on a panel in a night, calibrated frames only.</li>
   <li><b>Collect the lights on the server</b> if you mean to stack the data yourself. Everyone on it then sends their lights, flats, darks and bias through the files page, sorted by collaboration and person, and the card carries an <i>Open the files page</i> button. Off, the ledger records what was shot and the files stay with whoever shot them.</li>
+  <li><b>Live stacking</b> needs nothing on this form: it follows the collaboration. If you run a live stacking hub, or a hub's owner has listed you as a coordinator on theirs, the server stacks the new collaboration there. Otherwise, if you have linked your Rapid Stacker Collab account (once, in the Collab tab of the Starfront program, under <b>Live stacking</b>), the server makes the Rapid Stacker Collab project itself and keeps its name, region, filters and rules in step every time you edit the collaboration. With neither, it is not stacked. To turn it off, or to choose another hub or the cloud, use the Collab tab of the Starfront program. There is no project to make on Rapid Stacker Collab and no join code to paste. A join code pasted into an older collaboration keeps working, and the form shows it when you edit that collaboration. Every telescope on the collaboration with Live stacking turned on sends its lights to the stack; see section 9.</li>
   <li><b>Start it.</b> It is live at once, in everybody's list. Join it yourself to shoot your share.</li>
 </ol>
 <p>A collaboration you started shows <b>Edit</b>, <b>Deal again</b> and <b>Close</b> on its card. Edit changes anything, including the rules; nights already accepted stay accepted, and every telescope on it finds out at its next check-in. Deal again forgets tonight's lists so each telescope is dealt afresh when it next checks in; use it after changing the filters or goals. Close takes it off everybody's list and keeps what was collected on record.</p>
@@ -169,8 +171,23 @@ End
 <p><b>Reporting.</b> Every light is credited to the sky it covered, with its star size and guiding error, kept on this PC, and sent to the server at the next check-in. If the server was down, the frames go the next time it answers; nothing is lost. The server judges each night against the project's rules and the panel shows accepted or rejected, with the reason.</p>
 <p><b>When it ends.</b> The container finishes when the deal is shot, and your End instructions run as normal. If you have time to spare after it, put another target after the container.</p>
 
-<h2>9. Checking on it, and when something is wrong</h2>
-<p>Everything the plugin does is written to N.I.N.A.'s log with the prefix <b>Starfront:</b>, so the log answers most questions.</p>
+<h2>9. Live stacking (optional)</h2>
+<p>A collaboration that is live-stacked has everyone's lights stacked as they land: each light goes to its stacking project, which folds it into one deep stack per filter that grows through the night, for everybody on it to watch. The stacking project is either on the Rapid Stacker Collab cloud or on a live stacking hub, a computer its owner runs, often on the same home network as the telescopes. Either way it is made and kept in step from the collaboration by the Starfront server, so there is no join code to find (section 6). The card says <i>Live-stacked on Rapid Stacker Collab</i>. Taking part is your choice, and is off until you turn it on.</p>
+<ol>
+  <li>Under <b>Options &gt; Plugins &gt; Starfront</b>, scroll to <b>Live stacking</b> and turn on <b>Send my lights to live stacking</b>.</li>
+  <li>For a collaboration stacked on the cloud, press <b>Sign in to Rapid Stacker Collab</b>. As with Discord, a browser window opens with a code to approve; there is no password to type into N.I.N.A. This account is separate from your Discord sign-in, and lasts about six months; the options page says how long it has left. A collaboration stacked on a hub needs no Rapid Stacker Collab sign-in: the Starfront server hands your telescope a pass to the hub at each check-in, and the plugin asks for the sign-in only when a cloud collaboration needs it.</li>
+  <li>That is all. At the next check-in the telescope joins the stacking project of every linked collaboration you are on. <b>Linked collaborations</b> on the options page lists them, each marked <i>Cloud</i> or <i>Hub:</i> and the hub's name, with how each of your filters is sent (from the <i>Delivers</i> column of your exposure table and the filter's name; a filter the project does not use is not sent). For a cloud project you can change that mapping on the Rapid Stacker Collab website.</li>
+</ol>
+<p><b>What is sent.</b> Only the lights the Starfront container saves for a linked collaboration, and only if they were pointed at the stacking project's field: a light pointed well away from it (another target, or a target name reused) could only be rejected there, so it stays here. Never your own file: the plugin makes a copy with your site's latitude, longitude and height, the observer's name, and the altitude and azimuth (which would give the site away) taken out, sends the copy and deletes it. Your files are never moved, changed or deleted.</p>
+<p><b>Flats and darks.</b> A flat goes to the stacking projects that got your lights of the same filter that night; one taken in the evening, before any light, waits for them until the next midday. Flats of a night you spent on another target stay here. Darks, bias and dark flats go to your telescope's <b>calibration library</b> on Rapid Stacker Collab, which calibrates its lights in every project, so they are sent once rather than to each project. Under <b>Calibration library</b> you can also choose a folder of them (masters or raw frames) to keep in step with the library; nothing is ever removed from it by the plugin. <b>Send flats</b> and <b>Send new darks there</b> turn either off; <b>Also send darks, bias</b> sends darks to the project of the last light sent instead, as before.</p>
+<p><b>To a hub.</b> On the hub's home network the plugin sends straight to the hub's own address; anywhere else, or whenever the hub does not answer there, the lights go through the Starfront server instead, and the log says each time it switches. If a hub refuses the telescope's pass, only that hub's lights wait, and they go with the fresh pass from the next check-in, without a restart. Cloud uploads carry on meanwhile.</p>
+<p><b>When it is sent.</b> By default <i>when the camera is idle</i>, between exposures, so an upload never competes with a download from the camera. You can choose <i>as soon as a frame is saved</i>, or <i>only inside a daily time window</i> (say 06:00 to 14:00, for a slow line), and set a speed limit. Uploads that are cut off, by a restart or a dropped connection, carry on where they stopped.</p>
+<p><b>On the Starfront panel</b> a <b>Live stacking</b> block under Tonight's deal shows how many frames are waiting and sent, the one going now, why uploads are holding if they are, and anything you need to do. <b>Pause uploads</b> holds everything until you resume; <b>Upload now</b> sends what is waiting whatever the mode says.</p>
+<p><b>Terms.</b> Joining a stacking project accepts Rapid Stacker Collab's terms of contribution as they stand, as the line beside the switch says; read them on its website before turning Live stacking on. If they change in the moment between the plugin reading them and joining, that join waits: press <b>Read the new terms</b> and <b>Accept them and carry on</b> under Linked collaborations.</p>
+<div class="note">Live stacking sits beside the rest of the plugin, never in its way: the ledger, the reports and the night's deal are the same with it on or off, and with it off the plugin connects to nothing new.</div>
+
+<h2>10. Checking on it, and when something is wrong</h2>
+<p>Everything the plugin does is written to N.I.N.A.'s log with the prefix <b>Starfront:</b> (<b>Starfront stacking:</b> for live stacking), so the log answers most questions.</p>
 <p>The log is under <code>%LOCALAPPDATA%\NINA\Logs</code> (paste that into the Windows Explorer address bar); the newest file is tonight's. Search it for <code>Starfront:</code>. The Starfront panel's status line and its <b>Frames reported</b> list show the same things in short.</p>
 <table>
   <tr><th>What you see</th><th>What it means</th><th>What to do</th></tr>
@@ -184,16 +201,21 @@ End
   <tr><td><i>rejected - stars averaged 4.2", project wants 3.5" or better</i></td><td>The server judged the night against the project's rules</td><td>Nothing is lost locally; the coordinator can overrule a verdict</td></tr>
   <tr><td>Plugin not in the Plugins list</td><td>N.I.N.A. older than 3.2, or the repository address mistyped</td><td>Update N.I.N.A.; check Options &gt; General &gt; Plugin Repositories</td></tr>
   <tr><td>Meridian Flip ran at the very start of the container</td><td>Plugin older than 1.0.0.12</td><td>Update the plugin from Plugins &gt; Installed</td></tr>
+  <tr><td><i>Sign in to Rapid Stacker Collab ... to start sending</i></td><td>Live stacking is on but has no sign-in, or its sign-in lapsed</td><td>Options &gt; Plugins &gt; Starfront &gt; Sign in to Rapid Stacker Collab</td></tr>
+  <tr><td><i>The terms of M31 Deep changed; accept them to carry on</i></td><td>Rapid Stacker Collab's terms changed while the telescope was joining</td><td>Read and accept them under Linked collaborations; frames wait in the queue meanwhile</td></tr>
+  <tr><td><i>Joined M31 Deep; waiting for its owner to approve</i></td><td>The stacking project approves its members by hand</td><td>Nothing; frames wait and go once you are approved</td></tr>
+  <tr><td><i>Not joined: connect your camera first</i></td><td>The stacking project needs the camera's sensor and pixel size to describe your rig</td><td>Connect the camera once; it is tried again at the next check-in</td></tr>
+  <tr><td><i>Not joined: none of this wheel's filters is one the project wants</i></td><td>Your filters and the project's do not overlap, or the <i>Delivers</i> column says otherwise</td><td>Check the Delivers column of your exposure table, then <b>Retry now</b></td></tr>
 </table>
-<p>The plugin never touches your settings, profile or files beyond writing its own under <code>%LOCALAPPDATA%\NINA\PluginSettings</code>. Uninstalling it from the Plugins tab removes it completely.</p>
+<p>The plugin never touches your settings, profile or files beyond writing its own under <code>%LOCALAPPDATA%\NINA\PluginSettings</code> (live stacking keeps its queue and its temporary copies in a <code>stacking</code> folder there). Uninstalling it from the Plugins tab removes it completely.</p>
 
-<h2>10. Questions people ask</h2>
+<h2>11. Questions people ask</h2>
 <p><b>Can I still choose my exposure times?</b> Yes; that is what the exposure table is. The collaboration decides which filters tonight and how many frames go where, never how a frame is exposed.</p>
 <p><b>I set one hour but it dealt me more.</b> That was a flaw in the server's dealing, fixed on 9 October 2026. A one-hour night now gets about an hour of one filter, the one the project needs most.</p>
 <p><b>Will it move my rotator?</b> Only if one is connected and <i>Rotate to the project's angle</i> is ticked. Without a rotator it shoots at the angle the camera sits and tells the server, so your panels are laid along your camera's axes.</p>
 <p><b>What if clouds stop the night halfway?</b> Whatever was shot is credited and reported. The next night's deal starts from what everyone really collected, so nothing has to be made up by hand.</p>
 <p><b>Can I run my own targets the same night?</b> Yes. Put them before or after the container in the Targets area, with their own conditions. The container takes the time your sequence gives it and no more.</p>
-<p><b>Does it see my location?</b> No. The server is told your focal length, pixel size, sensor size, filters, exposures and, if you allow it, where the mount points. Your site, horizon and local times stay on your PC; that is why the plugin works out the Moon and altitudes itself.</p>
+<p><b>Does it see my location?</b> No. The server is told your focal length, pixel size, sensor size, filters, exposures and, if you allow it, where the mount points. Your site, horizon and local times stay on your PC; that is why the plugin works out the Moon and altitudes itself. With Live stacking on, the frames themselves go to Rapid Stacker Collab, with the site taken out of their headers first.</p>
 <p><b>I have Starfront and N.I.N.A. on different telescopes.</b> That is fine. Both talk to the same server, and the same person can own telescopes of either kind.</p>
 <p><b>Who do I ask?</b> The Starfront Discord server, where the people running the collaborations are. Say which telescope, and paste the <code>Starfront:</code> lines from the log for the night in question, or the whole log file.</p>
 </body>

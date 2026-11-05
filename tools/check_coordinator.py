@@ -397,6 +397,22 @@ case("it can start a project", bool(project.get("id")))
 case("and the project comes back with its region",
      admin.project(project["id"])["project"]["payload"]["region"]["dec"] == 60.0)
 
+# Since T706 the server makes the stacking project from the collaboration
+# itself, so a pasted Rapid Stacker Collab join code is refused rather than
+# stored (this check used to store one, and crashed on the refusal, which hid
+# every case after it behind the CI allow-list).
+try:
+    admin.add_project(
+        "Check stacked", region={"ra": 90.0, "dec": 60.0, "width": 8.0, "height": 2.0},
+        stacking_join_code="h4rt 92bk wnpc")
+    case("a pasted stacking join code is refused", False)
+except CollabError as exc:
+    case("a pasted stacking join code is refused",
+         exc.status == 400 and "no longer taken" in str(exc), str(exc)[:80])
+admin.update_project(project["id"], {"notes": "edited"})
+case("...and an edit that does not send one stores none",
+     not admin.project(project["id"])["project"]["payload"].get("stackingJoinCode"))
+
 # --------------------------------------------------------- the two tokens
 print("\n-- the two credentials --")
 

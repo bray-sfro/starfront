@@ -1,0 +1,53 @@
+<!doctype html>
+<!--
+  This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+  If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+  Ported from Starfront (EKE Services LLC).
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Filter — Starfront</title>
+  <meta name="description" content="One filter of a Starfront collaboration project: live and gold stacks, frames by contributor and master downloads.">
+  <meta name="robots" content="noindex">
+  <meta name="theme-color" content="#0d1017" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f3f5f8" media="(prefers-color-scheme: light)">
+  <link rel="icon" type="image/svg+xml" href="/stack/favicon.svg">
+  <link rel="stylesheet" href="/stack/css/tokens.css">
+  <link rel="stylesheet" href="/stack/css/base.css">
+  <link rel="stylesheet" href="/stack/css/components.css">
+  <link rel="stylesheet" href="/stack/css/pages.css">
+  <link rel="stylesheet" href="/stack/css/collab.css">
+  <script src="/stack/js/theme-init.js"></script>
+  <script src="/stack/js/site-config.js"></script>
+</head>
+<body>
+
+<header id="site-nav"></header>
+
+<main id="main">
+<svg width="0" height="0" aria-hidden="true" focusable="false" class="svg-defs">
+  <defs>
+    <filter id="adj-lift" color-interpolation-filters="sRGB"><feComponentTransfer><feFuncR type="gamma" exponent="0.7"/><feFuncG type="gamma" exponent="0.7"/><feFuncB type="gamma" exponent="0.7"/></feComponentTransfer></filter>
+    <filter id="adj-lift2" color-interpolation-filters="sRGB"><feComponentTransfer><feFuncR type="gamma" exponent="0.5"/><feFuncG type="gamma" exponent="0.5"/><feFuncB type="gamma" exponent="0.5"/></feComponentTransfer></filter>
+    <filter id="adj-dark" color-interpolation-filters="sRGB"><feComponentTransfer><feFuncR type="gamma" exponent="1.4"/><feFuncG type="gamma" exponent="1.4"/><feFuncB type="gamma" exponent="1.4"/></feComponentTransfer></filter>
+  </defs>
+</svg>
+<section class="section section--tight">
+  <div class="container">
+    <nav class="breadcrumb" aria-label="Breadcrumb"><ol><li><a href="/stack/">Projects</a></li><li><a href="/stack/" id="crumb-project">Project</a></li><li aria-current="page" id="crumb-filter">Filter</li></ol></nav>
+    <p class="loading" id="filter-loading" role="status">Loading</p>
+    <div id="filter-error" hidden role="alert"></div>
+    <div id="filter-body"></div>
+    <noscript><p class="callout callout--warning">This page needs JavaScript to show its data.</p></noscript>
+  </div>
+</section>
+</main>
+
+<footer id="site-footer"></footer>
+
+<script type="module" src="/stack/js/chrome.js"></script>
+<script type="module" src="/stack/js/pages/filter.js"></script>
+</body>
+</html>

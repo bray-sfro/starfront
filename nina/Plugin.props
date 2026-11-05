@@ -29,6 +29,7 @@ This plugin is the N.I.N.A. side of that:
 - **One instruction.** Drop the *Starfront collaboration* container into your Advanced Sequence where a target would go, inside your usual autofocus, meridian-flip and dither triggers. When it runs it reads tonight's deal once, then slews, centres (and rotates, if you have a rotator), switches filter and takes the frames - for the field, or for each panel in turn - skipping anything below the project's altitude floor until it rises.
 - **Frames are reported as they land.** Every light the container takes is credited to the sky it covered, with its star size and guiding error, and sent to the server on the next check-in, so everyone's depth map moves on and tomorrow's deal is made from what was really collected.
 - **An Imaging-tab panel** shows who is online, which collaborations are open to your telescope, how far each has got, and what you have been dealt tonight. You can start your own collaboration from it too.
+- **Live stacking (optional, off by default).** A coordinator can link a collaboration to a Rapid Stacker Collab project. Turn on *Live stacking* in the options and sign in, and every light the container saves for it is sent there as it lands - a copy, with your location taken out - so everyone's frames build one stack through the night. Your own files are never moved, changed or deleted.
 
 Made by Starfront Observatories, Rockwood, Texas - https://starfront.space</PluginLongDescription>
     <!-- The links N.I.N.A. shows at the top of the plugin's page. The homepage is
@@ -37,7 +38,7 @@ Made by Starfront Observatories, Rockwood, Texas - https://starfront.space</Plug
          is at https://github.com/bray-sfro/starfront (nina/). -->
     <RepositoryUrl>https://discord.com/invite/3ut6a7pfsY</RepositoryUrl>
     <PluginHomepage>https://starfront.space</PluginHomepage>
-    <PluginTags>Collaboration,Mosaic,Deep Sky,Discord,Starfront,Community,Sequencer</PluginTags>
+    <PluginTags>Collaboration,Mosaic,Deep Sky,Discord,Starfront,Community,Sequencer,Stacking</PluginTags>
     <MinimumNinaVersion>3.2.0.9001</MinimumNinaVersion>
     <PluginLicense>MPL-2.0</PluginLicense>
     <PluginLicenseUrl>https://www.mozilla.org/en-US/MPL/2.0/</PluginLicenseUrl>

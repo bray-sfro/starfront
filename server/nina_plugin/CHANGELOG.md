@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+*Draft: the version number and the release are the author's.*
+
+- Live stacking can send to a Rapid Stacker Collab hub as well as to the cloud. A collaboration whose stacking project is on a hub is linked the same way, and its lights go to the hub the collaboration is bound to.
+- Hub collaborations need no sign-in to Rapid Stacker Collab. The options page says so, and the Linked collaborations list shows each hub link as `(Hub: name)`. The Rapid Stacker Collab sign-in is asked for only when a cloud collaboration needs it.
+- On the home network a hub is reached directly over its LAN address, and the lights go through the Starfront server whenever it does not answer. The plugin writes one log line each time it switches.
+- A hub that refuses the telescope's grant holds only that hub's lights, which wait for the next check-in. A fresh grant is picked up at that check-in, and the held and new lights are sent without a restart. Cloud uploads keep going, and the cloud sign-in is not asked for again.
+- Each backend has its own rig id: the cloud keeps the rig id it was given, and each hub keeps its own, so one backend's join no longer overwrites another's.
+- Live stacking follows the collaboration. The start form no longer asks for a Rapid Stacker Collab join code: Starfront stacks a new collaboration on its coordinator's hub, or makes and keeps the Rapid Stacker Collab project itself once their Collab account is linked, and the Collab tab in Starfront turns it off or changes it. The join code box shows only when editing an old collaboration that was given a pasted code, which keeps working; the panel and options texts say so.
+
+## 1.0.0.33
+
+- *Live stacking* sends a light only if it was pointed at the stacking project's field. The target name says what the sequence meant to shoot, not where the telescope was; a light pointed well away from the field (farther from its centre than the field's half-diagonal plus a degree, and not named after the project) could only be rejected by Rapid Stacker Collab after it had cost you quota. The log says how far off it was.
+- Flats are sent by default, each to the stacking projects that got this telescope's lights of the same filter that night. A flat taken in the evening, before any light, waits for them until the next midday, then goes where lights in the same folder, the target name, a night up to three away or the last light sent say. A night spent on a target that is no linked collaboration's keeps its flats here. *Send flats* under Options > Plugins > Starfront turns it off.
+- Darks, bias and dark flats go to this telescope's calibration library on Rapid Stacker Collab, which calibrates its lights in every project, instead of to one project; the panel shows how the library stands. Under *Calibration library* you can keep a folder of them in step with it (a master per group if there is one, else the raw frames; never anything removed), every so many hours or with *Sync the library now*. *Send new darks there* turns it off, and *Also send darks, bias* then sends them to the project of the last light sent, as in 1.0.0.32.
+- The upload engine is Rapid Stacker Collab's plugin 0.2.2.0's, which pages the calibration library by 100 and keeps a record of the flats it is holding and the lights of other targets in its queue (it is upgraded on first start, keeping what is queued).
+
+## 1.0.0.32
+
+- *Live stacking*, off by default. A coordinator can put a Rapid Stacker Collab join code on a collaboration (a new field at the bottom of the start and edit form), and every telescope on it with *Live stacking* turned on under Options > Plugins > Starfront sends each light the Starfront container saves to that stacking project as it lands, so everyone's frames build one stack through the night. The code is handed only to telescopes on the collaboration and to the coordinator's own; the others' cards just say the lights are live-stacked.
+- Live stacking has its own sign-in, to Rapid Stacker Collab, the same way as the Discord one: a code to approve in the browser, no password in N.I.N.A. The telescope joins each linked project by itself at the next check-in, with its filters mapped from your exposure table's *Delivers* column and the filter names; a filter the project does not use is never sent. Joining accepts Rapid Stacker Collab's terms of contribution as they stand, and the switch says so; read them on its website first. If they change in the moment between the plugin reading them and joining, the join waits for you to read and accept them on the options page.
+- What is sent is a copy with your site's latitude, longitude and height, the observer, and the altitude and azimuth that would give them away taken out; your own files are never moved, changed or deleted. Only lights the container shot for a linked collaboration go, and darks, flats and bias only if you ask (to the project of the last light sent). Uploads wait for the camera to be idle unless you choose otherwise, can keep to a daily window, can be capped in speed, and resume where they stopped after a restart. The Starfront panel shows what is waiting and going, with *Pause uploads* and *Upload now*.
+- With it off, nothing changes: no sign-in, no connection, no queue, and the ledger and reporting work exactly as before.
+
 ## 1.0.0.31
 
 - *Collect the lights on the server* in the start-a-collaboration form, and on Edit. A collaboration with it on takes everyone's lights, flats, darks and bias through the files page at collab.starfront.space/files, sorted by collaboration and person, for the coordinator to stack. A card on such a collaboration says so and has an *Open the files page* button.

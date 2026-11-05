@@ -1,0 +1,10 @@
+<Project>
+  <!-- Tests of the parts of the plugin that use neither N.I.N.A. nor WPF, so
+       they run on macOS and Linux as well as Windows. Starfront's props above
+       would make this a WPF project; it is a plain net8.0 one. -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <UseWPF>false</UseWPF>
+  </PropertyGroup>
+</Project>

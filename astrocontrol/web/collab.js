@@ -376,6 +376,19 @@
     // Editing keeps the region it has unless a new one was chosen; starting
     // needs one either way.
     const editing = col.editing;
+    // Where the lights are stacked. A new collaboration always says so (the
+    // form starts on the server's default); an edit sends it only when it
+    // was changed, so a binding nobody touched is never rewritten.
+    const wanted = stackingChoice();
+    if (wanted.error) {
+      stackMessage(wanted.error, true);
+      app.toast(wanted.error, 'error');
+      return;
+    }
+    stackMessage('');
+    if (!editing || stackingChanged(wanted.value)) {
+      body.stacking = wanted.value;
+    }
     const wantsRegion = !editing || col.regionChanged;
     if (wantsRegion && shape() === 'mosaic') {
       const region = app.state.collabRegion;
@@ -450,6 +463,7 @@
       $('colPName').value = '';
       $('colPNotes').value = '';
       if ($('colPCollect')) $('colPCollect').checked = false;
+      resetStacking();
       col.filters = [];
       app.state.collabRegion = null;
       drawFilterRows();
@@ -677,7 +691,10 @@
         ? `<button class="btn small ghost" data-col-edit="${esc(project.id)}">Edit</button>
            <button class="btn small ghost" data-col-redeal="${esc(project.id)}"
                    title="Forget tonight's lists so every telescope is dealt afresh on its next poll - after changing the filters or goals">Re-deal tonight</button>
-           <button class="btn small ghost danger" data-col-close="${esc(project.id)}">Close</button>`
+           <button class="btn small ghost danger" data-col-close="${esc(project.id)}">Close</button>
+           ${(project.stacking || {}).backend === 'hub' || (project.stacking || {}).managed
+             ? `<button class="btn small ghost danger" data-col-delete="${esc(project.id)}"
+                  title="Restorable for seven days; then the raw frames are purged">Delete</button>` : ''}`
         : '';
 
       const open = col.expanded.has(project.id);
@@ -766,6 +783,10 @@
     box.querySelectorAll('[data-col-close]').forEach((button) => {
       button.addEventListener('click', () => closeProject(
         projects.find((p) => p.id === button.dataset.colClose)));
+    });
+    box.querySelectorAll('[data-col-delete]').forEach((button) => {
+      button.addEventListener('click', () => deleteProject(
+        projects.find((p) => p.id === button.dataset.colDelete)));
     });
     box.querySelectorAll('[data-col-redeal]').forEach((button) => {
       button.addEventListener('click', () => redealProject(
@@ -962,6 +983,7 @@
     set('colPName', project.name || '');
     set('colPNotes', project.notes || '');
     if ($('colPCollect')) $('colPCollect').checked = !!project.collectFiles;
+    loadStacking(project);
     set('colRMinFocal', wants.minFocalLength);
     set('colRMaxFocal', wants.maxFocalLength);
     const takesColour = wants.acceptColour !== false;
@@ -1002,7 +1024,10 @@
   }
 
   function endEdit() {
+    const was = col.editing;
     col.editing = null;
+    col.stackLoaded = null;
+    if (was) resetStacking();
     col.regionChanged = false;
     if ($('btnColCreate')) $('btnColCreate').textContent = 'Start it';
   }
@@ -1113,6 +1138,703 @@
      runs their own server edits settings.json by hand. */
   function syncSettings() {}
 
+
+  /* --------------------------------------- the live stacking fieldset */
+
+  /* Stacking follows the collaboration (T706, the author's rule): the
+     collaboration is the only place a project is made. A new one is stacked
+     where the server says by default - the person's hub, else Rapid Stacker
+     Collab when their account is linked - and this form shows that choice
+     and offers off or another. Every save sends the collaboration's fields
+     down to the stacking project; nothing is ever edited on the stacking side.
+     A cloud project is made and kept by the server through the Collab API;
+     an old collaboration's pasted join code is kept as it is, read-only. */
+
+  const stackBackend = () => {
+    if ($('stkCloud') && $('stkCloud').checked) return 'cloud';
+    if ($('stkHub') && $('stkHub').checked) return 'hub';
+    return '';
+  };
+
+  function stackMessage(text, bad = false) {
+    const node = $('stkMsg');
+    if (!node) return;
+    node.textContent = text || '';
+    node.style.color = bad ? 'var(--warn)' : '';
+  }
+
+  /** An old collaboration's pasted code, kept as it is unless converted. */
+  const legacyCode = () => {
+    const loaded = col.stackLoaded;
+    return loaded && loaded.backend === 'cloud' && !loaded.managed ? loaded.joinCode : '';
+  };
+
+  /** "Live stacking: on (hub NAME)", in words, for what the form says now. */
+  function stackSummary() {
+    const backend = stackBackend();
+    const cloud = (col.stackOpts || {}).cloud || {};
+    if (backend === 'hub') {
+      const pick = $('stkHubPick');
+      const hub = (col.hubs || []).find((h) => h.id === (pick && pick.value));
+      return `Live stacking: on (hub ${hub ? hub.name : (pick && pick.value) || '?'})`;
+    }
+    if (backend === 'cloud') {
+      if (legacyCode() && !($('stkConvert') && $('stkConvert').checked)) {
+        return 'Live stacking: on (Rapid Stacker Collab, the pasted join code it already has)';
+      }
+      return cloud.linked
+        ? `Live stacking: on (Rapid Stacker Collab${cloud.user ? `, as ${cloud.user}` : ''})`
+        : 'Live stacking: Rapid Stacker Collab, once your account is linked (below)';
+    }
+    return 'Live stacking: off';
+  }
+
+  /** Show the parts of the fieldset the chosen backend needs. */
+  function drawStacking() {
+    const backend = stackBackend();
+    if ($('stkCodeBox')) $('stkCodeBox').hidden = !(backend === 'cloud' && legacyCode());
+    if ($('stkHubBox')) $('stkHubBox').hidden = backend !== 'hub';
+    if ($('stkVisBox')) $('stkVisBox').hidden = backend === '';
+    if ($('stkSummary')) $('stkSummary').textContent = stackSummary();
+  }
+
+  /** What the fieldset says, or the reason it cannot be sent. */
+  function stackingChoice() {
+    const backend = stackBackend();
+    const value = { backend };
+    if (backend === 'cloud') {
+      const kept = legacyCode();
+      if (kept && !$('stkConvert').checked) {
+        value.joinCode = kept;              // the old link, read-only: kept as it is
+      } else if (!((col.stackOpts || {}).cloud || {}).linked) {
+        return { error: 'Link your Rapid Stacker Collab account first (Rapid Stacker '
+          + 'Collab account, below): the server makes the project with it.' };
+      }
+      value.visibility = $('stkVisibility').value || 'unlisted';
+    } else if (backend === 'hub') {
+      const hubId = $('stkHubPick').value;
+      if (!hubId) {
+        return { error: 'Choose a hub. Register one under Live stacking hub, below, '
+          + 'or ask a hub\'s owner to list you as a coordinator.' };
+      }
+      value.hubId = hubId;
+      value.visibility = $('stkVisibility').value || 'unlisted';
+    }
+    return { value };
+  }
+
+  /** Whether the fieldset differs from what the project had when it was loaded. */
+  function stackingChanged(now) {
+    const was = col.stackLoaded || { backend: '', hubId: '', visibility: 'unlisted' };
+    if (now.backend !== was.backend) return true;
+    if (now.backend === 'cloud') {
+      if (legacyCode()) return !now.joinCode;          // converting to a server-made project
+      return now.visibility !== was.visibility;
+    }
+    if (now.backend === 'hub') return now.hubId !== was.hubId || now.visibility !== was.visibility;
+    return false;
+  }
+
+  function setVisibility(value) {
+    $('stkVisibility').value = ['public', 'private'].includes(value) ? value : 'unlisted';
+  }
+
+  /** A new collaboration's form shows where the server would stack it. */
+  function applyStackDefault() {
+    if (col.editing || col.stackTouched) return;
+    const fallback = (col.stackOpts || {}).default || { backend: '' };
+    $('stkNone').checked = fallback.backend === '';
+    $('stkCloud').checked = fallback.backend === 'cloud';
+    $('stkHub').checked = fallback.backend === 'hub';
+    if (fallback.backend === 'hub') drawHubPick(fallback.hubId);
+    drawStacking();
+  }
+
+  /** The Edit form: where this collaboration is stacked, read from the
+   *  server as its owner (the listing tells a telescope less). */
+  async function loadStacking(project) {
+    const block = project.stacking || {};
+    const code = project.stackingJoinCode || '';
+    const backend = block.backend || (code ? 'cloud' : '');
+    col.stackLoaded = {
+      backend, managed: !!block.managed, joinCode: code, hubId: block.hubId || '',
+      visibility: block.visibility || 'unlisted',
+    };
+    showLoaded();
+    try {
+      const got = await app.api(`/api/collab/projects/${encodeURIComponent(project.id)}/stacking`);
+      if (!col.editing || col.editing.id !== project.id) return;
+      col.stackLoaded = {
+        backend: got.backend, managed: !!got.managed, joinCode: got.joinCode || '',
+        hubId: got.hubId || '', visibility: got.visibility || 'unlisted',
+      };
+      showLoaded();
+      drawStackState(got);
+    } catch (error) {
+      drawStackState(null, error.message);
+    }
+  }
+
+  function showLoaded() {
+    const loaded = col.stackLoaded;
+    $('stkNone').checked = loaded.backend === '';
+    $('stkCloud').checked = loaded.backend === 'cloud';
+    $('stkHub').checked = loaded.backend === 'hub';
+    $('stkJoinCode').value = legacyCode();
+    $('stkConvert').checked = false;
+    setVisibility(loaded.visibility);
+    drawHubPick(loaded.hubId);
+    drawStacking();
+  }
+
+  /** How the stacking project of the collaboration being edited is doing. */
+  function drawStackState(got, failed = '') {
+    const node = $('stkState');
+    if (!node) return;
+    if (failed) { node.textContent = `Could not read its stacking state: ${failed}`; return; }
+    const lines = [];
+    const cloud = got && got.cloud;
+    if (got && got.deletion && got.deletion.status === 'deleted') {
+      lines.push(`Deleted; restorable until ${String(got.deletion.delete_after || '').slice(0, 10)}.`);
+    }
+    if (cloud && got.managed) {
+      if (cloud.state === 'ok') {
+        lines.push(`Rapid Stacker Collab project ${cloud.slug || ''} is in step`
+          + `${cloud.remoteStatus ? ` (${cloud.remoteStatus})` : ''}.`);
+      } else if (cloud.state === 'pending') {
+        lines.push('Rapid Stacker Collab project: being made.');
+      } else if (cloud.error) {
+        lines.push(`Rapid Stacker Collab: ${cloud.error}`
+          + (cloud.state === 'failed' && cloud.nextAt
+            ? ` The server tries again at ${new Date(cloud.nextAt * 1000).toLocaleTimeString()}.` : ''));
+      }
+    } else if (got && got.backend === 'hub' && got.status) {
+      lines.push(`Stacking project on ${got.hubName || 'the hub'}: ${got.status}.`);
+    }
+    node.innerHTML = lines.map((line) => esc(line)).join('<br>')
+      + (cloud && cloud.pageUrl ? ` <a href="${esc(cloud.pageUrl)}" target="_blank" rel="noopener">Its page</a>` : '');
+  }
+
+  function resetStacking() {
+    col.stackLoaded = null;
+    col.stackTouched = false;
+    $('stkJoinCode').value = '';
+    $('stkConvert').checked = false;
+    setVisibility('unlisted');
+    if ($('stkState')) $('stkState').textContent = '';
+    stackMessage('');
+    applyStackDefault();
+  }
+
+  /** What the server offers this person: the hubs they may bind to, the
+   *  default, their Collab link and their deleted collaborations. */
+  async function loadHubs() {
+    try {
+      const answer = await app.api('/api/collab/stacking');
+      col.stackOpts = answer;
+      col.hubs = answer.hubs || [];
+      col.hubsError = '';
+    } catch (error) {
+      col.hubs = [];
+      col.hubsError = error.message;
+    }
+    drawHubPick();
+    drawCloudLink();
+    drawDeleted();
+    applyStackDefault();
+    drawStacking();
+  }
+
+  function drawHubPick(select) {
+    const pick = $('stkHubPick');
+    if (!pick) return;
+    const keep = select || pick.value;
+    const hubs = col.hubs || [];
+    pick.innerHTML = hubs.map((hub) => `<option value="${esc(hub.id)}">${esc(hub.name)}`
+      + `${hub.role === 'coordinator' ? ' (you coordinate)' : ''}`
+      + `${hub.lanUrl ? ` (${esc(hub.lanUrl)})` : ''}</option>`).join('');
+    // A project bound to a hub the list does not show (someone else's) still
+    // has to show it, or saving would silently rebind it.
+    if (keep && !hubs.some((hub) => hub.id === keep)) {
+      pick.insertAdjacentHTML('afterbegin',
+        `<option value="${esc(keep)}">${esc(keep)} (not one of yours)</option>`);
+    }
+    if (keep) pick.value = keep;
+    const note = $('stkHubNote');
+    if (note) {
+      note.textContent = col.hubsError ? `Could not ask the server: ${col.hubsError}`
+        : hubs.length ? '' : 'You have no hub to bind to. Set one up under Live '
+          + 'stacking hub, below, or ask a hub\'s owner to list you as a coordinator.';
+    }
+  }
+
+  /** The Rapid Stacker Collab account link: once per person, kept on the server. */
+  function drawCloudLink() {
+    const cloud = (col.stackOpts || {}).cloud || {};
+    const text = $('stkCloudLinkText');
+    if (text) {
+      text.textContent = cloud.linked
+        ? `Linked${cloud.user ? ` as ${cloud.user}` : ''} (${cloud.apiBase || ''})`
+          + `${cloud.expiresAt ? `; the token expires ${String(cloud.expiresAt).slice(0, 10)}` : ''}.`
+          + (cloud.sealed ? '' : ' This server keeps it unsealed: it has no key to seal it with.')
+        : cloud.unreadable
+          ? 'The link can no longer be read (the server\'s key changed): link again.'
+          : 'Not linked. Without it, collaborations cannot be stacked on Rapid Stacker Collab.';
+    }
+    if ($('btnStkCloudUnlink')) $('btnStkCloudUnlink').hidden = !cloud.linked;
+    if ($('stkCloudBase') && !$('stkCloudBase').value && cloud.apiBase) $('stkCloudBase').value = cloud.apiBase;
+  }
+
+  async function linkCloud() {
+    const token = ($('stkCloudToken').value || '').trim();
+    if (!token) { app.toast('Paste the API token first', 'error'); $('stkCloudToken').focus(); return; }
+    $('btnStkCloudLink').disabled = true;
+    try {
+      const answer = await app.api('/api/collab/stacking/cloud', 'POST',
+        { token, apiBase: ($('stkCloudBase').value || '').trim() });
+      $('stkCloudToken').value = '';
+      col.stackOpts = { ...(col.stackOpts || {}), cloud: answer.cloud };
+      app.toast('Rapid Stacker Collab is linked', 'success');
+      await loadHubs();
+    } catch (error) {
+      app.toast(error.message, 'error');
+      stackMessage(error.message, true);
+    }
+    $('btnStkCloudLink').disabled = false;
+  }
+
+  async function unlinkCloud() {
+    const ok = await app.confirmAction('Forget your Rapid Stacker Collab token on the server? '
+      + 'Collaborations already on the cloud keep their projects, but their changes wait '
+      + 'until you link again.', { title: 'Unlink Rapid Stacker Collab', confirmLabel: 'Unlink', danger: true });
+    if (!ok) return;
+    try {
+      await app.api('/api/collab/stacking/cloud/unlink', 'POST', {});
+      await loadHubs();
+    } catch (error) { app.toast(error.message, 'error'); }
+  }
+
+  /** Deleted collaborations are off every list; this is where they are restored. */
+  function drawDeleted() {
+    const box = $('colDeleted');
+    if (!box) return;
+    const deleted = ((col.stackOpts || {}).deleted || []).filter((d) => d.restorable);
+    box.hidden = !deleted.length;
+    box.innerHTML = deleted.length
+      ? `<h4>Deleted collaborations</h4>${deleted.map((d) => `<div class="row gap small">
+          <span class="grow">${esc(d.name)} — restorable until ${esc(String(d.deleteAfter || '').slice(0, 10))}${
+            d.note ? `<br><span class="muted">${esc(d.note)}</span>` : ''}</span>
+          <button class="btn small" data-col-restore="${esc(d.id)}">Restore</button></div>`).join('')}`
+      : '';
+    box.querySelectorAll('[data-col-restore]').forEach((button) => {
+      button.addEventListener('click', () => restoreProject(button.dataset.colRestore, button));
+    });
+  }
+
+  async function deleteProject(project) {
+    if (!project) return;
+    const days = (col.stackOpts || {}).windowDays || 7;
+    const ok = await app.confirmAction(
+      `Delete “${project.name}”? It comes off everybody's list and its stacking project stops `
+      + `taking frames. You can restore it for ${days} days; after that the raw frames are `
+      + 'purged. The finished stacks are kept until you remove them.',
+      { title: 'Delete collaboration', confirmLabel: 'Delete it', danger: true });
+    if (!ok) return;
+    try {
+      const answer = await app.api(`/api/collab/projects/${encodeURIComponent(project.id)}/delete`, 'POST', {});
+      col.state = answer.state || col.state;
+      const cloud = (answer.deletion || {}).cloud;
+      app.toast(cloud && cloud.state === 'needs_owner' ? cloud.error
+        : `“${project.name}” is deleted; restorable until `
+          + `${String((answer.deletion || {}).delete_after || '').slice(0, 10)}`, 'success', 8000);
+      await load(true);
+    } catch (error) { app.toast(error.message, 'error'); }
+  }
+
+  async function restoreProject(id, button) {
+    button.disabled = true;
+    try {
+      const answer = await app.api(`/api/collab/projects/${encodeURIComponent(id)}/restore`, 'POST', {});
+      col.state = answer.state || col.state;
+      app.toast('Restored', 'success');
+      await load(true);
+    } catch (error) {
+      app.toast(error.message, 'error');
+      button.disabled = false;
+    }
+  }
+
+  /* ------------------------------------------ small shared formatting */
+
+  /** A time as "12 s ago": epoch seconds or milliseconds, or an ISO string. */
+  function agoText(value) {
+    if (value === null || value === undefined || value === '') return '—';
+    let ms = typeof value === 'number' ? (value > 1e12 ? value : value * 1000) : Date.parse(value);
+    if (!Number.isFinite(ms)) return String(value);
+    const seconds = Math.round((Date.now() - ms) / 1000);
+    if (seconds < -5) return new Date(ms).toLocaleString();
+    return ago(Math.max(0, seconds));
+  }
+
+  /** A text field is the browser-mode fallback: a native dialog only exists
+   *  inside the desktop window. */
+  async function pickFolderInto(id) {
+    const native = (window.pywebview && window.pywebview.api) || null;
+    if (!native) { $(id).focus(); app.toast('Type the folder path here', 'info'); return; }
+    try {
+      const chosen = await native.pick_folder($(id).value || '');
+      if (chosen) $(id).value = chosen;
+    } catch (error) { app.toast(String(error), 'error'); }
+  }
+
+  const SIGNING_NOTE = 'Installs are refused until a Starfront release signing '
+    + 'key has been generated and built in. Nothing unverified is ever run, so '
+    + 'this cannot be worked around from here.';
+
+  /** An install error in words; the placeholder-key refusal said plainly. */
+  const installWords = (message) => (/signing key/i.test(message || '')
+    ? `${message} — ${SIGNING_NOTE}` : (message || ''));
+
+  function drawProgress(boxId, barId, textId, progress) {
+    const box = $(boxId);
+    if (!box) return;
+    const p = progress || {};
+    const show = !!(p.busy || p.error || (p.phase && p.phase !== 'idle'));
+    box.hidden = !show;
+    if (!show) return;
+    $(barId).style.width = `${Math.round(100 * (p.progress || 0))}%`;
+    const text = $(textId);
+    text.textContent = p.error ? installWords(p.error)
+      : `${p.phase}${p.message ? `: ${p.message}` : ''}`;
+    text.style.color = p.error ? 'var(--warn)' : '';
+  }
+
+  /* -------------------------------------------- the hub on this machine */
+
+  const hubState = { status: null, loaded: false, last: 0, logAt: 0, enrol: null };
+
+  function hubMessage(text, bad = false) {
+    const node = $('hubMsg');
+    if (!node) return;
+    node.textContent = text || '';
+    node.style.color = bad ? 'var(--warn)' : '';
+  }
+
+  /** The hub pill from the live snapshot: cheap, runs on every tick. */
+  function drawHubPill(summary) {
+    const pill = $('hubPill');
+    if (!pill || !summary) return;
+    const running = summary.state === 'running';
+    pill.className = `pill ${running ? 'on' : summary.lastError ? 'busy' : ''}`;
+    $('hubPillText').textContent = summary.enabled || running
+      ? `${summary.state || 'stopped'}${running && summary.workers !== null
+        && summary.workers !== undefined ? ` · ${summary.workers} worker${summary.workers === 1 ? '' : 's'}` : ''}`
+      : 'off';
+    $('hubUrlText').textContent = summary.url || '';
+    $('hubPill').title = summary.lastError || '';
+    const local = $('volLocalBox');
+    if (local) local.hidden = !summary.enabled;
+  }
+
+  /** Fill the form from the stored settings (once, or on a deliberate reload). */
+  async function loadHubSettings() {
+    try {
+      const all = await app.api('/api/settings');
+      const hub = all.hub || {};
+      $('hubEnabled').checked = !!hub.enabled;
+      $('hubAutoStart').checked = hub.autoStart !== false;
+      $('hubDataRoot').value = hub.dataRoot || '';
+      $('hubCatalogue').value = hub.catalogueDir || '';
+      $('hubBind').value = hub.bind || '';
+      $('hubPublicUrl').value = hub.publicUrl || '';
+      hubState.loaded = true;
+    } catch (error) { hubMessage(error.message, true); }
+  }
+
+  function drawHubStatus(status) {
+    hubState.status = status;
+    drawHubPill(status);
+    drawProgress('hubInstallBox', 'hubInstallBar', 'hubInstallText', status.install);
+    const installing = !!(status.install && status.install.busy);
+    $('btnHubInstall').disabled = installing;
+    $('btnHubInstall').textContent = status.binaryFound ? 'Update hub' : 'Install hub';
+    $('btnHubStart').disabled = status.state === 'running' || status.state === 'starting';
+    $('btnHubStop').disabled = status.state !== 'running' && status.state !== 'starting';
+    $('btnHubCheck').disabled = !!status.checking;
+    $('btnHubCheck').textContent = status.checking ? 'Checking…' : 'Check';
+
+    const report = $('hubCheckReport');
+    const check = status.check;
+    if (check && check.report) {
+      report.hidden = false;
+      report.textContent = (check.ok ? 'Check passed.\n' : 'Check failed.\n') + check.report;
+      report.style.borderColor = check.ok ? 'var(--good)' : 'var(--warn)';
+    } else { report.hidden = true; }
+
+    const reg = $('hubRegText');
+    if (status.registeredId) {
+      reg.textContent = `Registered with ${status.server || 'the server'} as `
+        + `“${status.registeredName || status.registeredId}” (${status.registeredId}).`;
+      $('btnHubRegister').textContent = 'Register again';
+    } else {
+      reg.textContent = status.server
+        ? `Not registered with ${status.server}. Sign in under Join with Discord first.`
+        : 'Not registered. Set a collaboration server and sign in first.';
+      $('btnHubRegister').textContent = 'Register with Starfront';
+    }
+    if (status.lastError) hubMessage(status.lastError, true);
+    drawFleet(status);
+  }
+
+  /** The fleet table. The hub's status JSON is not fixed yet, so this reads
+   *  whichever of the usual fields a worker carries, shows the rest as
+   *  key=value, and says plainly when there is nothing to show. */
+  function drawFleet(status) {
+    const box = $('hubFleet');
+    if (!box) return;
+    const raw = status.hubStatus && status.hubStatus.workers;
+    let workers = [];
+    if (Array.isArray(raw)) workers = raw;
+    else if (raw && typeof raw === 'object' && Array.isArray(raw.list)) workers = raw.list;
+    else if (raw && typeof raw === 'object') {
+      workers = Object.entries(raw).filter(([, v]) => v && typeof v === 'object')
+        .map(([key, v]) => ({ id: key, ...v }));
+    }
+    if (!workers.length) {
+      const count = status.workers;
+      box.innerHTML = `<p class="small muted">${status.state !== 'running'
+        ? 'The hub is not running.'
+        : count ? `${esc(count)} worker${count === 1 ? '' : 's'} reported, with no detail yet.`
+          : 'No worker has joined yet. Make an enrol code, below.'}</p>`;
+      return;
+    }
+    const first = (w, keys) => { for (const k of keys) if (w[k] !== undefined && w[k] !== null) return w[k]; return undefined; };
+    const used = new Set(['name', 'worker', 'worker_id', 'id', 'version', 'catalogue', 'busy',
+      'reason', 'busy_reason', 'why', 'state', 'last_heartbeat', 'heartbeat_at', 'last_seen', 'seen']);
+    const rows = workers.map((w) => {
+      const name = first(w, ['name', 'worker', 'worker_id', 'id']);
+      const busy = first(w, ['busy']);
+      const why = first(w, ['busy_reason', 'reason', 'why', 'state']);
+      const cat = first(w, ['catalogue']);
+      const extra = Object.entries(w).filter(([k, v]) => !used.has(k) && v !== null
+        && typeof v !== 'object').map(([k, v]) => `${k}=${v}`).join(' ');
+      return `<tr><td>${esc(name === undefined ? '—' : name)}</td>`
+        + `<td class="mono">${esc(first(w, ['version']) || '—')}</td>`
+        + `<td>${cat === undefined ? '—' : cat === true ? 'yes' : cat === false ? 'no' : esc(cat)}</td>`
+        + `<td>${busy === undefined ? esc(why || '—') : (busy ? 'busy' : 'idle')}`
+        + `${why && busy !== undefined ? ` <span class="muted">(${esc(why)})</span>` : ''}</td>`
+        + `<td>${esc(agoText(first(w, ['last_heartbeat', 'heartbeat_at', 'last_seen', 'seen'])))}</td>`
+        + `<td class="small muted">${esc(extra)}</td></tr>`;
+    }).join('');
+    box.innerHTML = '<table class="survey-fields"><thead><tr><th>Worker</th><th>Version</th>'
+      + '<th>Catalogue</th><th>State</th><th>Last heartbeat</th><th></th></tr></thead>'
+      + `<tbody>${rows}</tbody></table>`;
+  }
+
+  async function refreshHub() {
+    hubState.last = Date.now();
+    try { drawHubStatus(await app.api('/api/hub')); } catch (error) { hubMessage(error.message, true); }
+  }
+
+  async function hubAction(button, path, body) {
+    if (button) button.disabled = true;
+    hubMessage('');
+    try {
+      drawHubStatus(await app.api(path, 'POST', body === undefined ? {} : body));
+    } catch (error) {
+      hubMessage(installWords(error.message), true);
+      app.toast(error.message, 'error');
+    }
+    if (button) button.disabled = false;
+    refreshHub();
+  }
+
+  async function saveHub() {
+    const values = {
+      enabled: $('hubEnabled').checked, autoStart: $('hubAutoStart').checked,
+      dataRoot: $('hubDataRoot').value.trim(), catalogueDir: $('hubCatalogue').value.trim(),
+      publicUrl: $('hubPublicUrl').value.trim(),
+    };
+    const bind = $('hubBind').value.trim();
+    if (bind) values.bind = bind;
+    try {
+      drawHubStatus(await app.api('/api/settings/hub', 'POST', values));
+      hubMessage('Saved. Restart the hub for folder and address changes to apply.');
+    } catch (error) { hubMessage(error.message, true); app.toast(error.message, 'error'); }
+  }
+
+  async function newEnrolCode() {
+    $('btnHubEnrol').disabled = true;
+    try {
+      const answer = await app.api('/api/hub/enrol-code', 'POST', {});
+      hubState.enrol = answer;
+      $('hubEnrolBox').hidden = false;
+      $('hubEnrolCode').textContent = answer.code || '';
+      const at = answer.expires_at;
+      $('hubEnrolExpiry').textContent = at ? `expires ${typeof at === 'number'
+        ? new Date((at > 1e12 ? at : at * 1000)).toLocaleTimeString()
+        : new Date(at).toLocaleTimeString()}; works once` : 'works once';
+    } catch (error) { app.toast(error.message, 'error'); hubMessage(error.message, true); }
+    $('btnHubEnrol').disabled = false;
+  }
+
+  async function copyEnrolCode() {
+    const code = ($('hubEnrolCode').textContent || '').trim();
+    if (!code) return;
+    try {
+      await navigator.clipboard.writeText(code);
+      app.toast('Copied', 'success', 2000);
+    } catch (error) {
+      const range = document.createRange();
+      range.selectNodeContents($('hubEnrolCode'));
+      const selection = window.getSelection();
+      selection.removeAllRanges(); selection.addRange(range);
+      app.toast('Select and copy the code', 'info');
+    }
+  }
+
+  async function loadHubLog() {
+    hubState.logAt = Date.now();
+    try {
+      const answer = await app.api('/api/hub/log?n=200');
+      $('hubLog').textContent = (answer.lines || []).map((line) => {
+        const when = line.at ? new Date(line.at * 1000).toLocaleTimeString() : '';
+        return `${when} ${line.level || ''} ${line.message || line.raw || ''}`.trim();
+      }).join('\n') || 'Nothing logged yet.';
+    } catch (error) { $('hubLog').textContent = error.message; }
+  }
+
+  /* ---------------------------------------------- volunteer this machine */
+
+  const volState = { status: null, loaded: false, last: 0 };
+
+  function volMessage(text, bad = false) {
+    const node = $('volMsg');
+    if (!node) return;
+    node.textContent = text || '';
+    node.style.color = bad ? 'var(--warn)' : '';
+  }
+
+  function drawVolPill(summary) {
+    const pill = $('volPill');
+    if (!pill || !summary) return;
+    const running = /run|active|start/i.test(summary.service || '') && !/not|stop/i.test(summary.service || '');
+    pill.className = `pill ${running ? 'on' : summary.lastError ? 'busy' : ''}`;
+    $('volPillText').textContent = !summary.installed ? 'not installed'
+      : `${summary.version ? `v${summary.version} · ` : ''}${summary.service || 'installed'}`;
+    $('volStatusText').textContent = summary.busy ? `${summary.phase}…` : '';
+  }
+
+  function drawVolStatus(status) {
+    volState.status = status;
+    drawVolPill(status);
+    drawProgress('volProgressBox', 'volProgressBar', 'volProgressText', status.progress);
+    const busy = !!status.busy;
+    for (const id of ['btnVolInstall', 'btnVolUpdate', 'btnVolUninstall', 'btnVolStart', 'btnVolStop']) {
+      $(id).disabled = busy;
+    }
+    $('btnVolInstall').textContent = status.installed ? 'Reinstall' : 'Install';
+    $('btnVolUpdate').disabled = busy || !status.installed;
+    $('btnVolUninstall').disabled = busy || !status.installed;
+    $('btnVolStart').disabled = busy || !status.installed;
+    $('btnVolStop').disabled = busy || !status.installed;
+    const svc = status.serviceStatus || {};
+    const detail = svc.message || svc.detail || svc.status || '';
+    $('volStatusText').textContent = busy ? `${status.phase}…` : (detail ? String(detail) : '');
+    if (!status.signingKeyConfigured && !status.installed) {
+      volMessage(SIGNING_NOTE, true);
+    } else if (status.lastError) {
+      volMessage(installWords(status.lastError), true);
+    }
+  }
+
+  function fillVolForm(status) {
+    const s = status.settings || {};
+    $('volHubUrl').value = status.hubUrl || s.hubUrl || '';
+    $('volWhenIdle').checked = (s.idlePolicy || 'when_idle') === 'when_idle';
+    $('volPauseSeq').checked = s.pauseWhileSequencing !== false;
+    $('volPauseNina').checked = s.pauseWhileNina !== false;
+    $('volWindow').value = s.workWindow || '';
+    $('volScratch').value = s.scratchDir || '';
+    $('volCap').value = s.scratchCapGb || 0;
+    volState.loaded = true;
+  }
+
+  async function refreshVolunteer(fresh = false) {
+    volState.last = Date.now();
+    try {
+      const status = await app.api(fresh ? '/api/volunteer/status' : '/api/volunteer');
+      if (!volState.loaded) fillVolForm(status);
+      drawVolStatus(status);
+    } catch (error) { volMessage(error.message, true); }
+  }
+
+  function volHubUrl() {
+    if ($('volLocalHub').checked) {
+      return (hubState.status && (hubState.status.url || '')) || '';
+    }
+    return $('volHubUrl').value.trim();
+  }
+
+  async function volAction(path, body) {
+    volMessage('');
+    try {
+      drawVolStatus(await app.api(path, 'POST', body === undefined ? {} : body));
+    } catch (error) {
+      volMessage(installWords(error.message), true);
+      app.toast(error.message, 'error');
+    }
+  }
+
+  async function saveVolunteer() {
+    const cap = Number($('volCap').value || 0);
+    const values = {
+      idlePolicy: $('volWhenIdle').checked ? 'when_idle' : 'always',
+      pauseWhileSequencing: $('volPauseSeq').checked,
+      pauseWhileNina: $('volPauseNina').checked,
+      workWindow: $('volWindow').value.trim(),
+      scratchDir: $('volScratch').value.trim(),
+      scratchCapGb: Number.isFinite(cap) && cap >= 0 ? Math.round(cap) : 0,
+    };
+    if (values.workWindow && !/^\d{1,2}:\d{2}-\d{1,2}:\d{2}$/.test(values.workWindow)) {
+      volMessage('The work window is two times, like 22:00-06:00.', true);
+      return;
+    }
+    const url = volHubUrl();
+    if (url) values.hubUrl = url;
+    try {
+      drawVolStatus(await app.api('/api/settings/volunteer', 'POST', values));
+      volMessage('Saved.');
+    } catch (error) { volMessage(error.message, true); app.toast(error.message, 'error'); }
+  }
+
+  function installVolunteer() {
+    const url = volHubUrl();
+    const code = $('volCode').value.trim();
+    if (!url) { volMessage('Say which hub to work for: its address, or tick “Use this machine’s hub”.', true); return; }
+    if (!code && !(volState.status && volState.status.workerId)) {
+      volMessage('Enter the enrol code the hub’s owner gave you.', true);
+      return;
+    }
+    volAction('/api/volunteer/install', { code, hubUrl: url });
+  }
+
+  /** Called from the status tick: keep the pills fresh and, while a section
+   *  is open or a job is running, re-read it every few seconds. */
+  function tickStacking(status, shown) {
+    if (status.hub) drawHubPill(status.hub);
+    if (status.volunteer) drawVolPill(status.volunteer);
+    if (!shown) return;
+    const now = Date.now();
+    const hubBusy = !!(hubState.status && (hubState.status.install || {}).busy);
+    if (($('hubFold').open || hubBusy) && now - hubState.last > 3000) refreshHub();
+    if ($('hubFold').open && now - hubState.logAt > 5000) loadHubLog();
+    const volBusy = !!(status.volunteer && status.volunteer.busy);
+    if (($('volFold').open || volBusy) && now - volState.last > (volBusy ? 1500 : 5000)) {
+      refreshVolunteer(false);
+    }
+  }
+
   /* ------------------------------------------------------------- loading */
 
   async function load(force = false) {
@@ -1137,6 +1859,7 @@
       } catch (error) { /* the strip shows what presence alone can say */ }
     }
     col.loading = false;
+    loadHubs();
     drawServer();
     drawBrowse();
     drawTask();
@@ -1203,8 +1926,60 @@
       }
     });
 
+    // Live stacking on the form.
+    for (const id of ['stkNone', 'stkCloud', 'stkHub', 'stkConvert', 'stkHubPick']) {
+      on(id, 'change', () => { col.stackTouched = true; drawStacking(); stackMessage(''); });
+    }
+    on('btnStkHubs', 'click', loadHubs);
+    on('btnStkCloudLink', 'click', linkCloud);
+    on('btnStkCloudUnlink', 'click', unlinkCloud);
+
+    // The hub on this machine.
+    on('hubFold', 'toggle', () => {
+      if (!$('hubFold').open) return;
+      if (!hubState.loaded) loadHubSettings();
+      refreshHub();
+      loadHubLog();
+    });
+    on('btnHubDataBrowse', 'click', () => pickFolderInto('hubDataRoot'));
+    on('btnHubCatBrowse', 'click', () => pickFolderInto('hubCatalogue'));
+    on('btnHubSave', 'click', saveHub);
+    on('btnHubInstall', 'click', () => hubAction($('btnHubInstall'), '/api/hub/install'));
+    on('btnHubCheck', 'click', () => hubAction($('btnHubCheck'), '/api/hub/check'));
+    on('btnHubStart', 'click', () => hubAction($('btnHubStart'), '/api/hub/start'));
+    on('btnHubStop', 'click', () => hubAction($('btnHubStop'), '/api/hub/stop'));
+    on('btnHubRegister', 'click', () => {
+      const name = $('hubRegName').value.trim() || (hubState.status || {}).registeredName || '';
+      if (!name) { hubMessage('Give the hub a name first.', true); $('hubRegName').focus(); return; }
+      hubAction($('btnHubRegister'), '/api/hub/register',
+        { name, force: !!(hubState.status && hubState.status.registeredId) });
+    });
+    on('btnHubEnrol', 'click', newEnrolCode);
+    on('btnHubEnrolCopy', 'click', copyEnrolCode);
+    on('btnHubLog', 'click', loadHubLog);
+
+    // Volunteering this machine.
+    on('volFold', 'toggle', () => { if ($('volFold').open) refreshVolunteer(true); });
+    on('volLocalHub', 'change', () => {
+      const local = $('volLocalHub').checked;
+      $('volHubUrl').disabled = local;
+      if (local && hubState.status) $('volHubUrl').value = hubState.status.url || '';
+    });
+    on('btnVolScratchBrowse', 'click', () => pickFolderInto('volScratch'));
+    on('btnVolInstall', 'click', installVolunteer);
+    on('btnVolUpdate', 'click', () => volAction('/api/volunteer/update'));
+    on('btnVolUninstall', 'click', async () => {
+      const ok = await app.confirmAction('Remove the volunteer worker from this computer?',
+        { title: 'Uninstall', confirmLabel: 'Uninstall', danger: true });
+      if (ok) volAction('/api/volunteer/uninstall');
+    });
+    on('btnVolStart', 'click', () => volAction('/api/volunteer/start'));
+    on('btnVolStop', 'click', () => volAction('/api/volunteer/stop'));
+    on('btnVolSave', 'click', saveVolunteer);
+
     drawFilterRows();
     drawTargetPick();
+    drawStacking();
   }
 
   /* Loaded on arrival, not on every status tick: rebuilding these forms two
@@ -1213,6 +1988,7 @@
   let arrived = false;
   app.onStatus((status, tab) => {
     syncSettings(app.state.settings);
+    tickStacking(status || {}, tab === 'collab');
     if (tab !== 'collab') { arrived = false; return; }
     if (!arrived) {
       arrived = true;

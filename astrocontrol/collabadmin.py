@@ -207,14 +207,57 @@ class CollabAdmin:
                     requirements: dict[str, Any] | None = None,
                     goals: dict[str, float] | None = None,
                     coordinator: str = "", notes: str = "",
-                    kind: str = "mosaic", collect_files: bool = False) -> dict[str, Any]:
-        return self._call("POST", "/api/v1/projects", {
+                    kind: str = "mosaic", collect_files: bool = False,
+                    stacking_join_code: str = "",
+                    stacking: dict[str, Any] | None = None) -> dict[str, Any]:
+        body = {
             "name": name, "region": region, "kind": kind,
             "requirements": requirements or {},
             "goals": goals or {},
             "coordinator": coordinator, "notes": notes,
             "collectFiles": bool(collect_files),
-        })
+            "stackingJoinCode": stacking_join_code or "",
+        }
+        # The newer, fuller way to say where the lights are stacked; the server
+        # checks it (and who may bind to which hub) and ignores the join code
+        # above when it is present.
+        if stacking is not None:
+            body["stacking"] = stacking
+        return self._call("POST", "/api/v1/projects", body)
+
+    def hubs(self) -> list[dict[str, Any]]:
+        """The hubs registered by the person this program is signed in as."""
+        return self._call("GET", "/api/v1/hubs").get("hubs", [])
+
+    def stacking_options(self) -> dict[str, Any]:
+        """For the Live stacking fieldset: the hubs this person may bind to
+        (theirs, and those that list them), the default for a new
+        collaboration, their Rapid Stacker Collab link, and their deleted
+        collaborations that can still be restored."""
+        return self._call("GET", "/api/v1/stacking")
+
+    def link_cloud(self, token: str, api_base: str = "") -> dict[str, Any]:
+        """Link the person's Rapid Stacker Collab account on the server, once.
+
+        The token goes to the server and is kept there (sealed), never in this
+        program's settings: it can edit the person's Collab projects, and a
+        telescope's machine is the last place it belongs."""
+        return self._call("PUT", "/api/v1/stacking/cloud",
+                          {"token": token, "apiBase": api_base})
+
+    def unlink_cloud(self) -> dict[str, Any]:
+        return self._call("DELETE", "/api/v1/stacking/cloud")
+
+    def project_stacking(self, project_id: str) -> dict[str, Any]:
+        """Where one of the person's collaborations is stacked, and how that is going."""
+        return self._call("GET", f"/api/v1/projects/{urllib.parse.quote(project_id)}/stacking")
+
+    def delete_project(self, project_id: str) -> dict[str, Any]:
+        """The seven-day, restorable deletion of a stacked collaboration."""
+        return self._call("DELETE", f"/api/v1/projects/{urllib.parse.quote(project_id)}")
+
+    def restore_project(self, project_id: str) -> dict[str, Any]:
+        return self._call("POST", f"/api/v1/projects/{urllib.parse.quote(project_id)}/restore", {})
 
     def update_project(self, project_id: str,
                        changes: dict[str, Any]) -> dict[str, Any]:

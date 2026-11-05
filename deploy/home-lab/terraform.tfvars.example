@@ -1,0 +1,20 @@
+# Copy to terraform.tfvars (git-ignored) and fill in the two user names.
+server_user  = "your-linux-user"
+windows_user = "your-windows-user"
+
+# The defaults match the author's network; change them for another one.
+# server_host  = "omarchy.lan"
+# windows_host = "Eds9950X.lan"        # "" and drop the Windows worker for none
+# nas_host     = "DXP8800PLUS-76B2.lan"
+# nas_share    = "XPSD"
+# ssh_key      = "~/.ssh/id_ed25519"
+
+# "synthetic" first (lab.sh smoke), then "real" for N.I.N.A. and real frames.
+# catalogue_mode = "synthetic"
+# lab_region     = "84,0,1,1"          # the night's target, RA,DEC[,W,H] in degrees
+
+# workers = {
+#   mac-m3max = { os = "macos",   scratch_gb = 40 }
+#   omarchy   = { os = "linux",   scratch_gb = 100 }
+#   eds9950x  = { os = "windows", scratch_gb = 150 }   # ram_gb = N caps what the worker takes
+# }

@@ -1,0 +1,184 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+ * If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ * Ported from Rapid Stacker Collab (EKE Services LLC).
+ */
+/*
+ * Design tokens for the Starfront progress pages.
+ *
+ * Ported from Rapid Stacker Collab (EKE Services LLC). Re-accented to Starfront's look: a dark #0d1017 ground and the
+ * mint #7ee7a5 accent (see server/app.py's download page and astrocontrol/web/style.css). Light applies when the
+ * visitor's system asks for it, or when <html data-theme="light"> is set by the toggle; data-theme="dark" forces dark.
+ * The two light blocks below must stay identical. Every colour a component uses is a token. System fonts only.
+ */
+:root {
+  color-scheme: dark;
+
+  --surface-0: #0d1017;
+  --surface-1: #12151c;
+  --surface-2: #171b24;
+  --surface-3: #212733;
+  --border:    #2a3140;
+  --border-input: #66728a;
+
+  --text:       #e6ebf3;
+  --text-muted: #8f9aad;
+
+  /* Collab accent: teal. --primary fills buttons; --link colours text links. */
+  --primary:    #7ee7a5;
+  --primary-hi: #a3f0c0;
+  --on-primary: #06180d;
+  --primary-glow: rgba(126, 231, 165, 0.30);
+  --link:       #7ee7a5;
+  --link-hover: #ffa0c0;
+  --secondary:  #FF6B9D;
+
+  --success: #95E06C;
+  --warning: #FFD166;
+  --error:   #FF6B6B;
+
+  /* The two publishing modes (plan 13 Q4). Live is the running accumulator; gold is a full integration. */
+  --live: #6BB6FF;
+  --gold: #FFD166;
+
+  /* Filter colours: chips, chart series, leaderboard. */
+  --f-lum:  #E8E8F0;
+  --f-red:  #FF6B6B;
+  --f-green:#95E06C;
+  --f-blue: #6BB6FF;
+  --f-ha:   #FF5C8F;
+  --f-oiii: #4ECDC4;
+  --f-sii:  #FF8C42;
+  --f-other:#B9A6FF;
+
+  /* Previews are dark images with transparent edges; they sit on a dark mat in both themes. */
+  --preview-bg: #05070b;
+  --preview-text: #E8E9F5;
+
+  --nav-bg: rgba(13, 16, 23, 0.88);
+  --overlay: rgba(3, 5, 9, .82);
+  --badge-ok-bg: rgba(149, 224, 108, .16);
+  --badge-warn-bg: rgba(255, 209, 102, .16);
+  --badge-err-bg: rgba(255, 107, 107, .16);
+  --badge-info-bg: rgba(107, 182, 255, .16);
+  --badge-accent-bg: rgba(126, 231, 165, .16);
+
+  --radius-sm: 8px;
+  --radius:    12px;
+  --radius-lg: 14px;
+  --shadow-card:  0 6px 24px rgba(0,0,0,0.55);
+  --shadow-hover: 0 10px 32px rgba(0,0,0,0.65);
+
+  --font-prop: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
+
+  --container-max: 1200px;
+  --page-gutter: clamp(16px, 4vw, 48px);
+
+  --size-h1: clamp(34px, 5vw, 52px);
+  --size-h2: clamp(25px, 3.2vw, 34px);
+  --size-h3: 21px;
+  --size-body: 16px;
+  --size-small: 13.5px;
+  --size-mono: 14px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+
+    --surface-0: #f3f5f8;
+    --surface-1: #ffffff;
+    --surface-2: #e9edf2;
+    --surface-3: #d9dfe8;
+    --border:    #b3bccb;
+    --border-input: #667286;
+
+    --text:       #0d1017;
+    --text-muted: #454f60;
+
+    --primary:    #13683e;
+    --primary-hi: #1a8250;
+    --on-primary: #ffffff;
+    --primary-glow: rgba(19, 104, 62, 0.22);
+    --link:       #13683e;
+    --link-hover: #b1124f;
+    --secondary:  #B1124F;
+
+    --success: #2A6E0E;
+    --warning: #7A5200;
+    --error:   #B3261E;
+
+    --live: #12589E;
+    --gold: #7A5200;
+
+    --f-lum:  #4A4D66;
+    --f-red:  #B3261E;
+    --f-green:#2A6E0E;
+    --f-blue: #12589E;
+    --f-ha:   #B1124F;
+    --f-oiii: #0b6b65;
+    --f-sii:  #A04A00;
+    --f-other:#5B3FB8;
+
+    --nav-bg: rgba(243, 245, 248, 0.9);
+    --overlay: rgba(13, 16, 23, .6);
+    --badge-ok-bg: rgba(42, 110, 14, .12);
+    --badge-warn-bg: rgba(122, 82, 0, .12);
+    --badge-err-bg: rgba(179, 38, 30, .10);
+    --badge-info-bg: rgba(18, 88, 158, .10);
+    --badge-accent-bg: rgba(19, 104, 62, .12);
+
+    --shadow-card:  0 4px 16px rgba(20,21,43,0.10);
+    --shadow-hover: 0 8px 26px rgba(20,21,43,0.16);
+  }
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --surface-0: #f3f5f8;
+  --surface-1: #ffffff;
+  --surface-2: #e9edf2;
+  --surface-3: #d9dfe8;
+  --border:    #b3bccb;
+  --border-input: #667286;
+
+  --text:       #0d1017;
+  --text-muted: #454f60;
+
+  --primary:    #13683e;
+  --primary-hi: #1a8250;
+  --on-primary: #ffffff;
+  --primary-glow: rgba(19, 104, 62, 0.22);
+  --link:       #13683e;
+  --link-hover: #b1124f;
+  --secondary:  #B1124F;
+
+  --success: #2A6E0E;
+  --warning: #7A5200;
+  --error:   #B3261E;
+
+  --live: #12589E;
+  --gold: #7A5200;
+
+  --f-lum:  #4A4D66;
+  --f-red:  #B3261E;
+  --f-green:#2A6E0E;
+  --f-blue: #12589E;
+  --f-ha:   #B1124F;
+  --f-oiii: #0b6b65;
+  --f-sii:  #A04A00;
+  --f-other:#5B3FB8;
+
+  --nav-bg: rgba(243, 245, 248, 0.9);
+  --overlay: rgba(13, 16, 23, .6);
+  --badge-ok-bg: rgba(42, 110, 14, .12);
+  --badge-warn-bg: rgba(122, 82, 0, .12);
+  --badge-err-bg: rgba(179, 38, 30, .10);
+  --badge-info-bg: rgba(18, 88, 158, .10);
+  --badge-accent-bg: rgba(19, 104, 62, .12);
+
+  --shadow-card:  0 4px 16px rgba(20,21,43,0.10);
+  --shadow-hover: 0 8px 26px rgba(20,21,43,0.16);
+}

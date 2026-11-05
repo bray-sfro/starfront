@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <RootNamespace>Starfront.Collab.Tests</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="NUnit" Version="4.2.2" />
+    <PackageReference Include="NUnit3TestAdapter" Version="4.6.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/RapidStackerCollab.Core/RapidStackerCollab.Core.csproj" />
+    <!-- The upload engine's own fakes: the fake Rapid Stacker Collab server, the clock and the FITS builder. -->
+    <ProjectReference Include="../RapidStackerCollab.Core.Tests/RapidStackerCollab.Core.Tests.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- The plugin itself is a WPF library that only runs inside N.I.N.A.; the
+         files below use neither, so they are compiled in here by link. Add a
+         file to this list only if it has no N.I.N.A. or WPF reference. -->
+    <Compile Include="../../src/Starfront.Collab/Server/Models.cs" Link="Linked/Models.cs" />
+    <Compile Include="../../src/Starfront.Collab/Sky/Filters.cs" Link="Linked/Filters.cs" />
+    <Compile Include="../../src/Starfront.Collab/Services/Stacking/StackingLink.cs" Link="Linked/StackingLink.cs" />
+    <Compile Include="../../src/Starfront.Collab/Services/Stacking/ClientCache.cs" Link="Linked/ClientCache.cs" />
+    <Compile Include="../../src/Starfront.Collab/Services/Stacking/LanProbe.cs" Link="Linked/LanProbe.cs" />
+    <Compile Include="../../src/Starfront.Collab/Services/Stacking/GrantTokenStore.cs" Link="Linked/GrantTokenStore.cs" />
+    <Compile Include="../../src/Starfront.Collab/Services/Stacking/HubJoiner.cs" Link="Linked/HubJoiner.cs" />
+    <Compile Include="../../src/Starfront.Collab/Services/Stacking/RoutingApiClient.cs" Link="Linked/RoutingApiClient.cs" />
+    <Compile Include="../../src/Starfront.Collab/Services/Stacking/BrowserUrls.cs" Link="Linked/BrowserUrls.cs" />
+    <Compile Include="../../src/Starfront.Collab/Services/Stacking/JoinCodes.cs" Link="Linked/JoinCodes.cs" />
+    <Compile Include="../../src/Starfront.Collab/Services/Stacking/StackingMapping.cs" Link="Linked/StackingMapping.cs" />
+    <Compile Include="../../src/Starfront.Collab/Services/Stacking/StackingFlats.cs" Link="Linked/StackingFlats.cs" />
+    <Compile Include="../../src/Starfront.Collab/Services/Stacking/StackingLibrary.cs" Link="Linked/StackingLibrary.cs" />
+    <Compile Include="../../src/Starfront.Collab/Services/Stacking/HubBackend.cs" Link="Linked/HubBackend.cs" />
+    <Compile Include="../../src/Starfront.Collab/Services/Stacking/MembershipPauses.cs" Link="Linked/MembershipPauses.cs" />
+    <Compile Include="../../src/Starfront.Collab/Services/Stacking/StackingTargets.cs" Link="Linked/StackingTargets.cs" />
+    <Compile Include="../../src/Starfront.Collab/Services/Stacking/StackingLine.cs" Link="Linked/StackingLine.cs" />
+  </ItemGroup>
+</Project>

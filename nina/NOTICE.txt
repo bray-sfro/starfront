@@ -1,0 +1,19 @@
+Starfront for N.I.N.A.
+Copyright (c) 2026 Starfront Observatories. Mozilla Public License 2.0 (LICENSE.txt).
+
+THIRD-PARTY COMPONENTS SHIPPED IN THIS PLUGIN
+
+RapidStackerCollab.Core (RapidStackerCollab.Core.dll)
+  Copyright (c) 2026 EKE Services LLC. Mozilla Public License 2.0.
+  The platform-independent core of the Rapid Stacker Collab N.I.N.A. plugin,
+  copied from github.com/EKE-Services/rapid-stacker-collab at commit
+  dab8b3b425d33cb30c12013644d37433531e08a8 (src/RapidStackerCollab.Core/SOURCE.md).
+  It includes the filter alias table (aliases.json), under the same licence.
+
+Microsoft.Data.Sqlite (MIT), SQLitePCLRaw (Apache-2.0), SQLite (public domain)
+  The upload queue. e_sqlite3.dll is the SQLite library itself.
+
+N.I.N.A. plugin SDK (NINA.*; Mozilla Public License 2.0)
+  Referenced only; provided by N.I.N.A. at run time and never redistributed here.
+
+Each component remains under its own licence.

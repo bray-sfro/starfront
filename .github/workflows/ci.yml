@@ -1,0 +1,48 @@
+# Lives at the repository root because GitHub reads workflows only from
+# .github/workflows/. Every run step works in nina/, the plugin's folder.
+name: Build the N.I.N.A. plugin
+on:
+  push:
+    branches: ['**']
+    paths: ['nina/**', '.github/workflows/ci.yml']
+  pull_request:
+    paths: ['nina/**', '.github/workflows/ci.yml']
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: nina
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Restore and build
+        shell: pwsh
+        run: |
+          dotnet restore src/Starfront.Collab/Starfront.Collab.csproj
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          dotnet build src/Starfront.Collab/Starfront.Collab.csproj -c Release --no-restore
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Test the upload engine and live stacking's rules
+        shell: pwsh
+        run: |
+          dotnet test tests/RapidStackerCollab.Core.Tests/RapidStackerCollab.Core.Tests.csproj -c Release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          dotnet test tests/Starfront.Collab.Tests/Starfront.Collab.Tests.csproj -c Release
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Validate the distributable
+        shell: pwsh
+        env:
+          PLUGIN_REPOSITORY: ${{ github.repository }}
+        run: |
+          dotnet msbuild src/Starfront.Collab/Starfront.Collab.csproj -t:PackagePlugin -p:Configuration=Release -p:PluginPowerShell=pwsh "-p:RepositoryUrl=https://github.com/$env:PLUGIN_REPOSITORY"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plugin-validation
+          path: nina/artifacts/release/*
+          if-no-files-found: error

@@ -21,6 +21,7 @@ person's login should never be able to drive a mount.
 from __future__ import annotations
 
 import dataclasses
+import html
 import json
 import math
 import os
@@ -33,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
+from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
@@ -42,7 +44,17 @@ import astrocontrol                                              # noqa: E402
 from astrocontrol import catalog, collab, filters                # noqa: E402
 from astrocontrol.config import data_root                        # noqa: E402
 from server import auth                                          # noqa: E402
+from server import notify                                        # noqa: E402
 from server.files import COOKIE, COOKIE_SECONDS, Files           # noqa: E402
+from server.hubs import Hubs, mint_grant                          # noqa: E402
+from server.stack import defaults as stack_defaults             # noqa: E402
+from server.stack.auth import collab_identity                   # noqa: E402
+from server.stack import front as stack_front                   # noqa: E402
+from server.stack import relay as stack_relay                   # noqa: E402
+from server.stack import records as stack_records               # noqa: E402
+from server.stack import projects as stack_projects             # noqa: E402
+from server.stack import deletion as stack_deletion             # noqa: E402
+from server.stack import cloud as stack_cloud                   # noqa: E402
 from server.store import Store                                   # noqa: E402
 
 app = FastAPI(title="Starfront collaboration server", version="0.1.0")
@@ -161,6 +173,33 @@ def owns_project(who: dict[str, Any], project: dict[str, Any]) -> bool:
         return True
     owner = str(project.get("owner_id") or "")
     return bool(owner) and owner == who["id"]
+
+
+def _discord_webhook(text: str | None) -> str:
+    """The webhook as stored: blank, or a Discord webhook URL, else 400."""
+    cleaned = (text or "").strip()
+    if not notify.webhook_ok(cleaned):
+        raise HTTPException(status_code=400,
+                            detail="discordWebhookUrl must be a Discord webhook, "
+                                   "https://discord.com/api/webhooks/<id>/<token>, or blank")
+    return cleaned
+
+
+def _without_owner_fields(project: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A project record as anybody may read it: owner-only fields left out.
+
+    The stacking join code is one of them: it admits whoever holds it to the
+    stacking project, which is why the agent listing hands it only to the
+    telescopes on the collaboration. These reads are open to anyone, so a code
+    left in the payload here undid that rule (found in T706).
+    """
+    if project is None:
+        return None
+    payload = {k: v for k, v in (project.get("payload") or {}).items()
+               if k not in ("discordWebhookUrl", "stackingJoinCode")}
+    if isinstance(payload.get("stacking"), dict):
+        payload["stacking"] = {k: v for k, v in payload["stacking"].items() if k != "joinCode"}
+    return {**project, "payload": payload}
 
 
 def _require_project_owner(who: dict[str, Any], project_id: str) -> dict[str, Any]:
@@ -414,6 +453,501 @@ class AgentRequest(BaseModel):
     owner: str = Field(default="", max_length=80)
 
 
+#: The characters a Rapid Stacker Collab join code is made of: Crockford's
+#: base32, with the letters that look like digits left out.
+_JOIN_CODE_ALPHABET = "23456789ABCDEFGHJKMNPQRSTUVWXYZ"
+
+
+def _stacking_join_code(text: str) -> str:
+    """A Rapid Stacker Collab join code as the plugin will send it, or 400.
+
+    Blank means the collaboration is not live-stacked. Anything else has to be
+    the twelve characters of a real code, whatever spacing or hyphens or case
+    it was pasted with, because the code is a credential and not a label: a
+    telescope that is handed it joins a stacking project with it, and a typo
+    saved here would send every telescope on the collaboration to join a
+    project that does not exist, night after night.
+    """
+    cleaned = "".join(ch for ch in (text or "").upper() if ch not in " -_")
+    if not cleaned:
+        return ""
+    if len(cleaned) != 12 or any(ch not in _JOIN_CODE_ALPHABET for ch in cleaned):
+        raise HTTPException(status_code=400,
+                            detail="a Rapid Stacker Collab join code is twelve "
+                                   "characters, like H4RT-92BK-WNPC")
+    return f"{cleaned[0:4]}-{cleaned[4:8]}-{cleaned[8:12]}"
+
+
+class StackingRequest(BaseModel):
+    """Where a collaboration's lights are stacked.
+
+    `cloud`: Rapid Stacker Collab's service. This server makes and keeps the
+    Collab project itself (server/stack/cloud.py), with the owner's linked
+    account; `joinCode` is only for an old collaboration whose pasted code is
+    kept as it is, and a new pasted code is refused (the author's rule: the
+    collaboration is the only place a project is made). `hub`: a `collab-hub`
+    registered with this server (`hubId`), reached through this server's own
+    front door. Blank `backend` means the lights are not stacked.
+    """
+
+    backend: str = Field(default="", pattern="^(cloud|hub|)$")
+    joinCode: str = Field(default="", max_length=40)
+    apiBase: str = Field(default="", max_length=200)
+    hubId: str = Field(default="", max_length=80)
+    # public | unlisted | private. Unlisted unless asked (D003).
+    visibility: str | None = Field(default=None, pattern="^(public|unlisted|private)$")
+
+
+def _stacking_of(payload: dict[str, Any]) -> dict[str, Any]:
+    """How a stored collaboration is stacked, whatever wrote it.
+
+    A payload from before the `stacking` block has only `stackingJoinCode`,
+    which was always Rapid Stacker Collab's cloud, so it reads as `cloud`.
+    `managed` is True for a cloud project this server makes and keeps in step;
+    a cloud binding without it is an old pasted join code.
+    """
+    block = payload.get("stacking")
+    if isinstance(block, dict) and block.get("backend") in ("cloud", "hub"):
+        out = {"backend": block["backend"],
+               "joinCode": str(block.get("joinCode") or ""),
+               "apiBase": str(block.get("apiBase") or ""),
+               "hubId": str(block.get("hubId") or ""),
+               "visibility": str(block.get("visibility") or "")}
+        if block["backend"] == "cloud" and block.get("managed"):
+            out["managed"] = True
+        return out
+    code = str(payload.get("stackingJoinCode") or "")
+    if code and not isinstance(block, dict):
+        return {"backend": "cloud", "joinCode": code, "apiBase": "", "hubId": "",
+                "visibility": ""}
+    return {"backend": "", "joinCode": "", "apiBase": "", "hubId": "", "visibility": ""}
+
+
+def _is_managed(binding: dict[str, Any]) -> bool:
+    return binding.get("backend") == "cloud" and bool(binding.get("managed"))
+
+
+def _may_bind_to(who: dict[str, Any], hub_id: str) -> dict[str, Any]:
+    """The hub, when `who` owns it or is a coordinator listed on it, else 403.
+
+    One answer for "no such hub" and "not yours", as for any action the
+    caller may not take: a hub id is not worth confirming to a stranger.
+    """
+    hub = store.hub(hub_id) if hub_id else None
+    if hub is None or not (who["id"] == hub["owner"] or who["id"] in hub["coordinators"]):
+        raise HTTPException(status_code=403,
+                            detail="you may not bind a collaboration to that hub; "
+                                   "only its owner, or a coordinator the owner "
+                                   "listed, can")
+    return hub
+
+
+def _bindable_hubs(person_id: str) -> list[dict[str, Any]]:
+    """The hubs a person may bind a collaboration to (D002): their own, most
+    recently heard first, then those whose owner listed them as a coordinator."""
+    owned = sorted(store.hubs_of(person_id), key=lambda h: (-(h.get("seen") or 0), h["created"]))
+    listed = [store.hub(r["id"]) for r in store._all(
+        "SELECT id FROM hubs WHERE owner <> ? AND EXISTS (SELECT 1 FROM json_each(hubs.coordinators)"
+        " WHERE json_each.value = ?) ORDER BY created", person_id, person_id)] if person_id else []
+    return owned + [h for h in listed if h is not None]
+
+
+def _default_binding(who: dict[str, Any]) -> dict[str, Any]:
+    """Where a new collaboration is stacked when its owner said nothing.
+
+    The author's rule (T706): stacking follows the collaboration with no
+    separate step. A person with a hub of their own is bound to it (the one
+    heard from most recently, when there are several); one who owns none but
+    may bind to exactly one hub is bound to that; one who has linked a Rapid
+    Stacker Collab account and has no hub is stacked on the cloud; anyone else
+    is not stacked. The form shows the choice and offers off or another.
+    """
+    hubs = _bindable_hubs(who["id"])
+    owned = [h for h in hubs if h["owner"] == who["id"]]
+    pick = owned[0] if owned else (hubs[0] if len(hubs) == 1 else None)
+    if pick is not None:
+        return {"backend": "hub", "joinCode": "", "apiBase": "", "hubId": pick["id"],
+                "visibility": "unlisted"}
+    link = CLOUD.linked(who["id"])
+    if link is not None:
+        return {"backend": "cloud", "joinCode": "", "apiBase": link["api_base"], "hubId": "",
+                "visibility": "unlisted", "managed": True}
+    return _stacking_of({})
+
+
+_PASTE_REFUSED = ("a pasted Rapid Stacker Collab join code is no longer taken: this server "
+                  "makes the stacking project from the collaboration itself. Link your Rapid "
+                  "Stacker Collab account once in the Collab tab (Live stacking) and choose the "
+                  "cloud, or bind the collaboration to a hub")
+
+
+def _resolve_stacking(who: dict[str, Any], sf_project: str, current: dict[str, Any],
+                      want: StackingRequest, owner_id: str | None = None) -> dict[str, Any]:
+    """The binding a request asks for, checked, or 400, 403 or 409.
+
+    `owner_id` is the collaboration's owner (whose Collab account a cloud
+    project is made with); `who` when the collaboration is being started.
+    """
+    owner = who["id"] if owner_id is None else owner_id
+    visibility = want.visibility or current["visibility"] or "unlisted"
+    if want.backend == "cloud":
+        code = _stacking_join_code(want.joinCode)
+        if code:
+            # Only the code an old collaboration already has: read-only, kept.
+            if current["backend"] == "cloud" and not _is_managed(current) and code == current["joinCode"]:
+                return dict(current)
+            raise HTTPException(status_code=400, detail=_PASTE_REFUSED)
+        link = CLOUD.linked(owner)
+        if link is None:
+            raise HTTPException(status_code=400,
+                                detail="stacking on Rapid Stacker Collab needs the collaboration's "
+                                       "owner to link their Collab account first (Collab tab, Live "
+                                       "stacking, Rapid Stacker Collab account)")
+        new = {"backend": "cloud", "joinCode": "", "apiBase": link["api_base"], "hubId": "",
+               "visibility": visibility, "managed": True}
+    elif want.backend == "hub":
+        # Rebinding to the hub it is already on is not a new grant of power
+        # (a coordinator removed from the list can still edit the name).
+        if not (current["backend"] == "hub" and current["hubId"] == want.hubId):
+            _may_bind_to(who, want.hubId)
+        new = {"backend": "hub", "joinCode": "", "apiBase": "", "hubId": want.hubId,
+               "visibility": visibility}
+    else:
+        new = {"backend": "", "joinCode": "", "apiBase": "", "hubId": "", "visibility": ""}
+    if (new["backend"], new["hubId"]) != (current["backend"], current["hubId"]):
+        row = store.stack_project_of(sf_project)
+        if row is not None and store.stack_frame_count(row["project_id"]):
+            raise HTTPException(status_code=409,
+                                detail="frames are already stacked for this "
+                                       "collaboration, so its stacking backend can "
+                                       "no longer change")
+    return new
+
+
+def _stacking_into(payload: dict[str, Any], binding: dict[str, Any]) -> None:
+    """Write a binding into a payload, both ways: the `stacking` block and the
+    old `stackingJoinCode`, which a 1.0.0.33 plugin still reads. A managed cloud
+    project's code is not in the payload: it lives with the project
+    (`stack_cloud`) and reaches telescopes through the listing."""
+    payload["stacking"] = dict(binding)
+    payload["stackingJoinCode"] = (binding["joinCode"] if binding["backend"] == "cloud"
+                                   and not _is_managed(binding) else "")
+
+
+_PROJECT_ID_ALPHABET = "0123456789abcdefghjkmnpqrstvwxyz"
+
+
+def _slug_of(name: str) -> str:
+    base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:40].strip("-")
+    return base if len(base) >= 3 else (base + "-project").strip("-")[:40]
+
+
+def _unique_slug(name: str) -> str:
+    base = _slug_of(name)
+    slug, n = base, 1
+    while store.stack_slug_taken(slug):
+        n += 1
+        suffix = f"-{n}"
+        slug = base[:40 - len(suffix)].strip("-") + suffix
+    return slug
+
+
+def _colour_taken(wants: collab.Requirements) -> bool:
+    """Whether the collaboration takes one-shot colour cameras' data, by its
+    own rule (`collab.compatibility`): colour on, one of its bands on, and an
+    OSC band among the filters (or no filter list at all)."""
+    if not (wants.acceptColour and (wants.acceptOscRgb or wants.acceptOscNarrowband)):
+        return False
+    return not wants.filters or any(filters.is_osc(k) for k in collab.wanted_channels(wants))
+
+
+def _stack_filter_names(wants: collab.Requirements) -> list[str]:
+    """The collaboration's filters the stacking project declares: its list,
+    less any colour band whose switch is off (the switches win, as in
+    `collab.wanted_channels`)."""
+    out = []
+    for name in (wants.filters or {}):
+        if filters.is_osc(name):
+            narrow = "+" in str(name)
+            if not wants.acceptColour or (narrow and not wants.acceptOscNarrowband) \
+                    or (not narrow and not wants.acceptOscRgb):
+                continue
+        out.append(name)
+    return out
+
+
+def _policy_for(requirements: dict[str, Any], filters_: list[str]) -> dict[str, Any]:
+    """The contract `Policy` for a collaboration's requirements (T706).
+
+    Starting from the contract's defaults, so a stacking project judges frames
+    as one on the cloud would, and moving only where the collaboration says
+    something the policy has a word for. Until T706 the policy never moved
+    from the defaults, so a collaboration that took colour cameras had every
+    Bayer frame refused by its stack (`osc_not_allowed`: found by T701's local
+    night), and one that wanted calibrated frames only did not say so. The
+    mapping (`components/schemas/Policy`):
+
+    * colour cameras taken (`_colour_taken`) -> `osc_allowed: true`;
+    * `requireCalibrated` -> `calibration: required`;
+    * `minExposure` -> `min_exposure_s` (the contract refuses shorter lights);
+    * `maxHfr` (a night's mean star size, a half-flux radius in arcseconds)
+      only RAISES `max_fwhm_arcsec`, to twice it (a Gaussian's FWHM), capped at
+      the contract's 20: the stack must not throw away frames the collaboration
+      accepted, and tighter star control stays with the collaboration's own
+      night judgement and the policy's `fwhm_median_factor`.
+
+    Not mapped, because the contract's policy has no field for them: the
+    longest exposure, guiding RMS, the Moon and altitude rules, Bortle, the
+    focal length and pixel-scale limits (the policy's `accept_scale_*` are
+    ratios to the grid's scale, which is a placeholder until the first light):
+    the collaboration judges those per night, before a frame is ever sent.
+    """
+    wants = collab.Requirements.read(requirements or {})
+    policy = {**stack_defaults.POLICY,
+              "gold_exclude_classes": list(stack_defaults.POLICY["gold_exclude_classes"])}
+    if _colour_taken(wants):
+        policy["osc_allowed"] = True
+    if wants.requireCalibrated:
+        policy["calibration"] = "required"
+    if wants.minExposure is not None and wants.minExposure >= 0:
+        policy["min_exposure_s"] = round(float(wants.minExposure), 3)
+    if wants.maxHfr:
+        policy["max_fwhm_arcsec"] = min(20.0, max(float(policy["max_fwhm_arcsec"]),
+                                                  round(2.0 * float(wants.maxHfr), 2)))
+    return policy
+
+
+def _stack_fields(name: str, coordinator: str, payload: dict[str, Any],
+                  binding: dict[str, Any], status: str = "open",
+                  sf_project: str = "") -> dict[str, Any]:
+    """What the stacking engine is told about a collaboration, on a hub or the
+    cloud alike: the one derivation both backends use (T706).
+
+    `status` is the collaboration's (`open` or `closed`); the caller maps it to
+    each backend's lifecycle.
+
+    The grid: a mosaic with panels dealt (`sf_project` names it, so its tasks
+    can be read) is framed by its panels (`_mosaic_grid`), complete, and the
+    first light is not asked to frame it (`rotation_from_first_light` false).
+    Anything else gets the region's placeholder, which the first light frames.
+    """
+    region = payload.get("region") or {}
+    wants = collab.Requirements.read(payload.get("requirements") or {})
+    chosen = stack_defaults.contract_filters(_stack_filter_names(wants))
+    out = {
+        "name": name, "target_name": name,
+        "description": str(payload.get("notes") or "")[:2000],
+        "filters": chosen, "palette": stack_defaults.palette_for(chosen),
+        "visibility": binding.get("visibility") or "unlisted",
+        "licence": "members_only", "owner_name": coordinator,
+        "policy": _policy_for(payload.get("requirements") or {}, chosen),
+        "status": "open" if status == "open" else "closed",
+    }
+    mosaic = _mosaic_grid(sf_project, payload) if sf_project else None
+    if mosaic is not None:
+        out["grid"] = mosaic
+        out["rotation_from_first_light"] = False
+    elif region:
+        out["grid"] = stack_defaults.placeholder_grid(
+            region.get("ra", 0.0), region.get("dec", 0.0),
+            region.get("width", 1.0), region.get("height", 1.0))
+        out["rotation_from_first_light"] = True
+    return out
+
+
+#: The task states whose cells a mosaic's grid is framed to: the panels being
+#: shot, or shot. A declined or cancelled share frames nothing.
+_FRAMING_TASK_STATES = ("offered", "accepted", "complete")
+
+
+def _mosaic_grid(sf_project: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    """The grid a mosaic collaboration is stacked on, from the panels dealt to
+    its rigs (`stack_defaults.mosaic_grid`), or None for a single target, or
+    a mosaic no rig with a known camera has joined yet.
+
+    Each cell is a panel at its rig's camera angle; its field along the
+    camera's own axes comes from the rig's profile (a cell stores only the
+    north-up box the turned frame spans). The scale is the finest rig's: the
+    grid is the resolution every panel is resampled to.
+    """
+    if (payload.get("kind") or "mosaic") != "mosaic":
+        return None
+    panels: list[dict[str, Any]] = []
+    scales: list[float] = []
+    for task in store.tasks_in(sf_project):
+        if task.get("state") not in _FRAMING_TASK_STATES or not task.get("cells"):
+            continue
+        agent = store.agent(str(task.get("agent") or "")) or {}
+        profile = collab.RigProfile.read(agent.get("profile") or {})
+        field = profile.field()
+        if profile.scale():
+            scales.append(float(profile.scale()))
+        for cell in task["cells"]:
+            rotation = cell.get("rotation")
+            if field is not None and rotation is not None:
+                width, height = field
+            else:
+                # A rotator rig's cells are north-up frames already; one with no
+                # field known is framed by the box its cell spans.
+                width, height, rotation = cell.get("width"), cell.get("height"), 0.0
+            panels.append({"ra": cell.get("ra"), "dec": cell.get("dec"),
+                           "width": width, "height": height, "rotation": rotation})
+    if not panels or not scales:
+        return None
+    return stack_defaults.mosaic_grid(panels, min(scales))
+
+
+def _restack_grid(sf_project: str) -> None:
+    """Send a mosaic's stacking project the grid its panels now frame, when the
+    panels changed (a rig joined, left, or turned its camera) and no light has
+    locked it yet. Called wherever cells are dealt; cheap when nothing moved,
+    because nothing is written or sent then.
+    """
+    project = store.project(sf_project)
+    if project is None:
+        return
+    payload = project.get("payload") or {}
+    if (payload.get("kind") or "mosaic") != "mosaic":
+        return
+    binding = _stacking_of(payload)
+    fields = _stack_fields(project["name"], project.get("coordinator") or "", payload,
+                           binding, sf_project=sf_project)
+    grid, framed = fields.get("grid"), fields.get("rotation_from_first_light")
+    if binding["backend"] == "hub":
+        row = store.stack_project_of(sf_project)
+        if (row is None or store.stack_frame_count(row["project_id"])
+                or (row["doc"].get("grid") == grid
+                    and bool(row["doc"].get("rotation_from_first_light")) == bool(framed))):
+            return
+    elif _is_managed(binding):
+        cloud = CLOUD.row(sf_project)
+        if cloud is None or cloud["doc"].get("grid_locked") or cloud["doc"].get("grid_sent") == grid:
+            return
+    else:
+        return
+    _sync_stack(sf_project, project["name"], project.get("coordinator") or "", payload,
+                binding, binding, status=project.get("status") or "open")
+
+
+def _stack_doc(sf_project: str, name: str, coordinator: str, payload: dict[str, Any],
+               binding: dict[str, Any], old: dict[str, Any] | None,
+               keep_grid: bool = False, status: str = "open") -> dict[str, Any]:
+    """The Collab `Project` record (records.md, `collab-projects`) for a collaboration.
+
+    The grid is a placeholder from the region: the first light sets the real
+    rotation, centre and scale (`rotation_from_first_light`), and once any
+    frame exists (`keep_grid`) the grid in `old` is kept as it is. The status
+    follows the collaboration's: closing it closes the stacking project, and
+    reopening it reopens it (until T706 every edit wrote `open`, so a closed
+    collaboration went on taking joins on its hub).
+    """
+    fields = _stack_fields(name, coordinator, payload, binding, status, sf_project=sf_project)
+    grid = fields.pop("grid", None)
+    framed = fields.pop("rotation_from_first_light", None)
+    doc = dict(old or {})
+    doc.update(fields)
+    doc["licence"] = (old or {}).get("licence") or "members_only"
+    if old is None:
+        doc.update({
+            "project_id": "", "slug": "",
+            "approval": "open",
+            "quotas": dict(stack_defaults.QUOTAS),
+            "counts": {"member_count": 0, "frames_accepted": 0, "integration_s": 0},
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()),
+        })
+    doc["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+    if grid and not (keep_grid and old and old.get("grid")):
+        doc["grid"] = grid
+        # The placeholder asks the first light to frame it; a mosaic's grid,
+        # framed by its panels, does not (and a hub drops the flag when it is
+        # gone from the document).
+        if framed:
+            doc["rotation_from_first_light"] = True
+        else:
+            doc.pop("rotation_from_first_light", None)
+    return doc
+
+
+def _sync_stack(sf_project: str, name: str, coordinator: str, payload: dict[str, Any],
+                before: dict[str, Any], after: dict[str, Any], status: str = "open") -> None:
+    """Make the stacking project agree with the collaboration and its binding.
+
+    Hub: binding mints the stacking project (or reopens the one this
+    collaboration had) and tells the hub; every edit re-derives the document
+    and tells the hub when anything but `updated_at` moved; moving off a hub,
+    or clearing the binding, marks it closed and tells the hub. It is never
+    deleted here (deletion is server/stack/deletion.py).
+
+    Cloud (managed): the `stack_cloud` row is made on binding and every edit
+    calls the Collab API through it (server/stack/cloud.py); moving off it
+    pauses the Collab project. An old pasted join code has no row: nothing to
+    sync.
+    """
+    row = store.stack_project_of(sf_project)
+    if after["backend"] == "hub":
+        if row is None:
+            for _ in range(20):
+                project_id = "prj_" + "".join(secrets.choice(_PROJECT_ID_ALPHABET)
+                                              for _ in range(20))
+                code = "".join(secrets.choice(_JOIN_CODE_ALPHABET) for _ in range(12))
+                code = f"{code[0:4]}-{code[4:8]}-{code[8:12]}"
+                slug = _unique_slug(name)
+                doc = _stack_doc(sf_project, name, coordinator, payload, after, None, status=status)
+                doc.update({"project_id": project_id, "slug": slug})
+                if store.add_stack_project(project_id, sf_project, after["hubId"], slug,
+                                           code, doc):
+                    store.append_change(after["hubId"], "project", project_id)
+                    break
+            else:
+                raise HTTPException(status_code=500,
+                                    detail="could not mint a stacking project id")
+        else:
+            doc = _stack_doc(sf_project, name, coordinator, payload, after, row["doc"],
+                             keep_grid=bool(store.stack_frame_count(row["project_id"])),
+                             status=status)
+            # `updated_at` alone is not a change worth a hub's attention.
+            quiet = {k: v for k, v in doc.items() if k != "updated_at"}
+            was = {k: v for k, v in row["doc"].items() if k != "updated_at"}
+            if quiet != was or row["hub"] != after["hubId"]:
+                store.set_stack_project(row["project_id"], after["hubId"], doc)
+                for hub_id in {row["hub"], after["hubId"]} - {""}:
+                    store.append_change(hub_id, "project", row["project_id"])
+    elif row is not None and row["doc"].get("status") not in ("closed", "deleted"):
+        doc = dict(row["doc"])
+        doc["status"] = "closed"
+        doc["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+        store.set_stack_project(row["project_id"], row["hub"], doc)
+        if row["hub"]:
+            store.append_change(row["hub"], "project", row["project_id"])
+    if _is_managed(after):
+        project = store.project(sf_project)
+        CLOUD.bind(sf_project, str((project or {}).get("owner_id") or ""))
+    if _is_managed(after) or _is_managed(before) or CLOUD.row(sf_project) is not None:
+        CLOUD.sync(sf_project)
+
+
+def _cloud_wants(sf_project: str) -> dict[str, Any] | None:
+    """What the Collab project of a collaboration should be (server/stack/cloud.py's
+    `derive`): the same fields a hub project gets, `paused` while the
+    collaboration is closed (the contract's `closed` cannot reopen)."""
+    project = store.project(sf_project)
+    if project is None:
+        return None
+    payload = project.get("payload") or {}
+    binding = _stacking_of(payload)
+    fields = _stack_fields(project["name"], project.get("coordinator") or "", payload, binding,
+                           sf_project=sf_project)
+    return {"bound": _is_managed(binding), "fields": fields,
+            "status": "open" if project.get("status") == "open" else "paused",
+            "owner_name": project.get("coordinator") or ""}
+
+
+#: The cloud projects (server/stack/cloud.py). Its account tokens are sealed
+#: under STARFRONT_CREDENTIAL_KEY, else the admin token; with neither they are
+#: kept as typed, and the link says so.
+CLOUD = stack_cloud.Cloud(store, auth.setting("CREDENTIAL_KEY") or ADMIN_TOKEN, _cloud_wants)
+
+
 class ProjectRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     coordinator: str = Field(default="", max_length=80)
@@ -429,6 +963,22 @@ class ProjectRequest(BaseModel):
     # page, and in time the programs themselves), for the coordinator to
     # stack. Off unless asked: gigabytes a night are nobody's by accident.
     collectFiles: bool = False
+    # How much neighbouring mosaic panels share, in percent of a panel (0 to
+    # 50). Left out: `DEFAULT_OVERLAP_PERCENT`. More overlap costs panels but
+    # gives the stacking engine more shared sky to match panels' brightness
+    # and background by; N.I.N.A.'s Framing Assistant usually asks for 20.
+    overlap: float | None = Field(default=None, ge=0, le=50)
+    # The Discord webhook joins and gold integrations are posted to (server/
+    # notify.py). Owner-only: `_without_owner_fields` keeps it out of every read.
+    discordWebhookUrl: str = Field(default="", max_length=300)
+    # The old form of the binding: a pasted Rapid Stacker Collab join code.
+    # Refused when not blank since T706 (the server makes the project); blank,
+    # like leaving `stacking` out, means "the default" (`_default_binding`).
+    stackingJoinCode: str = Field(default="", max_length=40)
+    # Where it is stacked, and how. Left out: the default (the person's hub,
+    # else the cloud when their Collab account is linked, else none);
+    # `{"backend": ""}` turns stacking off.
+    stacking: StackingRequest | None = None
 
 
 class TaskRequest(BaseModel):
@@ -552,6 +1102,7 @@ def current_task(agent: dict[str, Any] = Depends(agent_from),
     for project_id in {task["project"] for task in tasks}:
         _redeal(project_id, {agent["id"]: night.strip()} if night.strip() else None,
                 moon=sky)
+        _restack_grid(project_id)
     tasks = store.tasks_for(agent["id"])
     task = tasks[0]
     project = store.project(task["project"])
@@ -732,6 +1283,72 @@ def activity(agent: dict[str, Any] = Depends(agent_from),
     }
 
 
+def _stacking_listing(project: dict[str, Any], binding: dict[str, str],
+                      agent: dict[str, Any], entitled: bool, owns: bool = False) -> dict[str, Any]:
+    """The `stacking` object of the project listing.
+
+    `grant` (and `visibility`, the stack project's, for the Edit form) is the
+    hub's bearer for this telescope, so it is held to the rule the join code
+    is: only telescopes on the collaboration, and the owner's own, get one.
+    Everyone else is told where it is stacked and nothing more.
+
+    `state` says whether a telescope can join yet: `ready`, `pending` (the
+    project is still being made) or `failed` (making it failed and is being
+    retried), blank when the collaboration is not stacked. Why: while the
+    server was still making a cloud project, or after Collab refused it (an
+    expired link, say), the listing carried an empty join code and the plugin
+    skipped the collaboration without a word; only the owner's desktop Edit
+    form said why, so an owner who uses only N.I.N.A. never found out.
+    `problem` is that reason, for the owner's own telescopes only: it can
+    name the owner's Collab account, which is nobody else's business.
+    """
+    out = {"backend": binding["backend"], "hubId": "", "hubName": "", "hubLanUrl": "",
+           "apiBase": binding["apiBase"], "collabProjectId": "", "grant": "",
+           "visibility": "", "managed": _is_managed(binding),
+           "state": "", "problem": ""}
+    if binding["backend"] == "cloud":
+        if not _is_managed(binding):
+            out["state"] = "ready" if binding["joinCode"] else ""
+            return out
+        if entitled:
+            out["visibility"] = binding["visibility"] or "unlisted"
+        if CLOUD.join_code(project["id"]):
+            out["state"] = "ready"
+        else:
+            seen = CLOUD.owner_view(project["id"]) or {}
+            out["state"] = "failed" if seen.get("state") in ("failed", "needs_owner") else "pending"
+            if owns and out["state"] == "failed":
+                out["problem"] = str(seen.get("error") or "")
+        return out
+    if binding["backend"] != "hub":
+        return out
+    hub = store.hub(binding["hubId"])
+    row = store.stack_project_of(project["id"])
+    if hub is None or row is None or row["doc"].get("status") in ("closed", "deleted"):
+        # Binding mints the stacking project at once, so this is a hub that
+        # has since been removed: it cannot be joined until the owner rebinds.
+        out["state"] = "failed"
+        return out
+    out["state"] = "ready"
+    person_id = str(agent.get("owner_id") or "")
+    person = store.user(person_id) if person_id else None
+    out.update({
+        "hubId": hub["id"], "hubName": hub["name"], "hubLanUrl": hub["lan_url"],
+        "apiBase": (DISCORD.public_url.rstrip("/") + "/stack/api/") if DISCORD.public_url else "",
+        "collabProjectId": row["project_id"],
+    })
+    if entitled:
+        # With the grant, because the Edit form of the owner's program shows it.
+        out["visibility"] = str(row["doc"].get("visibility") or "unlisted")
+        # The grant names its holder by collab user id: the hub keys members,
+        # rigs and frames by it and never sees a Starfront id, so a grant that
+        # named the Starfront id was "not a member" on the LAN short-cut.
+        name = (person or {}).get("name") or agent.get("owner") or agent["name"]
+        out["grant"] = mint_grant(hub, collab_identity(store, person_id or str(agent["id"]), name),
+                                  name, agent["id"], row["project_id"])
+    return out
+
+
 @app.get("/api/v1/agent/projects")
 def open_projects(agent: dict[str, Any] = Depends(agent_from)) -> dict[str, Any]:
     """Every project that is open, and whether this telescope can help.
@@ -753,6 +1370,19 @@ def open_projects(agent: dict[str, Any] = Depends(agent_from)) -> dict[str, Any]
         payload = project.get("payload") or {}
         wants = collab.Requirements.read(payload.get("requirements") or {})
         collected, progress = _figures(project["id"], payload)
+        # The stacking join code admits whoever holds it to the Rapid Stacker
+        # Collab project, so a telescope browsing for something to join is
+        # told only that the lights are live-stacked. The code itself goes
+        # to telescopes on the collaboration, and to the owner's own
+        # telescopes whether or not they are on it, because the owner's
+        # program fills its Edit form from this listing and an owner who
+        # could not see the code would save it away blank.
+        binding = _stacking_of(payload)
+        stacking_code = ((CLOUD.join_code(project["id"]) if _is_managed(binding) else binding["joinCode"])
+                         if binding["backend"] == "cloud" else "")
+        owner_id = project.get("owner_id") or ""
+        owns = bool(owner_id) and owner_id == (agent.get("owner_id") or "")
+        entitled = project["id"] in mine or owns
         listed.append({
             "id": project["id"],
             "name": project["name"],
@@ -763,6 +1393,8 @@ def open_projects(agent: dict[str, Any] = Depends(agent_from)) -> dict[str, Any]
             "created": float(project.get("created") or 0.0),
             "region": payload.get("region") or {},
             "kind": payload.get("kind") or "mosaic",
+            # The panel overlap the mosaic is cut with, in percent.
+            "overlap": round(_overlap_of(payload) * 100.0, 1),
             "requirements": wants.payload(),
             "goals": payload.get("goals") or {},
             "notes": payload.get("notes") or "",
@@ -771,6 +1403,11 @@ def open_projects(agent: dict[str, Any] = Depends(agent_from)) -> dict[str, Any]
             "collectFiles": bool(payload.get("collectFiles")),
             "filesUrl": (f"{DISCORD.public_url.rstrip('/')}/files#{project['id']}"
                          if payload.get("collectFiles") and DISCORD.public_url else ""),
+            # Whether the lights are stacked as they land, and the code that
+            # gets a telescope on this collaboration into that stack.
+            "stackingLinked": bool(stacking_code),
+            "stackingJoinCode": stacking_code if entitled else "",
+            "stacking": _stacking_listing(project, binding, agent, entitled, owns),
             "compatibility": collab.compatibility(profile, wants),
             "joined": project["id"] in mine,
             # What everyone together has collected, so somebody choosing where
@@ -1056,6 +1693,9 @@ def join_project(project_id: str, body: JoinRequest,
     sky = ({"illumination": body.moon, "upFraction": body.moonUp}
            if body.moon is not None and body.moonUp is not None else None)
     if already:
+        # A telescope still on the project that is joined again gives back a
+        # stacking membership a leave took (stack_projects.member_returned).
+        stack_projects.member_returned(store, project_id, agent.get("owner_id") or agent["id"])
         _redeal(project_id, nights, moon=sky)
         wants = collab.Requirements.read(payload.get("requirements") or {})
         return {"task": store.task(already[0]["id"]), "requirements": wants.payload(),
@@ -1076,7 +1716,7 @@ def join_project(project_id: str, body: JoinRequest,
 
     region = collab.Region.read(payload["region"])
     kind = "single" if payload.get("kind") == "single" else "mosaic"
-    cells = _tile(region, kind, profile)
+    cells = _tile(region, kind, profile, _overlap_of(payload))
     if not cells:
         raise HTTPException(status_code=409,
                             detail="there is nothing left to hand out")
@@ -1132,13 +1772,34 @@ def join_project(project_id: str, body: JoinRequest,
     # The angle the cells were cut for, so a camera that turns out to sit
     # somewhere else can be noticed and the cells cut again.
     stored["tiledRotation"] = profile.rotation
+    stored["tiledOverlap"] = _overlap_of(payload)
     store.add_task(stored)
+    # Joining again undoes a Leave: a stacking membership the telescope gave up
+    # by declining its last share comes back (an owner's removal does not).
+    stack_projects.member_returned(store, project_id, agent.get("owner_id") or agent["id"])
     _redeal(project_id, nights, moon=sky)
+    _restack_grid(project_id)
     return {"task": store.task(task.id), "requirements": wants.payload()}
 
 
+#: A mosaic's panel overlap when its collaboration does not say: what every
+#: collaboration was cut with before the overlap could be chosen, so a task
+#: cut then and one cut now agree.
+DEFAULT_OVERLAP_PERCENT = 10.0
+
+
+def _overlap_of(payload: dict[str, Any]) -> float:
+    """A collaboration's panel overlap as a fraction (0 to 0.5)."""
+    try:
+        percent = float(payload.get("overlap", DEFAULT_OVERLAP_PERCENT))
+    except (TypeError, ValueError):
+        percent = DEFAULT_OVERLAP_PERCENT
+    return round(min(50.0, max(0.0, percent)) / 100.0, 4)
+
+
 def _tile(region: collab.Region, kind: str,
-          profile: collab.RigProfile) -> list[dict[str, Any]]:
+          profile: collab.RigProfile, overlap: float = DEFAULT_OVERLAP_PERCENT / 100.0
+          ) -> list[dict[str, Any]]:
     """A rig's cells over a project: its own frame, or its own tiling.
 
     Tiled with what the camera really spans on the sky. A rig that cannot
@@ -1156,8 +1817,8 @@ def _tile(region: collab.Region, kind: str,
     if profile.rotation is not None:
         # No rotator: the grid the rig's own program lays, cell for panel,
         # so what is dealt here is exactly what is shot there.
-        return collab.camera_grid(region, field[0], field[1], float(profile.rotation), 0.1)
-    return collab.grid(region, across, down, 0.1)
+        return collab.camera_grid(region, field[0], field[1], float(profile.rotation), overlap)
+    return collab.grid(region, across, down, overlap)
 
 
 #: How far a camera may turn before its cells are cut again. The same figure
@@ -1220,8 +1881,9 @@ def _retile_if_turned(task: dict[str, Any], profile: collab.RigProfile,
     turned = ((was is None) != (now is None)
               or (was is not None and now is not None
                   and abs(((float(was) - float(now) + 90.0) % 180.0) - 90.0) > RETILE_DEGREES))
+    overlap = _overlap_of(payload)
     cells = _tile(collab.Region.read(payload["region"]),
-                  task.get("kind") or "mosaic", profile)
+                  task.get("kind") or "mosaic", profile, overlap)
     if not cells:
         return False
     # Cells cut by an older rule are cut again too: the tiling of a fixed
@@ -1232,10 +1894,17 @@ def _retile_if_turned(task: dict[str, Any], profile: collab.RigProfile,
     held_tonight = bool(task.get("share")) and night and task.get("assignedNight") == night
     if not turned and not held_tonight and not _same_cells(task.get("cells") or [], cells):
         turned = True
+    # A new overlap moves the cells by less than `SAME_CELL_DEGREES` (10 to 20 %
+    # of a panel is a twentieth of one), so it is noticed by what they were cut
+    # with; like a new rule, it waits for the night in hand to end.
+    was_overlap = float(task.get("tiledOverlap", DEFAULT_OVERLAP_PERCENT / 100.0))
+    if not turned and not held_tonight and abs(was_overlap - overlap) > 1e-6:
+        turned = True
     if not turned:
         return False
     task.update({"cells": cells, "share": [], "visit": {},
-                 "tiledRotation": now, "assignedNight": "", "assignedAt": 0.0,
+                 "tiledRotation": now, "tiledOverlap": overlap,
+                 "assignedNight": "", "assignedAt": 0.0,
                  "version": int(task.get("version") or 1) + 1})
     store.set_task(task)
     return True
@@ -1546,6 +2215,21 @@ def set_task_state(task_id: str, body: TaskStateRequest,
     task["state"] = body.state
     task["version"] = int(task.get("version", 1)) + 1
     store.set_task(task)
+    if body.state == "declined":
+        # Declining the last share a *person* holds in a project is leaving it:
+        # a hub-bound collaboration marks the stacking member removed. The
+        # member is the person (the owner of the telescopes), so the shares that
+        # count are all of theirs. Counting only this telescope's took the
+        # Bubble Nebula's member away on 2026-10-28 when one of the owner's two
+        # telescopes re-dealt its share, while the other was still on it.
+        person = agent.get("owner_id")
+        theirs = ({a["id"] for a in store.agents_of(person)} | {agent["id"]}) if person else {agent["id"]}
+        still = [t for t in store.tasks_in(task["project"]) if t["agent"] in theirs
+                 and t["id"] != task["id"] and t.get("state") in ("offered", "accepted", "complete")]
+        if not still:
+            stack_projects.member_left(store, task["project"],
+                                       person or agent["id"], by="telescope")
+    _restack_grid(task["project"])
     return {"task": task}
 
 
@@ -1637,6 +2321,7 @@ def create_project(body: ProjectRequest,
                             detail="starting a collaboration on this server needs "
                                    "a Discord role you do not hold")
     region = collab.Region.read(body.region)
+    project_id = collab.new_id()
     payload = {
         "region": region.payload(),
         "kind": body.kind,
@@ -1644,12 +2329,26 @@ def create_project(body: ProjectRequest,
         "goals": _goals(body.goals),
         "notes": body.notes,
         "collectFiles": bool(body.collectFiles),
+        "discordWebhookUrl": _discord_webhook(body.discordWebhookUrl),
     }
+    if body.overlap is not None:
+        payload["overlap"] = round(float(body.overlap), 1)
+    blank = _stacking_of({})
+    if body.stacking is not None:
+        binding = _resolve_stacking(who, project_id, blank, body.stacking)
+    elif _stacking_join_code(body.stackingJoinCode):
+        raise HTTPException(status_code=400, detail=_PASTE_REFUSED)
+    else:
+        # Said nothing (a plugin's form, an older desktop): stacking is on by
+        # default where the person has somewhere to stack (T706).
+        binding = _default_binding(who)
+    _stacking_into(payload, binding)
     # The name on it is the person's Discord name unless the owner, on the
     # admin token, chose to write one.
     coordinator = who["name"] if not who["admin"] else (body.coordinator or who["name"])
-    project = store.add_project(collab.new_id(), body.name, coordinator, payload,
+    project = store.add_project(project_id, body.name, coordinator, payload,
                                 owner_id=who["id"])
+    _sync_stack(project_id, body.name, coordinator, payload, blank, binding)
     return {"project": project}
 
 
@@ -1663,6 +2362,13 @@ class ProjectUpdateRequest(BaseModel):
     goals: dict[str, float] | None = None
     notes: str | None = Field(default=None, max_length=2000)
     collectFiles: bool | None = None
+    overlap: float | None = Field(default=None, ge=0, le=50)
+    # Blank clears the webhook; left out, it is left alone.
+    discordWebhookUrl: str | None = Field(default=None, max_length=300)
+    # Blank clears it; left out, it is left alone like every other field.
+    stackingJoinCode: str | None = Field(default=None, max_length=40)
+    # Where it is stacked; see ProjectRequest. Left out, the binding stands.
+    stacking: StackingRequest | None = None
     # open | closed. Closing takes it off everybody's list without deleting
     # the record of what was collected.
     status: str | None = Field(default=None, pattern="^(open|closed)$")
@@ -1683,6 +2389,12 @@ def update_project(project_id: str, body: ProjectUpdateRequest,
     because the requirements travel with the task.
     """
     project = _require_project_owner(who, project_id)
+    gone = store.stack_project_of(project_id)
+    cloud_gone = CLOUD.row(project_id)
+    if (gone is not None and gone["doc"].get("status") == "deleted") or (
+            cloud_gone is not None and cloud_gone["doc"].get("deleted_at")):
+        raise HTTPException(status_code=409,
+                            detail="this collaboration is deleted; restore it before changing it")
     payload = dict(project.get("payload") or {})
     if body.region is not None:
         payload["region"] = collab.Region.read(body.region).payload()
@@ -1696,10 +2408,238 @@ def update_project(project_id: str, body: ProjectUpdateRequest,
         payload["notes"] = body.notes
     if body.collectFiles is not None:
         payload["collectFiles"] = bool(body.collectFiles)
+    if body.overlap is not None:
+        payload["overlap"] = round(float(body.overlap), 1)
+    if body.discordWebhookUrl is not None:
+        payload["discordWebhookUrl"] = _discord_webhook(body.discordWebhookUrl)
+    before = _stacking_of(payload)
+    binding = before
+    owner = str(project.get("owner_id") or "")
+    if body.stacking is not None:
+        binding = _resolve_stacking(who, project_id, before, body.stacking, owner)
+    elif body.stackingJoinCode is not None:
+        code = _stacking_join_code(body.stackingJoinCode)
+        if code and not (before["backend"] == "cloud" and code == (
+                CLOUD.join_code(project_id) if _is_managed(before) else before["joinCode"])):
+            # A different code is a second project made elsewhere: refused.
+            raise HTTPException(status_code=400, detail=_PASTE_REFUSED)
+        if not code and before["backend"] == "cloud" and not _is_managed(before):
+            binding = _stacking_of({})
+        # The code the collaboration already has is no change. A blank one on
+        # a hub-backed or server-made cloud collaboration is left alone: a
+        # plugin that saves its Edit form sends what the listing gave it, and
+        # must not unbind anything by accident.
+    _stacking_into(payload, binding)
+    name = body.name.strip() if body.name is not None else project["name"]
     if body.name is not None:
-        store.rename_project(project_id, body.name.strip())
+        store.rename_project(project_id, name)
     updated = store.set_project(project_id, payload, body.status)
+    _sync_stack(project_id, name, project.get("coordinator") or "", payload, before, binding,
+                status=(updated or {}).get("status") or "open")
     return {"project": updated}
+
+
+def _deletion_view(doc: dict[str, Any]) -> dict[str, Any]:
+    return {k: doc.get(k) for k in ("status", "deleted_at", "delete_after", "deleted_by_role",
+                                    "relay_purged_at", "results_removed_at")}
+
+
+@app.delete("/api/v1/projects/{project_id}")
+def delete_project(project_id: str,
+                   who: dict[str, Any] = Depends(person_from)) -> dict[str, Any]:
+    """Delete a hub-backed collaboration (decision D004).
+
+    A restorable, seven-day delayed deletion: the hub is told (a `project` row in
+    its feed) and stops taking frames, joins and uploads on /stack/api answer 409
+    `project_deleted`, and the collaboration leaves everybody's list. After the
+    window the raw frames and the relay copy are purged; the final masters and
+    `status.json` stay until the owner removes them. Owner or server owner.
+    """
+    project = _require_project_owner(who, project_id)
+    if _is_managed(_stacking_of(project.get("payload") or {})):
+        return _delete_cloud(project, who)
+    try:
+        doc = stack_deletion.delete(store, project_id, who["id"],
+                                    "admin" if who["admin"] else "owner")
+    except stack_deletion.Refused as e:
+        raise HTTPException(status_code=e.status, detail=e.message)
+    return {"project": project_id, "deletion": _deletion_view(doc)}
+
+
+def _delete_cloud(project: dict[str, Any], who: dict[str, Any]) -> dict[str, Any]:
+    """Delete a collaboration stacked on a Collab project this server made.
+
+    The same seven-day, restorable deletion as a hub's (D004) on this side: the
+    collaboration is closed and the window recorded. The Collab project is
+    deleted with `projectsDelete` (its own delayed deletion) or, where the
+    contract keeps that for a signed-in browser, paused with the link to finish
+    there (server/stack/cloud.py)."""
+    now = time.time()
+    row = CLOUD.row(project["id"])
+    if row is not None and row["doc"].get("deleted_at"):
+        raise HTTPException(status_code=409, detail="This collaboration is already deleted.")
+    CLOUD.bind(project["id"], str(project.get("owner_id") or ""))
+    row = CLOUD.row(project["id"])
+    row["doc"].update(collab_status_before_delete=project.get("status") or "open",
+                      deleted_by=who["id"], deleted_by_role="admin" if who["admin"] else "owner")
+    CLOUD._save(row)
+    if project.get("status") != "closed":
+        store.set_project(project["id"], project["payload"], "closed")     # off everybody's list
+    CLOUD.delete(project["id"], stack_deletion.stamp(now),
+                 stack_deletion.stamp(now + stack_deletion.WINDOW_DAYS * 86400))
+    return {"project": project["id"], "deletion": _cloud_deletion_view(project["id"])}
+
+
+def _cloud_deletion_view(sf_project: str) -> dict[str, Any]:
+    row = CLOUD.row(sf_project) or {"doc": {}}
+    d = row["doc"]
+    return {"status": "deleted" if d.get("deleted_at") else "open",
+            "deleted_at": d.get("deleted_at"), "delete_after": d.get("delete_after"),
+            "deleted_by_role": d.get("deleted_by_role"), "relay_purged_at": None,
+            "results_removed_at": None, "cloud": CLOUD.owner_view(sf_project)}
+
+
+@app.post("/api/v1/projects/{project_id}/restore")
+def restore_project(project_id: str,
+                    who: dict[str, Any] = Depends(person_from)) -> dict[str, Any]:
+    """Undo a deletion within its seven days; refused with the date after."""
+    project = _require_project_owner(who, project_id)
+    row = CLOUD.row(project_id)
+    if row is not None and row["doc"].get("deleted_at"):
+        if not stack_deletion.window_open(row["doc"], time.time()):
+            raise HTTPException(status_code=409,
+                                detail=f"The restore window ended on {str(row['doc'].get('delete_after'))[:10]}.")
+        before = row["doc"].pop("collab_status_before_delete", None)
+        for k in ("deleted_by", "deleted_by_role"):
+            row["doc"].pop(k, None)
+        CLOUD._save(row)
+        if before:
+            store.set_project(project_id, project["payload"], before)
+        CLOUD.restore(project_id)
+        return {"project": project_id, "deletion": _cloud_deletion_view(project_id)}
+    try:
+        doc = stack_deletion.restore(store, project_id)
+    except stack_deletion.Refused as e:
+        raise HTTPException(status_code=e.status, detail=e.message)
+    return {"project": project_id, "deletion": _deletion_view(doc)}
+
+
+@app.delete("/api/v1/projects/{project_id}/stack/results")
+def remove_stack_results(project_id: str,
+                         who: dict[str, Any] = Depends(person_from)) -> dict[str, Any]:
+    """Remove the results kept after a deletion (`status.json`, masters,
+    previews). Only once the window has passed; the owner or server owner."""
+    _require_project_owner(who, project_id)
+    try:
+        doc = stack_deletion.remove_results(store, project_id, STACK_PUBLIC)
+    except stack_deletion.Refused as e:
+        raise HTTPException(status_code=e.status, detail=e.message)
+    return {"project": project_id, "deletion": _deletion_view(doc)}
+
+
+class CloudLinkRequest(BaseModel):
+    """A Rapid Stacker Collab API token with `projects:manage`, and where the
+    service is (blank: the production service)."""
+
+    token: str = Field(min_length=1, max_length=120)
+    apiBase: str = Field(default="", max_length=200)
+
+
+def _hub_choice(hub: dict[str, Any], person_id: str) -> dict[str, Any]:
+    seen = float(hub.get("seen") or 0.0)
+    return {"id": hub["id"], "name": hub["name"], "lanUrl": hub["lan_url"],
+            "role": "owner" if hub["owner"] == person_id else "coordinator",
+            "seen": seen, "online": bool(seen) and time.time() - seen < stack_projects.HUB_ONLINE_S}
+
+
+@app.get("/api/v1/stacking")
+def stacking_options(who: dict[str, Any] = Depends(person_from)) -> dict[str, Any]:
+    """Everything the desktop's Live stacking fieldset needs, for the person
+    asking: the hubs they may bind to (their own and those that list them,
+    D002), what a new collaboration of theirs gets by default, their Rapid
+    Stacker Collab link (never its token), and their deleted collaborations
+    that can still be restored (they are off every list, so nowhere else
+    shows them)."""
+    default = _default_binding(who)
+    hub = store.hub(default["hubId"]) if default["backend"] == "hub" else None
+    deleted = []
+    for project in store.projects_of(who["id"]):
+        row = store.stack_project_of(project["id"])
+        cloud_row = CLOUD.row(project["id"])
+        d = (row or {}).get("doc") or {}
+        if d.get("status") == "deleted" and not d.get("relay_purged_at"):
+            deleted.append({"id": project["id"], "name": project["name"], "backend": "hub",
+                            "deletedAt": d.get("deleted_at"), "deleteAfter": d.get("delete_after"),
+                            "restorable": stack_deletion.window_open(d, time.time())})
+        elif cloud_row is not None and cloud_row["doc"].get("deleted_at"):
+            c = cloud_row["doc"]
+            deleted.append({"id": project["id"], "name": project["name"], "backend": "cloud",
+                            "deletedAt": c.get("deleted_at"), "deleteAfter": c.get("delete_after"),
+                            "restorable": stack_deletion.window_open(c, time.time()),
+                            "note": c.get("error", "") if c.get("state") == "needs_owner" else ""})
+    return {"hubs": [_hub_choice(h, who["id"]) for h in _bindable_hubs(who["id"])],
+            "default": {"backend": default["backend"], "hubId": default["hubId"],
+                        "hubName": hub["name"] if hub else ""},
+            "cloud": CLOUD.view(who["id"]),
+            "deleted": deleted, "windowDays": stack_deletion.WINDOW_DAYS}
+
+
+@app.put("/api/v1/stacking/cloud")
+def link_cloud(body: CloudLinkRequest,
+               who: dict[str, Any] = Depends(person_from)) -> dict[str, Any]:
+    """Link the person's Rapid Stacker Collab account, once (T706).
+
+    The token is checked against the service (`GET /auth/me`: a token, with
+    `projects:manage`) and kept on this server only, sealed when the server has
+    a key (server/stack/cloud.py). It is never returned, listed, or handed to a
+    telescope."""
+    try:
+        view = CLOUD.link(who["id"], body.apiBase, body.token)
+    except stack_cloud.CloudError as e:
+        raise HTTPException(status_code=502 if e.transient else 400, detail=e.message)
+    return {"cloud": view}
+
+
+@app.delete("/api/v1/stacking/cloud")
+def unlink_cloud(who: dict[str, Any] = Depends(person_from)) -> dict[str, Any]:
+    """Forget the person's Collab token. Collaborations already on the cloud
+    keep their projects; their edits wait (recorded as failures) until the
+    account is linked again."""
+    CLOUD.unlink(who["id"])
+    return {"cloud": CLOUD.view(who["id"])}
+
+
+@app.get("/api/v1/projects/{project_id}/stacking")
+def project_stacking(project_id: str,
+                     who: dict[str, Any] = Depends(person_from)) -> dict[str, Any]:
+    """Where a collaboration is stacked and how that is going, for its owner's
+    Edit form: the binding, the hub's project (status, visibility, deletion),
+    or the Collab project this server keeps (its state, the last error, its
+    page). The owner or the server owner."""
+    project = _require_project_owner(who, project_id)
+    binding = _stacking_of(project.get("payload") or {})
+    out: dict[str, Any] = {"backend": binding["backend"], "managed": _is_managed(binding),
+                           "hubId": binding["hubId"], "hubName": "",
+                           "visibility": binding["visibility"] or ("unlisted" if binding["backend"] else ""),
+                           "joinCode": binding["joinCode"] if binding["backend"] == "cloud"
+                           and not _is_managed(binding) else "",
+                           "status": "", "deletion": None, "cloud": CLOUD.owner_view(project_id),
+                           "windowDays": stack_deletion.WINDOW_DAYS}
+    row = store.stack_project_of(project_id)
+    if binding["backend"] == "hub":
+        hub = store.hub(binding["hubId"])
+        out["hubName"] = hub["name"] if hub else ""
+    if row is not None:
+        d = row["doc"]
+        out["status"] = d.get("status", "")
+        if binding["backend"] == "hub":
+            out["visibility"] = d.get("visibility") or out["visibility"]
+        if d.get("status") == "deleted":
+            out["deletion"] = _deletion_view(d)
+    cloud_row = CLOUD.row(project_id)
+    if cloud_row is not None and cloud_row["doc"].get("deleted_at"):
+        out["deletion"] = _cloud_deletion_view(project_id)
+    return out
 
 
 @app.post("/api/v1/projects/{project_id}/redeal")
@@ -1733,7 +2673,7 @@ def redeal_project(project_id: str,
 @app.get("/api/v1/projects")
 def list_projects() -> dict[str, Any]:
     """Open to anyone: browsing is how people find a collab to join."""
-    return {"projects": store.projects()}
+    return {"projects": [_without_owner_fields(p) for p in store.projects()]}
 
 
 @app.get("/api/v1/lookup")
@@ -1769,7 +2709,7 @@ def read_project(project_id: str) -> dict[str, Any]:
     project = store.project(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="no such project")
-    return {"project": project, "tasks": store.tasks_in(project_id),
+    return {"project": _without_owner_fields(project), "tasks": store.tasks_in(project_id),
             "contributions": store.contributions(project_id)}
 
 
@@ -1786,7 +2726,9 @@ def create_task(project_id: str, body: TaskRequest,
         agent=body.agent, region=collab.Region.read(body.region),
         filters=[collab.FilterTask.read(entry) for entry in body.filters],
         state="offered", version=1, issued=time.time(), note=body.note)
-    return {"task": store.add_task(task.payload())}
+    added = store.add_task(task.payload())
+    _restack_grid(project_id)
+    return {"task": added}
 
 
 @app.post("/api/v1/contributions/{row_id}/verdict")
@@ -1980,6 +2922,120 @@ def download_file(name: str):
     return FileResponse(path, media_type="application/octet-stream", filename=name)
 
 
+# ---------------------------------------------------------------------------
+# The worker and hub binaries: Rapid Stacker Collab's collab-worker and
+# collab-hub, for the volunteers who run them (plan 4.6)
+# ---------------------------------------------------------------------------
+#
+# server/downloads/collab-worker/ and server/downloads/collab-hub/ hold a
+# latest.json (the manifest), its latest.json.sig (an Ed25519 signature made
+# offline) and one archive per platform. None of those files is committed:
+# the release step puts them there. Only names matching the patterns below are
+# served, so a folder listing or a dot-dot path is a 404 by construction.
+
+_BINARY_PLATFORMS = "macos-arm64|windows-x64|linux-x64"
+_BINARY_ARCHIVE = {
+    product: re.compile(
+        rf"{product}-[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?"
+        rf"-(?:{_BINARY_PLATFORMS})\.(?:zip|tar\.gz)")
+    for product in ("collab-worker", "collab-hub")
+}
+
+
+def _binary_file(product: str, name: str) -> FileResponse:
+    """One file of a binary's folder. The manifest and its signature change on
+    every release, so they are never cached; an archive's name carries its
+    version, so it may be cached for a year."""
+    filename = None
+    if name in ("latest.json", "latest.json.sig"):
+        media = "application/json" if name == "latest.json" else "application/octet-stream"
+        cache = "no-cache"
+    elif _BINARY_ARCHIVE[product].fullmatch(name):
+        media, cache = "application/octet-stream", "public, max-age=31536000, immutable"
+        filename = name
+    else:
+        raise HTTPException(status_code=404, detail="no such file")
+    folder = DOWNLOAD_DIR / product
+    path = folder / name
+    if not path.is_file() or path.resolve().parent != folder.resolve():
+        raise HTTPException(status_code=404, detail="no such file")
+    return FileResponse(path, media_type=media, filename=filename,
+                        headers={"Cache-Control": cache})
+
+
+#: How the download page names each platform, in the order it lists them.
+_PLATFORM_NAMES = {"windows-x64": "Windows, 64-bit", "macos-arm64": "macOS, Apple silicon",
+                   "linux-x64": "Linux, x86-64"}
+
+
+def _binary_offer(product: str) -> tuple[str, list[dict[str, Any]]] | None:
+    """The version and the archives a binary's `latest.json` names, for people.
+
+    The page is not where trust comes from: the desktop checks the manifest's
+    signature and the archive's SHA-256 before running anything, and the page
+    shows the hash so that someone installing by hand can do the same. An
+    archive is offered only when it is both in the manifest and on disk under a
+    name `_binary_file` will serve, so the page never links to a 404. A missing
+    or unreadable manifest offers nothing: before the first release the page
+    looks as it always did."""
+    folder = DOWNLOAD_DIR / product
+    try:
+        manifest = json.loads((folder / "latest.json").read_text(encoding="utf-8"))
+        version, assets = str(manifest["version"]), manifest["assets"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(assets, dict):
+        return None
+    offers = []
+    for os_key, platform in _PLATFORM_NAMES.items():
+        entry = assets.get(os_key)
+        primary = entry.get("primary") if isinstance(entry, dict) else None
+        if not isinstance(primary, dict):
+            continue
+        name = str(primary.get("filename") or "")
+        if not _BINARY_ARCHIVE[product].fullmatch(name) or not (folder / name).is_file():
+            continue
+        offers.append({"platform": platform, "file": name, "size": (folder / name).stat().st_size,
+                       "sha256": str(primary.get("sha256") or "")})
+    return (version, offers) if offers else None
+
+
+def _binaries_section() -> str:
+    """The download page's part for volunteers: empty until a release is published."""
+    offered = [(product, _binary_offer(product)) for product in ("collab-worker", "collab-hub")]
+    offered = [(product, offer) for product, offer in offered if offer is not None]
+    if not offered:
+        return ""
+    parts = ["<h2>Lending a computer to live stacking</h2>",
+             "<p>Starfront installs these for you, so most people never need the files below. "
+             "In Starfront, open <em>Collaborations &rarr; Volunteer this machine</em>, enter the "
+             "hub's address and its one-time code, and press Install; the hub itself is under "
+             "<em>Live stacking hub</em> on the same page. Starfront checks the release signature "
+             "and each file's SHA-256 before it runs anything, and checks every update the same way.</p>"]
+    for product, (version, files) in offered:
+        parts.append(f"<h3>{product} {html.escape(version)}</h3><ul class=\"files\">")
+        for f in files:
+            parts.append(f"<li><a href=\"/download/{product}/{f['file']}\">{f['platform']}</a> "
+                         f"<span class=\"small\">{f['file']} &middot; {f['size'] / (1024 * 1024):.0f} MB</span>"
+                         f"<br><code class=\"hash\">SHA-256 {html.escape(f['sha256'])}</code></li>")
+        parts.append("</ul>")
+    manifests = ", ".join(f"<a href=\"/download/{product}/latest.json\">{product}</a>"
+                          for product, _ in offered)
+    parts.append(f"<p class=\"small\">Signed manifests ({manifests}), each with its "
+                 f"<code>latest.json.sig</code> beside it.</p>")
+    return "\n  ".join(parts)
+
+
+@app.get("/download/collab-worker/{name}")
+def download_collab_worker(name: str) -> FileResponse:
+    return _binary_file("collab-worker", name)
+
+
+@app.get("/download/collab-hub/{name}")
+def download_collab_hub(name: str) -> FileResponse:
+    return _binary_file("collab-hub", name)
+
+
 _DOWNLOAD_PAGE = """<!doctype html>
 <html lang="en">
 <head>
@@ -1998,6 +3054,11 @@ _DOWNLOAD_PAGE = """<!doctype html>
   p, li {{ line-height: 1.5; }}
   a {{ color: #9fe4bd; }}
   code {{ background: #11161f; padding: 2px 6px; border-radius: 4px; }}
+  h3 {{ font-size: 0.95rem; margin: 20px 0 6px; }}
+  ul.files {{ padding-left: 20px; margin: 0; }}
+  ul.files li {{ margin: 0 0 10px; }}
+  .small {{ color: #8f9bb3; font-size: 0.85rem; }}
+  .hash {{ font-size: 0.75rem; word-break: break-all; }}
 </style>
 </head>
 <body>
@@ -2015,6 +3076,7 @@ _DOWNLOAD_PAGE = """<!doctype html>
   <p>There is a plugin instead. In N.I.N.A., Options &rarr; General &rarr; Plugin
   Repositories, press + and enter <code>{host}/nina</code>, then install
   &ldquo;Starfront&rdquo; from the Plugins tab.</p>
+  {binaries}
   <p><a href="/sky">Tonight at Starfront</a>: where the observatory's telescopes are pointed right now.</p>
 </main>
 </body>
@@ -2035,7 +3097,7 @@ def download_page(request: Request) -> HTMLResponse:
                   f"<p class=\"meta\">{latest['file']} &middot; {size:.0f} MB &middot; "
                   f"Windows 10 and 11, 64-bit</p>")
     host = DISCORD.public_url.rstrip("/") if DISCORD.public_url else f"{request.url.scheme}://{request.url.netloc}"
-    return HTMLResponse(_DOWNLOAD_PAGE.format(button=button, host=host))
+    return HTMLResponse(_DOWNLOAD_PAGE.format(button=button, host=host, binaries=_binaries_section()))
 
 
 # ---------------------------------------------------------------------------
@@ -2140,6 +3202,136 @@ files = Files(app, store, FILES_DIR, _person, owns_project, DISCORD.owners,
 
 
 # ---------------------------------------------------------------------------
+# Live stacking: the hubs on people's own networks. See server/hubs.py.
+# ---------------------------------------------------------------------------
+
+hubs = Hubs(app, store, _person, may_start)
+
+# The front door for hub-backed projects, in the Collab contract's envelope.
+# Its own sub-application so its error handlers cover exactly `/stack/api`.
+STACK_FRONT = stack_front.build(store, DATA / "stack" / "relay", DATA / "stack" / "public")
+# The cloud projects are retried by the same sweep thread (server/stack/cloud.py).
+STACK_FRONT.state.cloud = CLOUD
+app.mount("/stack/api", STACK_FRONT)
+# The frame part PUTs (`/stack/s3/...`) and the sweep of abandoned uploads.
+stack_front.install(app, STACK_FRONT)
+# The frame relay for the hub: list, ranged bytes, ack, retention (server/stack/relay.py).
+STACK_RELAY = stack_relay.install(app, store, hubs, STACK_FRONT, files)
+# Full member and rig records for the hub, by the keys of its change feed.
+stack_records.install(app, store, hubs)
+STACK_FRONT.state.frames.after_upload = STACK_RELAY.collect
+# What a hub pushes back: POST /api/v1/hubs/{id}/push (server/stack/push.py).
+STACK_FRONT.state.pushed.install(app, hubs)
+
+
+# ---------------------------------------------------------------------------
+# The progress pages: read-only, under /stack/. See server/web/stack/.
+# ---------------------------------------------------------------------------
+#
+# Static HTML, CSS and JS ported from Rapid Stacker Collab's website, plus the
+# artefacts a hub has pushed (status.json, previews, deep-zoom tiles), served
+# from STARFRONT_DATA/stack/public/<project id>/. This is the port of that
+# site's CloudFront rewrite (website/cloudfront/rewrite.js) for the pages that
+# are ported. The /stack/api front door is not here: where it is mounted it
+# must be registered BEFORE the static mount at the foot of this file.
+
+STACK_WEB = Path(__file__).resolve().parent / "web" / "stack"
+STACK_PUBLIC = DATA / "stack" / "public"
+
+#: Script, style, images and fetches from this origin only; nothing inline
+#: except style attributes (the charts set custom properties). Only /stack/.
+STACK_CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; "
+             "style-src-attr 'unsafe-inline'; img-src 'self' data: blob:; "
+             "connect-src 'self'; frame-ancestors 'none'")
+
+
+@app.middleware("http")
+async def _stack_headers(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path == "/stack" or path.startswith("/stack/"):
+        response.headers["Content-Security-Policy"] = STACK_CSP
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        # Static files and pages are revalidated, so a deploy shows at once;
+        # the public artefacts below set their own.
+        response.headers.setdefault("Cache-Control", "no-cache")
+    return response
+
+
+#: A slug is [a-z0-9]+(-[a-z0-9]+)*, 3-40 characters (the rewrite's rule).
+_STACK_SLUG = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def _stack_page(name: str, slug: str | None = None) -> FileResponse:
+    path = STACK_WEB / name
+    if (slug is not None and not (3 <= len(slug) <= 40 and _STACK_SLUG.match(slug))) \
+            or not path.is_file():
+        raise HTTPException(status_code=404, detail="no such page")
+    return FileResponse(path, media_type="text/html; charset=utf-8")
+
+
+@app.api_route("/stack", methods=["GET", "HEAD"])
+@app.api_route("/stack/", methods=["GET", "HEAD"])
+def stack_home():
+    """The home of the pages: the dashboard once there is one."""
+    here = "/stack/dashboard" if (STACK_WEB / "dashboard.html").is_file() else "/download"
+    return RedirectResponse(here, status_code=302)
+
+
+@app.api_route("/stack/p/{slug}", methods=["GET", "HEAD"])
+def stack_project_page(slug: str):
+    return _stack_page("project.html", slug)
+
+
+@app.api_route("/stack/p/{slug}/filter/{stream}", methods=["GET", "HEAD"])
+def stack_filter_page(slug: str, stream: str):
+    return _stack_page("filter.html", slug)
+
+
+@app.api_route("/stack/p/{slug}/combined", methods=["GET", "HEAD"])
+def stack_combined_page(slug: str):
+    return _stack_page("combined.html", slug)
+
+
+@app.api_route("/stack/dashboard", methods=["GET", "HEAD"])
+def stack_dashboard_page():
+    return _stack_page("dashboard.html")
+
+
+_STACK_TYPES = {".json": "application/json", ".png": "image/png",
+                ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".dzi": "application/xml", ".xml": "application/xml",
+                ".bin": "application/octet-stream"}
+_STACK_PROJECT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+@app.api_route("/stack/public/{project_id}/{path:path}", methods=["GET", "HEAD"])
+def stack_public(project_id: str, path: str):
+    """What a hub pushed for a project, with the cache headers of the public
+    bucket (docs/api/s3-layout.md): a minute for the mutable files, forever
+    for a deep-zoom tile, whose directory is named by the gold sequence and is
+    never rewritten. A path that leaves the project's folder is a 404."""
+    parts = path.split("/")
+    if (not _STACK_PROJECT.match(project_id) or not path
+            or any(p in ("", ".", "..") or "\\" in p or "\0" in p for p in parts)):
+        raise HTTPException(status_code=404, detail="no such file")
+    if parts[0] == "masters":      # members only (the contract): see /stack/api/projects/{p}/masters
+        raise HTTPException(status_code=404, detail="no such file")
+    root = (STACK_PUBLIC / project_id).resolve()
+    target = (root / path).resolve()
+    if not target.is_relative_to(root) or not target.is_file():
+        raise HTTPException(status_code=404, detail="no such file")
+    media = _STACK_TYPES.get(target.suffix.lower(), "application/octet-stream")
+    if parts[0] == "deepzoom":
+        cache = "public, max-age=31536000, immutable"
+    elif project_id == "filters":
+        cache = "public, max-age=300"
+    else:
+        cache = "public, max-age=60"
+    return FileResponse(target, media_type=media, headers={"Cache-Control": cache})
+
+
+# ---------------------------------------------------------------------------
 # Everything else
 # ---------------------------------------------------------------------------
 
@@ -2166,3 +3358,8 @@ def health() -> dict[str, Any]:
 async def _unhandled(_request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=500,
                         content={"detail": f"{type(exc).__name__}: {exc}"})
+
+
+# The pages' own files (css, js, favicon), last so that every route above
+# (and a /stack/api router added anywhere above) is tried first.
+app.mount("/stack", StaticFiles(directory=str(STACK_WEB), check_dir=False), name="stack-web")

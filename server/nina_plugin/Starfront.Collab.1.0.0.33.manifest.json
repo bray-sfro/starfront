@@ -1,0 +1,45 @@
+{
+  "Name": "Starfront",
+  "Identifier": "896B4E28-7CEB-4731-BB97-8BADE7460268",
+  "Version": {
+    "Major": "1",
+    "Minor": "0",
+    "Patch": "0",
+    "Build": "33"
+  },
+  "Author": "Starfront Observatories",
+  "Homepage": "https://starfront.space",
+  "Repository": "https://discord.com/invite/3ut6a7pfsY",
+  "License": "MPL-2.0",
+  "LicenseURL": "https://www.mozilla.org/en-US/MPL/2.0/",
+  "ChangelogURL": "https://collab.starfront.space/nina/changelog",
+  "Tags": [
+    "Collaboration",
+    "Mosaic",
+    "Deep Sky",
+    "Discord",
+    "Starfront",
+    "Community",
+    "Sequencer",
+    "Stacking"
+  ],
+  "MinimumApplicationVersion": {
+    "Major": "3",
+    "Minor": "2",
+    "Patch": "0",
+    "Build": "9001"
+  },
+  "Descriptions": {
+    "ShortDescription": "Take part in Starfront collaborations from anywhere, customer or not: join the Starfront Discord, sign in with it, join a project - a field or a mosaic - and one sequence container shoots what your telescope was dealt tonight at your own exposures.",
+    "LongDescription": "**You have to be in the Starfront Discord server to take part - you do not have to be a Starfront customer.** Anyone in the server, anywhere in the world, can join and start collaborations. Join it here: https://discord.com/invite/3ut6a7pfsY - then sign in with Discord under Options > Plugins > Starfront. Membership is the account; there is no password.\n\nStarfront lets several telescopes work on one target together: a single field everybody adds depth to, or a mosaic shared out between them.\n\nA coordinator starts a collaboration on the Starfront server: the field or region of sky, the filters wanted, and how deep to go at every point. Every night the server deals each telescope that has joined its part - the field itself, or a list of panels - and one filter: Ha or SII on a bright Moon, broadband or OIII on a dark one, sized to a night's work; the sequence shoots as much of it as it has time for. A night's deal, once made, holds for the whole night.\n\nThis plugin is the N.I.N.A. side of that:\n\n- **Sign in with Discord.** Only members of the Starfront Discord server can take part; membership is the account, there is no password.\n- **Your filters, your exposures.** The plugin lists the filters in your own filter wheel, by their own names, and you say how long you normally shoot each; the server works out which of its filters each one is. Your share is dealt at those lengths, so every light calibrates against your own darks. Gain, offset and binning come from your N.I.N.A. profile.\n- **One instruction.** Drop the *Starfront collaboration* container into your Advanced Sequence where a target would go, inside your usual autofocus, meridian-flip and dither triggers. When it runs it reads tonight's deal once, then slews, centres (and rotates, if you have a rotator), switches filter and takes the frames - for the field, or for each panel in turn - skipping anything below the project's altitude floor until it rises.\n- **Frames are reported as they land.** Every light the container takes is credited to the sky it covered, with its star size and guiding error, and sent to the server on the next check-in, so everyone's depth map moves on and tomorrow's deal is made from what was really collected.\n- **An Imaging-tab panel** shows who is online, which collaborations are open to your telescope, how far each has got, and what you have been dealt tonight. You can start your own collaboration from it too.\n- **Live stacking (optional, off by default).** A coordinator can link a collaboration to a Rapid Stacker Collab project. Turn on *Live stacking* in the options and sign in, and every light the container saves for it is sent there as it lands - a copy, with your location taken out - so everyone's frames build one stack through the night. Your own files are never moved, changed or deleted.\n\nMade by Starfront Observatories, Rockwood, Texas - https://starfront.space",
+    "FeaturedImageURL": "",
+    "ScreenshotURL": "",
+    "AltScreenshotURL": ""
+  },
+  "Installer": {
+    "URL": "https://collab.starfront.space/nina/download/Starfront.Collab.1.0.0.33.zip",
+    "Type": "ARCHIVE",
+    "Checksum": "5770F2A192D7E5592EC772C5CB90DC458541A00C481876513A695E665A7DCAFE",
+    "ChecksumType": "SHA256"
+  }
+}

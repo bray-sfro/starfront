@@ -6,6 +6,7 @@ using Newtonsoft.Json.Linq;
 using NINA.Core.Utility;
 using NINA.Profile;
 using NINA.Profile.Interfaces;
+using RapidStackerCollab.Core.Upload;
 
 namespace Starfront.Collab.Settings {
 
@@ -20,9 +21,16 @@ namespace Starfront.Collab.Settings {
     /// each filter is shot at, the camera's angle, gain, binning - is per
     /// N.I.N.A. profile, through the host's own plugin-settings store, so a
     /// second profile for a second camera keeps its own table.
+    ///
+    /// Live stacking adds a third credential, the Rapid Stacker Collab sign-in,
+    /// kept to the same rules as the other two: global, protected for this
+    /// Windows account, and never written anywhere else.
     /// </summary>
     public sealed class StarfrontSettings : BaseINPC {
         public const string DefaultServer = "https://collab.starfront.space";
+
+        /// <summary>The Rapid Stacker Collab API the lights are stacked by, with its trailing slash.</summary>
+        public const string DefaultStackingApi = "https://collab.astro.ekeservices.com/api/";
 
         /// <summary>Addresses the server used to live at; one typed in is pointed at the current one.</summary>
         private static readonly string[] LegacyServers = { "https://starfront-bray.duckdns.org" };
@@ -60,6 +68,33 @@ namespace Starfront.Collab.Settings {
             public string AgentName { get; set; } = "";
             public bool SharePosition { get; set; } = true;
             public int PollMinutes { get; set; } = 10;   // no longer read; kept so older files load
+
+            // Live stacking: the lights sent to a Rapid Stacker Collab project
+            // as they land. Off unless asked, and nothing below is read while
+            // it is off.
+            public bool StackingEnabled { get; set; }
+            public string StackingApiBase { get; set; } = "";
+            public string StackingToken { get; set; } = "";          // protected, like the two above
+            public string StackingTokenExpiresUtc { get; set; } = "";
+            public string StackingUserName { get; set; } = "";
+            public string StackingUserEmail { get; set; } = "";
+            public string StackingDisplayName { get; set; } = "";
+            public string StackingUploadMode { get; set; } = "WhenIdle";
+            public string StackingWindowStart { get; set; } = "06:00";
+            public string StackingWindowEnd { get; set; } = "14:00";
+            public int StackingIdleGraceSeconds { get; set; } = 30;
+            public int StackingBandwidthKBps { get; set; }
+            public bool StackingStripLocation { get; set; } = true;
+            public bool StackingIncludeCalibration { get; set; }
+            public bool StackingUploadFlats { get; set; } = true;
+            public bool StackingLibraryLive { get; set; } = true;
+            public bool StackingLibraryPreferRaw { get; set; }
+            public int StackingLibrarySyncHours { get; set; } = 24;
+            public int StackingTempRetentionHours { get; set; } = 24;
+            public int StackingHistoryDays { get; set; } = 30;
+            public bool StackingHubTrustLan { get; set; } = true;
+            public string StackingDefaultBackend { get; set; } = "cloud";
+            public bool StackingPaused { get; set; }
         }
 
         public void Load() {
@@ -163,7 +198,234 @@ namespace Starfront.Collab.Settings {
             RaiseAllPropertiesChanged();
         }
 
+        // -- live stacking: the person and this PC ----------------------------
+
+        /// <summary>Send the lights of a linked collaboration to Rapid Stacker Collab as they land. Off by default.</summary>
+        public bool StackingEnabled {
+            get => global.StackingEnabled;
+            set { global.StackingEnabled = value; Save(); RaisePropertyChanged(); }
+        }
+
+        /// <summary>The Rapid Stacker Collab API, ending in a slash. Blank means the built-in one.</summary>
+        public string StackingApiBase {
+            get {
+                var url = (global.StackingApiBase ?? "").Trim();
+                if (url.Length == 0) return DefaultStackingApi;
+                return url.EndsWith('/') ? url : url + "/";
+            }
+            set {
+                var url = (value ?? "").Trim();
+                if (url.Length > 0 && !url.EndsWith('/')) url += "/";
+                if (url == DefaultStackingApi) url = "";
+                global.StackingApiBase = url;
+                Save();
+                RaisePropertyChanged();
+            }
+        }
+
+        /// <summary>Use a hub's address on this PC's own network when it answers, instead of going through the server.</summary>
+        public bool StackingHubTrustLan {
+            get => global.StackingHubTrustLan;
+            set { global.StackingHubTrustLan = value; Save(); RaisePropertyChanged(); }
+        }
+
+        /// <summary>The backend for rig- and library-scoped calls, which belong to no project: "cloud" or "hub".</summary>
+        public string StackingDefaultBackend {
+            get => string.Equals(global.StackingDefaultBackend, "hub", StringComparison.OrdinalIgnoreCase) ? "hub" : "cloud";
+            set { global.StackingDefaultBackend = string.Equals(value?.Trim(), "hub", StringComparison.OrdinalIgnoreCase) ? "hub" : "cloud"; Save(); RaisePropertyChanged(); }
+        }
+
+        /// <summary>The Rapid Stacker Collab token (<c>rscu_…</c>), protected like the other two credentials.</summary>
+        public string StackingToken {
+            get => Protected.Unwrap(global.StackingToken);
+            set { global.StackingToken = Protected.Wrap(value); Save(); RaisePropertyChanged(); RaisePropertyChanged(nameof(StackingSignedIn)); }
+        }
+
+        /// <summary>When the token lapses, as the server said at sign-in; null when unknown. There is no refresh: a lapsed token means signing in again.</summary>
+        public DateTime? StackingTokenExpiresUtc {
+            get => DateTime.TryParse(global.StackingTokenExpiresUtc, CultureInfo.InvariantCulture,
+                                     DateTimeStyles.AdjustToUniversal | DateTimeStyles.AssumeUniversal, out var when) ? when : null;
+            set { global.StackingTokenExpiresUtc = value?.ToUniversalTime().ToString("o", CultureInfo.InvariantCulture) ?? ""; Save(); RaisePropertyChanged(); }
+        }
+
+        public string StackingUserName {
+            get => global.StackingUserName ?? "";
+            set { global.StackingUserName = value ?? ""; Save(); RaisePropertyChanged(); }
+        }
+
+        public string StackingUserEmail {
+            get => global.StackingUserEmail ?? "";
+            set { global.StackingUserEmail = value ?? ""; Save(); RaisePropertyChanged(); }
+        }
+
+        /// <summary>The name this person contributes under on Rapid Stacker Collab; blank falls back to the Discord name, then the telescope's.</summary>
+        public string StackingDisplayName {
+            get => global.StackingDisplayName ?? "";
+            set { global.StackingDisplayName = (value ?? "").Trim(); Save(); RaisePropertyChanged(); }
+        }
+
+        /// <summary>Whether somebody is signed in to Rapid Stacker Collab on this PC.</summary>
+        public bool StackingSignedIn => StackingToken.Length > 0;
+
+        /// <summary>Forget the Rapid Stacker Collab sign-in on this PC. The Starfront sign-in is untouched.</summary>
+        public void ForgetStackingCredentials() {
+            global.StackingToken = "";
+            global.StackingTokenExpiresUtc = "";
+            global.StackingUserName = "";
+            global.StackingUserEmail = "";
+            Save();
+            RaiseAllPropertiesChanged();
+        }
+
+        /// <summary>
+        /// When uploads may run: Immediately, WhenIdle or TimeWindow, as
+        /// <see cref="UploadMode"/> spells them. AfterSequenceEnd is upstream's
+        /// fourth mode and is read as WhenIdle here: nothing in this plugin
+        /// reports the sequencer's state, and a mode that waited for it would
+        /// wait for ever.
+        /// </summary>
+        public string StackingUploadMode {
+            get => StackingMode.ToString();
+            set { global.StackingUploadMode = ParseMode(value).ToString(); Save(); RaisePropertyChanged(); RaisePropertyChanged(nameof(StackingMode)); }
+        }
+
+        public UploadMode StackingMode => ParseMode(global.StackingUploadMode);
+
+        private static UploadMode ParseMode(string text) {
+            if (!Enum.TryParse<UploadMode>((text ?? "").Trim(), true, out var mode) || !Enum.IsDefined(mode)) return UploadMode.WhenIdle;
+            return mode == UploadMode.AfterSequenceEnd ? UploadMode.WhenIdle : mode;
+        }
+
+        /// <summary>The daily upload window's start, local time, HH:mm. Used by the TimeWindow mode.</summary>
+        public string StackingWindowStart {
+            get => WindowStart.ToString("HH:mm", CultureInfo.InvariantCulture);
+            set { global.StackingWindowStart = ParseTime(value, WindowStart).ToString("HH:mm", CultureInfo.InvariantCulture); Save(); RaisePropertyChanged(); }
+        }
+
+        public string StackingWindowEnd {
+            get => WindowEnd.ToString("HH:mm", CultureInfo.InvariantCulture);
+            set { global.StackingWindowEnd = ParseTime(value, WindowEnd).ToString("HH:mm", CultureInfo.InvariantCulture); Save(); RaisePropertyChanged(); }
+        }
+
+        private TimeOnly WindowStart => TryParseTime(global.StackingWindowStart, out var when) ? when : new TimeOnly(6, 0);
+        private TimeOnly WindowEnd => TryParseTime(global.StackingWindowEnd, out var when) ? when : new TimeOnly(14, 0);
+
+        /// <summary>A typed time: blank keeps what was there, anything unreadable is refused so the options page can say so.</summary>
+        private static TimeOnly ParseTime(string text, TimeOnly current) {
+            if (string.IsNullOrWhiteSpace(text)) return current;
+            if (TryParseTime(text, out var when)) return when;
+            throw new ArgumentException("A time is written as HH:mm, like 06:00");
+        }
+
+        /// <summary>A stored time: the file is read without exceptions, whatever is in it.</summary>
+        private static bool TryParseTime(string text, out TimeOnly when) {
+            var clean = (text ?? "").Trim();
+            return TimeOnly.TryParseExact(clean, "HH:mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out when)
+                || TimeOnly.TryParseExact(clean, "H:mm", CultureInfo.InvariantCulture, DateTimeStyles.None, out when)
+                || TimeOnly.TryParse(clean, CultureInfo.CurrentCulture, out when);
+        }
+
+        /// <summary>For WhenIdle: seconds to wait after the last saved image before an upload starts, 0 to 600.</summary>
+        public int StackingIdleGraceSeconds {
+            get => Math.Max(0, Math.Min(600, global.StackingIdleGraceSeconds));
+            set { global.StackingIdleGraceSeconds = Math.Max(0, Math.Min(600, value)); Save(); RaisePropertyChanged(); }
+        }
+
+        /// <summary>The upload cap in KB/s; 0 is unlimited.</summary>
+        public int StackingBandwidthKBps {
+            get => Math.Max(0, global.StackingBandwidthKBps);
+            set { global.StackingBandwidthKBps = Math.Max(0, value); Save(); RaisePropertyChanged(); }
+        }
+
+        /// <summary>Remove the observer's location from a temporary copy before it is uploaded. Default on; a project may insist on it.</summary>
+        public bool StackingStripLocation {
+            get => global.StackingStripLocation;
+            set { global.StackingStripLocation = value; Save(); RaisePropertyChanged(); }
+        }
+
+        /// <summary>
+        /// Also send darks, bias and dark flats to the project of the last
+        /// light sent, when they do not go to the rig's calibration library
+        /// (<see cref="StackingLibraryLive"/>). Default off. Flats follow
+        /// <see cref="StackingUploadFlats"/>.
+        /// </summary>
+        public bool StackingIncludeCalibration {
+            get => global.StackingIncludeCalibration;
+            set { global.StackingIncludeCalibration = value; Save(); RaisePropertyChanged(); }
+        }
+
+        /// <summary>
+        /// Send flats, each to the stacking projects that got this telescope's
+        /// lights of the same filter that night (an evening flat waits for
+        /// them). Default on: a light without its flat is stacked uncorrected.
+        /// </summary>
+        public bool StackingUploadFlats {
+            get => global.StackingUploadFlats;
+            set { global.StackingUploadFlats = value; Save(); RaisePropertyChanged(); }
+        }
+
+        /// <summary>
+        /// The darks, bias and dark flats N.I.N.A. saves go to this
+        /// telescope's calibration library on Rapid Stacker Collab, which
+        /// serves every project, instead of to one project. Default on; needs
+        /// the rig, which the first join makes.
+        /// </summary>
+        public bool StackingLibraryLive {
+            get => global.StackingLibraryLive;
+            set { global.StackingLibraryLive = value; Save(); RaisePropertyChanged(); }
+        }
+
+        /// <summary>Send a folder's raw calibration frames rather than its masters, for masters made by tools that already subtract the bias. Default off.</summary>
+        public bool StackingLibraryPreferRaw {
+            get => global.StackingLibraryPreferRaw;
+            set { global.StackingLibraryPreferRaw = value; Save(); RaisePropertyChanged(); }
+        }
+
+        /// <summary>Hours between two syncs of the calibration folder, 1 to 720.</summary>
+        public int StackingLibrarySyncHours {
+            get => Math.Max(1, Math.Min(720, global.StackingLibrarySyncHours));
+            set { global.StackingLibrarySyncHours = Math.Max(1, Math.Min(720, value)); Save(); RaisePropertyChanged(); }
+        }
+
+        /// <summary>Leftover temporary copies older than this many hours are deleted, 1 to 720.</summary>
+        public int StackingTempRetentionHours {
+            get => Math.Max(1, Math.Min(720, global.StackingTempRetentionHours));
+            set { global.StackingTempRetentionHours = Math.Max(1, Math.Min(720, value)); Save(); RaisePropertyChanged(); }
+        }
+
+        /// <summary>Finished uploads stay in the queue's history this many days, 1 to 3650.</summary>
+        public int StackingHistoryDays {
+            get => Math.Max(1, Math.Min(3650, global.StackingHistoryDays));
+            set { global.StackingHistoryDays = Math.Max(1, Math.Min(3650, value)); Save(); RaisePropertyChanged(); }
+        }
+
+        /// <summary>The pause switch: nothing is uploaded while it is on, whatever the mode says.</summary>
+        public bool StackingPaused {
+            get => global.StackingPaused;
+            set { global.StackingPaused = value; Save(); RaisePropertyChanged(); }
+        }
+
+        /// <summary>The upload policy as the engine reads it.</summary>
+        public UploadPolicySettings StackingPolicy() =>
+            new(StackingMode, WindowStart, WindowEnd, TimeSpan.FromSeconds(StackingIdleGraceSeconds), StackingPaused);
+
         // -- the equipment: per N.I.N.A. profile -------------------------------
+
+        /// <summary>The Rapid Stacker Collab rig (<c>rig_…</c>) this profile's equipment was confirmed as; blank until the first join.</summary>
+        public string StackingRigId {
+            get => options.GetValueString(nameof(StackingRigId), "");
+            set { options.SetValueString(nameof(StackingRigId), (value ?? "").Trim()); RaisePropertyChanged(); }
+        }
+
+        /// <summary>
+        /// The folder of bias, dark and dark-flat frames (and their masters)
+        /// kept in step with this telescope's calibration library; blank for
+        /// none. Per profile, like the rig it belongs to.
+        /// </summary>
+        public string StackingLibraryFolder {
+            get => options.GetValueString(nameof(StackingLibraryFolder), "");
+            set { options.SetValueString(nameof(StackingLibraryFolder), (value ?? "").Trim()); RaisePropertyChanged(); }
+        }
 
         /// <summary>What this telescope is called on the chart: the profile's name unless typed over.</summary>
         public string TelescopeName {

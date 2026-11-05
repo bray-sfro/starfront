@@ -1,0 +1,193 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+ * If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ * Ported from Rapid Stacker Collab (EKE Services LLC).
+ */
+/* Pieces that only Rapid Stacker Collab has. Written for this site; colours are tokens from tokens.css. */
+
+/* ----- Layout helpers ----- */
+.stack > * + * { margin-top: var(--gap, 18px); }
+.row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+.row--between { justify-content: space-between; }
+.toolbar { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; justify-content: space-between; margin-bottom: 16px; }
+.num { font-family: var(--font-mono); }
+.truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.panel { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px 22px; }
+.panel + .panel { margin-top: 18px; }
+.grid > .panel + .panel { margin-top: 0; }
+.panel h2, .panel h3 { margin-top: 0; }
+.empty { border: 1px dashed var(--border); border-radius: var(--radius); padding: 28px; text-align: center; color: var(--text-muted); }
+.loading { color: var(--text-muted); padding: 18px 0; }
+.loading::before { content: ""; display: inline-block; width: 12px; height: 12px; margin-right: 8px; border-radius: 50%; border: 2px solid var(--border); border-top-color: var(--primary); animation: spin .8s linear infinite; vertical-align: -1px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .loading::before { animation: none; } }
+
+dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 18px; margin: 0; }
+dl.kv dt { color: var(--text-muted); font-size: 14px; }
+dl.kv dd { margin: 0; }
+
+/* ----- Theme toggle ----- */
+.theme-toggle {
+  background: transparent; border: 1px solid var(--border); color: var(--text-muted);
+  border-radius: var(--radius-sm); padding: 4px 10px; cursor: pointer; font: inherit; font-size: 13px;
+}
+.theme-toggle:hover { border-color: var(--primary); color: var(--text); }
+
+/* A button that reads as a nav link (Log out). */
+.linklike { background: none; border: none; padding: 0; font: inherit; color: var(--text-muted); cursor: pointer; }
+.linklike:hover { color: var(--text); }
+
+/* ----- Segmented control (radio group) -----
+   Native radio inputs, visually restyled, so arrow keys and screen readers work with no JS. */
+.seg { border: 1px solid var(--border-input); border-radius: 999px; padding: 3px; display: inline-flex; gap: 2px; background: var(--surface-1); margin: 0; min-width: 0; }
+.seg legend { padding: 0; }
+.seg input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.seg label {
+  padding: 7px 16px; border-radius: 999px; cursor: pointer; font-weight: 600; font-size: 14px;
+  color: var(--text-muted); border: 1px solid transparent; white-space: nowrap;
+}
+.seg label:hover { color: var(--text); }
+.seg input:checked + label { background: var(--primary); color: var(--on-primary); }
+.seg input:focus-visible + label { outline: 2px solid var(--primary); outline-offset: 2px; }
+.seg input[value="gold"]:checked + label { background: var(--gold); color: var(--surface-0); }
+.seg input:disabled + label { opacity: .5; cursor: not-allowed; }
+
+/* ----- Mode labels: every preview says which stack it shows ----- */
+.mode { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; padding: 3px 9px; border-radius: 999px; border: 1px solid currentColor; background: var(--surface-1); }
+.mode::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.mode--live { color: var(--live); }
+.mode--gold { color: var(--gold); }
+.mode--none { color: var(--text-muted); }
+
+/* ----- Preview frames ----- */
+.preview { margin: 0; position: relative; background: var(--preview-bg); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.preview img { width: 100%; height: auto; }
+.preview__open { display: block; cursor: zoom-in; }
+.preview__open:focus-visible { outline: 2px solid var(--primary); outline-offset: -4px; }
+.preview__ph { display: grid; place-items: center; aspect-ratio: 4 / 3; color: var(--preview-text); opacity: .75; text-align: center; padding: 16px; font-size: 14px; }
+.preview__badges { position: absolute; left: 10px; top: 10px; display: flex; gap: 6px; flex-wrap: wrap; }
+.preview figcaption { padding: 8px 12px; font-size: 13px; color: var(--preview-text); background: rgba(5,6,15,.92); border-top: 1px solid var(--border); }
+.preview--adjust img { filter: var(--adjust, none); }
+
+/* ----- Project cards (directory) ----- */
+.project-card { display: flex; flex-direction: column; gap: 12px; color: var(--text); border-bottom: 1px solid var(--border); padding: 0; overflow: hidden; }
+.project-card:hover { color: var(--text); }
+.project-card .preview { border: none; border-radius: 0; }
+.project-card__body { padding: 0 20px 20px; display: flex; flex-direction: column; gap: 8px; }
+.project-card__title { font-size: 20px; margin: 0; }
+.project-card__meta { display: flex; gap: 14px; flex-wrap: wrap; color: var(--text-muted); font-size: 14px; }
+.project-card__meta strong { color: var(--text); font-family: var(--font-mono); font-weight: 400; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* ----- Per-filter stream cards ----- */
+.stream-card { padding: 0; overflow: hidden; display: flex; flex-direction: column; }
+.stream-card .preview { border: none; border-radius: 0; }
+.stream-card__body { padding: 14px 18px 18px; display: flex; flex-direction: column; gap: 10px; }
+.stream-card__head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.stream-card__head h3 { margin: 0; font-size: 18px; }
+.stream-card dl { margin: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; font-size: 13.5px; }
+.stream-card dt { color: var(--text-muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+.stream-card dd { margin: 0; font-family: var(--font-mono); }
+
+/* ----- Leaderboard ----- */
+.leader { width: 100%; border-collapse: collapse; font-size: 15px; }
+.leader th, .leader td { padding: 10px 10px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.leader th { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--text-muted); }
+.leader td.num, .leader th.num { text-align: right; white-space: nowrap; }
+.leader .rank { width: 44px; color: var(--text-muted); font-family: var(--font-mono); }
+.leader tr.leader__rig td { padding-top: 6px; padding-bottom: 6px; font-size: 14px; border-bottom-style: dashed; }
+.leader__rig-label { display: block; padding-left: 18px; color: var(--text-muted); position: relative; }
+.leader__rig-label::before { content: "\21B3"; position: absolute; left: 0; }
+.leader tr.leader__group th { font-size: 14px; text-transform: none; letter-spacing: 0; color: var(--text); background: var(--surface-2); }
+.meter--sub > span { opacity: .55; }
+.meter { display: block; height: 8px; border-radius: 999px; background: var(--surface-3); overflow: hidden; min-width: 80px; }
+.meter > span { display: block; height: 100%; background: var(--primary); border-radius: 999px; }
+
+/* ----- Progress scrubber ----- */
+.scrub { display: grid; gap: 12px; }
+.scrub input[type="range"] { width: 100%; accent-color: var(--primary); height: 28px; }
+.scrub__meta { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; font-size: 14px; color: var(--text-muted); }
+.scrub__meta strong { color: var(--text); font-family: var(--font-mono); font-weight: 400; }
+
+/* ----- Activity feed ----- */
+.feed { list-style: none; margin: 0; padding: 0; }
+.feed li { display: grid; grid-template-columns: 92px 1fr; gap: 14px; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 15px; }
+.feed time { color: var(--text-muted); font-size: 13px; font-family: var(--font-mono); }
+@media (max-width: 560px) { .feed li { grid-template-columns: 1fr; gap: 2px; } }
+
+/* ----- Charts (js/svg-charts.js). Colours arrive as inline style custom properties. ----- */
+.chart { width: 100%; height: auto; color: var(--text); overflow: hidden; }
+.chart text { fill: currentColor; font-family: var(--font-prop); font-size: 12px; }
+.chart .chart__muted { fill: var(--text-muted); }
+.chart .chart__value { font-family: var(--font-mono); font-size: 11.5px; }
+.chart__axis { stroke: var(--border); stroke-width: 1; }
+.chart__grid { stroke: var(--border); stroke-width: 1; stroke-dasharray: 3 4; opacity: .7; }
+.chart__bar { fill: var(--c, var(--primary)); }
+.chart__line { fill: none; stroke: var(--c, var(--primary)); stroke-width: 2; }
+.chart__area { fill: var(--c, var(--primary)); opacity: .16; }
+.chart__marker { fill: var(--c, var(--gold)); stroke: var(--surface-0); stroke-width: 1.5; }
+.chart__cursor { stroke: var(--text); stroke-width: 1.5; stroke-dasharray: 4 3; }
+.chart-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 13px; color: var(--text-muted); margin: 6px 0 0; padding: 0; list-style: none; }
+.chart-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; background: var(--c); }
+
+/* ----- Frames table (dashboard) ----- */
+.table-scroll { position: relative; overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-1); }
+.table-scroll .data-table { min-width: 760px; }
+
+/* ----- Drop zone / misc ----- */
+.code-input { font-family: var(--font-mono); font-size: 22px; letter-spacing: .16em; text-transform: uppercase; text-align: center; }
+
+/* ----- Mosaic: the console's Mosaic tab, the dashboard's "Your panels", the project page's panel grid ----- */
+.mosaic-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px 16px; }
+.mosaic-form .form__row { min-width: 0; }
+.mosaic-canvas-wrap { position: relative; background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--radius); padding: 6px; }
+.mosaic-canvas { display: block; width: 100%; height: min(70vh, 560px); touch-action: pan-y; cursor: crosshair; border-radius: var(--radius-sm); }
+.mosaic-canvas:focus-visible { outline: 3px solid var(--primary); outline-offset: 2px; }
+.mosaic-canvas--public { height: auto; aspect-ratio: 4 / 3; cursor: pointer; }
+.mosaic-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; list-style: none; margin: 10px 0 0; padding: 0; font-size: 14px; }
+.mosaic-swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; border: 1px solid var(--border-input); }
+.mosaic-swatch--claimed { background: transparent !important; border-style: dashed; border-width: 2px; }
+.mosaic-status { min-height: 1.4em; margin: 8px 0 0; font-size: 14px; color: var(--text-muted); }
+.mosaic-tools { display: flex; flex-wrap: wrap; gap: 12px 18px; align-items: flex-end; margin-bottom: 12px; }
+.mosaic-tools .form__row { width: auto; min-width: 150px; }
+.mosaic-tools select, .mosaic-tools input[type="number"], .mosaic-tools input[type="text"] { background: var(--surface-1); color: var(--text); border: 1px solid var(--border-input); border-radius: 10px; padding: 8px 12px; font: inherit; }
+.mosaic-tools input[type="number"] { width: 110px; }
+.mosaic-grid-2 { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr); gap: 20px; align-items: start; }
+@media (max-width: 980px) { .mosaic-grid-2 { grid-template-columns: minmax(0, 1fr); } }
+.mosaic-table-wrap { max-height: 320px; overflow: auto; }
+.mosaic-pick { background: var(--surface-1); color: var(--text); border: 1px solid var(--border-input); border-radius: 10px; padding: 8px 12px; font: inherit; max-width: 100%; }
+.pointings { font-family: var(--font-mono); font-size: 13px; }
+.panel-card { background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
+.panel-card + .panel-card { margin-top: 12px; }
+.panel-card h4 { margin: 0 0 6px; font-size: 16px; }
+.panel-card dl.kv dd { font-family: var(--font-mono); font-size: 14px; word-break: break-word; }
+.mosaic-picker-img { max-width: 100%; height: auto; }
+
+
+/* ----- Deep zoom: "Explore full resolution" (MOSAIC_PLAN.md phase 6). The stage is dark in both themes, like the previews: the gold has no
+   data where it is black, and a missing tile is blank. The controls above it are the page's own buttons. ----- */
+.dz__bar { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.dz__bar .row { gap: 8px; }
+.dz__stage { position: relative; width: 100%; height: min(68vh, 640px); min-height: 300px; background: var(--preview-bg); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.dz__stage:fullscreen { height: 100%; border: none; border-radius: 0; }
+.dz__stage .openseadragon-container, .dz__stage .openseadragon-canvas { outline: none; }
+.dz__stage:focus-within { outline: 2px solid var(--primary); outline-offset: 2px; }
+.dz__stage .openseadragon-canvas:focus-visible { outline: none; }
+.dz__status { position: absolute; inset: 0; display: grid; place-items: center; color: var(--preview-text); font-size: 14px; pointer-events: none; text-align: center; padding: 16px; }
+.dz__help { font-size: 13px; margin: 8px 0 0; }
+.dz__info { margin: 0 0 10px; font-size: 14px; }
+@media (max-width: 560px) { .dz__stage { height: min(60vh, 460px); min-height: 260px; } }
+
+/* Dashboard (My projects, My frames) */
+.dash-nav { margin: 12px 0 28px; }
+.dash-stats { grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr)); margin: 0 0 14px; }
+.dash-stat { font-size: 22px; }
+.dash-stat small { color: var(--text-muted); font-size: 14px; }
+.dash-title { margin: 0; }
+.dash-sub { margin: 6px 0 12px; }
+.dash-hub { margin: 0; font-size: 14px; color: var(--text-muted); }
+.dash-select { background: var(--surface-1); color: var(--text); border: 1px solid var(--border-input); border-radius: 10px; padding: 8px 12px; font: inherit; }
+.dash-file { min-width: 16ch; max-width: 260px; overflow-wrap: anywhere; }
+.dash-why { min-width: 24ch; }
+.dash-small { font-size: 13px; }
+.dash-tiny { font-size: 12px; }

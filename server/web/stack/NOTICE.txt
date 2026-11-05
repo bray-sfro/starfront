@@ -1,0 +1,19 @@
+Starfront progress pages (server/web/stack/)
+
+Licence of these files
+  The HTML, CSS and JavaScript here were ported from the Rapid Stacker Collab
+  website (EKE Services LLC) and are released inside Starfront under the
+  Mozilla Public License 2.0, as the licence of Starfront itself (see the
+  LICENSE file at the root of this repository). Each file says so in its header.
+
+Third-party files (kept under their own licence, served unmodified)
+
+  js/vendor/openseadragon/openseadragon.min.js
+    OpenSeadragon 4.1.1 (built 2024-04-01), the deep-zoom viewer.
+    Copyright (C) 2009 CodePlex Foundation
+    Copyright (C) 2010-2024 OpenSeadragon contributors
+    BSD-3-Clause. The licence text is in js/vendor/openseadragon/LICENSE.txt and
+    the provenance (npm package, integrity hash, SHA-256) in
+    js/vendor/openseadragon/NOTICE.txt. Home: https://openseadragon.github.io/
+
+Fonts: none are bundled. The pages use the system font stack.

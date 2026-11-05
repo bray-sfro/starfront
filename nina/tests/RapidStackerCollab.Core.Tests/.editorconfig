@@ -1,0 +1,12 @@
+root = true
+
+[*]
+charset = utf-8
+insert_final_newline = true
+
+[*.cs]
+# Every C# source file of RapidStackerCollab.Core carries the MPL-2.0 notice (IDE0073), as upstream requires;
+# the build enforces it, so a new file without the header fails to compile. This file is scoped to this folder
+# (root = true): Starfront's own sources carry no header.
+file_header_template = This Source Code Form is subject to the terms of the Mozilla Public\nLicense, v. 2.0. If a copy of the MPL was not distributed with this\nfile, You can obtain one at https://mozilla.org/MPL/2.0/.
+dotnet_diagnostic.IDE0073.severity = error

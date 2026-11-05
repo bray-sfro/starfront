@@ -1,0 +1,84 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+ * If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ * Ported from Rapid Stacker Collab (EKE Services LLC).
+ */
+/* Page-level layout. Copied from the Astro Tools hub (photon-ledger-website/website/css/pages.css, EKE Services
+   LLC) and trimmed to what this site uses. */
+
+/* ===== Home ===== */
+.how { counter-reset: step; display: grid; gap: 18px; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+@media (max-width: 760px) { .how { grid-template-columns: 1fr; } }
+.how__step { background: var(--surface-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px; }
+.how__step::before {
+  counter-increment: step; content: counter(step);
+  display: inline-grid; place-items: center;
+  width: 32px; height: 32px; border-radius: 999px;
+  background: var(--primary); color: var(--on-primary); font-weight: 700;
+  font-family: var(--font-mono); margin-bottom: 10px;
+}
+
+.faq__item { border-bottom: 1px solid var(--border); padding: 14px 0; }
+.faq__item summary {
+  cursor: pointer; font-weight: 600; padding: 6px 0;
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  list-style: none;
+}
+.faq__item summary::-webkit-details-marker { display: none; }
+.faq__item summary::after { content: "+"; color: var(--link); font-size: 22px; }
+.faq__item[open] summary::after { content: "\2212"; }
+.faq__item p { color: var(--text-muted); margin: 8px 0 0; }
+
+.fields-table {
+  width: 100%; border-collapse: collapse; font-size: 14px;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden;
+}
+.fields-table th, .fields-table td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--border); vertical-align: top; }
+.fields-table th { background: var(--surface-2); font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-muted); }
+.fields-table tr:last-child td { border-bottom: none; }
+.fields-table code { color: var(--link); }
+
+/* ===== Docs ===== */
+.docs-layout { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 36px; align-items: start; }
+@media (max-width: 860px) { .docs-layout { grid-template-columns: minmax(0, 1fr); } }
+.docs-side {
+  position: sticky; top: 82px;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 18px; align-self: start;
+}
+@media (max-width: 860px) { .docs-side { position: static; } }
+.docs-side h2 { font-size: 13px; text-transform: uppercase; color: var(--text-muted); letter-spacing: .1em; margin: 0 0 10px; }
+.docs-side ul { list-style: none; padding: 0; margin: 0 0 18px; }
+.docs-side li { padding: 4px 0; }
+.docs-side a { color: var(--text); border: none; }
+.docs-side a:hover, .docs-side a[aria-current="page"] { color: var(--link); }
+.docs-side a[aria-current="page"] { font-weight: 700; }
+
+.prose { max-width: 72ch; }
+.prose h2 { margin-top: 1.6em; }
+.prose h3 { margin-top: 1.4em; }
+.prose ul, .prose ol { padding-left: 1.4em; }
+.prose li { margin: .25em 0; }
+.prose hr { border: none; border-top: 1px solid var(--border); margin: 2.4em 0; }
+.prose :target { scroll-margin-top: 84px; }
+.prose figure { margin: 12px 0 18px; }
+.prose figcaption { font-size: 13px; color: var(--text-muted); margin-top: 6px; }
+
+.breadcrumb { font-size: 13px; color: var(--text-muted); margin: 0 0 14px; }
+.breadcrumb ol { list-style: none; display: flex; flex-wrap: wrap; gap: 6px; margin: 0; padding: 0; }
+.breadcrumb li + li::before { content: "/"; margin-right: 6px; opacity: .6; }
+.breadcrumb a { color: var(--text-muted); border: none; }
+.breadcrumb a:hover { color: var(--link-hover); }
+.breadcrumb [aria-current="page"] { color: var(--text); }
+
+/* ===== Account / 404 ===== */
+.center-form {
+  max-width: 480px; margin: 0 auto;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: var(--radius-lg); padding: 28px;
+}
+
+/* Utilities that replace inline style attributes, which the CSP on /stack/ would otherwise have to allow. */
+.svg-defs { position: absolute; }
+.mt-28 { margin-top: 28px; }
+.mt-36 { margin-top: 36px; }

@@ -20,6 +20,19 @@ $dist = Join-Path $PSScriptRoot "dist"
 New-Item -ItemType Directory -Force $build | Out-Null
 New-Item -ItemType Directory -Force $dist | Out-Null
 
+# An Anaconda Python, or a venv made from one, keeps the DLLs its own modules
+# load (libffi for _ctypes, OpenSSL, sqlite, lzma) in the base install's
+# Library\bin, and PyInstaller does not look there. Left off PATH they are left
+# out of the build, which finishes cleanly and then dies at start with "DLL load
+# failed while importing _ctypes": 0.2.44's first build did. A python.org
+# Python has no Library\bin, so this changes nothing there.
+$basePrefix = (python -c "import sys; print(sys.base_prefix)").Trim()
+$condaBin = Join-Path $basePrefix "Library\bin"
+if (Test-Path $condaBin) {
+    Write-Host "== Anaconda's DLLs from $condaBin"
+    $env:PATH = "$condaBin;$env:PATH"
+}
+
 Write-Host "== icon"
 python (Join-Path $PSScriptRoot "make_icon.py") (Join-Path $build "starfront.ico")
 

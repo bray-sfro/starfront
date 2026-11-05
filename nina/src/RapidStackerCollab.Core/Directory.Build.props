@@ -1,0 +1,24 @@
+<Project>
+  <!-- RapidStackerCollab.Core is copied from the Rapid Stacker Collab repository
+       (see SOURCE.md) and is built to that project's rules, not Starfront's: no
+       WPF, nullable on, every warning an error, and the MPL header on every
+       file (.editorconfig). Starfront's Directory.Build.props above this one
+       would otherwise turn a net8.0 class library into a WPF project. -->
+  <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+  <PropertyGroup>
+    <UseWPF>false</UseWPF>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <WarningLevel>9999</WarningLevel>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <Authors>EKE Services LLC</Authors>
+    <Company>EKE Services LLC</Company>
+    <Product>Rapid Stacker Collab</Product>
+    <Copyright>Copyright (c) 2026 EKE Services LLC. Mozilla Public License 2.0.</Copyright>
+    <!-- Upstream's version unless the Starfront release passes -p:Version, in
+         which case the Core assembly carries the plugin's version like the rest. -->
+    <Version Condition="'$(Version)' == ''">0.1.0.0</Version>
+    <AssemblyVersion>$(Version)</AssemblyVersion>
+    <FileVersion>$(Version)</FileVersion>
+  </PropertyGroup>
+</Project>

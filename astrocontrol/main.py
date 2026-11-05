@@ -24,6 +24,8 @@ from . import (allsky, astro, autoplan, calibrating, calibration, catalog,
                piercam, plans, safety, schedule, solarsystem, survey)
 from . import collab
 from . import filters
+from . import hub as hubmod
+from . import volunteer as volunteermod
 from . import identify
 from . import ninaimport
 from . import warnings
@@ -96,6 +98,15 @@ collab_client.start()
 # than contributing to one. Stateless, starts nothing, and holds the coordinator
 # token so it never has to reach the browser.
 collab_admin = collabadmin.CollabAdmin(config)
+
+# The collaboration hub this machine may host: the child process, its
+# configuration and its log. Started from the startup hook, and only if the
+# person turned it on; nothing here runs at import.
+hub_supervisor = hubmod.HubSupervisor(config, log=rigs.log)
+
+# This machine as a volunteer worker for somebody's hub: fetching, verifying
+# and installing `collab-worker` (and `collab-hub`). Starts nothing at import.
+volunteer_service = volunteermod.Volunteer(config, log=rigs.log, hub=hub_supervisor)
 
 # Telling somebody who is not in the room.
 notifier = notify.Notifier(config, log=rigs.log)
@@ -442,6 +453,20 @@ class CollabAgentRequest(BaseModel):
     owner: str = Field(default="", max_length=80)
 
 
+class CollabStackingRequest(BaseModel):
+    """Where a collaboration's lights are stacked; the server checks it.
+
+    Blank `backend` is none; `cloud` is the Rapid Stacker Collab project the
+    server makes and keeps (`joinCode` only to keep an old pasted one); `hub`
+    needs `hubId` (one the signed-in person owns, or coordinates).
+    """
+
+    backend: str = Field(default="", pattern="^(cloud|hub|)$")
+    joinCode: str = Field(default="", max_length=40)
+    hubId: str = Field(default="", max_length=80)
+    visibility: str | None = Field(default=None, pattern="^(public|unlisted|private)$")
+
+
 class CollabProjectRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     # A rectangle of sky: ra/dec/width/height/rotation, degrees throughout.
@@ -460,6 +485,12 @@ class CollabProjectRequest(BaseModel):
     notes: str = Field(default="", max_length=2000)
     # Collect contributors' lights on the server, for stacking.
     collectFiles: bool = False
+    # The Rapid Stacker Collab join code that stacks the lights as they land;
+    # blank for none. The server checks and normalises it.
+    stackingJoinCode: str = Field(default="", max_length=40)
+    # The fuller form (cloud join code, or one of your hubs). Wins over the
+    # join code above when both are sent.
+    stacking: CollabStackingRequest | None = None
 
 
 class CollabDelegateRequest(BaseModel):
@@ -1218,6 +1249,11 @@ def _snapshot() -> dict[str, Any]:
         "notify": notifier.status(),
         "filterOffsets": offsets_run.status(),
         "collab": {**collab_client.status(), "me": _me_brief()},
+        # State, address, worker count and last error: a snapshot, never a
+        # call to the hub, so a hub that hangs cannot slow this feed.
+        "hub": hub_supervisor.summary(),
+        # Installed or not, the service, and what an install is doing now.
+        "volunteer": volunteer_service.summary(),
         # The run, plus where the library resolved to — the settings form shows
         # the folder a blank field actually means.
         "calibration": {**calibrator.status(), "libraryRoot": str(library.root)},
@@ -3018,6 +3054,67 @@ def collab_activity() -> dict[str, Any]:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
+@app.get("/api/collab/hubs")
+def collab_hubs() -> dict[str, Any]:
+    """The hubs the signed-in person has registered, for the stacking picker.
+
+    Fetched as the person (never as a telescope), because the server lists
+    only the hubs its caller owns.
+    """
+    return {"hubs": _admin(collab_admin.hubs)}
+
+
+class CollabCloudLinkRequest(BaseModel):
+    token: str = Field(min_length=1, max_length=120)
+    apiBase: str = Field(default="", max_length=200)
+
+
+@app.get("/api/collab/stacking")
+def collab_stacking() -> dict[str, Any]:
+    """What the Live stacking fieldset offers the signed-in person: the hubs
+    they may bind to, the default a new collaboration gets, their Rapid
+    Stacker Collab link, and their deleted collaborations still restorable."""
+    return _admin(collab_admin.stacking_options)
+
+
+@app.post("/api/collab/stacking/cloud")
+def collab_link_cloud(body: CollabCloudLinkRequest) -> dict[str, Any]:
+    """Link the person's Rapid Stacker Collab account on the server, once.
+
+    Passed straight through and kept nowhere here: the server checks the token
+    and keeps it (sealed), so it never sits in this program's settings file.
+    """
+    return _admin(collab_admin.link_cloud, body.token.strip(), body.apiBase.strip())
+
+
+@app.post("/api/collab/stacking/cloud/unlink")
+def collab_unlink_cloud() -> dict[str, Any]:
+    return _admin(collab_admin.unlink_cloud)
+
+
+@app.get("/api/collab/projects/{project_id}/stacking")
+def collab_project_stacking(project_id: str) -> dict[str, Any]:
+    """Where a collaboration you started is stacked, and how that is going."""
+    return _admin(collab_admin.project_stacking, project_id)
+
+
+@app.post("/api/collab/projects/{project_id}/delete")
+def collab_delete_project(project_id: str) -> dict[str, Any]:
+    """Delete a stacked collaboration: restorable for seven days (D004)."""
+    made = _admin(collab_admin.delete_project, project_id)
+    with contextlib.suppress(Exception):
+        collab_client.poll()
+    return {**made, "state": _collab_state()}
+
+
+@app.post("/api/collab/projects/{project_id}/restore")
+def collab_restore_project(project_id: str) -> dict[str, Any]:
+    made = _admin(collab_admin.restore_project, project_id)
+    with contextlib.suppress(Exception):
+        collab_client.poll()
+    return {**made, "state": _collab_state()}
+
+
 @app.post("/api/collab/projects")
 def collab_add_project(body: CollabProjectRequest) -> dict[str, Any]:
     source = body.region
@@ -3043,7 +3140,8 @@ def collab_add_project(body: CollabProjectRequest) -> dict[str, Any]:
     made = _admin(collab_admin.add_project, body.name.strip(), region,
                   body.requirements, body.goals,
                   str(config.get("collab", "coordinator", "") or ""),
-                  body.notes, kind, body.collectFiles)
+                  body.notes, kind, body.collectFiles, body.stackingJoinCode,
+                  body.stacking.model_dump(exclude_none=True) if body.stacking else None)
     # So it appears in the list straight away. A collaboration you started that
     # you cannot see is one you cannot join, and the list is fetched as an
     # *agent* while this was created as a coordinator — two different calls, and
@@ -3094,6 +3192,9 @@ class CollabProjectUpdateRequest(BaseModel):
     goals: dict[str, float] | None = None
     notes: str | None = Field(default=None, max_length=2000)
     collectFiles: bool | None = None
+    # Sent only when the coordinator changed it; blank clears it.
+    stackingJoinCode: str | None = Field(default=None, max_length=40)
+    stacking: CollabStackingRequest | None = None
     status: str | None = Field(default=None, pattern="^(open|closed)$")
 
 
@@ -3686,10 +3787,15 @@ def get_settings(rig: str | None = None) -> dict[str, Any]:
         collab_settings["adminToken"] = "***"
     if collab_settings.get("userToken"):
         collab_settings["userToken"] = "***"
+    # The hub's own administration token is no different.
+    hub_settings = dict(everything.get("hub") or {})
+    if hub_settings.get("adminToken"):
+        hub_settings["adminToken"] = "***"
     return {
         **everything,
         "notify": notify_settings,
         "collab": collab_settings,
+        "hub": hub_settings,
         "site": {**config.section("site"),
                  "effective": effective_site(config, target.manager)},
         "rig": target.id,
@@ -6772,6 +6878,196 @@ def delete_profile(profile_id: str) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# The collaboration hub on this machine
+# ---------------------------------------------------------------------------
+#
+# Every handler here either reads a snapshot or sets a flag the supervising
+# thread acts on, so a hub that hangs, crashes or is slow to stop never holds a
+# request. The two that talk over the network (register, enrol-code) are plain
+# `def` handlers and so run in the thread pool, like the collaboration ones.
+
+class HubSettingsRequest(BaseModel):
+    enabled: bool | None = None
+    binary: str | None = Field(default=None, max_length=1024)
+    configDir: str | None = Field(default=None, max_length=1024)
+    dataRoot: str | None = Field(default=None, max_length=1024)
+    catalogueDir: str | None = Field(default=None, max_length=1024)
+    catalogueMacos: str | None = Field(default=None, max_length=1024)
+    catalogueWindows: str | None = Field(default=None, max_length=1024)
+    catalogueLinux: str | None = Field(default=None, max_length=1024)
+    bind: str | None = Field(default=None, pattern=r"^[A-Za-z0-9_.:\[\]-]*:[0-9]{1,5}$")
+    publicUrl: str | None = Field(default=None, max_length=512)
+    adminToken: str | None = Field(default=None, max_length=256)
+    autoStart: bool | None = None
+
+
+class HubRegisterRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    force: bool = False
+
+
+class HubEnrolRequest(BaseModel):
+    kind: str = Field(default="worker", pattern="^(worker|uploader)$")
+    note: str = Field(default="", max_length=200)
+    ttl_s: int = Field(default=900, ge=60, le=86400)
+
+
+def _hub_error(exc: collabadmin.CollabError) -> HTTPException:
+    return HTTPException(status_code=exc.status or 502, detail=str(exc))
+
+
+@app.get("/api/hub")
+def get_hub() -> dict[str, Any]:
+    return {**hub_supervisor.status(), "install": volunteer_service.hub_installer.progress.snapshot()}
+
+
+@app.post("/api/settings/hub")
+def set_hub_settings(body: HubSettingsRequest) -> dict[str, Any]:
+    """No generic `/api/settings/<section>` exists, so the hub has its own."""
+    values = body.model_dump(exclude_none=True)
+    if not values:
+        raise HTTPException(status_code=400, detail="nothing to change")
+    # The form shows a mask where the token is stored (see set_collab_settings).
+    if values.get("adminToken") == "***":
+        values.pop("adminToken")
+    config.update("hub", values)
+    return hub_supervisor.status()
+
+
+@app.post("/api/hub/start")
+def start_hub() -> dict[str, Any]:
+    hub_supervisor.start()
+    return hub_supervisor.status()
+
+
+@app.post("/api/hub/stop")
+def stop_hub() -> dict[str, Any]:
+    hub_supervisor.request_stop()
+    return hub_supervisor.status()
+
+
+@app.post("/api/hub/check")
+def check_hub() -> dict[str, Any]:
+    """Run `collab-hub check` in the background; the report arrives in /api/hub."""
+    hub_supervisor.check_async()
+    return hub_supervisor.status()
+
+
+@app.post("/api/hub/register")
+def register_hub(body: HubRegisterRequest) -> dict[str, Any]:
+    try:
+        hub_supervisor.register(body.name, force=body.force)
+    except collabadmin.CollabError as exc:
+        raise _hub_error(exc) from exc
+    return hub_supervisor.status()
+
+
+@app.post("/api/hub/enrol-code")
+def hub_enrol_code(body: HubEnrolRequest | None = None) -> dict[str, Any]:
+    body = body or HubEnrolRequest()
+    try:
+        return hub_supervisor.new_enrol_code(body.kind, body.note, body.ttl_s)
+    except collabadmin.CollabError as exc:
+        raise _hub_error(exc) from exc
+    except Exception as exc:                       # noqa: BLE001 - e.g. the binary vanished
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.post("/api/hub/install")
+def install_hub() -> dict[str, Any]:
+    """Download, verify and install `collab-hub` where the supervisor looks for it."""
+    if not volunteer_service.install_hub(hub_supervisor.binary()):
+        raise HTTPException(status_code=409, detail="the hub is already being installed")
+    return get_hub()
+
+
+@app.get("/api/hub/log")
+def hub_log(n: int = Query(200, ge=1, le=500)) -> dict[str, Any]:
+    return {"lines": hub_supervisor.log_lines(n)}
+
+
+class VolunteerSettingsRequest(BaseModel):
+    enabled: bool | None = None
+    hubUrl: str | None = Field(default=None, max_length=512)
+    workerId: str | None = Field(default=None, pattern=r"^[a-z0-9-]{0,40}$")
+    idlePolicy: str | None = Field(default=None, pattern=r"^(always|when_idle)$")
+    pauseWhileSequencing: bool | None = None
+    pauseWhileNina: bool | None = None
+    workWindow: str | None = Field(default=None, pattern=r"^([0-9]{1,2}:[0-9]{2}-[0-9]{1,2}:[0-9]{2})?$")
+    scratchDir: str | None = Field(default=None, max_length=1024)
+    scratchCapGb: int | None = Field(default=None, ge=0, le=100000)
+    manifestUrl: str | None = Field(default=None, max_length=512)
+
+
+class VolunteerInstallRequest(BaseModel):
+    code: str = Field(default="", max_length=32)
+    hubUrl: str = Field(default="", max_length=512)
+    workerId: str = Field(default="", pattern=r"^[a-z0-9-]{0,40}$")
+
+
+def _volunteer_started(started: bool, what: str) -> dict[str, Any]:
+    if not started:
+        raise HTTPException(status_code=409, detail="the worker is busy with another step")
+    return volunteer_service.status()
+
+
+@app.get("/api/volunteer")
+def get_volunteer() -> dict[str, Any]:
+    return volunteer_service.status()
+
+
+@app.post("/api/settings/volunteer")
+def set_volunteer_settings(body: VolunteerSettingsRequest) -> dict[str, Any]:
+    values = body.model_dump(exclude_none=True)
+    if not values:
+        raise HTTPException(status_code=400, detail="nothing to change")
+    config.update("volunteer", values)
+    with contextlib.suppress(Exception):
+        volunteer_service.apply_settings()         # into the worker's TOML, if enrolled
+    return volunteer_service.status()
+
+
+@app.post("/api/volunteer/install")
+def volunteer_install(body: VolunteerInstallRequest | None = None) -> dict[str, Any]:
+    body = body or VolunteerInstallRequest()
+    return _volunteer_started(
+        volunteer_service.install(body.code, body.hubUrl, body.workerId), "install")
+
+
+@app.post("/api/volunteer/update")
+def volunteer_update() -> dict[str, Any]:
+    return _volunteer_started(volunteer_service.update(), "update")
+
+
+@app.post("/api/volunteer/uninstall")
+def volunteer_uninstall() -> dict[str, Any]:
+    return _volunteer_started(volunteer_service.uninstall(), "uninstall")
+
+
+@app.post("/api/volunteer/start")
+def volunteer_start() -> dict[str, Any]:
+    return _volunteer_started(volunteer_service.control("start"), "start")
+
+
+@app.post("/api/volunteer/stop")
+def volunteer_stop() -> dict[str, Any]:
+    return _volunteer_started(volunteer_service.control("stop"), "stop")
+
+
+@app.get("/api/volunteer/status")
+def volunteer_status() -> dict[str, Any]:
+    """The service's status as last read; a fresh read runs in the background."""
+    volunteer_service.refresh_status()
+    return volunteer_service.status()
+
+
+@app.on_event("startup")
+def _start_hub() -> None:
+    with contextlib.suppress(Exception):
+        hub_supervisor.start_if_enabled()
+
+
+# ---------------------------------------------------------------------------
 # Live status
 # ---------------------------------------------------------------------------
 
@@ -6792,6 +7088,8 @@ async def status_socket(socket: WebSocket) -> None:
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
+    with contextlib.suppress(Exception):
+        hub_supervisor.shutdown()
     with contextlib.suppress(Exception):
         safety_watcher.stop()
     with contextlib.suppress(Exception):

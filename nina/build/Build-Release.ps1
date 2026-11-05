@@ -23,9 +23,11 @@ function Invoke-Dotnet([string[]]$Arguments) {
     if ($LASTEXITCODE) { throw "dotnet failed with exit code $LASTEXITCODE." }
 }
 $root = Split-Path $PSScriptRoot
-$project = @(Get-ChildItem -LiteralPath (Join-Path $root 'src') -Filter *.csproj -Recurse)
-if ($project.Count -ne 1) { throw 'Expected one plugin project under src.' }
-$project = $project[0].FullName
+# The plugin project by name: src/ also holds RapidStackerCollab.Core, the
+# upload engine the plugin references and ships, so "the one csproj under src"
+# no longer picks it out.
+$project = Join-Path $root 'src/Starfront.Collab/Starfront.Collab.csproj'
+if (-not (Test-Path -LiteralPath $project -PathType Leaf)) { throw "Plugin project not found: $project" }
 $repositoryUrl = "https://github.com/$Repository"
 
 Invoke-Dotnet @('restore', $project)

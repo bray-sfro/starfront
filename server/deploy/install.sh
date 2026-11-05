@@ -106,7 +106,8 @@ fi
 # The server needs FastAPI and uvicorn only; the desktop and Windows bits are
 # left out on purpose.
 "$APP/venv/bin/pip" install -q --upgrade pip
-"$APP/venv/bin/pip" install -q "fastapi>=0.110" "uvicorn[standard]>=0.27" "numpy>=1.24"
+"$APP/venv/bin/pip" install -q "fastapi>=0.110" "uvicorn[standard]>=0.27" "numpy>=1.24" \
+    "python-multipart>=0.0.18"
 chown -R root:root "$APP"
 chmod -R a+rX "$APP"
 if [[ -d "$OLD_APP" ]]; then

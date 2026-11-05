@@ -2419,3 +2419,16 @@ label.inline.compact input[type="range"] { width: 150px; margin-top: 0; }
 .col-join .btn.primary { white-space: nowrap; }
 .collab-share { margin: 0 0 8px; }
 .collab-share b { color: var(--good); margin-right: 6px; }
+
+/* Live stacking on the collaboration form, the hub and the volunteer section. */
+.col-stacking { border: 1px solid var(--line); border-radius: 6px; margin: 10px 0 0; padding: 6px 10px 8px; }
+.col-stacking legend { padding: 0 6px; font-size: 12px; color: var(--muted); }
+.col-stacking select { max-width: 100%; }
+.col-pre {
+  max-height: 220px; overflow: auto; margin: 6px 0 0; padding: 6px 8px;
+  white-space: pre-wrap; word-break: break-word;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px;
+}
+.col-enrol { display: flex; align-items: center; gap: 10px; margin: 4px 0 8px; }
+.col-enrol-code { font-size: 26px; letter-spacing: 0.12em; user-select: all; }
+#hubFleet table { width: 100%; }

@@ -28,6 +28,11 @@ $entries = foreach ($line in Get-Content -LiteralPath $FileList) {
 $entries = @($entries)
 if ($entries.Count -eq 0) { throw 'Nothing to stage.' }
 if (@($entries.Target | Sort-Object -Unique).Count -ne $entries.Count) { throw 'Duplicate package destination.' }
+# N.I.N.A. supplies its own copies of everything it exports, and a second copy
+# of one of them in a plugin folder breaks composition; nothing of N.I.N.A.'s
+# may ever be staged, whatever the package list says.
+$hostOwned = @($entries | Where-Object { (Split-Path -Leaf $_.Relative) -like 'NINA.*' })
+if ($hostOwned.Count) { throw "Refusing to ship N.I.N.A.'s own assemblies: $($hostOwned.Relative -join ', ')" }
 
 if (Test-Path -LiteralPath $destinationRoot) {
     if (-not (Test-Path -LiteralPath (Join-Path $destinationRoot $marker))) {

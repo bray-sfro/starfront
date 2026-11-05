@@ -1,11 +1,18 @@
 # Core
 fastapi>=0.110
 uvicorn[standard]>=0.27
+# Form parsing (Starlette's request.form()): the hub's multipart push to the
+# server needs it, and neither fastapi nor uvicorn[standard] brings it.
+python-multipart>=0.0.18
 numpy>=1.24
 
 # The application window (Edge WebView2 on Windows).  Only needed for the
 # desktop window; `python run.py --browser` runs without it.
 pywebview>=5.0
+
+# Checks the Ed25519 signature on a downloaded worker release (volunteer.py).
+# Without it a pure-Python verifier is used, so the check is never skipped.
+cryptography>=41
 
 # Windows only, for ASCOM Platform (COM) drivers
 pywin32>=306 ; sys_platform == "win32"

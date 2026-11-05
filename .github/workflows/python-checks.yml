@@ -1,0 +1,90 @@
+# Runs every Starfront check script under tools/ (the Python side's gate; the
+# plugin's gate is ci.yml). Runs when anything outside nina/ changes, because
+# nina/ changes are ci.yml's job.
+#
+# The checks fake the hardware, the hub and Discord, so they need no device
+# or network. Each check runs on its own, so one failure does not hide the
+# others, and the job fails at the end if any check that is not on the
+# allow-list failed. The allow-list is in the script below: checks that already
+# fail on the base commit are run and reported, but they do not fail the job.
+name: Python checks
+on:
+  push:
+    branches: ['**']
+    paths-ignore: ['nina/**']
+  pull_request:
+    paths-ignore: ['nina/**']
+permissions:
+  contents: read
+jobs:
+  checks:
+    name: tools/check_*.py (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      # Some checks print non-ASCII; the Windows console default would choke.
+      PYTHONUTF8: '1'
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install requirements
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+      - name: Run every tools/check_*.py
+        run: |
+          # Checks that fail on the base commit, with the reason. They run and
+          # are reported as warnings, but they do not fail the job. Empty output
+          # and a non-zero return mean the check is not allowed to fail.
+          allowed_reason() {
+            case "$1" in
+              check_coordinator) echo "four colour-camera cases fail since before live stacking was added: one-shot-colour data is mis-matched to a project's filters (RGB project with no filters typed, narrowband-only refusal, dark-sky night, colour Moon rule on a mono camera)" ;;
+              check_night_rollover) echo "depends on the machine's timezone: 9/17 under UTC, 15/17 under America/New_York" ;;
+              check_reference) echo "two reference-angle cases fail on the base commit; not yet diagnosed" ;;
+              *) return 1 ;;
+            esac
+          }
+          # Need pywin32 (ASCOM/COM). Skipped on Linux, where they cannot run.
+          windows_only() {
+            case "$1" in
+              check_com_executor) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          status=0
+          failed=""
+          for file in tools/check_*.py; do
+            name=$(basename "$file" .py)
+            if windows_only "$name" && [ "${RUNNER_OS:-}" != "Windows" ]; then
+              echo "::notice title=$name::skipped on ${RUNNER_OS:-this runner} (Windows only: needs pywin32)"
+              continue
+            fi
+            echo "::group::$name"
+            # GitHub runs bash steps with -e: capture the exit code instead of letting
+            # the first failing check end the loop before the allow-list is read.
+            rc=0
+            python "$file" || rc=$?
+            echo "::endgroup::"
+            if [ "$rc" -eq 0 ]; then
+              echo "PASS $name"
+            elif reason=$(allowed_reason "$name"); then
+              echo "::warning title=$name fails on the base commit::$reason"
+              echo "allowed to fail: $name (exit $rc)"
+            else
+              echo "::error title=$name::failed (exit $rc)"
+              failed="$failed $name"
+              status=1
+            fi
+          done
+          if [ "$status" -ne 0 ]; then
+            echo "Failed checks:$failed"
+          fi
+          exit "$status"

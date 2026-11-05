@@ -1,0 +1,12 @@
+<svg width="64" height="64" viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Starfront">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7ee7a5"/>
+      <stop offset="1" stop-color="#4bb87a"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="url(#g)"/>
+  <rect x="14" y="14" width="30" height="30" rx="4" fill="#06180d" opacity=".35"/>
+  <rect x="19" y="19" width="30" height="30" rx="4" fill="#06180d" opacity=".6"/>
+  <path d="M34 22 Q36.4 31.6 46 34 Q36.4 36.4 34 46 Q31.6 36.4 22 34 Q31.6 31.6 34 22 Z" fill="#FFFFFF"/>
+</svg>

@@ -1,0 +1,70 @@
+<!doctype html>
+<!--
+  This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+  If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+  Ported from Rapid Stacker Collab (EKE Services LLC).
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>My projects — Starfront</title>
+  <meta name="description" content="Your live-stacking projects and how each of your frames was judged.">
+  <meta name="robots" content="noindex">
+  <meta name="theme-color" content="#0d1017" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f3f5f8" media="(prefers-color-scheme: light)">
+  <link rel="icon" type="image/svg+xml" href="/stack/favicon.svg">
+  <link rel="stylesheet" href="/stack/css/tokens.css">
+  <link rel="stylesheet" href="/stack/css/base.css">
+  <link rel="stylesheet" href="/stack/css/components.css">
+  <link rel="stylesheet" href="/stack/css/pages.css">
+  <link rel="stylesheet" href="/stack/css/collab.css">
+  <script src="/stack/js/theme-init.js"></script>
+  <script src="/stack/js/site-config.js"></script>
+</head>
+<body>
+
+<header id="site-nav"></header>
+
+<main id="main">
+<section class="section" id="dashboard-body">
+  <div class="container">
+    <p class="eyebrow">Dashboard</p>
+    <h1>Welcome, <span id="who"></span></h1>
+    <div id="signin" class="callout" hidden><p>Sign in with Discord to see your projects. <a id="signin-link" href="/files/signin?next=%2Fstack%2Fdashboard">Sign in</a></p></div>
+    <div id="dash" hidden>
+      <nav aria-label="Dashboard sections" class="row dash-nav">
+        <a class="btn btn-ghost btn--sm" href="#projects">My projects</a><a class="btn btn-ghost btn--sm" href="#frames">My frames</a>
+      </nav>
+
+      <section id="projects" aria-labelledby="projects-h" class="section--tight">
+        <div class="section-header"><h2 id="projects-h">My projects</h2><p>The stacking projects your telescopes have joined, and what is stacking them.</p></div>
+        <div id="projects-out"><p class="loading" role="status">Loading projects</p></div>
+      </section>
+
+      <section id="frames" aria-labelledby="frames-h" class="section--tight mt-36">
+        <div class="section-header"><h2 id="frames-h">My frames</h2><p>How each frame you uploaded was judged, and why. Only your own frames are listed.</p></div>
+        <div class="toolbar">
+          <div class="row">
+            <div class="form__row"><label for="fr-project">Project</label><select id="fr-project" class="dash-select"></select></div>
+            <div class="form__row"><label for="fr-status">Status</label><select id="fr-status" class="dash-select"><option value="">All</option><option value="accepted">Accepted</option><option value="accumulated">In the live stack</option><option value="in_gold">In gold</option><option value="rejected">Rejected</option><option value="quarantined">Quarantined</option><option value="uploading">Uploading</option><option value="failed">Failed</option><option value="withdrawn">Withdrawn</option></select></div>
+            <div class="form__row"><label for="fr-filter">Filter</label><select id="fr-filter" class="dash-select"><option value="">All</option><option>L</option><option>R</option><option>G</option><option>B</option><option>HA</option><option>OIII</option><option>SII</option><option value="UNKNOWN">Unknown</option></select></div>
+          </div>
+          <div class="row"><button class="btn btn-ghost btn--sm" type="button" id="fr-csv" disabled>Export CSV</button><span class="muted" id="fr-csv-note" role="status" aria-live="polite"></span></div>
+        </div>
+        <div id="frames-out"></div>
+        <p><button class="btn btn-ghost btn--sm" type="button" id="fr-more" hidden>Load more frames</button></p>
+        <p class="muted dash-small">Hover a reason for what it means.</p>
+      </section>
+    </div>
+    <noscript><p class="callout callout--warning">The dashboard needs JavaScript.</p></noscript>
+  </div>
+</section>
+</main>
+
+<footer id="site-footer"></footer>
+
+<script type="module" src="/stack/js/chrome.js"></script>
+<script type="module" src="/stack/js/pages/dashboard.js"></script>
+</body>
+</html>

@@ -6,6 +6,7 @@ using NINA.Profile.Interfaces;
 using NINA.WPF.Base.Interfaces.Mediator;
 using Starfront.Collab.Ledger;
 using Starfront.Collab.Server;
+using Starfront.Collab.Services.Stacking;
 using Starfront.Collab.Settings;
 
 namespace Starfront.Collab.Services {
@@ -35,6 +36,8 @@ namespace Starfront.Collab.Services {
         public static FrameLedger Ledger { get; private set; }
         public static FrameReporter Reporter { get; private set; }
         public static StarfrontSession Session { get; private set; }
+        /// <summary>Live stacking; built always, started only while its setting is on.</summary>
+        public static StackingUploader Stacking { get; private set; }
 
         public static void Ensure(HostServices host) {
             lock (Gate) {
@@ -47,6 +50,7 @@ namespace Starfront.Collab.Services {
                 Ledger.Load();
                 Reporter = new FrameReporter(host.ImageSave, Ledger);
                 Session = new StarfrontSession(host, Settings, Client, Ledger, Reporter);
+                Stacking = new StackingUploader(host, Settings, Reporter, Session);
                 Ready = true;
             }
         }
@@ -57,12 +61,16 @@ namespace Starfront.Collab.Services {
                 if (!Ready) return;
                 Reporter.Initialize();
                 Session.Start();
+                try { Stacking.Apply(); } catch (Exception ex) { Logger.Error("Starfront stacking could not start", ex); }
             }
         }
 
         public static void Shutdown() {
             lock (Gate) {
                 if (!Ready) return;
+                // Stacking first: it is fed by the image pipeline the reporter
+                // unhooks below, and nothing may land in a queue being closed.
+                try { Stacking.Dispose(); } catch (Exception ex) { Logger.Error(ex); }
                 try { Session.Stop(); } catch (Exception ex) { Logger.Error(ex); }
                 try { Reporter.Dispose(); } catch (Exception ex) { Logger.Error(ex); }
                 try { Ledger.Save(); } catch (Exception ex) { Logger.Error(ex); }

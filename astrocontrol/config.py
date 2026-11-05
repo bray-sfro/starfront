@@ -698,6 +698,42 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # what a mount did tonight would be the software going rogue.
         "autoAccept": False,
     },
+    # This machine as a host for the collaboration hub: the program runs
+    # collab-hub beside the telescope, so the hub's own settings are kept here
+    # and nowhere else.
+    "hub": {
+        "enabled": False,          # run the hub from this machine
+        "binary": "",              # blank means the copy installed under the data root
+        "configDir": "",           # blank means the default under the data root
+        "dataRoot": "",            # where the hub keeps its database and files
+        "catalogueDir": "",        # the star catalogue the hub hands out
+        # The same catalogue as each other OS's workers reach it (a share), e.g.
+        # \\nas\XPSD for Windows; blank means that OS's workers are told none.
+        "catalogueMacos": "",
+        "catalogueWindows": "",
+        "catalogueLinux": "",
+        "bind": "0.0.0.0:8790",    # address and port the hub listens on
+        "publicUrl": "",           # the address other machines reach it at
+        "adminToken": "",          # the hub's own administration token
+        "autoStart": True,         # start the hub when the program does
+        "registeredId": "",        # the hub's id on the Starfront server, once registered
+        "registeredName": "",      # and the name it was registered under
+    },
+    # This machine as a volunteer: it does collaboration work for a hub when it
+    # is idle, and never while the telescope is in use.
+    "volunteer": {
+        "enabled": False,          # offer this machine to a hub
+        "hubUrl": "",              # the hub it works for
+        "workerId": "",            # this worker's id, once enrolled
+        "idlePolicy": "when_idle", # when it is allowed to work
+        "pauseWhileSequencing": True,  # stop while a sequence is running
+        "pauseWhileNina": True,    # stop while N.I.N.A. is running
+        "workWindow": "",          # optional clock window, e.g. "22:00-07:00"
+        "scratchDir": "",          # where it keeps scratch files
+        "scratchCapGb": 0,         # most scratch space it may use, in GB; 0 means no cap
+        "installedVersion": "",    # the worker version currently installed
+        "manifestUrl": "",         # where the signed worker manifest is fetched from
+    },
     # Telling somebody who is not in the room. A night that dies at one in the
     # morning is a night lost entirely unless something says so.
     "notify": {

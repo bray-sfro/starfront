@@ -11,6 +11,8 @@ using NINA.WPF.Base.Interfaces.ViewModel;
 using Starfront.Collab.Server;
 using Starfront.Collab.Services;
 
+using Starfront.Collab.Services.Stacking;
+
 namespace Starfront.Collab.Ui {
 
     /// <summary>One filter a collaboration wants: how deep, and how narrow the filter may be.</summary>
@@ -55,6 +57,7 @@ namespace Starfront.Collab.Ui {
         private double rotation;
         private bool single = true;
         private string widthText = "";
+        private string overlapText = "10";
         private string heightText = "";
         private string notes = "";
         private string minFocal = "", maxFocal = "", maxHfr = "", maxGuideRms = "", minExposure = "", maxExposure = "";
@@ -109,6 +112,13 @@ namespace Starfront.Collab.Ui {
         };
         public string WidthText { get => widthText; set { widthText = value ?? ""; RaisePropertyChanged(); } }
         public string HeightText { get => heightText; set { heightText = value ?? ""; RaisePropertyChanged(); } }
+        /// <summary>
+        /// How much neighbouring panels share, in percent: the server cuts every
+        /// telescope's panels with it. Taken from the Framing Assistant with the
+        /// rest of the framing (N.I.N.A. usually asks for 20); more overlap costs
+        /// panels but gives the stack more shared sky to even the panels out by.
+        /// </summary>
+        public string OverlapText { get => overlapText; set { overlapText = value ?? ""; RaisePropertyChanged(); } }
         public string Notes { get => notes; set { notes = value ?? ""; RaisePropertyChanged(); } }
         public string MinFocal { get => minFocal; set { minFocal = value ?? ""; RaisePropertyChanged(); } }
         public string MaxFocal { get => maxFocal; set { maxFocal = value ?? ""; RaisePropertyChanged(); } }
@@ -125,6 +135,18 @@ namespace Starfront.Collab.Ui {
         /// <summary>Collect everyone's lights (and calibration frames) on the server, for the coordinator to stack.</summary>
         public bool CollectFiles { get => collectFiles; set { collectFiles = value; RaisePropertyChanged(); } }
         private bool collectFiles;
+        /// <summary>
+        /// An old collaboration's pasted Rapid Stacker Collab join code, kept as it is. Since T706
+        /// stacking follows the collaboration: the server binds a new one to its owner's hub, or makes
+        /// and keeps the Rapid Stacker Collab project itself, and refuses a newly pasted code. The box
+        /// shows only when the collaboration being edited has a pasted code (it may be cleared).
+        /// </summary>
+        public string StackingJoinCode { get => stackingJoinCode; set { stackingJoinCode = value ?? ""; RaisePropertyChanged(); } }
+        private string stackingJoinCode = "";
+        /// <summary>The code as the form was loaded with it, so an edit sends it only when it was changed.</summary>
+        private string loadedStackingJoinCode = "";
+        /// <summary>Whether the form shows the join code box: only for an old collaboration's pasted code.</summary>
+        public bool ShowJoinCode => loadedStackingJoinCode.Length > 0;
 
         /// <summary>
         /// A colour camera's data is its own band, kept apart from the mono
@@ -161,11 +183,14 @@ namespace Starfront.Collab.Ui {
         public void Reset() {
             editingId = "";
             Name = ""; Target = ""; RaText = ""; DecText = ""; rotation = 0; Single = true;
-            WidthText = ""; HeightText = ""; Notes = ""; FoundText = "";
+            WidthText = ""; HeightText = ""; OverlapText = "10"; Notes = ""; FoundText = "";
             MinFocal = ""; MaxFocal = ""; MaxHfr = ""; MaxGuideRms = ""; MinExposure = ""; MaxExposure = "";
             MaxMoon = ""; MinMoonSeparation = ""; MinAltitude = ""; MinFrames = "10"; MaxBortle = "";
             RequireCalibrated = false;
             CollectFiles = false;
+            StackingJoinCode = "";
+            loadedStackingJoinCode = "";
+            RaisePropertyChanged(nameof(ShowJoinCode));
             Filters.Clear();
             acceptOscRgb = true; acceptOscNarrowband = true;
             RaisePropertyChanged(nameof(AcceptOscRgb));
@@ -209,6 +234,10 @@ namespace Starfront.Collab.Ui {
             Name = listing.Name;
             Notes = listing.Notes ?? "";
             CollectFiles = listing.CollectFiles;
+            // A server-made cloud project's code is the server's to keep: not shown, never sent.
+            StackingJoinCode = listing.Stacking?.Managed == true ? "" : listing.StackingJoinCode ?? "";
+            loadedStackingJoinCode = StackingJoinCode;
+            RaisePropertyChanged(nameof(ShowJoinCode));
             Single = listing.Kind == "single";
             var region = listing.Region;
             if (region != null) {
@@ -218,6 +247,7 @@ namespace Starfront.Collab.Ui {
                 WidthText = region.Width.ToString("0.00", CultureInfo.InvariantCulture);
                 HeightText = region.Height.ToString("0.00", CultureInfo.InvariantCulture);
             }
+            OverlapText = listing.Overlap.ToString("0.#", CultureInfo.InvariantCulture);
             var wants = listing.Requirements ?? new Requirements();
             MinFocal = Text(wants.MinFocalLength); MaxFocal = Text(wants.MaxFocalLength);
             MaxHfr = Text(wants.MaxHfr); MaxGuideRms = Text(wants.MaxGuideRms);
@@ -316,6 +346,11 @@ namespace Starfront.Collab.Ui {
                 } else {
                     overlapW = overlapH = Math.Max(0, framing.OverlapPixels) * (scale > 0 ? scale : 0) / 3600.0;
                 }
+                // The panels are cut on the server with one fraction for both axes:
+                // the larger of the two keeps at least what was drawn everywhere.
+                var share = Math.Max(fieldW > 0 ? overlapW / fieldW : 0, fieldH > 0 ? overlapH / fieldH : 0);
+                if (across > 1 || down > 1)
+                    OverlapText = Math.Round(Math.Min(50, Math.Max(0, share * 100)), 1).ToString("0.#", CultureInfo.InvariantCulture);
                 var width = across * fieldW - (across - 1) * overlapW;
                 var height = down * fieldH - (down - 1) * overlapH;
 
@@ -396,6 +431,11 @@ namespace Starfront.Collab.Ui {
                 if (width <= 0 || height <= 0) throw new ArgumentException("A mosaic needs its width and height in degrees.");
                 if (width > 60 || height > 60) throw new ArgumentException("A region is at most 60° across.");
             }
+            double? overlap = null;
+            if (!Single) {
+                overlap = Num(OverlapText);
+                if (overlap is not double o || o < 0 || o > 50) throw new ArgumentException("The panel overlap is 0 to 50 %.");
+            }
 
             var filters = new JObject();
             var goals = new JObject();
@@ -418,6 +458,7 @@ namespace Starfront.Collab.Ui {
             var moon = Num(MaxMoon);
             var bortle = Num(MaxBortle);
             if (bortle is double b && (b < 1 || b > 9)) throw new ArgumentException("Bortle is 1 to 9.");
+            if (!JoinCodes.TryNormalize(StackingJoinCode, out var stackingCode)) throw new ArgumentException(JoinCodes.Hint + ", or leave it blank.");
             var requirements = new JObject {
                 ["minFocalLength"] = Json(Num(MinFocal)),
                 ["maxFocalLength"] = Json(Num(MaxFocal)),
@@ -436,11 +477,12 @@ namespace Starfront.Collab.Ui {
                 ["maxBortle"] = bortle.HasValue ? new JValue((int)Math.Round(bortle.Value)) : JValue.CreateNull(),
                 ["filters"] = filters,
             };
-            return new JObject {
+            var body = new JObject {
                 ["name"] = title,
                 ["kind"] = Single ? "single" : "mosaic",
                 ["notes"] = Notes.Trim(),
                 ["collectFiles"] = CollectFiles,
+                ["overlap"] = overlap.HasValue ? new JValue(overlap.Value) : JValue.CreateNull(),
                 ["region"] = new JObject {
                     ["ra"] = Math.Round(ra.Value, 5), ["dec"] = Math.Round(dec.Value, 5),
                     ["width"] = Math.Round(width, 4), ["height"] = Math.Round(height, 4),
@@ -449,6 +491,14 @@ namespace Starfront.Collab.Ui {
                 ["requirements"] = requirements,
                 ["goals"] = goals,
             };
+            // An old collaboration's pasted code goes on an edit only when it was
+            // changed (blank clears it; a different one the server refuses).
+            // A new collaboration sends none: the server stacks it where its
+            // owner can (their hub, or the Rapid Stacker Collab project it
+            // makes), and the Collab tab in Starfront changes that.
+            JoinCodes.TryNormalize(loadedStackingJoinCode, out var loaded);
+            if (Editing && stackingCode != loaded) body["stackingJoinCode"] = stackingCode;
+            return body;
         }
 
         private static JToken Json(double? value) => value.HasValue ? new JValue(value.Value) : JValue.CreateNull();

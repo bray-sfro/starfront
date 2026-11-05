@@ -22,6 +22,20 @@
     <PluginPackageFile Include="$(TargetPath)" Destination="$(TargetFileName)" />
     <PluginPackageFile Include="$(TargetDir)$(TargetName).pdb" Destination="$(TargetName).pdb" />
     <PluginPackageFile Include="$(PluginRoot)/LICENSE.txt" Destination="LICENSE.txt" />
+    <!-- Live stacking: the Rapid Stacker Collab core and the SQLite it keeps
+         its upload queue in. The native library goes under runtimes/, where
+         SQLitePCLRaw looks for it; N.I.N.A. adds that folder to the search
+         path only after the plugin is initialised, which is why the plugin
+         loads it by full path before the first queue is opened. NOTICE.txt
+         carries the licences. -->
+    <PluginPackageFile Include="$(TargetDir)RapidStackerCollab.Core.dll" Destination="RapidStackerCollab.Core.dll" />
+    <PluginPackageFile Include="$(TargetDir)RapidStackerCollab.Core.pdb" Destination="RapidStackerCollab.Core.pdb" />
+    <PluginPackageFile Include="$(TargetDir)Microsoft.Data.Sqlite.dll" Destination="Microsoft.Data.Sqlite.dll" />
+    <PluginPackageFile Include="$(TargetDir)SQLitePCLRaw.core.dll" Destination="SQLitePCLRaw.core.dll" />
+    <PluginPackageFile Include="$(TargetDir)SQLitePCLRaw.batteries_v2.dll" Destination="SQLitePCLRaw.batteries_v2.dll" />
+    <PluginPackageFile Include="$(TargetDir)SQLitePCLRaw.provider.e_sqlite3.dll" Destination="SQLitePCLRaw.provider.e_sqlite3.dll" />
+    <PluginPackageFile Include="$(TargetDir)runtimes/win-x64/native/e_sqlite3.dll" Destination="runtimes/win-x64/native/e_sqlite3.dll" />
+    <PluginPackageFile Include="$(PluginRoot)/NOTICE.txt" Destination="NOTICE.txt" />
   </ItemGroup>
 
   <Target Name="StagePlugin" DependsOnTargets="Build">

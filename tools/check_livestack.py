@@ -1,40 +1,36 @@
-"""The whole pipeline, from a raw sub on disk to a shared picture on a server.
+"""The desktop live stacker, from a raw sub on disk to a local stack.
 
     python tools/check_livestack.py
 
-Over real HTTP against a real server on a real port, like `check_server.py`,
-and for the same reason: the thing being checked is two machines agreeing on
-a grid and a picture, and the parts most likely to be wrong — that both sides
-build the identical canvas from the same handful of numbers, that a tile
-sent twice is counted once, that a frame nobody can place is refused rather
-than smeared across everybody's image — are exactly the parts a shortcut
-around the network would skip.
+The thing being checked is the single-rig preview in `astrocontrol/livestack.py`
+and `pipeline.py`: that every machine builds the identical canvas from the same
+handful of numbers, that a tile added twice is counted once, that a frame
+nobody can place is refused rather than smeared across the image.
+
+It once also drove `/api/v1/agent/stack/*` on the server. Those routes lived in
+`server/stacks.py`, which was never mounted and is gone (the distributed
+stacking plan moves the shared stack to the Collab engine on a hub), so the
+network half of this check went with it.
 
 What it walks through:
 
   * two invented observatories with different focal lengths and different
-    sensors, both enrolled on one collaboration;
+    sensors;
   * raw subs written to disk with the headers a real program writes, dust and
     an offset baked in, plus the masters that correct them;
   * the calibration library matching those masters and applying them;
   * the pipeline placing each calibrated frame, resampling it onto the
-    project's canvas and folding it into a local stack;
-  * the tile going up, the server folding it into the community stack, and
-    a PNG of the result coming back to anybody who asks.
+    canvas and folding it into a local stack;
+  * tiles added twice, tiles of the wrong sky and rubbish refused.
 
 No test framework, for the same reason as the other checks here.
 """
 
-import json
 import math
 import os
-import socket
 import sys
 import tempfile
-import threading
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 import numpy as np
@@ -42,11 +38,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-DATA = Path(tempfile.mkdtemp(prefix="check-livestack-server-"))
 HOME = Path(tempfile.mkdtemp(prefix="check-livestack-rig-"))
-ADMIN = "test-admin-token"
-os.environ["STARFRONT_DATA"] = str(DATA)
-os.environ["STARFRONT_ADMIN_TOKEN"] = ADMIN
 os.environ.setdefault("ASTRO_DATA_DIR", str(HOME))
 
 from astrocontrol import calibration, collab, livestack, pipeline   # noqa: E402
@@ -61,49 +53,6 @@ def case(name, ok, detail=""):
     results.append(bool(ok))
     return ok
 
-
-# ---------------------------------------------------------------- the server
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
-PORT = free_port()
-BASE = f"http://127.0.0.1:{PORT}"
-
-import uvicorn                                                      # noqa: E402
-
-from server.app import app                                          # noqa: E402
-
-server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=PORT,
-                                       log_level="error"))
-threading.Thread(target=server.run, daemon=True).start()
-for _ in range(100):
-    try:
-        urllib.request.urlopen(f"{BASE}/api/v1/health", timeout=1).read()
-        break
-    except Exception:                                               # noqa: BLE001
-        time.sleep(0.1)
-else:
-    print("FAIL  the server never came up")
-    sys.exit(1)
-
-
-def call(method, path, body=None, token=ADMIN, raw=None, content=None):
-    data = raw if raw is not None else (
-        None if body is None else json.dumps(body).encode())
-    headers = {"Authorization": f"Bearer {token}",
-               "Content-Type": content or "application/json"}
-    request = urllib.request.Request(f"{BASE}{path}", data=data, method=method,
-                                     headers=headers)
-    with urllib.request.urlopen(request, timeout=30) as response:
-        payload = response.read()
-    return json.loads(payload) if payload else {}
-
-
-health = call("GET", "/api/v1/health", token="")
-case("the server says it can live stack", health.get("liveStacking") is True)
 
 # --------------------------------------------------------------- the sky
 TRUE_RA, TRUE_DEC = 84.05, -6.4
@@ -303,42 +252,19 @@ case("the raw frame is untouched",
      and abs(corner_ratio(raw_frame) - 1.0) > 0.2)
 
 # --------------------------------------------------------------- a project
-print("\n== a collaboration ==")
-agents = {}
-for rig in (ALPHA, BETA):
-    made = call("POST", "/api/v1/agents", {"name": rig.name, "owner": "check"})
-    agents[rig.name] = made["token"]
-    call("POST", "/api/v1/agent/hello", {
-        "protocol": collab.PROTOCOL,
-        "profile": collab.RigProfile(
-            name=rig.name, focalLength=rig.focal, pixelSize=rig.pixel,
-            sensorWidth=rig.width, sensorHeight=rig.height, binning=1,
-            filters={"L": None}, exposures={"L": 300.0}).payload(),
-    }, token=made["token"])
-
-project = call("POST", "/api/v1/projects", {
-    "name": "NGC 9999 live", "region": {"ra": TRUE_RA, "dec": TRUE_DEC,
-                                        "width": 1.6, "height": 1.2},
-    "kind": "single", "requirements": {"filters": {"L": None}},
-    "goals": {"L": 4.0}})["project"]
-for rig in (ALPHA, BETA):
-    call("POST", f"/api/v1/agent/projects/{project['id']}/join",
-         {"hours": 2.0, "exposures": {"L": 300.0}}, token=agents[rig.name])
-case("both telescopes joined the project", True, project["id"])
-
-plans = {rig.name: call("GET", f"/api/v1/agent/stack/plan?project={project['id']}",
-                        token=agents[rig.name])["plan"]
-         for rig in (ALPHA, BETA)}
-case("both telescopes are given the same canvas",
-     plans["alpha"] == plans["beta"],
-     f"{plans['alpha']['pixelWidth']}x{plans['alpha']['pixelHeight']} at "
-     f"{plans['alpha']['actualScale']:.3f}\"/px")
-
-plan = livestack.Plan.read(plans["alpha"])
+print("\n== a canvas ==")
+PROJECT = "prj_check_live"
+# What the hub's engine now does for a collaboration, done here for the one
+# rig-local preview: one canvas from the region and the median scale.
+plan = livestack.Plan.for_region(TRUE_RA, TRUE_DEC, 1.6, 1.2,
+                                 scales=[ALPHA.scale, BETA.scale])
+payload = plan.payload()
 canvas_here = plan.canvas()
-canvas_there = livestack.Plan.read(plans["beta"]).canvas()
-case("the canvas is identical on both machines, to the pixel",
-     canvas_here.payload() == canvas_there.payload())
+canvas_there = livestack.Plan.read(payload).canvas()
+case("the canvas is identical when rebuilt from its numbers, to the pixel",
+     canvas_here.payload() == canvas_there.payload(),
+     f"{payload['pixelWidth']}x{payload['pixelHeight']} at "
+     f"{payload['actualScale']:.3f}\"/px")
 case("the canvas covers the project's region",
      canvas_here.field[0] >= 1.6 - 1e-6 and canvas_here.field[1] >= 1.2 - 1e-6,
      f"{canvas_here.field[0]:.3f}x{canvas_here.field[1]:.3f} deg")
@@ -349,11 +275,8 @@ sent = []
 
 
 def send(tile, job):
-    answer = call("POST", f"/api/v1/agent/stack/tile?project={job.project}",
-                  raw=tile.encode(), token=agents[job.agent],
-                  content="application/octet-stream")
-    sent.append(answer)
-    return bool(answer.get("added"))
+    sent.append({"added": True, "tile": tile.id})
+    return True
 
 
 config.update("livestack", {"enabled": True, "maxPixels": plan.maxPixels})
@@ -364,7 +287,7 @@ frames = 0
 for index in range(3):
     for rig in (ALPHA, BETA):
         path = rig.expose(index, seed=100 + index * 7 + len(rig.name),
-                          project=project["id"])
+                          project=PROJECT)
         want = {"width": rig.width, "height": rig.height, "binning": 1,
                 "gain": 100, "offset": 50, "temperature": -10.0, "filter": "L",
                 "telescope": rig.name, "camera": f"{rig.name} camera",
@@ -373,7 +296,7 @@ for index in range(3):
         if not result.get("calibrated"):
             case(f"{rig.name} sub {index} calibrates", False, result["reasons"])
             continue
-        job = pipeline.Job(Path(result["path"]), project["id"], "L", plan,
+        job = pipeline.Job(Path(result["path"]), PROJECT, "L", plan,
                            night="2026-09-24", agent=rig.name, seconds=300.0,
                            telescope=rig.name)
         stacker.submit(job)
@@ -404,7 +327,7 @@ case("the pipeline reports what it did to the last frame",
      bool((status.get("last") or {}).get("placing")),
      (status.get("last") or {}).get("placing", {}).get("detail", "")[:80])
 
-local = stacker.stacks().get(f"{project['id']}/L")
+local = stacker.stacks().get(f"{PROJECT}/L")
 case("the local stack holds both telescopes",
      local is not None and len(local.summary()["agents"]) == 2,
      local and f"{local.summary()['frames']} frames from "
@@ -421,55 +344,24 @@ case("the last frame was aligned rather than trusted",
      bool(placing.get("aligned")) and placing.get("residual", 99) < 1.5,
      placing.get("detail", "")[:90])
 
-# --------------------------------------------------------------- the server
-print("\n== the community stack ==")
-case("every tile was taken by the server",
-     all(row.get("added") for row in sent) and len(sent) == frames,
-     f"{sum(1 for row in sent if row.get('added'))} of {len(sent)} added")
+# --------------------------------------------------------------- tiles
+print("\n== tiles ==")
+case("every tile was handed on", len(sent) == frames,
+     f"{len(sent)} of {frames}")
 
-community = call("GET", f"/api/v1/stacks/{project['id']}/L", token="")["stack"]
-case("the community stack holds every telescope's frames",
-     community["frames"] == frames and len(community["agents"]) == 2,
-     f"{community['frames']} frames, {community['seconds']:.0f}s, "
-     f"{community['covered'] * 100:.0f}% covered")
-case("the community stack is on the project's canvas",
-     community["plan"]["pixelWidth"] == plans["alpha"]["pixelWidth"])
-case("the community stack measured its own depth",
-     community["maxFramesDeep"] >= 2 and community["deepestSeconds"] > 300,
-     f"{community['maxFramesDeep']} frames deep, "
-     f"{community['deepestSeconds']:.0f}s at the deepest")
-
-listed = call("GET", f"/api/v1/stacks?project={project['id']}", token="")["stacks"]
-case("the stack is listed for anybody to find", len(listed) == 1
-     and listed[0]["filter"] == "L", listed and listed[0]["id"])
-
-request = urllib.request.Request(
-    f"{BASE}/api/v1/stacks/{project['id']}/L/preview.png?width=500")
-with urllib.request.urlopen(request, timeout=30) as response:
-    image = response.read()
-    kind = response.headers.get("Content-Type")
-case("anybody can watch the picture", image[:8] == b"\x89PNG\r\n\x1a\n"
-     and kind == "image/png", f"{len(image)} bytes of PNG")
-
-# Sending the same tile again must not count it twice. A retry after a
-# dropped connection is the normal case rather than an error, and a ledger
-# that counts the same hour twice is the one way it silently becomes wrong.
+# Adding the same tile again must not count it twice. A retry is the normal
+# case rather than an error, and a ledger that counts the same hour twice is
+# the one way it silently becomes wrong.
 repeat_frame, repeat_header = fits.read(calibrated["alpha"])
 repeat_tile = livestack.make_tile(
     repeat_frame, wcs.from_header(repeat_header), canvas_here,
     "alpha:repeat", seconds=300, agent="alpha", filter_name="L")
-first = call("POST", f"/api/v1/agent/stack/tile?project={project['id']}",
-             raw=repeat_tile.encode(), token=agents["alpha"],
-             content="application/octet-stream")
-again = call("POST", f"/api/v1/agent/stack/tile?project={project['id']}",
-             raw=repeat_tile.encode(), token=agents["alpha"],
-             content="application/octet-stream")
+first = local.add(repeat_tile)
+again = local.add(repeat_tile)
 case("the same tile twice is counted once",
      bool(first.get("added")) and not again.get("added")
-     and again["stack"]["frames"] == first["stack"]["frames"]
-     and again["stack"]["seconds"] == first["stack"]["seconds"],
-     f"{first['stack']['frames']} frames and "
-     f"{first['stack']['seconds']:.0f}s after both")
+     and again.get("duplicate") is True,
+     f"{local.summary()['frames']} frames after both")
 
 # --------------------------------------------------------------- refusals
 print("\n== refusals ==")
@@ -477,65 +369,42 @@ elsewhere = Observatory("gamma", focal=530.0, pixel=3.76, width=1600,
                         height=1200, gain=1.0, sky=760.0, noise=11.0,
                         rotation=12.0, offset=(28.0, 14.0))
 elsewhere.write_masters(library)
-stray = elsewhere.expose(0, seed=999, project=project["id"])
+stray = elsewhere.expose(0, seed=999, project=PROJECT)
 result = library.calibrate_file(stray, {
     "width": 1600, "height": 1200, "binning": 1, "gain": 100, "offset": 50,
     "temperature": -10.0, "filter": "L", "telescope": "gamma",
     "camera": "gamma camera", "exposure": 300.0})
-made = call("POST", "/api/v1/agents", {"name": "gamma", "owner": "check"})
-agents["gamma"] = made["token"]
 frame, header = fits.read(Path(result["path"]))
 solution = wcs.from_header(header)
 try:
     tile = livestack.make_tile(frame, solution, canvas_here, "gamma:1",
                                seconds=300, agent="gamma", filter_name="L")
-    refused = call("POST", f"/api/v1/agent/stack/tile?project={project['id']}",
-                   raw=tile.encode(), token=agents["gamma"],
-                   content="application/octet-stream")
+    refused = local.add(tile)
     case("a frame of the wrong sky is refused rather than stacked",
-         not refused.get("added"), refused.get("detail", "")[:90])
+         not refused.get("added"), str(refused.get("detail", ""))[:90])
 except livestack.StackError as exc:
     case("a frame of the wrong sky is refused rather than stacked", True,
          str(exc)[:90])
 
 try:
-    call("POST", f"/api/v1/agent/stack/tile?project={project['id']}",
-         raw=b"not a tile at all", token=agents["alpha"],
-         content="application/octet-stream")
+    livestack.Tile.decode(b"not a tile at all")
     case("rubbish is refused", False, "it was accepted")
-except urllib.error.HTTPError as exc:
-    case("rubbish is refused with a reason", exc.code == 400,
-         json.loads(exc.read()).get("detail", "")[:70])
-
-try:
-    call("GET", "/api/v1/agent/stack/plan?project=nonsense",
-         token=agents["alpha"])
-    case("an unknown project has no canvas", False, "it was given one")
-except urllib.error.HTTPError as exc:
-    case("an unknown project has no canvas", exc.code == 404)
-
-try:
-    call("POST", f"/api/v1/agent/stack/tile?project={project['id']}",
-         raw=b"anything", token="not-a-real-token",
-         content="application/octet-stream")
-    case("an unknown telescope cannot contribute", False, "it was accepted")
-except urllib.error.HTTPError as exc:
-    case("an unknown telescope cannot contribute", exc.code == 401)
+except livestack.StackError as exc:
+    case("rubbish is refused with a reason", True, str(exc)[:70])
 
 # --------------------------------------------------------------- keeping it
 print("\n== keeping it ==")
 stacker.save_all()
 reopened = livestack.LiveStack.open(
-    livestack.stack_root(HOME / "stacks", project["id"], "L"))
+    livestack.stack_root(HOME / "stacks", PROJECT, "L"))
 case("a stack survives being closed and reopened",
      reopened.frames == local.frames
      and float(np.max(np.abs(reopened.mean() - local.mean()))) < 1e-9,
      f"{reopened.frames} frames")
 stored = livestack.stored_plan(
-    livestack.stack_root(HOME / "stacks", project["id"], "L"))
+    livestack.stack_root(HOME / "stacks", PROJECT, "L"))
 case("the canvas a stack was built on is remembered",
      stored is not None and stored.payload() == plan.payload())
 
-server.should_exit = True
 print(f"\n{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

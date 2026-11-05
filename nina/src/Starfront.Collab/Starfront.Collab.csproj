@@ -12,5 +12,11 @@
   <ItemGroup>
     <PackageReference Include="NINA.Plugin" Version="$(NinaPackageVersion)" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- Live stacking: the Rapid Stacker Collab upload engine, copied from
+         that project (see src/RapidStackerCollab.Core/SOURCE.md). Ships in the
+         zip beside this assembly, with its SQLite dependencies. -->
+    <ProjectReference Include="../RapidStackerCollab.Core/RapidStackerCollab.Core.csproj" />
+  </ItemGroup>
   <Import Project="../../build/Plugin.targets" />
 </Project>

@@ -670,6 +670,26 @@ laid, restarted = angle_case(88.0, COLLAB)       # 268 - 180: the same footprint
 results.append(case("...and exactly half a turn away is no turn at all",
                     laid == [] and not restarted, f"laid={laid}"))
 
+# 14. Giving up on a target is one of the ends of a run: the busy file goes.
+from astrocontrol.sequencer import _busy_path                   # noqa: E402
+
+if _busy_path().exists():
+    _busy_path().unlink()
+mount = Mount()
+seq, rig, config = build({"mount": mount})
+config.update("recovery", {"onGiveUp": "park"})
+during = {}
+seq._night = lambda: (during.update(text=_busy_path().read_text(encoding="utf-8")),
+                      seq._give_up("the guider keeps losing its star"))
+try:
+    seq._run()
+except _Stopped:
+    pass
+results.append(case("the busy file exists while recovery is trying",
+                    "pid=" in during.get("text", "")))
+results.append(case("and is gone once recovery gives up and the run ends",
+                    not _busy_path().exists()))
+
 print()
 print(f"{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

@@ -214,10 +214,14 @@ class Files:
             return HTMLResponse(_PAGE)
 
         @app.get("/files/signin")
-        def files_signin():
-            """Begin a browser sign-in that comes back here."""
+        def files_signin(next: str = Query(default="")):
+            """Begin a browser sign-in that comes back here, or to `next`: a
+            path on this server under /files or /stack/ (anything else, and any
+            protocol-relative or backslashed address, goes to /files)."""
+            back = next if (re.fullmatch(r"/(files|stack)(/[A-Za-z0-9._~%/@-]*)?", next)
+                            and "//" not in next and ".." not in next) else "/files"
             code = self.new_login_code()
-            self.store.add_login(code, back="/files")
+            self.store.add_login(code, back=back)
             return RedirectResponse(f"/auth/discord/start?code={code}", status_code=303)
 
         @app.post("/files/signout")

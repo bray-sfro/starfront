@@ -57,6 +57,7 @@ namespace Starfront.Collab {
                                             filterWheelMediator, rotatorMediator, guiderMediator,
                                             imageSaveMediator, nighttimeCalculator));
             exposures = new ExposureTableVM(Runtime.Settings, profileService);
+            Stacking = new StackingOptionsVM(Runtime.Settings, Runtime.Stacking);
             SignInCommand = new AsyncRelayCommand(SignInAsync, () => !Runtime.Session.Busy);
             SignOutCommand = new AsyncRelayCommand(SignOutAsync, () => !Runtime.Session.Busy);
             RefreshCommand = new AsyncRelayCommand(RefreshAsync, () => !Runtime.Session.Busy);
@@ -90,6 +91,8 @@ namespace Starfront.Collab {
         public StarfrontSettings Settings => Runtime.Settings;
         public Services.StarfrontSession Session => Runtime.Session;
         public ExposureTableVM Exposures => exposures;
+        /// <summary>The Live stacking section.</summary>
+        public StackingOptionsVM Stacking { get; }
 
         public AsyncRelayCommand SignInCommand { get; }
         public AsyncRelayCommand SignOutCommand { get; }

@@ -81,7 +81,7 @@ def admin_token(folder: Path) -> tuple[str, bool]:
     return token, True
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Starfront collaboration server")
     parser.add_argument("--host", default="127.0.0.1",
                         help="bind address; 0.0.0.0 to accept from other machines")
@@ -89,7 +89,7 @@ def main() -> None:
     parser.add_argument("--reload", action="store_true", help="development only")
     parser.add_argument("--show-token", action="store_true",
                         help="print the coordinator token and exit")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     folder = data_dir()
     token, fresh = admin_token(folder)

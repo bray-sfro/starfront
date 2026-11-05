@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Starfront lab on another local network</title>
+<style>
+  @page { size: A4; margin: 20mm 18mm; }
+  body { font-family: "Segoe UI", system-ui, sans-serif; font-size: 10.5pt; line-height: 1.5; color: #1a1d24; max-width: 174mm; margin: 0 auto; }
+  h1 { font-size: 24pt; margin: 0 0 2px; }
+  .sub { color: #5c6470; margin: 0 0 18px; font-size: 10.5pt; }
+  h2 { font-size: 14pt; margin: 24px 0 8px; border-bottom: 1px solid #d6dae2; padding-bottom: 4px; page-break-after: avoid; }
+  h3 { font-size: 11pt; margin: 14px 0 4px; page-break-after: avoid; }
+  p { margin: 0 0 8px; }
+  ul, ol { margin: 0 0 8px 22px; padding: 0; }
+  li { margin: 0 0 4px; }
+  b { color: #0b0e14; }
+  code { font-family: Consolas, monospace; font-size: 9.5pt; background: #f1f4f8; padding: 1px 4px; border-radius: 3px; }
+  pre { font-family: Consolas, monospace; font-size: 9.5pt; background: #f1f4f8; padding: 8px 10px; border-radius: 4px; white-space: pre-wrap; margin: 6px 0 10px; page-break-inside: avoid; }
+  table { border-collapse: collapse; width: 100%; margin: 6px 0 12px; font-size: 10pt; page-break-inside: avoid; }
+  th, td { text-align: left; vertical-align: top; padding: 5px 8px; border-bottom: 1px solid #e3e6ec; }
+  th { background: #f1f4f8; font-weight: 600; }
+  .note { background: #eef8f2; border-left: 3px solid #7ee7a5; padding: 7px 11px; margin: 10px 0; }
+  .warn { background: #fdf3e7; border-left: 3px solid #d9a03d; padding: 7px 11px; margin: 10px 0; }
+  .src { color: #5c6470; font-size: 9pt; margin-top: 18px; }
+</style>
+</head>
+<body>
+<h1>Starfront lab on another local network</h1>
+<p class="sub">Installing Terraform, then the Starfront server (the web site, collaborations and downloads), the live-stacking hub and its workers on a network of your own. Based on <code>deploy/home-lab/</code> in the Starfront repository as it stood on 28 October 2026; its <code>README.md</code> has the same steps in brief.</p>
+
+<div class="warn"><b>For local testing only.</b> The lab server signs people in with a stand-in Discord, so anyone who can reach it can sign in as anyone, the owner included. Keep it on a network you trust, never forward its ports from the router, and never point it at the real Starfront (collab.starfront.space). In particular, do not run <code>Deploy the Starfront server.cmd</code>: it deploys to the production server.</div>
+
+<h2>1. What you end up with</h2>
+<table>
+  <tr><th>Machine</th><th>Role</th><th>Needed?</th></tr>
+  <tr><td><b>Controller</b> (a Mac)</td><td>Runs Terraform. Every step is a script it runs over SSH. Can also run a worker (a LaunchAgent).</td><td>Yes</td></tr>
+  <tr><td><b>Server host</b> (Linux)</td><td>The Starfront server on port 8800 (web site, <code>/download</code>, the N.I.N.A. plugin feed <code>/nina</code>, collaborations, stacking pages) and <code>collab-hub</code> on 8790, both as systemd user units; a worker.</td><td>Yes</td></tr>
+  <tr><td><b>Windows PC</b></td><td>A worker (a logon task that pauses while N.I.N.A. runs), N.I.N.A. with the Starfront plugin, the Starfront desktop.</td><td>Optional</td></tr>
+  <tr><td><b>NAS</b></td><td>A read-only SMB share holding the 16 <code>gdr3-*.xpsd</code> star-catalogue files (about 45 GB), for real frames.</td><td>Only for real mode</td></tr>
+  <tr><td><b>Imaging rigs</b></td><td>Any PC with N.I.N.A.: the plugin, installed with one line. No SSH, nothing for Terraform to know about.</td><td>Optional</td></tr>
+</table>
+<p>Terraform here is only the inventory, the order of the steps, change detection and teardown. There is no cloud provider and nothing leaves the network. Its state is local and git-ignored, because the scripts pass tokens around.</p>
+
+<h2>2. What you need first</h2>
+<ul>
+  <li><b>The Starfront repository.</b> That is all the hub and worker need: their signed release downloads from Rapid Stacker Collab's public downloads, or Starfront's GitHub releases as the fallback (section 5). A Rapid Stacker Collab checkout (private) is needed only to build them yourself, or for <code>collab-uploader</code>; it goes at <code>../Rust/rapid-stacker-collab</code> relative to Starfront (or set <code>RSC=/path/to/it</code>).</li>
+  <li><b>GitHub CLI</b> (<code>gh</code>), signed in, for the N.I.N.A. plugin build from Starfront's CI (and, when building, with access to <code>EKE-Services/rapid-stacker-collab</code>).</li>
+  <li><b>On the controller:</b> <code>python3</code>, <code>ssh</code>/<code>ssh-keygen</code>, <code>rsync</code>, and Terraform 1.6 or later (section 3).</li>
+  <li><b>Only to build the programs yourself</b> (not needed with the public release): Rust (rustup) and read access to the private <code>rapid-stacker</code> repository.</li>
+  <li><b>The network:</b> a router that hands out fixed (reserved) addresses and, ideally, answers machine names such as <code>server.lan</code>. Internet access once, for <code>terraform init</code> and the Python packages.</li>
+</ul>
+
+<h2>3. Install Terraform, if it is not there</h2>
+<p>Terraform is needed only on the controller. Check what you have:</p>
+<pre>terraform version        # this lab needs 1.6 or later</pre>
+
+<h3>macOS (Homebrew)</h3>
+<pre>brew tap hashicorp/tap
+brew install hashicorp/tap/terraform
+
+brew upgrade hashicorp/tap/terraform   # later, to update it</pre>
+<div class="warn"><b>Do not use plain <code>brew install terraform</code>.</b> Homebrew's own formula stopped at 1.5.7 when Terraform's licence changed, and this lab requires 1.6 or later. If <code>terraform version</code> says 1.5.x, run <code>brew uninstall terraform</code> and install from the HashiCorp tap as above. (The author's Mac has 1.17.1 from that tap.)</div>
+
+<h3>Linux controller</h3>
+<p>Debian or Ubuntu, from HashiCorp's apt repository:</p>
+<pre>wget -O- https://apt.releases.hashicorp.com/gpg | \
+  sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+  https://apt.releases.hashicorp.com $(lsb_release -cs) main" | \
+  sudo tee /etc/apt/sources.list.d/hashicorp.list
+sudo apt update &amp;&amp; sudo apt install terraform</pre>
+<p>Arch: <code>sudo pacman -S terraform</code>. Anything else: download the zip for your system from <code>developer.hashicorp.com/terraform/install</code>, unzip it, and put the <code>terraform</code> binary on your <code>PATH</code>.</p>
+<p>The lab's scripts are bash and the macOS worker runs on the controller itself, so the lab has only been run from a Mac. A Linux controller should work if you have no macOS worker, but it is untested. Terraform on Windows is no use here.</p>
+<p>Then, once, in the lab folder (it downloads the one provider the lab uses, <code>hashicorp/external</code>):</p>
+<pre>cd deploy/home-lab
+terraform init</pre>
+
+<h2>4. Prepare the machines (once, by hand)</h2>
+<p>These steps need root or administrator rights, so Terraform does not do them.</p>
+
+<h3>4.1 The router</h3>
+<p>Reserve addresses for the server host, the Windows PC and the NAS, by each one's built-in network card. Then check that the controller can resolve each name the router gives them. If the router does not answer names, you can give Terraform the server's and the Windows PC's reserved IP addresses instead, but <b>the NAS needs a name</b>: the Windows share path is built from the first part of it (<code>\\NAS\XPSD</code>).</p>
+
+<h3>4.2 The controller</h3>
+<pre>ssh-keygen -t ed25519        # only if ~/.ssh/id_ed25519 does not exist yet</pre>
+
+<h3>4.3 The Linux server host</h3>
+<p><b>Arch or Omarchy:</b> copy <code>bootstrap-linux.sh</code> to it and run it at its own keyboard, with your subnet and NAS:</p>
+<pre>sudo bash bootstrap-linux.sh --subnet 192.168.1.0/24 \
+     --nas &lt;nas-name&gt;.lan --share XPSD --nas-user &lt;nas user&gt;
+# or, with no NAS (synthetic mode only):
+sudo bash bootstrap-linux.sh --subnet 192.168.1.0/24 --no-nas</pre>
+<p>It installs sshd, rsync, Python, curl and cifs-utils; opens TCP 22, 8800 and 8790 to the subnet and the network's IPv6 prefix only (ufw); turns on linger so the services run while nobody is logged in; and mounts the share read-only at <code>/mnt/xpsd</code>.</p>
+<p><b>Any other distribution:</b> the script uses <code>pacman</code>, so do the same by hand. On Debian or Ubuntu:</p>
+<pre>sudo apt install openssh-server rsync python3 python3-venv curl cifs-utils
+sudo systemctl enable --now ssh
+for port in 22 8800 8790; do
+  sudo ufw allow from 192.168.1.0/24 to any port $port proto tcp
+done                          # and the same for your IPv6 /64, if the router gives one
+sudo loginctl enable-linger $USER</pre>
+<p><code>python3-venv</code> matters: the server is installed into a virtual environment. Open the IPv6 ports too if the router hands out IPv6 addresses, or every connection waits out an IPv6 timeout first. For real mode, mount the share read-only at <code>/mnt/xpsd</code> with a line like this in <code>/etc/fstab</code> (the credentials file holds <code>username=</code> and <code>password=</code> lines and is readable by root only):</p>
+<pre>//&lt;nas-name&gt;.lan/XPSD /mnt/xpsd cifs ro,credentials=/etc/starfront-lab/nas-credentials,\
+  uid=&lt;your uid&gt;,gid=&lt;your gid&gt;,iocharset=utf8,vers=3.0,_netdev,nofail,x-systemd.automount 0 0</pre>
+<p>Then, from the controller:</p>
+<pre>ssh-copy-id &lt;you&gt;@&lt;server&gt;.lan</pre>
+
+<h3>4.4 The Windows PC (optional)</h3>
+<p>In an <b>elevated</b> PowerShell, signed in as the account N.I.N.A. runs under, run <code>bootstrap-windows.ps1</code>. It installs OpenSSH Server with PowerShell as its shell, makes the network profile Private and allows SSH from the subnet only, authorises the controller's key, and stores the NAS credential for the worker:</p>
+<pre>powershell -ExecutionPolicy Bypass -File bootstrap-windows.ps1 `
+    -MacPublicKey "&lt;contents of ~/.ssh/id_ed25519.pub&gt;" -Subnet 192.168.1.0/24 `
+    -NasHost &lt;nas-name&gt; -NasUser &lt;nas user&gt;</pre>
+<p>Its <code>-NasHost</code> defaults to the author's NAS, so pass your own. For Terraform's <code>windows_user</code>, use the account's <b>sign-in name</b>, which can differ from its profile folder: on the author's PC the account is <code>eddie</code> but its folder is <code>C:\Users\edell</code>.</p>
+
+<h3>4.5 The NAS (real mode only)</h3>
+<p>Create the <code>XPSD</code> share with a read-only user, and copy in the 16 <code>gdr3-*.xpsd</code> files. The <code>gdr3sp-*</code> and <code>apass_*</code> files are not needed. For a worker on the Mac, mount it in Finder (Go, Connect to Server, <code>smb://&lt;nas-name&gt;.lan/XPSD</code>); it appears at <code>/Volumes/XPSD</code> and does not remount by itself after a restart.</p>
+
+<h3>4.6 Check the network the way Terraform will</h3>
+<pre>echo '{"server":"&lt;server&gt;.lan","windows":"&lt;pc&gt;.lan","nas":"&lt;nas&gt;.lan","ssh":"server,windows"}' \
+  | python3 scripts/discover.py</pre>
+<p>It resolves each name and checks that SSH answers where Terraform needs it, and says what is missing before anything is touched. Leave a name blank for a machine you do not have.</p>
+
+<h2>5. Get the hub and worker programs</h2>
+<p>Rust is not cross-compiled, so each system's <code>collab-hub</code> and <code>collab-worker</code> come from a build on that system. They go into <code>deploy/home-lab/bin/&lt;os&gt;/</code>, where Terraform looks:</p>
+<pre>scripts/fetch-binaries.sh --from-release          # all three systems, from the public signed release
+scripts/fetch-binaries.sh --plugin                # the N.I.N.A. plugin from Starfront's CI</pre>
+<p><b>Start with <code>--from-release</code>.</b> It needs no Rapid Stacker Collab checkout and no private access: it downloads the public signed release from Rapid Stacker Collab's downloads (<code>https://collab.astro.ekeservices.com/downloads/</code>), or, failing that, from the GitHub releases on Starfront's repository (tags <code>collab-worker</code> and <code>collab-hub</code>), checks each manifest's signature against the key built into Starfront and each archive's SHA-256, and stops before installing anything that fails. The programs are proprietary (free to use with Starfront, not covered by its MPL-2.0). The release has no <code>collab-uploader</code>, which only <code>lab.sh smoke</code> and <code>lab.sh upload</code> use; for those, build it as below. On one machine, <code>python tools/local_night.py --bin-dir deploy/home-lab/bin/macos-arm64</code> runs the same downloaded programs.</p>
+<p>With access to Rapid Stacker Collab, you can build them instead:</p>
+<pre>scripts/fetch-binaries.sh --from-run &lt;run id&gt;    # Linux and Windows, from a worker-release run
+scripts/fetch-binaries.sh --mac                   # this Mac, built from source (also collab-uploader)
+scripts/fetch-binaries.sh --build-on &lt;you&gt;@&lt;server&gt;.lan   # or build natively on the Linux host</pre>
+<p>For <code>--from-run</code>, start the Rapid Stacker Collab <code>worker-release</code> workflow on <code>master</code> and use its run id once it finishes (about 20 to 30 minutes):</p>
+<pre>gh workflow run worker-release.yml -R EKE-Services/rapid-stacker-collab --ref master
+gh run list -R EKE-Services/rapid-stacker-collab -w worker-release -L 1</pre>
+<p>The workflow builds and nothing else: it signs, uploads and tags nothing. Use a Starfront checkout at or after commit <code>34bfe5a</code> (28 October 2026): before it, the hub handed Windows workers a broken share path (<code>\\NAS\XPSD</code> arrived as <code>\NASXPSD</code>).</p>
+
+<h2>6. Configure and bring it up</h2>
+<pre>cd deploy/home-lab
+cp terraform.tfvars.example terraform.tfvars</pre>
+<p>Edit <code>terraform.tfvars</code> (git-ignored). The defaults describe the author's network, so set every line that applies to yours:</p>
+<table>
+  <tr><th>Setting</th><th>What to put</th></tr>
+  <tr><td><code>server_user</code>, <code>windows_user</code></td><td>The SSH user names on the server host and the Windows PC.</td></tr>
+  <tr><td><code>server_host</code></td><td>The server host's name (or reserved address).</td></tr>
+  <tr><td><code>windows_host</code></td><td>The Windows PC's name, or <code>""</code> for none (and drop its worker below).</td></tr>
+  <tr><td><code>nas_host</code>, <code>nas_share</code></td><td>The NAS's name (not an address) and the share, for real mode.</td></tr>
+  <tr><td><code>workers</code></td><td>One entry per worker: a unique name, its system (macos, linux or windows) and its scratch space in GB. Remove the entries for machines you do not have.</td></tr>
+  <tr><td><code>catalogue_mode</code></td><td><code>"synthetic"</code> first; <code>"real"</code> once the smoke tests pass.</td></tr>
+  <tr><td><code>lab_region</code></td><td>The night's target, RA,DEC[,W,H] in degrees: real frames solve only against it.</td></tr>
+</table>
+<p>Then, synthetic first. No NAS is needed, and both smoke tests should publish a live preview:</p>
+<pre>terraform apply
+scripts/lab.sh status          # the workers, the catalogue, the Starfront link
+scripts/lab.sh smoke relay     # synthetic frames through the server's front door
+scripts/lab.sh smoke hub       # ...and straight to the hub over the LAN</pre>
+<p>Then the real catalogue, and the lab's collaboration:</p>
+<pre>terraform apply -var catalogue_mode=real -var lab_region="&lt;RA&gt;,&lt;DEC&gt;,1,1"
+scripts/lab.sh night           # the "Lab night" collaboration and its project page
+terraform output -raw server_url</pre>
+
+<h2>7. The web site and its downloads</h2>
+<p>The server answers at <code>http://&lt;server&gt;:8800</code>: the download page <code>/download</code>, the N.I.N.A. plugin feed <code>/nina</code>, the stacking pages under <code>/stack/dashboard</code>, and the collaborations. It serves whatever is in the controller's <code>server/downloads/</code>. Any change there, like any change under <code>server/</code>, makes the next <code>terraform apply</code> copy it across and restart the server. (<code>scripts/server-up.sh</code> does the same by hand.)</p>
+<ul>
+  <li><b>The desktop installer:</b> put <code>Starfront-Setup-&lt;version&gt;.exe</code> in <code>server/downloads/</code> (it is built on Windows with <code>packaging\build.ps1</code>). The page offers the newest version found there. Use 0.2.46 or later: 0.2.45 cannot complete a volunteer install.</li>
+  <li><b>The worker and hub, for the desktop's Volunteer install:</b> put each product's three archives, its <code>latest.json</code> and its <code>latest.json.sig</code> in <code>server/downloads/collab-worker/</code> and <code>server/downloads/collab-hub/</code>. The manifests must be signed with the release key, and their file URLs must be <b>relative</b> (the file name only), so they resolve against this server and never against collab.starfront.space. The download page then lists them, with their SHA-256.</li>
+</ul>
+
+<h2>8. Connect the other computers</h2>
+<h3>N.I.N.A., on any PC</h3>
+<p>Close N.I.N.A., then in an ordinary (not administrator) PowerShell:</p>
+<pre>irm http://&lt;server&gt;:8800/_local/install-nina-plugin.ps1 | iex</pre>
+<p>It installs the plugin build the lab server offers, after checking its SHA-256, and points the plugin at the lab server. A sign-in belongs to one server, so sign in again afterwards.</p>
+
+<h3>The Starfront desktop</h3>
+<p>Install it from <code>http://&lt;server&gt;:8800/download</code>, then set its collaboration server (<code>collab.serverUrl</code>) to the lab's <code>server_url</code>.</p>
+
+<h3>Volunteering a computer for stacking</h3>
+<p>In the desktop: Collaborations, Volunteer this machine; the hub is <code>http://&lt;server&gt;:8790</code>, with a one-time code from the hub:</p>
+<pre>ssh &lt;you&gt;@&lt;server&gt;.lan 'starfront-lab/bin/collab-hub enrol-code \
+    --config starfront-lab/hub/collab-hub.toml --ttl 2h'</pre>
+<ul>
+  <li>A code works once, for a worker, until it expires (1 hour by default, at most 7 days). An install that fails after joining the hub has still spent it: mint another.</li>
+  <li>The desktop installs the same logon task the lab's own Windows worker uses. On a PC that already runs a lab worker, stop that one first (<code>LAB_ID=&lt;name&gt; LAB_OS=windows LAB_TARGET=&lt;user&gt;@&lt;pc&gt; scripts/worker-down.sh</code>).</li>
+  <li>Give every worker a different name. Both default to the computer's name, and a second enrolment under the same name replaces the first one's token.</li>
+</ul>
+
+<h2>9. Day to day, restarts and teardown</h2>
+<pre>scripts/lab.sh status                     # how the hub sees things
+scripts/lab.sh logs server|hub|&lt;worker&gt;   # follow a service's log
+scripts/lab.sh upload &lt;folder&gt;            # real frames from this Mac, as the Lab scope telescope</pre>
+<table>
+  <tr><th>After a restart</th><th>What comes back by itself</th></tr>
+  <tr><td>Linux server host</td><td>Everything: the server, the hub and its worker, with nobody signed in (linger).</td></tr>
+  <tr><td>Mac</td><td>Its worker, once you sign in. <code>/Volumes/XPSD</code> must be reconnected (or added to Login Items).</td></tr>
+  <tr><td>Windows PC</td><td>Its worker, once the account signs in. The stored NAS credential survives restarts.</td></tr>
+  <tr><td>Imaging rig</td><td>The plugin, whenever N.I.N.A. starts.</td></tr>
+</table>
+<p>To stop the services on the server host without removing them:</p>
+<pre>ssh &lt;you&gt;@&lt;server&gt;.lan 'systemctl --user stop collab-worker collab-hub starfront-lab'</pre>
+<p>They start again at the next boot, or with <code>systemctl --user start</code>. Powering the machine off needs sudo, so run it yourself: <code>ssh -t &lt;you&gt;@&lt;server&gt;.lan sudo systemctl poweroff</code>.</p>
+<p><code>terraform destroy</code> stops and removes every unit, LaunchAgent and logon task; the data stays on the server host in <code>~/starfront-lab</code>. With <code>-var wipe_data=true</code> the hub is backed up first, then the database, frames and stacks are deleted. A step run by hand (as in section 8) is not known to Terraform: bring such a worker back with <code>terraform apply -replace</code> on it.</p>
+
+<h2>10. Things that caught us out</h2>
+<ul>
+  <li>Homebrew's own <code>terraform</code> is 1.5.7, too old for this lab: use the HashiCorp tap.</li>
+  <li><code>bootstrap-linux.sh</code> is for Arch (it uses <code>pacman</code>); other distributions need the manual steps in 4.3, including <code>python3-venv</code>.</li>
+  <li>On Windows, the sign-in name and the profile folder can differ; Terraform wants the sign-in name.</li>
+  <li>Before Starfront <code>34bfe5a</code>, Windows workers were handed a broken NAS path by the hub.</li>
+  <li>Desktop 0.2.45 deleted the worker's scratch settings and every volunteer install failed after spending its code; 0.2.46 fixes it.</li>
+  <li>Enrol codes are single-use, and worker names must be unique.</li>
+  <li>Installers left in a Windows checkout's <code>server\downloads</code> would be published by <code>Deploy the Starfront server.cmd</code>, which targets production. Don't run it.</li>
+</ul>
+
+<p class="src">Sources: deploy/home-lab/README.md, main.tf, variables.tf, terraform.tfvars.example, bootstrap-linux.sh, bootstrap-windows.ps1 and scripts/ in the Starfront repository; checked against the author's lab on 28 October 2026.</p>
+</body>
+</html>

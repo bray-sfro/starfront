@@ -1,0 +1,7 @@
+# Local state holds tokens; the binaries are built or downloaded per OS.
+.terraform/
+*.tfstate
+*.tfstate.*
+terraform.tfvars
+bin/
+*.plan

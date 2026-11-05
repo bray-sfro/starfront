@@ -1,0 +1,85 @@
+/*
+ * This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+ * If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+ * Ported from Rapid Stacker Collab (EKE Services LLC).
+ */
+/* Copied from the Astro Tools hub (photon-ledger-website/website/css/base.css, EKE Services LLC). Colours are
+   tokens (tokens.css) so the light theme needs no changes here. */
+*, *::before, *::after { box-sizing: border-box; }
+
+html {
+  background: var(--surface-0);
+  scroll-behavior: smooth;
+}
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+body {
+  margin: 0;
+  font-family: var(--font-prop);
+  font-size: var(--size-body);
+  line-height: 1.55;
+  color: var(--text);
+  background: var(--surface-0);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* height:auto keeps the aspect ratio when width/height attributes are set
+   (they reserve layout space against CLS) and max-width scales the image down. */
+img, svg, video { max-width: 100%; height: auto; display: block; }
+
+a {
+  color: var(--link);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: color .15s, border-color .15s;
+}
+a:hover { color: var(--link-hover); border-bottom-color: currentColor; }
+
+h1, h2, h3, h4 { font-family: var(--font-prop); font-weight: 700; line-height: 1.15; margin: 0 0 .4em; }
+h1 { font-size: var(--size-h1); letter-spacing: -0.01em; }
+h2 { font-size: var(--size-h2); }
+h3 { font-size: var(--size-h3); }
+p { margin: 0 0 1em; }
+small { font-size: var(--size-small); color: var(--text-muted); }
+code, kbd, pre, samp { font-family: var(--font-mono); font-size: var(--size-mono); }
+pre {
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 14px 16px;
+  overflow-x: auto;
+}
+:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.container {
+  max-width: var(--container-max);
+  margin: 0 auto;
+  padding-inline: var(--page-gutter);
+}
+
+.section { padding-block: clamp(40px, 7vw, 88px); }
+.section--tight { padding-block: clamp(28px, 4.5vw, 52px); }
+
+.muted { color: var(--text-muted); }
+.eyebrow { text-transform: uppercase; letter-spacing: .14em; font-size: 12.5px; color: var(--link); font-weight: 600; }
+.center { text-align: center; }
+
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; padding: 0;
+  margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0; white-space: nowrap;
+}
+
+/* Skip link: first focusable element on every page (js/chrome.js adds the target id). */
+.skip-link {
+  position: absolute; left: 12px; top: -64px; z-index: 100;
+  background: var(--primary); color: var(--on-primary);
+  padding: 10px 16px; border-radius: var(--radius-sm); font-weight: 700; border: none;
+}
+.skip-link:focus { top: 10px; color: var(--on-primary); }
+
+[hidden] { display: none !important; }

@@ -1,0 +1,59 @@
+<!doctype html>
+<!--
+  This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+  If a copy of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
+  Ported from Starfront (EKE Services LLC).
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Project — Starfront</title>
+  <meta name="description" content="A Starfront collaboration project: live and gold stacks, contributors and progress.">
+  <meta name="robots" content="noindex">
+  <meta name="theme-color" content="#0d1017" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f3f5f8" media="(prefers-color-scheme: light)">
+  <link rel="icon" type="image/svg+xml" href="/stack/favicon.svg">
+  <link rel="stylesheet" href="/stack/css/tokens.css">
+  <link rel="stylesheet" href="/stack/css/base.css">
+  <link rel="stylesheet" href="/stack/css/components.css">
+  <link rel="stylesheet" href="/stack/css/pages.css">
+  <link rel="stylesheet" href="/stack/css/collab.css">
+  <script src="/stack/js/theme-init.js"></script>
+  <script src="/stack/js/site-config.js"></script>
+</head>
+<body>
+
+<header id="site-nav"></header>
+
+<main id="main">
+<section class="section section--tight">
+  <div class="container">
+    <nav class="breadcrumb" aria-label="Breadcrumb"><ol><li><a href="/stack/">Projects</a></li><li aria-current="page" id="crumb-name">Project</li></ol></nav>
+    <p class="loading" id="project-loading" role="status">Loading project</p>
+    <div id="project-error" hidden role="alert"></div>
+    <div id="project-head"></div>
+    <div id="project-body" class="mt-28"></div>
+    <div id="lower" hidden>
+      <section aria-labelledby="feed-h" class="section--tight mt-36">
+        <div class="section-header"><h2 id="feed-h">Activity</h2><p>Newest first. Display names only.</p></div>
+        <ul class="feed" id="feed"></ul>
+        <p class="muted" id="feed-empty" hidden>Nothing has happened yet.</p>
+        <p><button class="btn btn-ghost btn--sm" id="feed-more" type="button" hidden>Show older activity</button></p>
+      </section>
+      <section aria-labelledby="join-h" class="section--tight mt-36">
+        <div class="section-header"><h2 id="join-h">Join this project</h2></div>
+        <div id="join-body"></div>
+      </section>
+    </div>
+    <noscript><p class="callout callout--warning">Project pages need JavaScript to show their data.</p></noscript>
+  </div>
+</section>
+</main>
+
+<footer id="site-footer"></footer>
+
+<script type="module" src="/stack/js/chrome.js"></script>
+<script type="module" src="/stack/js/pages/project.js"></script>
+</body>
+</html>

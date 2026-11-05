@@ -1,0 +1,15 @@
+OpenSeadragon 4.1.1 (built 2024-04-01), vendored unmodified.
+
+  Source        npm package "openseadragon@4.1.1", file build/openseadragon/openseadragon.min.js
+  npm integrity sha512-owU9gsasAcobLN+LM8lN58Xc2VDSDotY9mkrwS/NB6g9KX/PcusV4RZvhHng2RF/Q0pMziwldf62glwXoGnuzg== (the tarball)
+  SHA-256       7fdfdc04f10db24346c574104d74d442dadc80881912b3447d695397c629dc0c  openseadragon.min.js
+  Home          https://openseadragon.github.io/
+  Licence       BSD-3-Clause, in LICENSE.txt beside this file (kept with every copy, as the licence requires)
+
+It is the deep-zoom viewer of the public project page (js/components/deep-zoom.js), loaded only when a visitor opens
+"Explore full resolution". It is served from this origin, so the site's Content-Security-Policy (script-src 'self') needs
+no exception; the file makes no network request of its own beyond the image tiles it is asked for. The source map the
+file's last line names is not shipped.
+
+To update: download the new version from npm, replace openseadragon.min.js and LICENSE.txt, update this file (version,
+date, both hashes) and OSD_VERSION in js/deep-zoom.js, and run `node --test` and `node scripts/browser-smoke.mjs`.

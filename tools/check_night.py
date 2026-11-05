@@ -1045,6 +1045,124 @@ case("...across zero: 190 against 350 is 10", astro.same_half_turn(190.0, 350.0)
 case("...and an angle already within a quarter turn is left alone",
      astro.same_half_turn(45.0, 0.0) == 45.0 and astro.same_half_turn(135.0, 0.0) == 315.0)
 
+# ------------------------------------------------------------- the busy file
+#
+# A volunteer's stacking worker pauses while this file exists, so it has to be
+# there for exactly as long as a sequence runs, however the run ends.
+from astrocontrol.sequencer import _busy_path                   # noqa: E402
+
+
+def busy_text():
+    path = _busy_path()
+    return path.read_text(encoding="utf-8") if path.is_file() else None
+
+
+def clear_busy():
+    path = _busy_path()
+    if path.is_dir():
+        path.rmdir()
+    elif path.exists():
+        path.unlink()
+
+
+seen = {}
+clear_busy()
+seq, rig, config = build({"mount": Mount()})
+seq._night = lambda: seen.update(during=busy_text())     # what the worker would see
+seq._run()
+case("the busy file exists while a sequence runs",
+     seen.get("during") is not None and f"pid={os.getpid()}" in seen["during"],
+     repr(seen.get("during")))
+case("and is gone after a normal end", busy_text() is None)
+
+seq, rig, config = build({"mount": Mount()})
+
+
+def stop_during():
+    seen["stop"] = busy_text()
+    seq.stop()
+
+
+seq._night = stop_during
+seq._run()
+case("the busy file exists until a run is stopped", seen.get("stop") is not None)
+case("and is gone after a stop", busy_text() is None)
+
+seq, rig, config = build({"mount": Mount()})
+
+
+def abort_during():
+    seq._abort.set()                    # Abort: the loop is told not to go on
+
+
+seq._night = abort_during
+seq._run()
+case("and is gone after an abort", busy_text() is None)
+
+seq, rig, config = build({"mount": Mount()})
+
+
+def fall_over():
+    seen["fall"] = busy_text()
+    raise RuntimeError("the camera fell over")
+
+
+seq._night = fall_over
+try:
+    seq._run()
+    raised = False
+except RuntimeError:
+    raised = True
+case("the busy file is gone after an exception that escapes the run",
+     raised and seen.get("fall") is not None and busy_text() is None)
+
+# Armed for dusk is not imaging: a loop waiting for the sky must not pause
+# the volunteers. The file appears only once a night actually runs.
+seq, rig, config = build({"mount": Mount()})
+seen.pop("dusk", None)
+
+
+def dusk_wait(after=None):
+    seen["dusk"] = busy_text()
+    return False                        # the wait ends without a night
+
+
+seq._loop = True
+seq._wait_for_dusk = dusk_wait
+seq._night = lambda: seen.update(loop_night=busy_text())
+seq._run()
+case("the busy file does not exist while the sequencer waits for dusk",
+     seen.get("dusk") is None, repr(seen.get("dusk")))
+case("and no night ran, so it never appeared", seen.get("loop_night") is None
+     and busy_text() is None)
+
+# A file left by a process that died mid-night is removed when the sequencer
+# is built; a file naming this process is ours, and is left alone.
+clear_busy()
+_busy_path().parent.mkdir(parents=True, exist_ok=True)
+_busy_path().write_text("started=last night\npid=424242\n", encoding="utf-8")
+build({"mount": Mount()})
+case("a stale busy file from another pid is removed when the sequencer is built",
+     busy_text() is None)
+_busy_path().write_text(f"started=now\npid={os.getpid()}\n", encoding="utf-8")
+build({"mount": Mount()})
+case("a busy file naming this process is left alone", busy_text() is not None)
+clear_busy()
+
+# A busy file that cannot be written or removed must not stop a sequence.
+_busy_path().mkdir(parents=True, exist_ok=True)     # a directory where the file goes
+seq, rig, config = build({"mount": Mount()})
+ran = {}
+seq._night = lambda: ran.update(done=True)
+try:
+    seq._run()
+    survived = True
+except Exception:                                   # noqa: BLE001
+    survived = False
+case("a busy file that cannot be written does not stop the sequence",
+     survived and ran.get("done") is True)
+clear_busy()
+
 print()
 print(f"{sum(results)}/{len(results)} passed")
 sys.exit(0 if all(results) else 1)

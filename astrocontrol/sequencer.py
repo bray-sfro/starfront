@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
+import os
 import shutil
 import threading
 import time
@@ -46,6 +48,7 @@ from pathlib import Path
 from typing import Any
 
 from . import allsky, astro, capture, filters, plans, schedule
+from .config import data_root
 from .devices.base import DeviceError
 from .imaging import stars
 
@@ -111,9 +114,64 @@ def _flatten(allocation: list[dict[str, Any]],
     return dealt
 
 
+_log = logging.getLogger("astrocontrol.sequencer")
+
+
+def _busy_path() -> Path:
+    """Where the volunteer stacking worker looks to learn a sequence is imaging.
+
+    Its presence means "pause": the worker stops polling while it exists. The
+    content (start time and this process's pid) is for a person reading it,
+    and for the stale check at start-up, which needs the pid.
+    """
+    return data_root() / "collab-worker" / "busy"
+
+
+def _mark_busy() -> None:
+    """Create the busy file. Never raises: a full disk must not stop a sequence."""
+    try:
+        path = _busy_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        path.write_text(f"started={started}\npid={os.getpid()}\n", encoding="utf-8")
+    except Exception:                       # noqa: BLE001 - logged, never fatal
+        _log.warning("could not write the busy file", exc_info=True)
+
+
+def _clear_busy() -> None:
+    """Remove the busy file. Never raises."""
+    try:
+        _busy_path().unlink(missing_ok=True)
+    except Exception:                       # noqa: BLE001 - logged, never fatal
+        _log.warning("could not remove the busy file", exc_info=True)
+
+
+def _clear_stale_busy() -> None:
+    """Remove a busy file left by an earlier process that died mid-sequence.
+
+    Without this a crash during a night would leave volunteers paused until
+    someone found the file by hand. A file that names this process is left
+    alone: it can only be ours.
+    """
+    try:
+        path = _busy_path()
+        if not path.exists():
+            return
+        pid = None
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("pid="):
+                pid = line[len("pid="):].strip()
+        if pid != str(os.getpid()):
+            path.unlink(missing_ok=True)
+            _log.info("removed a stale busy file from pid %s", pid or "?")
+    except Exception:                       # noqa: BLE001 - logged, never fatal
+        _log.warning("could not check the busy file", exc_info=True)
+
+
 class Sequencer:
     def __init__(self, rigs, config, targets, plan, coverage=None,
                  recipes=None, calibrator=None, progress=None) -> None:
+        _clear_stale_busy()
         self.rigs = rigs
         self.config = config
         self.targets = targets
@@ -791,6 +849,20 @@ class Sequencer:
         self._say(f"{rig.name}: camera cooler off", "success")
 
     # -- the run -----------------------------------------------------------
+    def _imaging_night(self) -> None:
+        """`_night`, with the busy file held for exactly as long as it runs.
+
+        The file means "imaging now". A loop armed in the afternoon waits for
+        dusk outside this, so volunteers are not paused by a sequence that is
+        only armed. Every way a night ends (plan run out, Stop, Abort, recovery
+        giving up, an exception) passes through the finally.
+        """
+        _mark_busy()
+        try:
+            self._night()
+        finally:
+            _clear_busy()
+
     def _run(self) -> None:
         try:
             # The night just run ends at its dawn; the next one is the first
@@ -807,7 +879,7 @@ class Sequencer:
                     if self._nights:
                         self._stop_warming()
                         self._reset_night()
-                self._night()
+                self._imaging_night()
                 if not self._loop or self._abort.is_set():
                     break
                 after = self._dawn() or time.time()
