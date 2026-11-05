@@ -1,0 +1,1563 @@
+diff --git a/astrocontrol/__init__.py b/astrocontrol/__init__.py
+index f2acb4c..6f388d8 100644
+--- a/astrocontrol/__init__.py
++++ b/astrocontrol/__init__.py
+@@ -1,4 +1,4 @@
+ ﻿"""Starfront - astrophotography equipment control."""
+ 
+-__version__ = "0.2.53b"
++__version__ = "0.2.53c"
+ 
+diff --git a/astrocontrol/capture.py b/astrocontrol/capture.py
+index 9f77854..24695a3 100644
+--- a/astrocontrol/capture.py
++++ b/astrocontrol/capture.py
+@@ -724,12 +724,21 @@ class CaptureService:
+                 done["panel"] = True
+                 self.manager.log("Flat panel switched off for a light frame")
+ 
+-            # "notpresent" and "unknown" are left alone: there is either no
+-            # cover or no way to tell, and driving one blind is worse.
+-            if panel.has_cover and panel.cover_state in ("closed", "moving"):
+-                if panel.cover_state == "closed":
+-                    self.manager.log("Opening the cover for a light frame")
+-                    panel.open_cover()
++            # NotPresent: lamp only, do not command. Unknown is not that.
++            # A failed read is reported and not commanded.
++            action = panel.cover_prepare() if hasattr(panel, "cover_prepare") else (
++                "open" if panel.has_cover and panel.cover_state in ("closed", "moving")
++                else "skip")
++            if action == "unreadable":
++                self.manager.log(
++                    "CoverState could not be read — not treating the panel as "
++                    "coverless, and not sending OpenCover", "error")
++                return done
++            if action == "open":
++                state = str(panel.cover_state)
++                self.manager.log(
++                    f"Opening the cover for a light frame (driver reports {state})")
++                panel.open_cover()
+                 timeout = float(self.config.get("calibration",
+                                                 "coverTimeoutSeconds", 180.0))
+                 deadline = time.monotonic() + timeout
+diff --git a/astrocontrol/config.py b/astrocontrol/config.py
+index 43e474d..a1922ae 100644
+--- a/astrocontrol/config.py
++++ b/astrocontrol/config.py
+@@ -595,6 +595,10 @@ DEFAULTS: dict[str, dict[str, Any]] = {
+         # abort that never finishes is an abort that never parked.
+         "coverTimeoutSeconds": 120.0,
+         "roofTimeoutSeconds": 300.0,
++        # After CloseShutter, how long the driver may keep reporting the same
++        # word before that is called a conflict. The close keeps waiting until
++        # roofTimeoutSeconds. 0.2.53b gave up on the first still-open read.
++        "roofCloseNoChangeSeconds": 30.0,
+         # 0.2.53b - the roof at the start of a target. Open it (lead telescope
+         # only) before the first home/slew/focus/light of every target if it
+         # is not open; acts only when a dome/roof with a shutter is connected.
+diff --git a/astrocontrol/devices/alpaca.py b/astrocontrol/devices/alpaca.py
+index 7ff3a4c..923bb01 100644
+--- a/astrocontrol/devices/alpaca.py
++++ b/astrocontrol/devices/alpaca.py
+@@ -787,7 +787,6 @@ class AlpacaFlatPanel(_AlpacaDevice, FlatPanel):
+     def connect(self) -> None:
+         super().connect()
+         self.max_brightness = int(self._client.get("maxbrightness") or 100)
+-        self.has_cover = self.cover_state not in ("notpresent", "unknown")
+ 
+     @property
+     def brightness(self) -> int:
+@@ -799,8 +798,15 @@ class AlpacaFlatPanel(_AlpacaDevice, FlatPanel):
+ 
+     @property
+     def cover_state(self) -> str:
+-        value = self._client.get_cached("coverstate", 1.0, 0)
+-        return self._COVER_STATES.get(int(value or 0), "unknown")
++        missing = object()
++        value = self._client.get_cached("coverstate", 1.0, missing)
++        if value is missing or value is None:
++            return "unread"
++        try:
++            number = int(value)
++        except (TypeError, ValueError):
++            return "unread"
++        return self._COVER_STATES.get(number, "unread")
+ 
+     def turn_on(self, brightness: int) -> None:
+         self._require()
+@@ -828,6 +834,7 @@ class AlpacaFlatPanel(_AlpacaDevice, FlatPanel):
+             "lightOn": self.light_on,
+             "hasCover": self.has_cover,
+             "coverState": self.cover_state,
++            "coverPrepare": self.cover_prepare(),
+         }
+ 
+ 
+@@ -887,11 +894,21 @@ class AlpacaDome(_AlpacaDevice, Dome):
+ 
+     def open_shutter(self) -> None:
+         self._require()
+-        self._client.put("openshutter")
++        self.begin_shutter_command("open")
++        try:
++            self._client.put("openshutter")
++        except Exception as exc:
++            self.fail_shutter_command(str(exc))
++            raise
+ 
+     def close_shutter(self) -> None:
+         self._require()
+-        self._client.put("closeshutter")
++        self.begin_shutter_command("close")
++        try:
++            self._client.put("closeshutter")
++        except Exception as exc:
++            self.fail_shutter_command(str(exc))
++            raise
+ 
+     def park(self) -> None:
+         self._require()
+@@ -903,10 +920,17 @@ class AlpacaDome(_AlpacaDevice, Dome):
+ 
+     def status(self) -> dict[str, Any]:
+         if not self._connected:
+-            return {"connected": False}
++            return {
++                "connected": False,
++                "shutterState": "unknown",
++                "shutterVerified": False,
++                "shutterQuality": "unknown",
++                "shutterNote": self.SHUTTER_NOTE,
++            }
++        # A missing shutterstatus stays error (the cache default), never open.
++        report = self.shutter_report(self.shutter_state)
+         return {
+             "connected": True,
+-            "shutterState": self.shutter_state,
+             "canShutter": self.can_shutter,
+             "canPark": self.can_park,
+             "canSlave": self.can_slave,
+@@ -914,6 +938,7 @@ class AlpacaDome(_AlpacaDevice, Dome):
+             "atPark": self.at_park,
+             "slewing": self.slewing,
+             "azimuth": self.azimuth,
++            **report,
+         }
+ 
+ 
+diff --git a/astrocontrol/devices/ascom.py b/astrocontrol/devices/ascom.py
+index 9557d64..8f7c338 100644
+--- a/astrocontrol/devices/ascom.py
++++ b/astrocontrol/devices/ascom.py
+@@ -1121,7 +1121,6 @@ class AscomFlatPanel(_AscomDevice, FlatPanel):
+         self._set("Connected", True)
+         self._connected = True
+         self.max_brightness = int(self._get("MaxBrightness", 100) or 100)
+-        self.has_cover = self.cover_state not in ("notpresent", "unknown")
+ 
+     def disconnect(self) -> None:
+         try:
+@@ -1140,7 +1139,18 @@ class AscomFlatPanel(_AscomDevice, FlatPanel):
+ 
+     @property
+     def cover_state(self) -> str:
+-        return self._COVER_STATES.get(int(self._get("CoverState", 0) or 0), "unknown")
++        # 0 is CoverStatus.NotPresent, a real answer. A failed read must not
++        # use that number, or a panel whose cover cannot be read is treated
++        # as a lamp with no cover and OpenCover is never sent.
++        missing = object()
++        value = self._get("CoverState", missing)
++        if value is missing or value is None:
++            return "unread"
++        try:
++            number = int(value)
++        except (TypeError, ValueError):
++            return "unread"
++        return self._COVER_STATES.get(number, "unread")
+ 
+     def turn_on(self, brightness: int) -> None:
+         self._require()
+@@ -1168,6 +1178,7 @@ class AscomFlatPanel(_AscomDevice, FlatPanel):
+             "lightOn": self.light_on,
+             "hasCover": self.has_cover,
+             "coverState": self.cover_state,
++            "coverPrepare": self.cover_prepare(),
+         }
+ 
+ 
+@@ -1203,13 +1214,46 @@ class AscomSafetyMonitor(_AscomDevice, SafetyMonitor):
+ class AscomDome(_AscomDevice, Dome):
+     _SHUTTER_STATES = {0: "open", 1: "closed", 2: "opening", 3: "closing", 4: "error"}
+ 
++    # Status-panel polling must not turn into a roof-server read on every
++    # refresh. Control loops call refresh_shutter(), which is allowed once a
++    # second. A reading older than STALE_SECONDS is unknown, never the last open.
++    POLL_SECONDS = 5.0
++    STALE_SECONDS = 30.0
++    MIN_REFRESH_SECONDS = 1.0
++    BACKOFF_MAX_SECONDS = 60.0
++    _shutter_driver = "unknown"
++    _shutter_last_good: str | None = None
++    _shutter_read_at: float | None = None
++    _shutter_tried_at: float | None = None
++    _shutter_failures = 0
++
+     def __init__(self, prog_id: str, name: str) -> None:
+         Dome.__init__(self, prog_id, name)
+         self._prog_id = prog_id
++        self._reset_shutter_account()
++
++    def _reset_shutter_account(self) -> None:
++        self._shutter_driver = "unknown"
++        self._shutter_last_good = None
++        self._shutter_read_at = None
++        self._shutter_tried_at = None
++        self._shutter_failures = 0
++        self._shutter_command = None
++        self._shutter_command_pending = False
++        self._shutter_command_error = None
++        self._shutter_conflict = None
+ 
+     def connect(self) -> None:
+         self._open(self._prog_id)
+         self._set("Connected", True)
++        # A new connection has not been read yet. Do not keep a previous open,
++        # and do not treat a driver's default as a roof that is open.
++        self._reset_shutter_account()
++        if self._get("Connected", True) is False:
++            self._connected = False
++            raise DeviceError(
++                f"{self.name}: the driver did not connect (it reports "
++                "Connected = False after being asked to connect)")
+         self._connected = True
+         self.can_park = bool(self._get("CanPark", False))
+         self.can_shutter = bool(self._get("CanSetShutter", False))
+@@ -1220,18 +1264,116 @@ class AscomDome(_AscomDevice, Dome):
+             self._set("Connected", False)
+         finally:
+             self._connected = False
++            self._reset_shutter_account()
++
++    @staticmethod
++    def _map_shutter_status(value: Any) -> str:
++        """Map an ASCOM ShutterStatus integer. 0 is open. None is unknown, not open."""
++        if value is None:
++            return "unknown"
++        try:
++            return AscomDome._SHUTTER_STATES.get(int(value), "error")
++        except (TypeError, ValueError):
++            return "error"
++
++    def _pull_shutter(self, now: float) -> None:
++        self._shutter_tried_at = now
++        missing = object()
++        value = self._get("ShutterStatus", missing)
++        if value is missing:
++            self._shutter_failures += 1
++            return
++        state = self._map_shutter_status(value)
++        if state in ("error", "unknown"):
++            self._shutter_failures += 1
++            if state == "error":
++                self._shutter_driver = "error"
++                self._shutter_read_at = now
++            return
++        previous = self._shutter_last_good
++        self._shutter_failures = 0
++        self._shutter_driver = state
++        self._shutter_last_good = state
++        self._shutter_read_at = now
++        self._settle_shutter_command(state, previous)
++
++    def _settle_shutter_command(self, state: str, previous: str | None) -> None:
++        command = self._shutter_command
++        pending = self._shutter_command_pending
++        if pending and command == "close" and state == "opening":
++            # HakosRoof has been seen to report opening after CloseShutter.
++            # That is a driver word, not proof the roof is moving shut.
++            self._shutter_conflict = (
++                "driver reports opening while a close command is still pending")
++        elif pending and command == "open" and state == "open":
++            self._shutter_command_pending = False
++        elif pending and command == "close" and state == "closed":
++            self._shutter_command_pending = False
++            if self._shutter_conflict and "close command" in self._shutter_conflict:
++                self._shutter_conflict = None
++        elif (previous in ("open", "closed") and state in ("open", "closed")
++              and previous != state and not pending):
++            self._shutter_conflict = (
++                f"driver flipped from {previous} to {state} with no command in progress")
++
++    def _shutter_due(self, now: float) -> bool:
++        tried = self._shutter_tried_at
++        if tried is None:
++            return True
++        wait = self.POLL_SECONDS
++        if self._shutter_failures:
++            wait = min(self.BACKOFF_MAX_SECONDS,
++                       self.POLL_SECONDS * (2 ** min(self._shutter_failures, 8)))
++        return now >= tried + wait
++
++    def _published_shutter(self) -> str:
++        if not self.can_shutter:
++            return "notpresent"
++        now = time.monotonic()
++        read_at = self._shutter_read_at
++        if read_at is not None and now - read_at > self.STALE_SECONDS:
++            return "unknown"
++        if self._shutter_failures:
++            return "error"
++        if read_at is None:
++            return "unknown"
++        return self._shutter_driver or "unknown"
+ 
+     @property
+     def shutter_state(self) -> str:
+         if not self.can_shutter:
+             return "notpresent"
+-        # 0.2.53b: ShutterStatus 0 *is* shutterOpen. `... or 4` turned every
+-        # open roof into "error", so nothing could ever see one open.
+-        value = self._get("ShutterStatus", None)
+-        try:
+-            return self._SHUTTER_STATES.get(int(value), "error")
+-        except (TypeError, ValueError):
+-            return "error"
++        now = time.monotonic()
++        if self._shutter_due(now):
++            self._pull_shutter(now)
++        return self._published_shutter()
++
++    def shutter_age(self) -> float | None:
++        if self._shutter_read_at is None:
++            return None
++        return max(0.0, time.monotonic() - self._shutter_read_at)
++
++    def refresh_shutter(self) -> str:
++        """A driver read for a control loop, at most once a second."""
++        if not self.can_shutter:
++            return "notpresent"
++        now = time.monotonic()
++        tried = self._shutter_tried_at
++        if tried is None or now - tried >= self.MIN_REFRESH_SECONDS:
++            self._pull_shutter(now)
++        return self._published_shutter()
++
++    def shutter_report(self, state: str | None = None) -> dict[str, Any]:
++        if state is None:
++            state = self._published_shutter() if self.can_shutter else "notpresent"
++        report = super().shutter_report(state)
++        age = self.shutter_age()
++        report["shutterAgeSeconds"] = None if age is None else round(age, 1)
++        report["shutterLastDriver"] = self._shutter_last_good
++        if age is not None and age > self.STALE_SECONDS:
++            report["shutterQuality"] = "stale"
++            report["shutterState"] = "unknown"
++        return report
+ 
+     @property
+     def at_park(self) -> bool:
+@@ -1252,11 +1394,21 @@ class AscomDome(_AscomDevice, Dome):
+ 
+     def open_shutter(self) -> None:
+         self._require()
+-        self._invoke("OpenShutter")
++        self.begin_shutter_command("open")
++        try:
++            self._invoke("OpenShutter")
++        except Exception as exc:
++            self.fail_shutter_command(str(exc))
++            raise
+ 
+     def close_shutter(self) -> None:
+         self._require()
+-        self._invoke("CloseShutter")
++        self.begin_shutter_command("close")
++        try:
++            self._invoke("CloseShutter")
++        except Exception as exc:
++            self.fail_shutter_command(str(exc))
++            raise
+ 
+     def park(self) -> None:
+         self._require()
+@@ -1268,10 +1420,16 @@ class AscomDome(_AscomDevice, Dome):
+ 
+     def status(self) -> dict[str, Any]:
+         if not self._connected:
+-            return {"connected": False}
++            return {
++                "connected": False,
++                "shutterState": "unknown",
++                "shutterVerified": False,
++                "shutterQuality": "unknown",
++                "shutterNote": self.SHUTTER_NOTE,
++            }
++        report = self.shutter_report(self.shutter_state)
+         return {
+             "connected": True,
+-            "shutterState": self.shutter_state,
+             "canShutter": self.can_shutter,
+             "canPark": self.can_park,
+             "canSlave": self.can_slave,
+@@ -1279,6 +1437,7 @@ class AscomDome(_AscomDevice, Dome):
+             "atPark": self.at_park,
+             "slewing": self.slewing,
+             "azimuth": self.azimuth,
++            **report,
+         }
+ 
+ 
+diff --git a/astrocontrol/devices/base.py b/astrocontrol/devices/base.py
+index 5c5b5bb..25d00c0 100644
+--- a/astrocontrol/devices/base.py
++++ b/astrocontrol/devices/base.py
+@@ -447,7 +447,34 @@ class FlatPanel(Device):
+     kind = "flatpanel"
+ 
+     max_brightness: int = 100
+-    has_cover: bool = False
++    @property
++    def has_cover(self) -> bool | None:
++        """True when the driver has shown a cover, False when it reports none.
++
++        None when the state is unknown or the read failed. Unknown is not
++        "no cover", and a failed read is not "no cover".
++        """
++        state = str(self.cover_state or "unread")
++        if state == "notpresent":
++            return False
++        if state in ("closed", "moving", "open", "error"):
++            return True
++        return None
++
++    def cover_prepare(self) -> str:
++        """What a light-path prep may do. Never a physical cap position.
++
++        "skip" — driver says open, or NotPresent (lamp only: do not command).
++        "unreadable" — CoverState could not be read. Do not command, do not
++        pretend there is no cover.
++        "open" — closed, moving, unknown, or a cover error. Ask OpenCover.
++        """
++        state = str(self.cover_state or "unread")
++        if state in ("open", "notpresent"):
++            return "skip"
++        if state == "unread":
++            return "unreadable"
++        return "open"
+ 
+     @property
+     def brightness(self) -> int:
+@@ -543,6 +570,63 @@ class Dome(Device):
+     def set_slaved(self, on: bool) -> None:
+         raise DeviceError("dome cannot slave itself")
+ 
++    # A driver word is not a roof sensor. Nothing in this program may set
++    # shutterVerified true: ASCOM ShutterStatus is the driver's claim.
++    SHUTTER_NOTE = (
++        "Driver-reported only. Starfront has no roof position sensor and "
++        "does not treat this reading as physically open or closed."
++    )
++    _shutter_command: str | None = None
++    _shutter_command_pending: bool = False
++    _shutter_command_error: str | None = None
++    _shutter_conflict: str | None = None
++
++    def begin_shutter_command(self, command: str) -> None:
++        """Record that a command was accepted by us, not that the roof moved."""
++        self._shutter_command = command
++        self._shutter_command_pending = True
++        self._shutter_command_error = None
++
++    def fail_shutter_command(self, error: str) -> None:
++        self._shutter_command_pending = False
++        self._shutter_command_error = str(error)
++
++    def note_shutter_conflict(self, text: str | None) -> None:
++        self._shutter_conflict = text or None
++
++    def shutter_report(self, state: str | None = None) -> dict[str, Any]:
++        """Driver state plus the limits of that state. `shutterVerified` is false."""
++        if state is None:
++            try:
++                state = str(self.shutter_state or "unknown")
++            except Exception:                     # noqa: BLE001 - a fault is not open
++                state = "error"
++        pending = bool(getattr(self, "_shutter_command_pending", False))
++        error = getattr(self, "_shutter_command_error", None)
++        conflict = getattr(self, "_shutter_conflict", None)
++        if state in ("unknown", "notpresent"):
++            quality = "unknown"
++        elif error or state == "error":
++            quality = "error"
++        elif conflict:
++            quality = "conflict"
++        elif pending or state in ("opening", "closing"):
++            quality = "pending"
++        else:
++            quality = "driver"
++        return {
++            "shutterState": state,
++            "shutterVerified": False,
++            "shutterQuality": quality,
++            "shutterCommand": getattr(self, "_shutter_command", None),
++            "shutterCommandPending": pending,
++            "shutterCommandError": error,
++            "shutterConflict": conflict,
++            "shutterAgeSeconds": None,
++            "shutterLastDriver": None,
++            "shutterNote": self.SHUTTER_NOTE,
++        }
++
+ 
+ class SwitchBank(Device):
+     """Switched outputs: power, dew heaters, anything with a state.
+diff --git a/astrocontrol/main.py b/astrocontrol/main.py
+index e69a637..c5ddc51 100644
+--- a/astrocontrol/main.py
++++ b/astrocontrol/main.py
+@@ -771,6 +771,7 @@ class SequencerSettingsRequest(BaseModel):
+     pauseLightsUnlessRoofOpen: bool | None = None
+     closeRoofAtEnd: bool | None = None
+     reopenRoofOnAutoRestart: bool | None = None
++    roofCloseNoChangeSeconds: float | None = Field(default=None, ge=5, le=600)
+ 
+ 
+ class GuidingSettingsRequest(BaseModel):
+@@ -3649,8 +3650,15 @@ def dome_shutter(body: DomeShutterRequest) -> dict[str, Any]:
+             status_code=409,
+             detail="the safety monitor says it is not safe to open")
+     _guard(dome.open_shutter if body.open else dome.close_shutter)
+-    rigs.log(f"Roof: {'opening' if body.open else 'closing'}", "warn")
+-    return {"ok": True}
++    # Acceptance is not a position. The driver has been asked; it has not
++    # been checked, and this program cannot check it physically.
++    report = dome.shutter_report() if hasattr(dome, "shutter_report") else {
++        "shutterVerified": False, "shutterQuality": "pending"}
++    rigs.log(
++        f"Roof command accepted: asking the driver to "
++        f"{'open' if body.open else 'close'}. Not a verified roof position.",
++        "warn")
++    return {"accepted": True, "verified": False, "pending": True, "shutter": report}
+ 
+ 
+ @app.post("/api/dome/park")
+diff --git a/astrocontrol/sequencer.py b/astrocontrol/sequencer.py
+index 9609a8c..5084111 100644
+--- a/astrocontrol/sequencer.py
++++ b/astrocontrol/sequencer.py
+@@ -1701,27 +1701,41 @@ class Sequencer:
+         opens it, and nothing did: the next night's frames were of the inside
+         of the lid. A cover that will not open ends the night here rather than
+         after an hour of those.
++
++        ASCOM CoverStatus.NotPresent is the only "no cover" answer. Unknown is
++        not that answer, and a failed read is not that answer either. A
++        lamp-only panel that reports NotPresent is not commanded.
+         """
+         panel = self.manager.get("flatpanel")
+         if panel is None or not panel.connected:
+             return
+         with contextlib.suppress(Exception):
+             panel.turn_off()
+-        if not getattr(panel, "has_cover", False):
+-            return
+-        if panel.cover_state in ("open", "notpresent"):
++        action = panel.cover_prepare() if hasattr(panel, "cover_prepare") else (
++            "skip" if str(getattr(panel, "cover_state", "")) in ("open", "notpresent")
++            or not getattr(panel, "has_cover", False) else "open")
++        if action == "skip":
+             return
++        state = str(getattr(panel, "cover_state", "unread"))
++        if action == "unreadable":
++            raise DeviceError(
++                "CoverState could not be read — the panel is not being treated "
++                "as coverless, and OpenCover was not sent")
+         self._set("homing", "opening the cover")
+-        self._say("Opening the flat panel's cover")
+-        panel.open_cover()
++        self._say(f"Opening the flat panel's cover (driver reports {state})", "warn")
++        try:
++            panel.open_cover()
++        except Exception as exc:                  # noqa: BLE001 - show the driver error
++            raise DeviceError(f"OpenCover failed while the driver reported {state}: {exc}") from exc
+         deadline = time.monotonic() + float(
+             self._settings().get("coverTimeoutSeconds") or 120.0)
+-        while panel.cover_state == "moving" and time.monotonic() < deadline:
++        while str(panel.cover_state) != "open" and time.monotonic() < deadline:
+             self._check()
+             time.sleep(0.5)
+         if panel.cover_state != "open":
+             raise DeviceError(f"the flat panel's cover is {panel.cover_state}, "
+-                              "not open")
++                              "not open — OpenCover was sent and the driver "
++                              "did not report open")
+         self._say("Cover open", "success")
+ 
+     def _walk_plan(self, stored: dict[str, Any], known: dict[str, Any]) -> None:
+@@ -3911,12 +3925,21 @@ class Sequencer:
+ 
+     @staticmethod
+     def _roof_state(dome) -> str:
+-        """open, closed, opening, closing, error - a read that fails is error."""
++        """Driver word. A failed read is error. Unknown is not open."""
+         try:
+-            return str(dome.shutter_state or "error").lower()
++            refresh = getattr(dome, "refresh_shutter", None)
++            if refresh is not None:
++                return str(refresh() or "unknown").lower()
++            return str(dome.shutter_state or "unknown").lower()
+         except Exception:                         # noqa: BLE001 - a fault is not open
+             return "error"
+ 
++    @staticmethod
++    def _note_roof_conflict(dome, text: str | None) -> None:
++        note = getattr(dome, "note_shutter_conflict", None)
++        if note is not None:
++            note(text)
++
+     def _safety_watching(self) -> bool:
+         watcher = getattr(self, "safety", None)
+         if watcher is None:
+@@ -3969,6 +3992,11 @@ class Sequencer:
+         if dome is None:
+             return True
+         if self._roof_state(dome) == "open":
++            # Already-reported open is the driver's word. Do not send another
++            # OpenShutter, and do not call it verified.
++            self._say(
++                f"Driver already reports the roof open before {label} — "
++                "not verified. No OpenShutter sent.", "warn")
+             return True
+         if self._roof_locked:
+             raise DeviceError(f"the roof is treated as locked ({self._roof_locked}); "
+@@ -4002,11 +4030,13 @@ class Sequencer:
+             raise DeviceError("the roof was not opened: 'Require safety monitor to "
+                               "open' is on and there is no safety monitor")
+         else:
+-            title = "Roof opened with no safety monitor - nothing will close it for weather"
+-            detail = (f"{getattr(dome, 'name', 'The roof')} is being opened for {label} "
+-                      "with no safety monitor connected or configured. Starfront "
+-                      "closes it at the end of the run, but nothing will close it "
+-                      "if the weather turns.")
++            title = ("Roof commanded open with no safety monitor"
++                     " — nothing will close it for weather")
++            detail = (f"{getattr(dome, 'name', 'The roof')} is being commanded open "
++                      f"for {label} with no safety monitor connected or configured. "
++                      "The command has not been carried out yet. Starfront asks the "
++                      "driver to close at the end of the run, but nothing will close "
++                      "it if the weather turns.")
+             self._warn("roof.nosafety", "warning", title, detail,
+                        "Connect a safety monitor (Equipment → Safety), or watch the sky.")
+             self._roof_alert(title, detail)
+@@ -4035,7 +4065,9 @@ class Sequencer:
+                 self._roof_lock(dome, f"not open after {timeout:.0f} s (it reads {state})")
+             self._sleep(self.ROOF_POLL_SECONDS)
+             state = self._roof_state(dome)
+-        self._say("Roof open", "success")
++        self._say(
++            "Driver reports the roof open — not verified. "
++            "Starfront has no roof sensor and did not see the roof move.", "warn")
+         self._unwarn("roof.closed")
+         return True
+ 
+@@ -4059,27 +4091,29 @@ class Sequencer:
+             return
+         started = time.monotonic()
+         alerted = False
+-        self._say(f"Holding the lights: the roof reads {state}", "warn")
++        self._say(f"Holding the lights: the driver reports the roof {state}", "warn")
+         while state != "open":
+-            self._set("waiting", f"lights held: the roof reads {state}")
++            self._set("waiting", f"lights held: the driver reports {state}")
+             if not alerted and time.monotonic() - started >= 60.0:
+                 alerted = True
+-                title = "Lights held: the roof is not open"
++                title = "Lights held: the driver does not report the roof open"
+                 detail = (f"{getattr(dome, 'name', 'The roof')} has read {state} for a "
+-                          "minute. No light is taken until it reads open"
++                          "minute. No light is taken while the driver reports that. "
++                          "This is the driver's word, not a physical position."
+                           + (f" (treated as locked: {self._roof_locked})"
+-                             if self._roof_locked else "") + ".")
++                             if self._roof_locked else ""))
+                 self._warn("roof.closed", "critical", title, detail,
+                            "Open the roof, or stop the sequence.")
+                 self._roof_alert(title, detail)
+-            reason = self._past_deadline(None, None)
+-            if reason:
+-                self._say(f"{reason} while the lights were held for the roof", "warn")
++            end = self._past_deadline(None, None)
++            if end:
++                self._say(f"{end} while the lights were held for the roof", "warn")
+                 raise _Skipped()
+             self._sleep(5.0)
+             state = self._roof_state(dome)
+         self._unwarn("roof.closed")
+-        self._say("The roof reads open again: carrying on", "success")
++        self._say("Driver reports the roof open again — not verified. Carrying on.",
++                  "warn")
+ 
+     def _close_roof_after_run(self) -> None:
+         """Shut the roof this run opened, once the mount is parked (0.2.53b)."""
+@@ -4129,18 +4163,45 @@ class Sequencer:
+             return
+ 
+         self._set("parking", "closing the roof")
+-        dome.close_shutter()
++        try:
++            dome.close_shutter()
++        except Exception as exc:                  # noqa: BLE001 - the driver's word
++            raise DeviceError(f"CloseShutter failed: {exc}") from exc
++        # 0.2.53b returned on the first read. HakosRoof was still reporting
++        # open for about a second, then opening, then closed. Wait the timeout.
++        no_change = float(self._settings().get("roofCloseNoChangeSeconds") or 30.0)
+         deadline = time.monotonic() + timeout
+-        while dome.shutter_state in ("closing", "opening") \
+-                and time.monotonic() < deadline:
++        started = time.monotonic()
++        last = self._roof_state(dome)
++        changed_at = started
++        alerted = False
++        while time.monotonic() < deadline:
++            state = self._roof_state(dome)
++            if state == "closed":
++                self._say("Driver reports the roof closed — not independently verified",
++                          "warn")
++                self._unwarn("roof.nosafety")
++                if getattr(dome, "can_park", False) and not dome.at_park:
++                    with contextlib.suppress(Exception):
++                        dome.park()
++                return
++            if state != last:
++                last = state
++                changed_at = time.monotonic()
++            elif not alerted and time.monotonic() - changed_at >= no_change:
++                alerted = True
++                detail = (f"Close still pending: the driver still reports {state} "
++                          f"{no_change:.0f}s after CloseShutter. Not verified.")
++                self._say(detail, "error")
++                self._note_roof_conflict(dome, detail)
++                self._warn("roof.close", "critical",
++                           "The driver has not reported the roof closed",
++                           detail, "Look at the roof. Do not treat the driver word as proof.")
+             time.sleep(1.0)
+-        if dome.shutter_state != "closed":
+-            raise DeviceError(f"the roof is {dome.shutter_state}")
+-        self._say("Roof closed", "success")
+-        self._unwarn("roof.nosafety")
+-        if getattr(dome, "can_park", False) and not dome.at_park:
+-            with contextlib.suppress(Exception):
+-                dome.park()
++        state = self._roof_state(dome)
++        raise DeviceError(
++            f"the driver still reports {state} {timeout:.0f}s after CloseShutter"
++            " — not verified closed")
+ 
+     def _abort_cameras(self) -> None:
+         for stop in list(self.extra_aborts):
+@@ -4161,7 +4222,9 @@ class Sequencer:
+             return
+         with contextlib.suppress(Exception):
+             panel.turn_off()
+-        if not getattr(panel, "has_cover", False):
++        # Close only a cover the driver has shown us. Unknown is not a
++        # command to move, and NotPresent is a lamp with no cover.
++        if panel.has_cover is not True:
+             return
+         if panel.cover_state == "closed":
+             return
+diff --git a/astrocontrol/warnings.py b/astrocontrol/warnings.py
+index 2644fb1..c7e401a 100644
+--- a/astrocontrol/warnings.py
++++ b/astrocontrol/warnings.py
+@@ -807,10 +807,25 @@ def light_path(board: WarningBoard, ctx: Context) -> None:
+     panel = ctx.device("flatpanel")
+     if panel is not None:
+         with contextlib.suppress(Exception):
+-            if getattr(panel, "has_cover", False) and panel.cover_state in ("closed", "moving"):
++            state = str(getattr(panel, "cover_state", "unread"))
++            if state == "unread":
++                board.raise_("panel.cover", "critical",
++                             "The flat panel cover could not be read",
++                             "A failed cover reading is not a lamp-only panel, and it "
++                             "is not an open cap.",
++                             "Check the flip-flat driver. OpenCover is not sent until "
++                             "CoverState can be read.")
++            elif state == "unknown" or panel.has_cover is None:
++                board.raise_("panel.cover", "critical",
++                             "The flat panel cover state is unknown",
++                             "Unknown is not 'no cover', and it is not a physical "
++                             "cap position.",
++                             "The next light-path prep asks the driver to open. "
++                             "Confirm the cap by eye before trusting the sky.")
++            elif panel.has_cover and state in ("closed", "moving"):
+                 board.raise_("panel.cover", "critical", "The cover is shut while imaging",
+-                             f"The flat panel's cover is {panel.cover_state} and a light "
+-                             "frame is running.",
++                             f"The driver reports the flat panel cover {state} during a light "
++                             "frame. That is the driver's word, not a physical check.",
+                              "Open the cover from the flat panel panel; check 'open the "
+                              "cover before any light frame' under Calibrate.")
+             elif panel.light_on:
+@@ -971,22 +986,20 @@ def sequence_health(board: WarningBoard, ctx: Context) -> None:
+             offset = float(recent[0].offset or 0)
+             medians = [float((r.stats or {}).get("median") or 0.0) for r in recent]
+             if all(m <= offset * 10 + 30 for m in medians) and all(m < 300 for m in medians):
+-                # 0.2.53b: say so when the roof is the reason. The sequencer
+-                # holds every light while a connected roof is not open.
++                # Dark frames are an optical-path fact. They do not say whether
++                # the roof, a cap, cloud, or the exposure is the cause.
+                 roof = ""
+                 with contextlib.suppress(Exception):
+                     dome = ctx.rigs.master.manager.get("dome")
+                     if dome is not None and dome.connected and getattr(dome, "can_shutter", False):
+                         state = str(dome.shutter_state)
+                         if state != "open":
+-                            roof = f" The roof reads {state}."
++                            roof = f" The driver reports the roof {state}."
+                 board.raise_("frames.black", "critical", "The frames are black",
+                              f"The last {len(recent)} lights have a median of "
+                              f"{medians[-1]:.0f} ADU: nothing is reaching the sensor.{roof}",
+-                             ("The roof is not open: the run holds its lights until it "
+-                              "reads open." if roof else
+-                              "A cover still on, the panel's cover shut, or a dark filter "
+-                              "slot. Check the light path."))
++                             "The light path is blocked or dark. That can be a cap, "
++                             "the roof, cloud, or the exposure. This is not a roof position.")
+             elif all(m > 60000 for m in medians):
+                 board.raise_("frames.white", "critical", "The frames are saturated",
+                              f"The last {len(recent)} lights are at {medians[-1]:.0f} ADU.",
+diff --git a/astrocontrol/web/app.js b/astrocontrol/web/app.js
+index 4dc9bfe..ff5e05a 100644
+--- a/astrocontrol/web/app.js
++++ b/astrocontrol/web/app.js
+@@ -2311,6 +2311,53 @@ function updateGuider(guider) {
+   $('btnGuide').classList.toggle('active', !!guider.guiding);
+ }
+ 
++/* A driver word is never drawn as a verified open or closed. */
++function roofReadout(dome) {
++  const driver = String(dome.shutterState || 'unknown');
++  const quality = dome.shutterQuality || (driver === 'unknown' ? 'unknown' : 'driver');
++  const pending = !!dome.shutterCommandPending || quality === 'pending';
++  const command = dome.shutterCommand === 'close' ? 'close' : 'open';
++  const note = dome.shutterConflict
++    || dome.shutterCommandError
++    || dome.shutterNote
++    || 'Driver-reported only. Not a physical roof check.';
++  if (quality === 'stale') {
++    const last = dome.shutterLastDriver ? ` Last driver word was ${dome.shutterLastDriver}.` : '';
++    return {
++      text: 'STALE',
++      kind: 'roof-unknown',
++      note: `No fresh driver reading.${last} Not a current open or closed. ${note}`,
++    };
++  }
++  if (quality === 'unknown' || driver === 'unknown' || driver === 'notpresent') {
++    return {
++      text: driver === 'notpresent' ? 'NO SHUTTER' : 'UNKNOWN',
++      kind: 'roof-unknown',
++      note,
++    };
++  }
++  if (quality === 'error' || driver === 'error' || dome.shutterCommandError) {
++    return { text: 'DRIVER ERROR', kind: 'roof-error', note };
++  }
++  if (quality === 'conflict') {
++    return { text: `CONFLICT — driver says ${driver}`, kind: 'roof-conflict', note };
++  }
++  if (pending || driver === 'opening' || driver === 'closing') {
++    return {
++      text: `PENDING ${command} — driver says ${driver}`,
++      kind: 'roof-pending',
++      note,
++    };
++  }
++  if (driver === 'open') {
++    return { text: 'DRIVER: OPEN — not verified', kind: 'roof-driver-open', note };
++  }
++  if (driver === 'closed') {
++    return { text: 'DRIVER: CLOSED — not verified', kind: 'roof-driver-closed', note };
++  }
++  return { text: `DRIVER: ${driver} — not verified`, kind: 'roof-pending', note };
++}
++
+ /* ------------------------------------------------------------- observatory */
+ 
+ /* The building, not the telescope. Weather first and largest, because it is the
+@@ -2352,11 +2399,16 @@ function updateObservatory(status) {
+   $('domeRow').hidden = !haveDome;
+   $('domeControls').hidden = !haveDome;
+   if (haveDome) {
+-    setText('domeShutter', dome.shutterState || '—');
++    const roof = roofReadout(dome);
++    setText('domeShutter', roof.text);
++    const note = $('domeShutterNote');
++    if (note) note.textContent = roof.note;
+     setText('domeAz', dome.azimuth === null || dome.azimuth === undefined
+       ? (dome.atPark ? 'parked' : '—') : `${dome.azimuth.toFixed(0)}°`);
+     const shutterNode = $('domeShutter');
+-    if (shutterNode) shutterNode.classList.toggle('alert', dome.shutterState === 'error');
++    if (shutterNode) {
++      shutterNode.className = roof.kind;
++    }
+     // Opening is refused while unsafe by the server; disabling it here as well
+     // means the button says so rather than the error doing it.
+     $('btnRoofOpen').disabled = !dome.canShutter || safety.safe === false;
+@@ -4019,6 +4071,7 @@ const EQUIPMENT_FIELDS = [
+   ['sequencer', 'openRoofAtStart', 'seqOpenRoof', 'check'],
+   ['sequencer', 'requireSafetyToOpen', 'seqRoofNeedsSafety', 'check'],
+   ['sequencer', 'roofOpenTimeoutSeconds', 'seqRoofOpenTimeout', 'number'],
++  ['sequencer', 'roofCloseNoChangeSeconds', 'seqRoofCloseNoChange', 'number'],
+   ['sequencer', 'pauseLightsUnlessRoofOpen', 'seqRoofGate', 'check'],
+   ['sequencer', 'closeRoofAtEnd', 'seqRoofCloseAtEnd', 'check'],
+   ['sequencer', 'loopLeadMinutes', 'seqLoopLead', 'number'],
+@@ -6336,14 +6389,16 @@ function bindControls() {
+   // that can come down on it.
+   $('btnRoofOpen').addEventListener('click', async () => {
+     const ok = await confirmAction(
+-      'Open the roof? Check nothing is in the way of the shutter.',
+-      { title: 'Open roof', confirmLabel: 'Open', danger: true });
++      'Send OpenShutter? The driver will be asked to open. Its later status '
++      + 'is not a physical check that the roof moved.',
++      { title: 'Ask the driver to open', confirmLabel: 'Send open', danger: true });
+     if (ok) send('/api/dome/shutter', 'POST', { open: true });
+   });
+   $('btnRoofClose').addEventListener('click', async () => {
+     const ok = await confirmAction(
+-      'Close the roof? Make sure the telescope is parked clear of the shutter.',
+-      { title: 'Close roof', confirmLabel: 'Close', danger: true });
++      'Send CloseShutter? Make sure the telescope is parked clear of the shutter. '
++      + 'A driver status of closed afterwards is not a physical check.',
++      { title: 'Ask the driver to close', confirmLabel: 'Send close', danger: true });
+     if (ok) send('/api/dome/shutter', 'POST', { open: false });
+   });
+   $('btnOffsetsRun').addEventListener('click', async () => {
+diff --git a/astrocontrol/web/index.html b/astrocontrol/web/index.html
+index 393a9f4..46aeb6b 100644
+--- a/astrocontrol/web/index.html
++++ b/astrocontrol/web/index.html
+@@ -1605,6 +1605,7 @@
+ 
+       <div class="readout-row" id="domeRow" hidden>
+         <div class="readout"><span>Roof</span><b id="domeShutter">—</b></div>
++        <div class="small" id="domeShutterNote"></div>
+         <div class="readout"><span>Dome</span><b id="domeAz">—</b></div>
+       </div>
+       <div class="row gap" id="domeControls" hidden>
+@@ -2136,11 +2137,12 @@
+     <label class="inline"><input type="checkbox" id="seqOpenRoof" checked>
+       Open roof at sequence start</label>
+     <p class="small muted">
+-      With a dome or roll-off connected, the lead telescope opens it before the
+-      first slew of every target, and nothing moves or exposes until it reads
+-      open. An open that fails or does not finish in time is treated as the
+-      site's technician lock: nothing more is sent to the roof, no lights are
+-      taken, you are alerted and the run stops (park, warm).
++      With a dome or roll-off connected, the lead telescope sends OpenShutter
++      before the first slew of every target. Nothing moves or exposes until the
++      driver reports open. That report is not a physical check. An open that
++      fails or does not finish in time is treated as the site's technician lock:
++      nothing more is sent to the roof, no lights are taken, you are alerted
++      and the run stops (park, warm).
+     </p>
+     <label class="inline"><input type="checkbox" id="seqRoofNeedsSafety">
+       Require safety monitor to open</label>
+@@ -2150,6 +2152,8 @@
+     </p>
+     <label>Roof open timeout (s)
+       <input type="number" id="seqRoofOpenTimeout" min="10" max="1800" step="10" value="180"></label>
++    <label>Close: warn if the driver reading has not changed (s)
++      <input type="number" id="seqRoofCloseNoChange" min="5" max="600" step="5" value="30"></label>
+     <label class="inline"><input type="checkbox" id="seqRoofGate" checked>
+       Hold lights while the roof is not open</label>
+     <label class="inline"><input type="checkbox" id="seqRoofCloseAtEnd" checked>
+diff --git a/astrocontrol/web/style.css b/astrocontrol/web/style.css
+index eb6905f..39ad0bf 100644
+--- a/astrocontrol/web/style.css
++++ b/astrocontrol/web/style.css
+@@ -260,6 +260,13 @@ input[type="checkbox"] { accent-color: var(--accent); }
+   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+ }
+ .readout b.alert { color: var(--warn); }
++.readout b.roof-driver-open,
++.readout b.roof-pending { color: var(--warn); }
++.readout b.roof-driver-closed,
++.readout b.roof-unknown { color: var(--muted); }
++.readout b.roof-conflict,
++.readout b.roof-error { color: #ffb4a8; }
++#domeShutterNote { margin: -6px 0 8px; }
+ 
+ .progress {
+   height: 4px; background: var(--panel-2); border-radius: 3px;
+diff --git a/tools/check_cover.py b/tools/check_cover.py
+new file mode 100644
+index 0000000..7dc2618
+--- /dev/null
++++ b/tools/check_cover.py
+@@ -0,0 +1,213 @@
++"""Flat-panel cover capability (0.2.53c).
++
++ASCOM CoverStatus: 0 NotPresent, 1 Closed, 2 Moving, 3 Open, 4 Unknown, 5 Error.
++Unknown and a failed read are not NotPresent. A lamp-only panel (0) is not
++commanded. Nothing here talks to hardware.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(ROOT))
++TMP = Path(tempfile.mkdtemp(prefix="cover-"))
++os.environ.setdefault("ASTRO_DATA_DIR", str(TMP / "data"))
++os.environ.setdefault("HOME", str(TMP / "home"))
++os.environ.setdefault("LOCALAPPDATA", str(TMP / "lad"))
++
++from astrocontrol.devices.ascom import AscomFlatPanel          # noqa: E402
++from astrocontrol.devices.base import DeviceError, FlatPanel   # noqa: E402
++
++results: list[bool] = []
++
++
++def case(name, ok, detail=""):
++    print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  - {detail}" if detail else ""))
++    results.append(bool(ok))
++    return ok
++
++
++def panel(value, name="Optec Alnitak"):
++    device = AscomFlatPanel.__new__(AscomFlatPanel)
++    device.name = name
++    device._prog_id = "ASCOM.OptecAlnitak.CoverCalibrator"
++    device._connected = True
++    device.store = {} if value is None else {"CoverState": value}
++    device.commands = []
++
++    def _get(prop, default=None):
++        if prop in device.store:
++            return device.store[prop]
++        return default
++
++    device._get = _get
++    device._require = lambda: None
++
++    def _invoke(method, *args):
++        device.commands.append(method)
++        if method == "OpenCover" and device.store.get("CoverState") in (1, 4, 5):
++            device.store["CoverState"] = 3
++
++    device._invoke = _invoke
++    return device
++
++
++class Lamp(FlatPanel):
++    def __init__(self):
++        super().__init__("lamp", "Lamp only")
++        self._connected = True
++        self.commands = []
++        self._state = "notpresent"
++
++    @property
++    def cover_state(self):
++        return self._state
++
++    def open_cover(self):
++        self.commands.append("open")
++
++    def turn_off(self):
++        pass
++
++
++class Unknown(FlatPanel):
++    def __init__(self):
++        super().__init__("ASCOM.OptecAlnitak.CoverCalibrator", "Optec Alnitak")
++        self._connected = True
++        self.commands = []
++        self._state = "unknown"
++
++    @property
++    def cover_state(self):
++        return self._state
++
++    def open_cover(self):
++        self.commands.append("open")
++        self._state = "open"
++
++    def turn_off(self):
++        pass
++
++
++class Unread(FlatPanel):
++    def __init__(self):
++        super().__init__("panel", "Mystery")
++        self._connected = True
++        self.commands = []
++
++    @property
++    def cover_state(self):
++        return "unread"
++
++    def open_cover(self):
++        self.commands.append("open")
++
++    def turn_off(self):
++        pass
++
++
++# Enum map. Integer 0 stays NotPresent. A missing value is unread, not 0.
++for value, want in ((0, "notpresent"), (1, "closed"), (2, "moving"),
++                    (3, "open"), (4, "unknown"), (5, "error")):
++    case(f"CoverState {value} maps to {want}", panel(value).cover_state == want)
++
++missing = panel(None)
++case("a failed CoverState read is unread, not notpresent",
++     missing.cover_state == "unread" and missing.has_cover is None)
++
++present = panel(0, name="Optec Alnitak")
++case("NotPresent is no cover even if the name says Alnitak",
++     present.cover_state == "notpresent" and present.has_cover is False
++     and present.cover_prepare() == "skip")
++
++unknown = panel(4)
++case("Unknown is not hasCover false",
++     unknown.cover_state == "unknown" and unknown.has_cover is None
++     and unknown.cover_prepare() == "open",
++     f"{unknown.has_cover} {unknown.cover_prepare()}")
++
++case("Closed prepares an open and does not claim a physical position",
++     panel(1).has_cover is True and panel(1).cover_prepare() == "open")
++case("Open does not send another OpenCover", panel(3).cover_prepare() == "skip")
++case("cover error is a cover, not 'no cover'",
++     panel(5).has_cover is True and panel(5).cover_prepare() == "open")
++
++
++# Sequence prep uses the same decision and does not command a lamp.
++import astrocontrol.sequencer as sequencer_mod                 # noqa: E402
++from astrocontrol.config import Config                          # noqa: E402
++from astrocontrol.sequencer import Sequencer                    # noqa: E402
++
++class Clock:
++    def __init__(self):
++        self.t = 1000.0
++
++    def monotonic(self):
++        return self.t
++
++    def time(self):
++        return self.t
++
++    def sleep(self, seconds):
++        self.t += max(0.01, float(seconds))
++
++
++sequencer_mod.time = Clock()
++
++
++def run_open(flat):
++    config = Config(Path(tempfile.mkdtemp(dir=TMP)) / "settings.json")
++
++    class Manager:
++        def __init__(self):
++            self.devices = {"flatpanel": flat}
++
++        def get(self, kind):
++            return self.devices.get(kind)
++
++        def log(self, *args, **kwargs):
++            pass
++
++    class Rig:
++        manager = Manager()
++
++    class Rigs:
++        master = Rig()
++
++    seq = Sequencer.__new__(Sequencer)
++    seq.rigs = Rigs()
++    seq.config = config
++    seq._state = "idle"
++    seq._message = ""
++    seq._check = lambda: None
++    seq._say = lambda *args, **kwargs: None
++    seq._set = lambda *args, **kwargs: None
++    try:
++        seq._open_cover()
++        return "ok"
++    except DeviceError as exc:
++        return str(exc)
++
++
++lamp = Lamp()
++case("lamp-only NotPresent: OpenCover is not sent",
++     run_open(lamp) == "ok" and lamp.commands == [], str(lamp.commands))
++
++unk = Unknown()
++case("driver unknown: OpenCover is sent once",
++     run_open(unk) == "ok" and unk.commands == ["open"] and unk.cover_state == "open",
++     f"{unk.commands} {unk.cover_state}")
++
++bad = Unread()
++text = run_open(bad)
++case("unreadable cover: no OpenCover, and the error is not swallowed",
++     bad.commands == [] and "not being treated" in text and "not sent" in text,
++     text)
++
++print()
++print(f"{sum(results)} of {len(results)} passed")
++sys.exit(0 if all(results) else 1)
+diff --git a/tools/check_roof_open.py b/tools/check_roof_open.py
+index 50127e3..a40202e 100644
+--- a/tools/check_roof_open.py
++++ b/tools/check_roof_open.py
+@@ -82,6 +82,15 @@ class Dome:
+     def shutter_state(self):
+         if self._open_at is not None and CLOCK.t >= self._open_at:
+             self.state, self._open_at = "open", None
++        mark = getattr(self, "_close_mark", None)
++        if mark is not None:
++            elapsed = CLOCK.t - mark
++            if elapsed >= 50:
++                self.state = "closed"
++            elif elapsed >= 5:
++                self.state = "opening"
++            else:
++                self.state = "open"
+         return self.state
+ 
+     def open_shutter(self):
+@@ -101,6 +110,15 @@ class Dome:
+ 
+     def close_shutter(self):
+         self.commands.append("close")
++        if self.mode == "slow-close":
++            # Stays open, then reports opening, then closed. The Nov 4 close
++            # did this; 0.2.53b failed on the first still-open read.
++            self._close_mark = CLOCK.t
++            self.state = "open"
++            return
++        if self.mode == "stay-open":
++            self.state = "open"
++            return
+         self.state = "closed"
+ 
+ 
+@@ -215,9 +233,12 @@ case("normal open marks the run as the opener", s._roof_opened_by_run)
+ case("no safety monitor: warning stays up + alert sent",
+      "roof.nosafety" in s.warnings.up and any("no safety monitor" in subj for _, subj in s.told),
+      str(s.told))
+-case("the warning text is the agreed one",
++case("the warning text is the command, not a completed open",
+      s.warnings.up.get("roof.nosafety", ("", ""))[1]
+-     == "Roof opened with no safety monitor - nothing will close it for weather")
++     == "Roof commanded open with no safety monitor — nothing will close it for weather")
++case("a finished open is not logged as a bare verified open",
++     any("not verified" in msg for _, msg in LOG)
++     and not any(msg == "Roof open" for _, msg in LOG))
+ # then a light: the gate lets it straight through
+ before = CLOCK.t
+ s._roof_gate_lights()
+@@ -227,6 +248,8 @@ case("open roof: lights pass the gate at once", CLOCK.t == before)
+ d = Dome(state="open")
+ s = build(d)
+ case("already open: nothing sent", s._ensure_roof_open("m42") and d.commands == [])
++case("already open is labelled unverified",
++     any("not verified" in msg and "No OpenShutter" in msg for _, msg in LOG))
+ 
+ # 3. open timeout = locked: no retry, no lights, no close-back
+ d = Dome(mode="lock")
+@@ -327,8 +350,8 @@ t0 = CLOCK.t
+ s._roof_gate_lights()
+ CLOCK.hooks.clear()
+ case("closed mid-run: lights held until it reads open", CLOCK.t - t0 >= 150.0)
+-case("closed mid-run: alerted (once) while held", sum("roof is not open" in subj
+-                                                       for _, subj in s.told) == 1, str(s.told))
++case("closed mid-run: alerted (once) while held",
++     sum("does not report the roof open" in subj for _, subj in s.told) == 1, str(s.told))
+ case("closed mid-run: the gate never sends a roof command", d.commands == [])
+ case("closed mid-run: warning cleared once open", "roof.closed" not in s.warnings.up)
+ 
+@@ -387,22 +410,33 @@ s._roof_locked = "not open after 180 s"
+ why = raises(s.restart_unpark)
+ case("auto-restart: a latched lock is never opened against", why and d.commands == [], why)
+ 
+-# 13. ASCOM ShutterStatus 0 is open (0.2.53a read it as error)
++# 13. ASCOM ShutterStatus 0 is the driver's open. A missing value is unknown,
++# never open. The live cache is exercised in check_roof_status.py.
+ from astrocontrol.devices.ascom import AscomDome               # noqa: E402
+-ad = AscomDome.__new__(AscomDome)
+-ad.can_shutter = True
+-reads = {}
+-ad._get = lambda name, default=None: reads.get(name, default)
+-got = {}
+-for value, want in [(0, "open"), (1, "closed"), (2, "opening"), (3, "closing"), (4, "error")]:
+-    reads["ShutterStatus"] = value
+-    got[value] = ad.shutter_state
+-reads.clear()
+-got["none"] = ad.shutter_state
+-case("ASCOM dome: 0=open 1=closed 2=opening 3=closing 4=error, no answer=error",
+-     got == {0: "open", 1: "closed", 2: "opening", 3: "closing", 4: "error", "none": "error"},
++got = {value: AscomDome._map_shutter_status(value)
++       for value in (0, 1, 2, 3, 4)}
++got["none"] = AscomDome._map_shutter_status(None)
++case("ASCOM dome: 0=open 1=closed 2=opening 3=closing 4=error, no answer=unknown",
++     got == {0: "open", 1: "closed", 2: "opening", 3: "closing", 4: "error",
++             "none": "unknown"},
+      str(got))
+ 
++# 13b. Close waits. A driver that is still open on the first read is not a failure.
++d = Dome(state="open", mode="slow-close")
++s = build(d, roofTimeoutSeconds=120, roofCloseNoChangeSeconds=30)
++s._close_roof()
++case("close waits out a still-open read and a later opening report",
++     d.commands == ["close"] and d.state == "closed", f"{d.commands} {d.state}")
++case("close success is driver-reported, not verified",
++     any("not independently verified" in msg for _, msg in LOG))
++d = Dome(state="open", mode="stay-open")
++s = build(d, roofTimeoutSeconds=12, roofCloseNoChangeSeconds=5)
++t0 = CLOCK.t
++why = raises(lambda: s._close_roof())
++case("close that stays open fails at the timeout, not on the first read",
++     why and "still reports open" in why and 11 <= CLOCK.t - t0 <= 14,
++     f"{why} after {CLOCK.t - t0:.1f}s")
++
+ # 14. the settings route takes the new fields
+ from astrocontrol.main import SequencerSettingsRequest         # noqa: E402
+ body = SequencerSettingsRequest(openRoofAtStart=True, requireSafetyToOpen=False,
+@@ -414,6 +448,8 @@ seqd = DEFAULTS["sequencer"]
+ case("defaults: open on, require off, 180 s, gate on, close at end on",
+      (seqd["openRoofAtStart"], seqd["requireSafetyToOpen"], seqd["roofOpenTimeoutSeconds"],
+       seqd["pauseLightsUnlessRoofOpen"], seqd["closeRoofAtEnd"]) == (True, False, 180.0, True, True))
++case("close no-change warning defaults to 30 s",
++     seqd["roofCloseNoChangeSeconds"] == 30.0)
+ 
+ # 15. order inside a real target: the roof is open before the first slew/home
+ d = Dome()
+diff --git a/tools/check_roof_status.py b/tools/check_roof_status.py
+new file mode 100644
+index 0000000..935a11f
+--- /dev/null
++++ b/tools/check_roof_status.py
+@@ -0,0 +1,219 @@
++"""Driver roof status is never a verified open or closed (0.2.53c).
++
++The installed 0.2.53b build treated ASCOM ShutterStatus as the roof. These
++cases use a fake driver object and a fake clock. They do not open a COM
++connection, talk to a roof server, or read a driver key.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import tempfile
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(ROOT))
++TMP = Path(tempfile.mkdtemp(prefix="roofstatus-"))
++os.environ.setdefault("ASTRO_DATA_DIR", str(TMP / "data"))
++os.environ.setdefault("HOME", str(TMP / "home"))
++os.environ.setdefault("LOCALAPPDATA", str(TMP / "lad"))
++
++import astrocontrol.devices.ascom as ascom_mod                 # noqa: E402
++from astrocontrol.devices.ascom import AscomDome               # noqa: E402
++from astrocontrol.devices.base import DeviceError              # noqa: E402
++
++results: list[bool] = []
++
++
++def case(name, ok, detail=""):
++    print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  - {detail}" if detail else ""))
++    results.append(bool(ok))
++    return ok
++
++
++class Clock:
++    def __init__(self):
++        self.t = 5000.0
++
++    def monotonic(self):
++        return self.t
++
++    def time(self):
++        return self.t
++
++
++CLOCK = Clock()
++ascom_mod.time = CLOCK
++
++
++def fresh():
++    dome = AscomDome.__new__(AscomDome)
++    dome.can_shutter = True
++    dome.can_park = False
++    dome.can_slave = False
++    dome.name = "test roof"
++    dome._prog_id = "ASCOM.HakosRoof.Dome"
++    dome._connected = False
++    dome._reset_shutter_account()
++    dome.store = {}
++
++    def _get(name, default=None):
++        if name in dome.store:
++            return dome.store[name]
++        return default
++
++    dome._get = _get
++    dome._open = lambda prog_id: None
++    dome._set = lambda *args, **kwargs: None
++    dome._invoke = lambda *args, **kwargs: None
++    dome._require = lambda: None
++    return dome
++
++
++# 1. Startup, before any driver read.
++dome = fresh()
++report = dome.shutter_report(dome._published_shutter())
++case("startup is unknown, not open",
++     report["shutterState"] == "unknown" and report["shutterQuality"] == "unknown")
++case("startup is not verified", report["shutterVerified"] is False)
++
++# 2. Integer 0 is the driver's open, still not verified.
++dome = fresh()
++dome.store["ShutterStatus"] = 0
++state = dome.shutter_state
++report = dome.shutter_report(state)
++case("ShutterStatus 0 is driver open", state == "open" and report["shutterState"] == "open")
++case("driver open is not verified", report["shutterVerified"] is False
++     and report["shutterQuality"] == "driver")
++
++# 3. A failed read does not keep the previous open.
++CLOCK.t += 6
++dome.store.pop("ShutterStatus")
++case("a failed read is error, not the previous open", dome.shutter_state == "error")
++case("that error is not verified open",
++     dome.shutter_report()["shutterVerified"] is False
++     and dome.shutter_report()["shutterState"] != "open")
++
++# 4. A reading older than 30s with no fresh answer is stale, not open.
++dome = fresh()
++dome.store["ShutterStatus"] = 0
++dome.shutter_state
++dome.store.pop("ShutterStatus")
++CLOCK.t += 31
++report = dome.shutter_report(dome.shutter_state)
++case("stale reading is unknown, not open",
++     report["shutterState"] == "unknown" and report["shutterQuality"] == "stale",
++     str(report))
++case("stale reading keeps the last driver word beside it",
++     report["shutterLastDriver"] == "open" and report["shutterVerified"] is False)
++
++# 5. Open then closed, no command in progress, is a conflict.
++dome = fresh()
++dome.store["ShutterStatus"] = 0
++dome.refresh_shutter()
++CLOCK.t += 1.1
++dome.store["ShutterStatus"] = 1
++state = dome.refresh_shutter()
++report = dome.shutter_report(state)
++case("contradictory open/closed reads are a conflict",
++     state == "closed" and report["shutterQuality"] == "conflict"
++     and "flipped" in (report["shutterConflict"] or "")
++     and report["shutterVerified"] is False, str(report))
++
++# 6. Connect that reports Connected false does not become an open roof.
++dome = fresh()
++dome.store["Connected"] = False
++rejected = False
++try:
++    dome.connect()
++except DeviceError:
++    rejected = True
++status = dome.status()
++case("rejected connect is not connected and not open",
++     rejected and status.get("connected") is False
++     and status.get("shutterState") == "unknown"
++     and status.get("shutterVerified") is False, str(status))
++
++# 7. OpenShutter raising does not publish open.
++dome = fresh()
++dome._connected = True
++dome.store["ShutterStatus"] = 1
++dome.refresh_shutter()
++
++def refuse(*args, **kwargs):
++    raise DeviceError("the roof server refused")
++
++dome._invoke = refuse
++raised = False
++try:
++    dome.open_shutter()
++except DeviceError:
++    raised = True
++report = dome.shutter_report()
++case("OpenShutter failure stays not-open and records the error",
++     raised and report["shutterState"] == "closed"
++     and report["shutterCommandPending"] is False
++     and report["shutterCommandError"]
++     and report["shutterVerified"] is False
++     and report["shutterQuality"] == "error", str(report))
++
++# 8. Accepting OpenShutter does not change a closed reading into open.
++dome = fresh()
++dome._connected = True
++dome.store["ShutterStatus"] = 1
++dome.refresh_shutter()
++dome._invoke = lambda *args, **kwargs: None
++dome.open_shutter()
++report = dome.shutter_report(dome.refresh_shutter())
++case("command acceptance is pending on the driver's current word",
++     report["shutterCommandPending"] is True and report["shutterState"] == "closed"
++     and report["shutterVerified"] is False and report["shutterQuality"] == "pending",
++     str(report))
++
++# 9. Close pending while the driver says opening is a conflict, not open.
++CLOCK.t += 1.1
++dome.store["ShutterStatus"] = 0
++dome.refresh_shutter()
++dome.close_shutter()
++CLOCK.t += 1.1
++dome.store["ShutterStatus"] = 2
++state = dome.refresh_shutter()
++report = dome.shutter_report(state)
++case("close pending and driver opening is a conflict",
++     state == "opening" and report["shutterQuality"] == "conflict"
++     and "close command" in (report["shutterConflict"] or "")
++     and report["shutterVerified"] is False, str(report))
++
++# 10. The status cache does not follow every poll; a forced refresh does.
++dome = fresh()
++dome.store["ShutterStatus"] = 0
++CLOCK.t += 6
++case("fresh read sees open", dome.shutter_state == "open")
++dome.store["ShutterStatus"] = 1
++CLOCK.t += 1
++case("a poll inside the cache window does not replace open by itself",
++     dome.shutter_state == "open")
++CLOCK.t += 0.2
++case("refresh after a second sees the new driver word",
++     dome.refresh_shutter() == "closed" and dome.shutter_report()["shutterVerified"] is False)
++
++# 11. A later closed reading settles a close command without calling it verified.
++dome = fresh()
++dome._connected = True
++dome.store["ShutterStatus"] = 2
++dome._invoke = lambda *args, **kwargs: None
++dome.refresh_shutter()
++dome.close_shutter()
++CLOCK.t += 1.1
++dome.store["ShutterStatus"] = 1
++state = dome.refresh_shutter()
++report = dome.shutter_report(state)
++case("driver closed after CloseShutter is unverified closed, not pending",
++     state == "closed" and report["shutterCommandPending"] is False
++     and report["shutterVerified"] is False and report["shutterQuality"] == "driver",
++     str(report))
++
++print()
++print(f"{sum(results)} of {len(results)} passed")
++sys.exit(0 if all(results) else 1)
