@@ -927,6 +927,71 @@ def _goals(goals: dict[str, float]) -> dict[str, float]:
     return out
 
 
+def _goal_keys(goals: dict[str, Any]) -> set[str]:
+    """The channels a project has a positive goal for, as compared.
+
+    2026-11-04 (CST): the M42 horse mosaic allowed L, R, G, B, H, O and S in
+    its requirements but set goals only for L, R, G, B and H. The dealer
+    built every rig's filters from the allowed list, gave O and S a
+    placeholder hour each, and sent vsd100 and others out for a night of
+    OIII nobody had asked for. A filter is dealt only when its project wants
+    hours in it; "allowed" says what may be uploaded, not what to shoot.
+    """
+    out: set[str] = set()
+    for name, hours in (goals or {}).items():
+        try:
+            if float(hours) <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if str(name).strip().lower() in collab.COLOUR_FILTERS:
+            out.update(("r", "g", "b"))
+        out.add(collab._key(name))
+    return out
+
+
+def _wanted_from_goals(wants: collab.Requirements,
+                       goals: dict[str, Any]) -> dict[str, float | None]:
+    """The channels to deal, each with its bandpass limit: the goals.
+
+    Built from the project's goals, in the order the requirements list them
+    (the coordinator's order, which a tied deal falls back to), with each
+    channel's bandpass limit taken from the requirements when they give one.
+    A channel the requirements allow with no goal is not here. A project
+    with no positive goal at all is dealt what its requirements list, as
+    before - there is nothing else to go on.
+    """
+    keys = _goal_keys(goals)
+    if not keys:
+        return collab.wanted_channels(wants) if wants.filters else {}
+    allowed = collab.wanted_channels(wants) if wants.filters else {}
+    out: dict[str, float | None] = {k: v for k, v in allowed.items() if k in keys}
+    for name, hours in (goals or {}).items():
+        key = collab._key(name)
+        if key not in keys or key in out:
+            continue
+        if str(name).strip().lower() in collab.COLOUR_FILTERS:
+            for letter in ("r", "g", "b"):
+                out.setdefault(letter, allowed.get(letter))
+            continue
+        # A colour band the project has switched off stays off.
+        if collab._is_osc(key):
+            narrow = "+" in key
+            if not wants.acceptColour:
+                continue
+            if narrow and not wants.acceptOscNarrowband:
+                continue
+            if not narrow and not wants.acceptOscRgb:
+                continue
+        out[key] = allowed.get(key)
+    return out
+
+
+def _dealable(entry: "collab.FilterTask", keys: set[str]) -> bool:
+    """Whether a task filter delivers any channel the project has a goal for."""
+    return not keys or bool(set(entry.keys()) & keys)
+
+
 #: How finely a region is cut when progress is measured across it: the
 #: longer side in this many cells. Sixteen across a fifteen-degree mosaic
 #: is a cell under a degree, a quarter of a panel - fine enough that a
@@ -1187,6 +1252,18 @@ def join_project(project_id: str, body: JoinRequest,
     # B on an H, O, R, G, B project is dealt R, G and B and nothing else, and
     # the deal sends the H and O to the rigs that have them.
     names = list(verdict.get("usable") or []) or list(wants.filters) or list(goals) or ["L"]
+    # Only filters the project has a goal for; one it merely allows is not
+    # dealt (see `_goal_keys`).
+    goal_keys = _goal_keys(goals)
+    if goal_keys:
+        names = [name for name in names
+                 if {collab._key(c) for c in (profile.delivers(name) or [name])} & goal_keys
+                 or collab._key(name) in goal_keys]
+        if not names:
+            raise HTTPException(
+                status_code=409,
+                detail="this telescope carries none of the filters the project "
+                       "has a goal for")
     fallback = body.exposure or _middle_exposure(wants)
     # The rig's own exposure per filter first: that is the length its darks
     # are built for, and a light with no dark of its own length is a light
@@ -1382,6 +1459,9 @@ def _redeal(project_id: str, nights: dict[str, str] | None = None,
     wants = collab.Requirements.read(payload.get("requirements") or {})
     goals = {str(name): float(hours)
              for name, hours in (payload.get("goals") or {}).items()}
+    goal_keys = _goal_keys(goals)
+    # The goals the deal weighs are the positive ones; a zero goal is no goal.
+    goals = {name: hours for name, hours in goals.items() if hours > 0} if goal_keys else goals
 
     tasks = [task for task in store.tasks_in(project_id)
              if task.get("state") in ("offered", "accepted")]
@@ -1469,6 +1549,22 @@ def _redeal(project_id: str, nights: dict[str, str] | None = None,
             able = [f for f in filters if collab._key(f.filter) in carried]
             if able:
                 filters = able
+        # Never a filter the project has no goal for, whatever an older task
+        # list still carries (see `_goal_keys`). A rig left with nothing the
+        # project wants is dealt no panels rather than a night of the wrong
+        # filter.
+        if goal_keys:
+            filters = [f for f in filters if _dealable(f, goal_keys)]
+            if not filters:
+                if held or task.get("visit"):
+                    task["share"] = []
+                    task["visit"] = {}
+                    task["version"] = int(task.get("version") or 1) + 1
+                    changed += 1
+                task["assignedAt"] = now
+                task["assignedNight"] = asked if asked is not None else made_for
+                store.set_task(task)
+                continue
         night_goals = goals
         chosen = None
         need = None
@@ -1561,13 +1657,15 @@ def _sync_task_filters(task: dict[str, Any], wants: collab.Requirements,
     of what the project takes - and a filter the project dropped is
     dropped. True when anything changed.
     """
-    names = list(wants.filters) or list(goals)
-    if not names:
+    # The channels the project wants, with their bandpass limits: built from
+    # its goals, not from the filters its requirements allow (see
+    # `_goal_keys`). A goal with no filter entry wants its channel with no
+    # limit.
+    wanted = _wanted_from_goals(wants, goals) if _goal_keys(goals) else (
+        collab.wanted_channels(wants) if wants.filters else {
+            collab._key(name): None for name in goals})
+    if not wanted:
         return False
-    # The channels the project wants, with their bandpass limits; a goal
-    # with no filter entry wants its channel with no limit.
-    wanted = collab.wanted_channels(wants) if wants.filters else {
-        collab._key(name): None for name in goals}
     goal_of = {collab._key(name): float(hours) for name, hours in goals.items()}
     held = list(task.get("filters") or [])
     by_key = {collab._key(f.get("filter")): f for f in held}
