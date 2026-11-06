@@ -1,0 +1,2 @@
+caed063d9abe762d214a80f3d9df1d69973cabadac5adc54c955e860f43a5912  Starfront-quota-507-from-0.2.53f.patch
+b8b4a80e358505fe2bb3b5270abb0715f21929b52dcd226b2c950f60ebe35cd0  Starfront-0.2.53f-quota-507-source.zip
