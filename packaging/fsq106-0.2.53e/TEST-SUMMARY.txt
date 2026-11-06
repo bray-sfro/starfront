@@ -1,0 +1,24 @@
+Starfront 0.2.53e centering checks
+Baseline: fee06568ffcb14997087aca1a37d11159bdae41c (Starfront 0.2.53 single)
+Command: python3 tools/check_centring.py
+Result: 17/17 passed
+
+PASS  a mount that refuses to sync is still centred
+PASS  one offset slew of the measured error, from the target
+PASS  SyncToCoordinates is never called during centring
+PASS  every attempt logs RA and Dec error
+PASS  the offset slew names the aim
+PASS  landing within tolerance
+PASS  a mount that would accept a sync is still not synced
+PASS  the offset never compounds across attempts
+PASS  a flipped solve (~24° away, rotation ~180° from the camera) is rejected and does not slew toward 2.7h
+PASS  the rejection is logged
+PASS  a large same-angle model error is corrected, not rejected
+PASS  a near-hint miss uses one blind solve, then the tight radius again
+PASS  that blind solve is not repeated
+PASS  the following tight solve finishes the centring
+PASS  flipped solves exhaust centring with no offset slew and no sync
+PASS  exhausted centring raises a target failure before focus
+PASS  that target is not marked finished, and the next target still runs
+
+No other checks were run. No hardware.
