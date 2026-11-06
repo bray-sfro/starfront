@@ -1,0 +1,24 @@
+Starfront 0.2.53f centering checks
+Base: 0.2.53e (itself fee06568ffcb14997087aca1a37d11159bdae41c plus the 0.2.53e centering patch)
+Command: python3 tools/check_centring.py
+Result: 21/21 passed
+
+Prior 0.2.53e cases still pass, including:
+- offset slew from the target, SyncToCoordinates never called during centring
+- a single flipped solve is rejected and does not slew toward 2.7h
+- a large same-angle model error is corrected
+- one blind solve on a near-hint miss, then the tight radius
+- flipped solves can exhaust centring with no offset slew
+- exhausted centring fails the target before focus; the next target still runs
+
+0.2.53f cases:
+- a rejected blind solve does not block a later whole-sky recovery (wide called again)
+- a trusted far field (scale and image FOV match) offsets back to the target
+  aim = target - (solved - target). For the measured field RA 22.7206h Dec +41.366°
+  and target RA 0.71167h Dec +41.2667° that command is RA 2.7027h Dec +41.1674°.
+  It is not a slew to the measured field, and it is not a sync.
+  An untrusted flip still does not make that slew.
+- the flipped angle is not saved (camera angle stays +95.65°)
+- a confirm solve passes -r 1.5 and -fov 3.5377 separately (no -z)
+
+No hardware. No Windows package built here.
