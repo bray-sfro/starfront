@@ -23,9 +23,10 @@ def test_contrast_is_css_only_and_defaults_to_100(world):  # noqa: F811
     client, *_ = world
     html = client.get("/files").text
     assert 'let contrastPct = 100;' in html
-    assert "contrastPct === 100 ? ''" in html
-    assert 'filter: var(--img-contrast, contrast(1))' in html
-    assert "'--img-contrast'" in html
+    # 100% contrast and 0 black point: no filter at all, the published image.
+    assert 'if (contrastPct !== 100)' in html and 'if (blackPoint > 0)' in html
+    assert 'filter: var(--img-filter, none)' in html
+    assert "'--img-filter'" in html
     # Only the two preview elements are filtered; no image is re-encoded.
     assert '#hero .shot img' in html and '#viewerImg { filter:' in html
     assert '<canvas' not in html and 'getContext(' not in html and 'toDataURL(' not in html

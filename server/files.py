@@ -900,13 +900,13 @@ _PAGE = r"""<!doctype html>
      downloads are untouched. The value is one number for the page's life,
      shared by the embedded preview and the full-screen viewer, and it
      survives switching images (see applyContrast). */
-  #hero .shot img, #hero .shot .ghost { filter: var(--img-contrast, contrast(1)); }
-  #viewerImg { filter: var(--img-contrast, contrast(1)); }
+  #hero .shot img, #hero .shot .ghost, #viewerImg { filter: var(--img-filter, none); }
   .contrast { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; }
   .contrast label { font-size: 13px; font-weight: 600; color: #dbe3ee; white-space: nowrap; }
   .contrast input[type="range"] { width: clamp(96px, 24vw, 200px); height: 44px; margin: 0; accent-color: #7ee7a5; cursor: pointer; touch-action: pan-y; }
   .contrast input[type="range"]:focus-visible { outline: 2px solid #9fe4bd; outline-offset: 2px; }
   .contrast output { min-width: 4ch; font-size: 13px; font-variant-numeric: tabular-nums; color: #dbe3ee; }
+  #starfrontDisplayFilters { position: absolute; width: 0; height: 0; overflow: hidden; }
   #viewerBar .contrast { pointer-events: auto; background: #1a2130dd; border: 1px solid #2a3344; border-radius: 8px; padding: 0 8px; }
   #viewerBar .contrast button { font-size: 13px; min-width: 44px; height: 42px; }
   #hero .contrast { background: #141a25; border: 1px solid #2a3344; border-radius: 8px; padding: 0 10px; }
@@ -1128,6 +1128,20 @@ _PAGE = r"""<!doctype html>
     </div>
   </details>
 </div>
+<!-- Display-only black point: a linear stretch of each RGB channel,
+     out = (in - bp) / (1 - bp), clamped by the browser. Referenced by the
+     previews' CSS filter; it changes no bytes on the server. Kept in the
+     body at zero size rather than display:none, which some browsers refuse
+     to resolve a CSS url(#...) filter against. -->
+<svg id="starfrontDisplayFilters" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" focusable="false">
+  <filter id="sfBlackPoint" color-interpolation-filters="sRGB">
+    <feComponentTransfer>
+      <feFuncR id="sfBpR" type="linear" slope="1" intercept="0"/>
+      <feFuncG id="sfBpG" type="linear" slope="1" intercept="0"/>
+      <feFuncB id="sfBpB" type="linear" slope="1" intercept="0"/>
+    </feComponentTransfer>
+  </filter>
+</svg>
 <div id="viewer" hidden role="dialog" aria-modal="true" aria-label="Image viewer">
   <div id="viewerStage"><img id="viewerImg" alt="" draggable="false"></div>
   <button type="button" id="viewerClose" aria-label="Close viewer" title="Close (Esc)">✕</button>
@@ -1155,27 +1169,67 @@ _PAGE = r"""<!doctype html>
   // the embedded preview and the full-screen viewer. It is deliberately not
   // stored: a new tab starts at 100%.
   let contrastPct = 100;
+  // Black point, as a fraction of full range (0-0.5). Same display-only idea:
+  // an inline SVG feComponentTransfer linear stretch, referenced from the CSS
+  // filter alongside contrast(), so the two combine in one pass.
+  let blackPoint = 0;
+  function applyDisplay() {
+    // Contrast first (CSS's own contrast is about mid grey), then the black
+    // point stretch; both off means the image exactly as published.
+    const parts = [];
+    if (contrastPct !== 100) parts.push(`contrast(${contrastPct / 100})`);
+    if (blackPoint > 0) parts.push('url(#sfBlackPoint)');
+    const f = parts.join(' ');
+    const slope = String(1 / (1 - blackPoint)), intercept = String(-blackPoint / (1 - blackPoint));
+    for (const id of ['sfBpR', 'sfBpG', 'sfBpB']) {
+      const fn = document.getElementById(id);
+      if (fn) { fn.setAttribute('slope', slope); fn.setAttribute('intercept', intercept); }
+    }
+    document.getElementById('hero').style.setProperty('--img-filter', f);
+    document.getElementById('viewer').style.setProperty('--img-filter', f);
+    const readouts = [['[data-contrast]', contrastPct, contrastPct + '%'],
+                      ['[data-blackpoint]', Math.round(blackPoint * 100), Math.round(blackPoint * 100) + '%']];
+    for (const [sel, value, text] of readouts) {
+      document.querySelectorAll(sel).forEach((r) => {
+        if (Number(r.value) !== value) r.value = String(value);
+        r.setAttribute('aria-valuetext', text.replace('%', ' percent'));
+        const out = r.closest('.contrast').querySelector('output');
+        if (out) out.textContent = text;
+      });
+    }
+  }
   function applyContrast(pct) {
     contrastPct = Math.min(300, Math.max(50, Math.round(Number(pct) || 100)));
-    const f = contrastPct === 100 ? '' : `contrast(${contrastPct / 100})`;
-    document.getElementById('hero').style.setProperty('--img-contrast', f);
-    document.getElementById('viewer').style.setProperty('--img-contrast', f);
-    document.querySelectorAll('[data-contrast]').forEach((r) => {
-      if (Number(r.value) !== contrastPct) r.value = String(contrastPct);
-      r.setAttribute('aria-valuetext', `${contrastPct} percent`);
-      const out = r.closest('.contrast').querySelector('output');
-      if (out) out.textContent = contrastPct + '%';
-    });
+    applyDisplay();
+  }
+  function applyBlackPoint(pct) {
+    blackPoint = Math.min(50, Math.max(0, Math.round(Number(pct) || 0))) / 100;
+    applyDisplay();
   }
   // Two labelled sliders (embedded preview, full-screen viewer), one value.
+  // Each has its own Reset; the title says which control it puts back.
   function contrastControl(which) {
     return `<span class="contrast"><label for="contrast${which}">Contrast</label>` +
       `<input type="range" id="contrast${which}" data-contrast min="50" max="300" step="5" value="${contrastPct}" aria-describedby="contrastHint${which}">` +
       `<output id="contrastHint${which}" for="contrast${which}">${contrastPct}%</output>` +
-      `<button type="button" data-contrast-reset title="Back to the image as published (100%)">Reset</button></span>`;
+      `<button type="button" data-contrast-reset aria-label="Reset contrast" title="Reset contrast to the published image (100%)">Reset</button></span>` +
+      `<span class="contrast"><label for="blackpoint${which}">Black point</label>` +
+      `<input type="range" id="blackpoint${which}" data-blackpoint min="0" max="50" step="1" value="${Math.round(blackPoint * 100)}" aria-describedby="blackpointHint${which}">` +
+      `<output id="blackpointHint${which}" for="blackpoint${which}">${Math.round(blackPoint * 100)}%</output>` +
+      `<button type="button" data-blackpoint-reset aria-label="Reset black point" title="Reset black point to 0% (no clipping)">Reset</button></span>`;
   }
-  document.addEventListener('input', (e) => { if (e.target && e.target.dataset && 'contrast' in e.target.dataset) applyContrast(e.target.value); });
-  document.addEventListener('click', (e) => { if (e.target && e.target.dataset && 'contrastReset' in e.target.dataset) applyContrast(100); });
+  document.addEventListener('input', (e) => {
+    const d = e.target && e.target.dataset;
+    if (!d) return;
+    if ('contrast' in d) applyContrast(e.target.value);
+    else if ('blackpoint' in d) applyBlackPoint(e.target.value);
+  });
+  document.addEventListener('click', (e) => {
+    const d = e.target && e.target.dataset;
+    if (!d) return;
+    if ('contrastReset' in d) applyContrast(100);
+    else if ('blackpointReset' in d) applyBlackPoint(0);
+  });
   const label = (k) => (state.kinds.find((x) => x.id === k) || { label: k }).label;
   const kindSummary = (kinds) => Object.entries(kinds || {}).map(([k, n]) => `${n} ${label(k).toLowerCase()}`).join(', ');
 
@@ -1301,7 +1355,7 @@ _PAGE = r"""<!doctype html>
   (function wireViewer() {
     const stage = $('viewerStage');
     $('viewerContrast').innerHTML = contrastControl('Viewer');
-    applyContrast(contrastPct);
+    applyDisplay();
     $('viewerClose').addEventListener('click', viewerClose);
     document.addEventListener('keydown', (e) => {
       if (!V.open) return;
@@ -1511,7 +1565,7 @@ _PAGE = r"""<!doctype html>
         ${contrastControl('Hero')}
       </figcaption></figure>`;
     box.hidden = false;
-    applyContrast(contrastPct);
+    applyDisplay();
     drawStarTools();
     // The starless twin's 2400 px: fetch it once the page has settled.
     setTimeout(() => { const v = views[viewIdx]; if (v && v.starless) preload(v.starless.src); }, 1500);
