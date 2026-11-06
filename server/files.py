@@ -911,6 +911,12 @@ _PAGE = r"""<!doctype html>
   #viewerBar .contrast button { font-size: 13px; min-width: 44px; height: 42px; }
   #hero .contrast { background: #141a25; border: 1px solid #2a3344; border-radius: 8px; padding: 0 10px; }
   #hero .contrast button { background: transparent; border: 1px solid #2a3344; border-radius: 6px; color: #dbe3ee; font-size: 13px; min-width: 44px; min-height: 32px; cursor: pointer; }
+  /* Contrast and Black point sit side by side, but on a phone each takes its
+     own row: the pair must never push a Reset off the screen. */
+  #viewerContrast { display: flex; flex-wrap: wrap; gap: 8px; max-width: 100%; min-width: 0; }
+  @media (max-width: 700px) {
+    #hero .contrast input[type="range"], #viewerContrast input[type="range"] { width: clamp(80px, 22vw, 160px); }
+  }
   @media (max-width: 520px) { .contrast input[type="range"] { width: clamp(88px, 26vw, 160px); } }
   .seg { display: inline-flex; border: 1px solid #2a3344; border-radius: 8px; overflow: hidden; vertical-align: middle; background: #141a25; }
   .seg button, #viewerBar .seg button { background: transparent; color: #c3ccd9; border: 0; border-radius: 0; min-width: 0; height: auto; min-height: 32px; padding: 4px 14px; font-size: 13px; font-weight: 500; cursor: pointer; }
