@@ -1,0 +1,2 @@
+05f51d796d3088c1f5e1a4300f3f99176f565dbaf5a9ee946086967c8d617ce3  Starfront-mount-clock-from-0.2.53f.patch
+336160892d84797a44f21e6c0e5f5ca73d0fc528e6fcfd8f436639276d94b553  Starfront-0.2.53f-mount-clock-source.zip

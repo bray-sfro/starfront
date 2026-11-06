@@ -1,0 +1,922 @@
+diff -ruN --exclude __pycache__ --exclude '*.pyc' a/astrocontrol/devices/alpaca.py b/astrocontrol/devices/alpaca.py
+--- a/astrocontrol/devices/alpaca.py	2026-11-04 17:43:50.000000000 +0000
++++ b/astrocontrol/devices/alpaca.py	2026-11-06 06:38:10.890976049 +0000
+@@ -418,6 +418,19 @@
+         return {"latitude": float(latitude), "longitude": float(longitude),
+                 "elevation": float(self._client.get_cached("siteelevation", 30.0, 0.0) or 0.0)}
+ 
++    def reported_clock(self) -> dict[str, Any]:
++        """``utcdate`` and ``siderealtime``. GET only; the clock is not set."""
++        utc = lst = None
++        try:
++            utc = self._client.get("utcdate", timeout=8.0)
++        except DeviceError:
++            utc = None
++        try:
++            lst = self._client.get("siderealtime", timeout=8.0)
++        except DeviceError:
++            lst = None
++        return {"utc": utc, "lst": lst}
++
+     def slew_to(self, ra_hours: float, dec_deg: float) -> None:
+         self._require()
+         self._client.put("slewtocoordinatesasync",
+diff -ruN --exclude __pycache__ --exclude '*.pyc' a/astrocontrol/devices/ascom.py b/astrocontrol/devices/ascom.py
+--- a/astrocontrol/devices/ascom.py	2026-11-04 17:43:50.000000000 +0000
++++ b/astrocontrol/devices/ascom.py	2026-11-06 06:38:09.454964056 +0000
+@@ -792,6 +792,27 @@
+         return {"latitude": float(latitude), "longitude": float(longitude),
+                 "elevation": float(self._get("SiteElevation", 0.0) or 0.0)}
+ 
++    def reported_clock(self) -> dict[str, Any]:
++        """UTCDate and SiderealTime. One read, and it does not write.
++
++        The same driver properties the status panel already uses for
++        sidereal time, plus the UTC clock beside them. Not urgent: a clock
++        check must not step in front of a stop or a park. Eight seconds is
++        as long as a quiet driver may take. Neither property is required.
++        """
++        def read() -> dict[str, Any]:
++            utc = lst = None
++            with contextlib.suppress(Exception):
++                utc = self._driver.UTCDate
++            with contextlib.suppress(Exception):
++                lst = self._driver.SiderealTime
++            return {"utc": utc, "lst": lst}
++
++        try:
++            return _com(self._channel).call(read, timeout=8.0, label="clock")
++        except Exception:
++            return {"utc": None, "lst": None}
++
+     def slew_to(self, ra_hours: float, dec_deg: float) -> None:
+         self._require()
+         if self._get("CanSlewAsync", False):
+diff -ruN --exclude __pycache__ --exclude '*.pyc' a/astrocontrol/devices/base.py b/astrocontrol/devices/base.py
+--- a/astrocontrol/devices/base.py	2026-11-04 17:43:50.000000000 +0000
++++ b/astrocontrol/devices/base.py	2026-11-06 06:38:07.086943771 +0000
+@@ -222,6 +222,15 @@
+         """
+         return None
+ 
++    def reported_clock(self) -> dict[str, Any]:
++        """UTC and local sidereal time the driver is using. Read-only.
++
++        ``utc`` is a datetime, an ISO-8601 string, or None. ``lst`` is hours,
++        or None. A backend that has no clock leaves both empty. This must
++        not set the time, sync, slew, or change tracking.
++        """
++        return {"utc": None, "lst": None}
++
+     def slew_to(self, ra_hours: float, dec_deg: float) -> None:
+         raise NotImplementedError
+ 
+diff -ruN --exclude __pycache__ --exclude '*.pyc' a/astrocontrol/main.py b/astrocontrol/main.py
+--- a/astrocontrol/main.py	2026-11-04 17:43:50.000000000 +0000
++++ b/astrocontrol/main.py	2026-11-06 06:38:11.930984580 +0000
+@@ -29,6 +29,7 @@
+ from . import filters
+ from . import identify
+ from . import ninaimport
++from . import mountclock
+ from . import warnings
+ from .capture import clean_target
+ from .capture import CaptureService
+@@ -1356,6 +1357,10 @@
+     payload.setdefault("devices", {})
+     payload.setdefault("rigs", [])
+     payload["serverTime"] = time.time()
++    # Mount UTC and sidereal time against this PC. The watchdog fills it in;
++    # until a mount is connected it says the check was skipped. Reading it
++    # does not talk to the driver.
++    payload["mountClock"] = mountclock.latest()
+     payload["seq"] = next(_snapshot_seq)
+     if errors:
+         payload["sectionErrors"] = errors
+diff -ruN --exclude __pycache__ --exclude '*.pyc' a/astrocontrol/mountclock.py b/astrocontrol/mountclock.py
+--- a/astrocontrol/mountclock.py	1970-01-01 00:00:00.000000000 +0000
++++ b/astrocontrol/mountclock.py	2026-11-06 06:40:55.743262532 +0000
+@@ -0,0 +1,418 @@
++"""Compare the mount's clock with this PC. Read-only.
++
++TheSkyX keeps its own time. On FSQ106 that clock was wrong while the PC's
++timezone and the site coordinates were right, and the right ascension the
++mount reported was off by about the same amount. This reads the UTC and
++the local sidereal time the driver already exposes — ASCOM ``UTCDate`` and
++``SiderealTime``, or the Alpaca names of those — and warns when either is
++more than a minute from this PC. It does not set the time, sync, slew, or
++change tracking.
++
++The warnings watchdog calls `observe` on its ordinary pass, including the
++first one shortly after startup. A connected mount is read once; later
++passes repeat that verdict without asking the driver again. With no mount,
++or a driver that does not answer, the result is ``clock check skipped``.
++"""
++
++from __future__ import annotations
++
++import copy
++import math
++import threading
++from datetime import datetime, timedelta, timezone
++from typing import Any, Callable
++
++from . import astro
++
++#: More than about a minute. A few seconds of formula (mean sidereal time
++#: here, apparent sidereal time on the driver) must not warn.
++SKEW_LIMIT_SECONDS = 60.0
++
++WARNING_KEY = "mount.clock"
++
++_TITLE = "The mount's clock does not match this PC"
++_FIX = ("Set TheSky's time to this PC, then reconnect the mount so this "
++        "check runs again. Starfront will not set the clock and will not "
++        "sync the mount.")
++
++_SKIPPED = "clock check skipped"
++_SKIPPED_SILENT = "clock check skipped: the mount did not report a time"
++
++_OLE_EPOCH = datetime(1899, 12, 30, tzinfo=timezone.utc)
++
++_lock = threading.Lock()
++_cache: dict[int, dict[str, Any]] = {}
++_logged: str | None = None
++_latest: dict[str, Any] = {}
++
++#: Replaced in tests. Production uses the PC's UTC clock.
++def _pc_now() -> datetime:
++    return datetime.now(timezone.utc)
++
++
++clock: Callable[[], datetime] = _pc_now
++
++
++def _report(*, state: str, detail: str, title: str = "", fix: str = "",
++            utc: float | None = None, lst: float | None = None,
++            compared: list[str] | None = None,
++            mounts: list[dict[str, Any]] | None = None) -> dict[str, Any]:
++    return {
++        "state": state,
++        "detail": detail,
++        "title": title,
++        "fix": fix,
++        "utcDeltaSeconds": None if utc is None else round(float(utc), 1),
++        "lstDeltaSeconds": None if lst is None else round(float(lst), 1),
++        "limitSeconds": SKEW_LIMIT_SECONDS,
++        "compared": list(compared or []),
++        "mounts": list(mounts or []),
++    }
++
++
++def _skipped(detail: str = _SKIPPED) -> dict[str, Any]:
++    return _report(state="skipped", detail=detail)
++
++
++_latest.update(_skipped())
++
++
++def reset() -> None:
++    """Forget the last read. Tests use this; a reconnect does it itself."""
++    global _logged
++    with _lock:
++        _cache.clear()
++        _logged = None
++        _latest.clear()
++        _latest.update(_skipped())
++
++
++def latest() -> dict[str, Any]:
++    """The last verdict, for the status payload. Never blocks on the mount."""
++    with _lock:
++        return copy.deepcopy(_latest)
++
++
++def lst_delta_seconds(mount_hours: float, pc_hours: float) -> float:
++    """Signed seconds, mount minus PC, the short way around 24 hours."""
++    diff_hours = (float(mount_hours) - float(pc_hours) + 12.0) % 24.0 - 12.0
++    return diff_hours * 3600.0
++
++
++def coerce_utc(value: Any) -> datetime | None:
++    """A driver clock as timezone-aware UTC, or None when it is not a time.
++
++    ASCOM hands back a datetime (naive, meaning UTC). Alpaca hands back an
++    ISO-8601 string. A bare OLE Automation date is accepted too.
++    """
++    if value is None or isinstance(value, bool):
++        return None
++    if isinstance(value, datetime):
++        if value.tzinfo is None:
++            return value.replace(tzinfo=timezone.utc)
++        return value.astimezone(timezone.utc)
++    if isinstance(value, (int, float)):
++        number = float(value)
++        # Below ~1954 this is not a calendar date. Sidereal hours must not
++        # be read as one.
++        if not math.isfinite(number) or number < 20000:
++            return None
++        return _OLE_EPOCH + timedelta(days=number)
++    if isinstance(value, str):
++        text = value.strip()
++        if not text:
++            return None
++        if text.endswith("Z"):
++            text = text[:-1] + "+00:00"
++        try:
++            parsed = datetime.fromisoformat(text)
++        except ValueError:
++            return None
++        if parsed.tzinfo is None:
++            return parsed.replace(tzinfo=timezone.utc)
++        return parsed.astimezone(timezone.utc)
++    year = getattr(value, "year", None)
++    if not year:
++        return None
++    try:
++        naive = datetime(int(value.year), int(value.month), int(value.day),
++                         int(getattr(value, "hour", 0) or 0),
++                         int(getattr(value, "minute", 0) or 0),
++                         int(getattr(value, "second", 0) or 0),
++                         int(getattr(value, "microsecond", 0) or 0))
++    except (TypeError, ValueError):
++        return None
++    return naive.replace(tzinfo=timezone.utc)
++
++
++def coerce_hours(value: Any) -> float | None:
++    """Local sidereal time in hours, wrapped into 0..24, or None."""
++    if value is None or isinstance(value, bool) or value == "":
++        return None
++    try:
++        hours = float(value)
++    except (TypeError, ValueError):
++        return None
++    if not math.isfinite(hours):
++        return None
++    return hours % 24.0
++
++
++def _as_utc(when: datetime) -> datetime:
++    if when.tzinfo is None:
++        return when.replace(tzinfo=timezone.utc)
++    return when.astimezone(timezone.utc)
++
++
++def _amount(seconds: float) -> str:
++    """``2h 03m`` / ``45s``. The sign is carried by the caller."""
++    whole = int(round(abs(seconds)))
++    if whole >= 3600:
++        hours, rest = divmod(whole, 3600)
++        minutes = int(round(rest / 60.0))
++        if minutes == 60:
++            hours += 1
++            minutes = 0
++        return f"{hours}h {minutes:02d}m" if minutes else f"{hours}h"
++    if whole >= 60:
++        minutes, secs = divmod(whole, 60)
++        return f"{minutes}m {secs:02d}s" if secs else f"{minutes}m"
++    return f"{whole}s"
++
++
++def _way(seconds: float) -> str:
++    return "ahead" if seconds >= 0 else "behind"
++
++
++def _placement(seconds: float) -> str:
++    """``2h ahead of this PC`` / ``45s behind this PC``."""
++    if seconds >= 0:
++        return f"{_amount(seconds)} ahead of this PC"
++    return f"{_amount(seconds)} behind this PC"
++
++
++def _degrees(seconds: float) -> str:
++    degrees = abs(seconds) / 3600.0 * 15.0
++    if degrees >= 10:
++        return f"{degrees:.0f}°"
++    return f"{degrees:.1f}°"
++
++
++def assess(raw: dict[str, Any] | None, *, now: datetime,
++           longitude: float | None) -> dict[str, Any]:
++    """One driver's clock against `now`. Pure: it does not touch a device.
++
++    `raw` is ``{"utc": ..., "lst": ...}`` from `Mount.reported_clock`.
++    None, or a reading with neither value, is a skip.
++    """
++    if not raw:
++        return _skipped(_SKIPPED_SILENT)
++    when = _as_utc(now)
++    utc_value = coerce_utc(raw.get("utc"))
++    lst_value = coerce_hours(raw.get("lst"))
++    utc_delta = ((utc_value - when).total_seconds() if utc_value is not None else None)
++    lst_delta = None
++    if lst_value is not None and longitude is not None:
++        pc_lst = astro.local_sidereal_hours(float(longitude), when)
++        lst_delta = lst_delta_seconds(lst_value, pc_lst)
++    compared = []
++    if utc_delta is not None:
++        compared.append("utc")
++    if lst_delta is not None:
++        compared.append("lst")
++    if not compared:
++        return _skipped(_SKIPPED_SILENT)
++
++    offending = []
++    if utc_delta is not None and abs(utc_delta) > SKEW_LIMIT_SECONDS:
++        offending.append(abs(utc_delta))
++    if lst_delta is not None and abs(lst_delta) > SKEW_LIMIT_SECONDS:
++        offending.append(abs(lst_delta))
++    if not offending:
++        bits = []
++        if utc_delta is not None:
++            bits.append("UTC matches" if abs(utc_delta) < 0.5
++                        else f"UTC {_amount(utc_delta)} {_way(utc_delta)}")
++        if lst_delta is not None:
++            bits.append("LST matches" if abs(lst_delta) < 0.5
++                        else f"LST {_amount(lst_delta)} {_way(lst_delta)}")
++        return _report(state="ok",
++                       detail="Mount clock matches this PC (" + ", ".join(bits) + ").",
++                       utc=utc_delta, lst=lst_delta, compared=compared)
++
++    problems = []
++    notes = []
++    if utc_delta is not None and abs(utc_delta) > SKEW_LIMIT_SECONDS:
++        problems.append(f"UTC {_placement(utc_delta)}")
++    elif utc_delta is not None:
++        notes.append(f"UTC agrees ({_amount(utc_delta)} {_way(utc_delta)})")
++    else:
++        notes.append("the driver did not report UTC")
++    if lst_delta is not None and abs(lst_delta) > SKEW_LIMIT_SECONDS:
++        problems.append(f"local sidereal time {_placement(lst_delta)}")
++    elif lst_delta is not None:
++        notes.append(f"LST agrees ({_amount(lst_delta)} {_way(lst_delta)})")
++    detail = "The mount reports " + " and ".join(problems) + "."
++    if notes:
++        detail += " " + " ".join(note[0].upper() + note[1:] + "." for note in notes)
++    detail += (f" That shifts right ascension by about {_degrees(max(offending))}."
++               " Nothing was changed.")
++    return _report(state="warn", detail=detail, title=_TITLE, fix=_FIX,
++                   utc=utc_delta, lst=lst_delta, compared=compared)
++
++
++def _connected(ctx: Any) -> list[tuple[Any, Any]]:
++    rigs = getattr(ctx, "rigs", None)
++    if rigs is None:
++        return []
++    found = []
++    for rig in list(getattr(rigs, "all", None) or []):
++        manager = getattr(rig, "manager", None)
++        get = getattr(manager, "get", None)
++        if not callable(get):
++            continue
++        try:
++            device = get("mount")
++        except Exception:
++            continue
++        if device is not None and getattr(device, "connected", False):
++            found.append((rig, device))
++    return found
++
++
++def _longitude(ctx: Any, mounts: list[tuple[Any, Any]]) -> float | None:
++    """The PC's site first. The mount's own longitude is only a fallback.
++
++    The point of the sidereal comparison is the sky this PC believes, which
++    is what a plan is aimed at. A mount longitude is used when the site has
++    not been typed in yet.
++    """
++    section: Any = {}
++    try:
++        if hasattr(ctx, "section"):
++            section = ctx.section("site")
++    except Exception:
++        section = {}
++    if isinstance(section, dict) and section.get("longitude") is not None:
++        try:
++            return float(section["longitude"])
++        except (TypeError, ValueError):
++            pass
++    for _rig, mount in mounts:
++        site = getattr(mount, "site", None)
++        if isinstance(site, dict) and site.get("longitude") is not None:
++            try:
++                return float(site["longitude"])
++            except (TypeError, ValueError):
++                continue
++    return None
++
++
++def _sample(mount: Any) -> dict[str, Any] | None:
++    """Call the driver's read-only clock, or None if it cannot answer."""
++    reader = getattr(mount, "reported_clock", None)
++    if not callable(reader):
++        return None
++    try:
++        raw = reader()
++    except Exception:
++        return None
++    return raw if isinstance(raw, dict) else None
++
++
++def _rig_log(ctx: Any) -> Callable[..., Any] | None:
++    rigs = getattr(ctx, "rigs", None)
++    log = getattr(rigs, "log", None) if rigs is not None else None
++    return log if callable(log) else None
++
++
++def _emit(log: Callable[..., Any], text: str, level: str) -> None:
++    try:
++        log(text, level)
++    except TypeError:
++        log(text)
++
++
++def observe(ctx: Any, log: Callable[..., Any] | None = None) -> dict[str, Any]:
++    """Look once per connected mount, then repeat that verdict.
++
++    Safe to call on every watchdog pass. The driver is asked only the first
++    time that mount object is seen connected. Disconnecting drops the
++    memory, so the next connection is read again.
++    """
++    global _logged
++    if log is None:
++        log = _rig_log(ctx)
++    mounts = _connected(ctx)
++    now = _as_utc(clock())
++    longitude = _longitude(ctx, mounts)
++    fresh: list[tuple[Any, dict[str, Any]]] = []
++    ready: list[dict[str, Any]] = []
++    with _lock:
++        live = {id(mount) for _rig, mount in mounts}
++        for stale in [key for key in _cache if key not in live]:
++            del _cache[stale]
++        pending = []
++        for rig, mount in mounts:
++            hit = _cache.get(id(mount))
++            if hit is None:
++                pending.append((rig, mount))
++            else:
++                ready.append(hit)
++    for rig, mount in pending:
++        name = str(getattr(rig, "name", "") or "").strip()
++        raw = _sample(mount)
++        part = assess(raw, now=now, longitude=longitude)
++        part = {**part, "name": name}
++        if name and len(mounts) > 1 and part["detail"]:
++            part = {**part, "detail": f"{name}: {part['detail']}"}
++        fresh.append((mount, part))
++    with _lock:
++        for mount, part in fresh:
++            _cache[id(mount)] = part
++        report = _combine(ready + [part for _mount, part in fresh])
++        _latest.clear()
++        _latest.update(report)
++        announce = None
++        if report["detail"] != _logged:
++            _logged = report["detail"]
++            if report["state"] != "warn":
++                announce = report["detail"]
++    if announce and log is not None:
++        _emit(log, announce, "info")
++    return copy.deepcopy(report)
++
++
++def _combine(parts: list[dict[str, Any]]) -> dict[str, Any]:
++    if not parts:
++        return _skipped()
++    warns = [part for part in parts if part["state"] == "warn"]
++    oks = [part for part in parts if part["state"] == "ok"]
++    if warns:
++        chosen = max(warns, key=lambda part: max(
++            abs(part["utcDeltaSeconds"] or 0.0), abs(part["lstDeltaSeconds"] or 0.0)))
++        compared: list[str] = []
++        for part in warns:
++            for name in part["compared"]:
++                if name not in compared:
++                    compared.append(name)
++        return _report(state="warn", detail=" ".join(part["detail"] for part in warns),
++                       title=_TITLE, fix=_FIX,
++                       utc=chosen["utcDeltaSeconds"], lst=chosen["lstDeltaSeconds"],
++                       compared=compared, mounts=[_face(part) for part in parts])
++    if oks:
++        chosen = oks[0]
++        return _report(state="ok", detail=" ".join(part["detail"] for part in oks),
++                       utc=chosen["utcDeltaSeconds"], lst=chosen["lstDeltaSeconds"],
++                       compared=list(chosen["compared"]), mounts=[_face(part) for part in parts])
++    return _report(state="skipped", detail=parts[0]["detail"],
++                   mounts=[_face(part) for part in parts])
++
++
++def _face(part: dict[str, Any]) -> dict[str, Any]:
++    """One mount, as published. No nested copy of the same shape."""
++    shown = dict(part)
++    shown.pop("mounts", None)
++    shown.pop("fix", None)
++    shown.pop("title", None)
++    return shown
+diff -ruN --exclude __pycache__ --exclude '*.pyc' a/astrocontrol/warnings.py b/astrocontrol/warnings.py
+--- a/astrocontrol/warnings.py	2026-11-04 17:43:50.000000000 +0000
++++ b/astrocontrol/warnings.py	2026-11-06 06:38:19.471042734 +0000
+@@ -3,6 +3,7 @@
+ A rig fails in two ways. Loudly - an exception, a device that refuses - which
+ the sequencer already reports. And quietly: the cooler that never reached
+ its setpoint, the mount whose site is a hundred miles from the observatory,
++the mount whose clock is an hour away from this PC,
+ the cover that stayed shut, the disk with two frames' worth of room, the
+ frames that have had no stars in them since the cloud came over. Nothing
+ throws, the night runs to the end, and the morning finds it was wasted.
+@@ -31,6 +32,7 @@
+ from typing import Any, Callable
+ 
+ from . import filters as filternames
++from . import mountclock
+ from .focushealth import bogus_reading
+ 
+ LEVELS = ("critical", "warning", "notice")
+@@ -339,6 +341,22 @@
+ 
+ 
+ @check
++def mount_clock(board: WarningBoard, ctx: Context) -> None:
++    """The driver's UTC and sidereal time against this PC.
++
++    Raised when the difference is more than a minute. With no mount, the
++    result is a skip and the board stays quiet. The watchdog runs this with
++    the others, so it happens at startup and again after a mount connects.
++    The driver is only read.
++    """
++    report = mountclock.observe(ctx)
++    if report.get("state") != "warn":
++        return
++    board.raise_(mountclock.WARNING_KEY, "warning", report["title"],
++                 report["detail"], report["fix"])
++
++
++@check
+ def plan_tonight(board: WarningBoard, ctx: Context) -> None:
+     run = ctx.run()
+     entries = ctx.light_entries()
+diff -ruN --exclude __pycache__ --exclude '*.pyc' a/tools/check_mount_clock.py b/tools/check_mount_clock.py
+--- a/tools/check_mount_clock.py	1970-01-01 00:00:00.000000000 +0000
++++ b/tools/check_mount_clock.py	2026-11-06 06:39:37.543338591 +0000
+@@ -0,0 +1,359 @@
++"""The mount clock against this PC. Read-only.
++
++    python3 tools/check_mount_clock.py
++
++A connected mount whose UTC or local sidereal time is more than a minute
++from this PC raises a warning on the board that status already publishes.
++A clock inside that minute does not. No mount, a mount that is
++disconnected, or a driver that does not answer is "clock check skipped".
++The driver is read once per connection. Nothing is synced or slewed.
++
++No test framework, for the same reason as the other checks here.
++"""
++import ast
++import os
++import sys
++import tempfile
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(ROOT))
++os.environ.setdefault("ASTRO_DATA_DIR", tempfile.mkdtemp())
++
++from astrocontrol import __version__, astro, mountclock, warnings          # noqa: E402
++from astrocontrol.config import Config                                      # noqa: E402
++
++results = []
++
++
++def case(name, ok, detail=""):
++    print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  - {detail}" if detail else ""))
++    results.append(bool(ok))
++    return ok
++
++
++NOW = datetime(2026, 11, 6, 6, 0, tzinfo=timezone.utc)
++mountclock.clock = lambda: NOW
++
++WRITES = ("sync_to", "slew_to", "set_tracking", "park", "unpark", "abort_slew")
++
++
++def pc_lst(longitude=0.0):
++    return astro.local_sidereal_hours(longitude, NOW)
++
++
++class Manager:
++    def __init__(self, devices):
++        self.devices = devices
++
++    def get(self, kind):
++        return self.devices.get(kind)
++
++
++class Rig:
++    def __init__(self, devices, name="FSQ106"):
++        self.id = name
++        self.name = name
++        self.manager = Manager(devices)
++
++
++class Rigs:
++    def __init__(self, rig, log):
++        self.master = rig
++        self.all = [rig]
++        self.log = log
++
++
++class ClockMount:
++    """A mount that reports a clock and records anything that would move it."""
++
++    def __init__(self, utc=None, lst=None, boom=False):
++        self.connected = True
++        self.tracking = True
++        self.slewing = False
++        self.site = {"latitude": 31.9, "longitude": 0.0, "elevation": 1000.0}
++        self.calls = []
++        self.utc = utc
++        self.lst = lst
++        self.boom = boom
++
++    def reported_clock(self):
++        self.calls.append("reported_clock")
++        if self.boom:
++            raise RuntimeError("driver busy")
++        return {"utc": self.utc, "lst": self.lst}
++
++    def sync_to(self, *args, **kwargs):
++        self.calls.append("sync_to")
++
++    def slew_to(self, *args, **kwargs):
++        self.calls.append("slew_to")
++
++    def set_tracking(self, *args, **kwargs):
++        self.calls.append("set_tracking")
++
++    def park(self, *args, **kwargs):
++        self.calls.append("park")
++
++    def unpark(self, *args, **kwargs):
++        self.calls.append("unpark")
++
++    def abort_slew(self, *args, **kwargs):
++        self.calls.append("abort_slew")
++
++
++def build(devices, longitude=0.0):
++    mountclock.reset()
++    config = Config(Path(tempfile.mkdtemp()) / "settings.json")
++    config.update("site", {"latitude": 31.9, "longitude": longitude, "useMount": True})
++    # A roomy disk, so the disk check stays quiet on this machine.
++    config.update("warnings", {"diskCriticalGb": 0.0, "diskWarnGb": 0.0})
++    logs = []
++    rig = Rig(devices)
++    board = warnings.WarningBoard(log=lambda message, level="info": logs.append((level, message)))
++    ctx = warnings.Context(
++        config=config, rigs=Rigs(rig, lambda message, level="info": logs.append((level, message))),
++        night=lambda: None)
++    dog = warnings.Watchdog(board, ctx, interval=999,
++                            log=lambda message, level="info": logs.append((level, message)))
++    return board, dog, logs
++
++
++def active(board):
++    return {item["key"]: item for item in board.snapshot()["active"]}
++
++
++def method_body(path, name):
++    lines = Path(path).read_text().splitlines()
++    start = next(index for index, line in enumerate(lines) if f"def {name}(" in line)
++    body = []
++    for line in lines[start + 1:]:
++        if line.startswith("    def ") or line.startswith("class "):
++            break
++        body.append(line)
++    return "\n".join(body)
++
++
++# ---------------------------------------------------------------- the wiring
++case("version stays 0.2.53f", __version__ == "0.2.53f", __version__)
++case("the clock check is on the watchdog",
++     any(fn.__name__ == "mount_clock" for fn in warnings.CHECKS))
++main_text = (ROOT / "astrocontrol/main.py").read_text()
++case("status publishes the verdict without asking the mount again",
++     'payload["mountClock"] = mountclock.latest()' in main_text)
++
++ascom_body = method_body(ROOT / "astrocontrol/devices/ascom.py", "reported_clock")
++case("ASCOM clock read does not write",
++     "_set" not in ascom_body and "_invoke" not in ascom_body
++     and "setattr" not in ascom_body and "Sync" not in ascom_body
++     and "Slew" not in ascom_body and "UTCDate" in ascom_body
++     and "SiderealTime" in ascom_body)
++alpaca_body = method_body(ROOT / "astrocontrol/devices/alpaca.py", "reported_clock")
++case("Alpaca clock read is GET only",
++     ".put(" not in alpaca_body and "utcdate" in alpaca_body and "siderealtime" in alpaca_body)
++clock_source = (ROOT / "astrocontrol/mountclock.py").read_text()
++case("the comparison itself never commands the mount",
++     not any(name in clock_source for name in ("sync_to", "slew_to", "set_tracking", ".put(")))
++
++
++# ---------------------------------------------------------------- a real skew
++ahead = ClockMount(utc=NOW + timedelta(hours=2), lst=(pc_lst() + 2.0) % 24.0)
++board, dog, logs = build({"mount": ahead})
++dog.pass_once()
++found = active(board)
++warning = found.get("mount.clock")
++verdict = mountclock.latest()
++case("two hours fast is a warning",
++     warning is not None and warning["level"] == "warning"
++     and verdict["state"] == "warn"
++     and abs(verdict["utcDeltaSeconds"] - 7200) < 1
++     and abs(verdict["lstDeltaSeconds"] - 7200) < 1
++     and verdict["compared"] == ["utc", "lst"],
++     verdict["detail"])
++case("...and the warning names the shift and that nothing was changed",
++     warning is not None and "2h ahead of this PC" in warning["detail"]
++     and "30°" in warning["detail"] and "Nothing was changed." in warning["detail"]
++     and "will not sync" in warning["fix"])
++case("...and the mount was only read",
++     ahead.calls == ["reported_clock"] and not any(name in ahead.calls for name in WRITES))
++dog.pass_once()
++case("a second pass repeats the warning without reading again",
++     "mount.clock" in active(board) and ahead.calls == ["reported_clock"])
++case("the warning is on the board status publishes",
++     any(item["key"] == "mount.clock" for item in board.snapshot()["active"]))
++
++behind = ClockMount(utc=NOW - timedelta(hours=2))
++board, dog, logs = build({"mount": behind})
++dog.pass_once()
++text = active(board)["mount.clock"]["detail"]
++case("two hours slow says behind, and still only reads",
++     "2h behind this PC" in text and behind.calls == ["reported_clock"]
++     and mountclock.latest()["utcDeltaSeconds"] < 0)
++
++
++# ---------------------------------------------------------------- no skew
++matched = ClockMount(utc=NOW + timedelta(seconds=5), lst=(pc_lst() + 5 / 3600.0) % 24.0)
++board, dog, logs = build({"mount": matched})
++dog.pass_once()
++ok = mountclock.latest()
++case("five seconds is not a warning",
++     "mount.clock" not in active(board) and ok["state"] == "ok"
++     and abs(ok["utcDeltaSeconds"] - 5) < 1 and "matches this PC" in ok["detail"],
++     ok["detail"])
++case("...and the session log says so once",
++     sum(1 for level, message in logs if "matches this PC" in message) == 1)
++dog.pass_once()
++case("...and a second pass does not read or log it again",
++     matched.calls == ["reported_clock"]
++     and sum(1 for level, message in logs if "matches this PC" in message) == 1)
++
++on_the_minute = ClockMount(utc=NOW + timedelta(seconds=60))
++board, dog, _logs = build({"mount": on_the_minute})
++dog.pass_once()
++case("exactly one minute is still inside the limit",
++     mountclock.latest()["state"] == "ok" and "mount.clock" not in active(board))
++
++over = ClockMount(utc=NOW + timedelta(seconds=61))
++board, dog, _logs = build({"mount": over})
++dog.pass_once()
++case("a second past a minute is a warning",
++     "mount.clock" in active(board) and mountclock.latest()["state"] == "warn"
++     and "1m 01s ahead of this PC" in active(board)["mount.clock"]["detail"])
++
++
++# ---------------------------------------------------------------- skipped
++board, dog, logs = build({})
++dog.pass_once()
++skipped = mountclock.latest()
++case("no mount skips quietly",
++     skipped["state"] == "skipped" and skipped["detail"] == "clock check skipped"
++     and "mount.clock" not in active(board))
++case("...and says so in the log once",
++     sum(1 for _level, message in logs if message == "clock check skipped") == 1)
++
++asleep = ClockMount(utc=NOW + timedelta(hours=2))
++asleep.connected = False
++board, dog, _logs = build({"mount": asleep})
++dog.pass_once()
++case("a disconnected mount is a skip and is not asked",
++     mountclock.latest()["detail"] == "clock check skipped" and asleep.calls == []
++     and "mount.clock" not in active(board))
++
++broken = ClockMount(boom=True)
++board, dog, _logs = build({"mount": broken})
++dog.pass_once()
++silent = mountclock.latest()
++case("a driver that throws is a skip, not a crash",
++     silent["state"] == "skipped" and "did not report" in silent["detail"]
++     and "mount.clock" not in active(board) and broken.calls == ["reported_clock"])
++dog.pass_once()
++case("...and it is not asked again while it stays connected",
++     broken.calls == ["reported_clock"])
++
++mute = ClockMount(utc=None, lst=None)
++board, dog, _logs = build({"mount": mute})
++dog.pass_once()
++case("a connected mount with no time is a skip",
++     "did not report" in mountclock.latest()["detail"] and "mount.clock" not in active(board))
++
++
++# ---------------------------------------------------------------- sidereal time
++lst_only = ClockMount(utc=None, lst=(pc_lst() + 2.0) % 24.0)
++board, dog, _logs = build({"mount": lst_only})
++dog.pass_once()
++lst_warn = active(board)["mount.clock"]
++case("sidereal time two hours off warns when UTC is absent",
++     mountclock.latest()["compared"] == ["lst"]
++     and abs(mountclock.latest()["lstDeltaSeconds"] - 7200) < 1
++     and "local sidereal time" in lst_warn["detail"]
++     and "did not report UTC" in lst_warn["detail"]
++     and lst_only.calls == ["reported_clock"])
++
++lst_ok = ClockMount(utc=None, lst=pc_lst())
++board, dog, _logs = build({"mount": lst_ok})
++dog.pass_once()
++case("sidereal time that matches is not a warning",
++     mountclock.latest()["state"] == "ok" and "mount.clock" not in active(board))
++
++long_way = ClockMount(utc=None, lst=(pc_lst() + 23.0) % 24.0)
++board, dog, _logs = build({"mount": long_way})
++dog.pass_once()
++wrapped = mountclock.latest()
++case("twenty-three hours ahead is one hour behind, the short way",
++     wrapped["state"] == "warn" and wrapped["lstDeltaSeconds"] < 0
++     and abs(wrapped["lstDeltaSeconds"] + 3600) < 2
++     and "behind this PC" in active(board)["mount.clock"]["detail"],
++     str(wrapped["lstDeltaSeconds"]))
++
++utc_ok_lst_bad = ClockMount(utc=NOW + timedelta(seconds=3), lst=(pc_lst() + 2.0) % 24.0)
++board, dog, _logs = build({"mount": utc_ok_lst_bad})
++dog.pass_once()
++mixed = active(board)["mount.clock"]["detail"]
++case("a good UTC with a bad sidereal time still warns",
++     "local sidereal time" in mixed and "UTC agrees" in mixed
++     and mountclock.latest()["compared"] == ["utc", "lst"])
++
++no_longitude = ClockMount(utc=None, lst=(pc_lst() + 5.0) % 24.0)
++board, dog, _logs = build({"mount": no_longitude})
++# Site longitude removed: LST alone cannot be compared.
++dog.context.config.update("site", {"latitude": None, "longitude": None})
++# The mount's own site would still supply one. Clear it.
++no_longitude.site = None
++dog.pass_once()
++case("sidereal time with no longitude to compare is a skip",
++     mountclock.latest()["state"] == "skipped" and "mount.clock" not in active(board))
++
++
++# ---------------------------------------------------------------- what a driver might hand back
++iso = mountclock.assess({"utc": "2026-11-06T08:00:00Z", "lst": None},
++                        now=NOW, longitude=0.0)
++case("an ISO UTC two hours fast is the same warning",
++     iso["state"] == "warn" and abs(iso["utcDeltaSeconds"] - 7200) < 1)
++
++naive = mountclock.assess({"utc": datetime(2026, 11, 6, 8, 0), "lst": None},
++                          now=NOW, longitude=0.0)
++case("a naive datetime is taken as UTC",
++     naive["state"] == "warn" and abs(naive["utcDeltaSeconds"] - 7200) < 1)
++
++epoch = datetime(1899, 12, 30, tzinfo=timezone.utc)
++ole = (datetime(2026, 11, 6, 8, 0, tzinfo=timezone.utc) - epoch).total_seconds() / 86400.0
++from_ole = mountclock.assess({"utc": ole, "lst": None}, now=NOW, longitude=0.0)
++case("an OLE automation date is accepted",
++     from_ole["state"] == "warn" and abs(from_ole["utcDeltaSeconds"] - 7200) < 1)
++
++hours_as_date = mountclock.assess({"utc": 12.5, "lst": None}, now=NOW, longitude=None)
++case("a sidereal-sized number is not read as a calendar date",
++     hours_as_date["state"] == "skipped")
++
++
++# ---------------------------------------------------------------- reconnect
++fixed = ClockMount(utc=NOW + timedelta(hours=2))
++board, dog, _logs = build({"mount": fixed})
++dog.pass_once()
++case("the skew is on the board before anyone corrects it", "mount.clock" in active(board))
++fixed.connected = False
++dog.pass_once()
++case("disconnecting clears the warning and skips",
++     "mount.clock" not in active(board)
++     and mountclock.latest()["detail"] == "clock check skipped")
++fixed.connected = True
++fixed.utc = NOW + timedelta(seconds=1)
++dog.pass_once()
++case("reconnecting reads again, and a corrected clock is quiet",
++     fixed.calls.count("reported_clock") == 2
++     and "mount.clock" not in active(board)
++     and mountclock.latest()["state"] == "ok"
++     and not any(name in fixed.calls for name in WRITES))
++
++
++# The module parses. A syntax error in the drivers would still import, because
++# those bodies are only compiled with the file; this catches a broken tree.
++for relative in ("astrocontrol/mountclock.py", "astrocontrol/warnings.py",
++                 "astrocontrol/devices/base.py", "astrocontrol/devices/ascom.py",
++                 "astrocontrol/devices/alpaca.py", "astrocontrol/main.py"):
++    ast.parse((ROOT / relative).read_text())
++case("the touched files parse", True)
++
++print(f"\n{sum(results)}/{len(results)} passed")
++sys.exit(0 if all(results) else 1)
