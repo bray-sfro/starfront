@@ -1,0 +1,710 @@
+diff -ruN --exclude __pycache__ --exclude '*.pyc' a/astrocontrol/__init__.py b/astrocontrol/__init__.py
+--- a/astrocontrol/__init__.py	2026-11-04 17:43:50.000000000 +0000
++++ b/astrocontrol/__init__.py	2026-11-06 03:51:29.634960915 +0000
+@@ -1,4 +1,4 @@
+ ﻿"""Starfront - astrophotography equipment control."""
+ 
+-__version__ = "0.2.53"
++__version__ = "0.2.53e"
+ 
+diff -ruN --exclude __pycache__ --exclude '*.pyc' a/astrocontrol/sequencer.py b/astrocontrol/sequencer.py
+--- a/astrocontrol/sequencer.py	2026-11-04 17:43:50.000000000 +0000
++++ b/astrocontrol/sequencer.py	2026-11-06 03:52:19.610906511 +0000
+@@ -26,7 +26,7 @@
+   * **the meridian** - a German equatorial mount cannot track through it.
+     Imaging stops before the target gets there, the mount is sent back to the
+     same coordinates (which makes the driver flip), the new pointing is plate
+-    solved and synced, and imaging resumes.
++    solved and corrected by the pointing offset, and imaging resumes.
+   * **focus drift** - temperature moves, filters are not parfocal, and hours
+     pass.  A focus run is triggered on whichever of those comes first.
+ 
+@@ -1604,6 +1604,10 @@
+                         self._say(f"{entry['name']}: the deal changed under the run - "
+                                   "starting over on what the plan says now", "warn")
+                     continue
++                except _CentreFailed as exc:
++                    self._say(f"{entry['name']}: {exc}", "error")
++                    self._tell("failure", f"{entry['name']}: centring failed",
++                               str(exc))
+                 except _Skipped:
+                     self._say(f"Skipped {entry['name']}", "warn")
+                 break
+@@ -2521,16 +2525,21 @@
+                 self._solve_failures = 0
+                 self._unwarn("solver.failing")
+             except DeviceError as exc:
+-                # A failed centre is not a reason to abandon the night; the frame
+-                # is still usable, just not perfectly framed.
+-                self._say(f"Could not centre on {label}: {exc}", "warn")
++                # Centring ran out. Focusing and exposing anyway is how a night
++                # shoots a field it is not on. This target stops; the next one
++                # is still tried. The night is not closed out for it.
+                 self._solve_failures += 1
++                self._say(f"Could not centre on {label}: {exc}. "
++                          "Not focusing or imaging this target.", "error")
+                 if self._solve_failures >= 3:
+                     self._warn("solver.failing", "warning", "Plate solving keeps failing",
+                                f"{self._solve_failures} centring solves in a row have failed; "
+                                f"last: {exc}",
+                                "Cloud, focus, or a wrong focal length in Site & Optics. "
+-                               "Targets are being shot where the mount put them.")
++                               "This target was not imaged.")
++                raise _CentreFailed(
++                    f"{label} was not centred ({exc}); autofocus and imaging "
++                    "were not started") from exc
+ 
+         # Slew, settle and centre together: what one panel costs before a single
+         # frame of it is taken, which on a mosaic is paid once per panel.
+@@ -3054,7 +3063,11 @@
+                                   float(rotation) if rotating else None)
+                 self._wait_for_solver()
+             except DeviceError as exc:
+-                self._say(f"Could not re-centre after the flip: {exc}", "warn")
++                self._say(f"Could not re-centre after the flip: {exc}. "
++                          "Not imaging this target from here.", "error")
++                raise _CentreFailed(
++                    f"{label} was not re-centred after the flip ({exc}); "
++                    "imaging was stopped") from exc
+ 
+         if guiding:
+             self._say("Restarting guiding")
+@@ -4298,6 +4311,8 @@
+                 self._goto(panel, label)
+                 recovered = True
+                 break
++            except _CentreFailed:
++                raise
+             except DeviceError as exc:
+                 self._say(f"Could not get back on target (attempt {attempt} of "
+                           f"{attempts}): {exc}", "warn")
+@@ -4737,8 +4752,12 @@
+                                 False)
+                 return
+         if self.solver is not None and self.solver.executable() is not None:
+-            with contextlib.suppress(Exception):
++            try:
+                 self._goto(panel, label)
++            except _CentreFailed:
++                raise
++            except Exception:
++                pass
+         if not tracking:
+             self._recovered("mount", "Tracking again", True)
+ 
+@@ -5140,6 +5159,15 @@
+         return True
+ 
+ 
++class _CentreFailed(Exception):
++    """Centring ran out of attempts. This target is not focused or imaged.
++
++    The rest of the plan still runs. Raising DeviceError here would end the
++    night, which is what a failed slew does, and swallowing it is what used
++    to start autofocus on a field the telescope was not on.
++    """
++
++
+ class _Stopped(Exception):
+     """The operator stopped the sequence."""
+ 
+diff -ruN --exclude __pycache__ --exclude '*.pyc' a/astrocontrol/solving.py b/astrocontrol/solving.py
+--- a/astrocontrol/solving.py	2026-11-04 17:43:50.000000000 +0000
++++ b/astrocontrol/solving.py	2026-11-06 03:53:03.758909068 +0000
+@@ -5,10 +5,13 @@
+ `.ini` file beside its output path.  Everything here is that conversation, plus
+ the two things a solved position is actually good for at the eyepiece:
+ 
+-  * **sync**   - tell the mount where it really is, once.
+-  * **centre** - solve, sync, slew back to the target and solve again, until the
+-    target is under the crosshair.  This is what makes "go to M51" land M51 in
+-    the middle of the frame rather than somewhere in the general area.
++  * **sync**   - tell the mount where it really is, once. The operator's
++    own Sync button. Centring does not use it.
++  * **centre** - solve, and slew to the target minus the measured offset
++    (aim = target + (target − solved)), until the target is under the
++    crosshair. The mount is not synced: TheSky's SyncToCoordinates throws,
++    and a thrown sync must not be treated as a pointing model. A solve that
++    is flipped or a jump is thrown away before any slew.
+ 
+ Solves run on their own thread; the UI polls `status()` through the status
+ socket, exactly like a capture.
+@@ -504,12 +507,134 @@
+             time.sleep(0.3)
+         return True
+ 
++    # A reported angle this close to half a turn from the reference is the
++    # other way up. ASTAP's false match on a mirrored field comes back that
++    # way (M31: +95.6° on the target, −84.5° on the match 24° away). A correct
++    # solve is also free to quote the other half-turn, but then it is still
++    # sitting on the same piece of sky, so the angle alone is not the reject.
++    _FLIP_WINDOW_DEG = 15.0
++    # Farther than this from the target, a flipped angle is not the mount's
++    # model being wrong. After a home the model can be tens of degrees out
++    # and still the right way up; that solve is kept.
++    _FLIP_FAR_DEG = 5.0
++    # After a correction, a new solve may land this far past the move just
++    # commanded before it is thrown away. Three times the slew, and never
++    # tighter than five degrees: a one-arcminute nudge must not reject a
++    # solve a degree off because the mount did not go where it was told.
++    _JUMP_FLOOR_DEG = 5.0
++    _JUMP_FACTOR = 3.0
++
++    @staticmethod
++    def _rotation_apart(a: float, b: float) -> float:
++        """Shortest turn from `a` to `b`, in degrees, 0 to 180."""
++        return abs(((float(a) - float(b) + 180.0) % 360.0) - 180.0)
++
++    def _optics_angle(self) -> float | None:
++        raw = self.config.get("optics", "rotation", None)
++        try:
++            if raw is None:
++                return None
++            return float(raw)
++        except (TypeError, ValueError):
++            return None
++
++    def _centring_outlier(self, result: SolveResult, target_ra: float,
++                          target_dec: float, accepted: dict[str, float] | None,
++                          commanded_deg: float | None) -> str | None:
++        """Why this solve must not move the mount, or None if it may.
++
++        A flipped solve is one whose angle is ~180° from the camera's, and
++        which is not on the field the last accepted solve (or the target, the
++        first time) said we were on. A jump is a solve that moved many times
++        further than the slew just commanded. Either one is discarded before
++        an offset is applied.
++        """
++        reference = accepted["rotation"] if accepted else self._optics_angle()
++        flipped = (reference is not None and self._rotation_apart(
++            result.rotation, reference) >= 180.0 - self._FLIP_WINDOW_DEG)
++        if accepted is None:
++            if not flipped:
++                return None
++            away = astro.separation_degrees(
++                result.ra, result.dec, target_ra, target_dec)
++            if away > self._FLIP_FAR_DEG:
++                return (f"rotation {result.rotation:.1f}° is flipped from the "
++                        f"camera angle {reference:.1f}°, and the solve is "
++                        f"{away:.1f}° from the target")
++            return None
++        jumped = astro.separation_degrees(
++            result.ra, result.dec, accepted["ra"], accepted["dec"])
++        if flipped and jumped > 1.0:
++            return (f"rotation flipped from {accepted['rotation']:.1f}° to "
++                    f"{result.rotation:.1f}° and the solve jumped {jumped:.1f}°")
++        limit = max(self._JUMP_FLOOR_DEG,
++                    (commanded_deg or 0.0) * self._JUMP_FACTOR)
++        if jumped > limit:
++            return (f"the solve jumped {jumped:.1f}°, more than {limit:.1f}° "
++                    f"after a {(commanded_deg or 0.0):.1f}° correction")
++        return None
++
++    def _solve_for_centring(self, record: Any, blind_left: list[bool]
++                            ) -> SolveResult | None:
++        """The tight solve, or one blind solve if the hint finds nothing.
++
++        `blind_left` is a one-element list so the single fallback is spent
++        for the whole centring, not once per attempt. None means this frame
++        produced no solution and the mount must not be moved.
++        """
++        try:
++            return self._solve_image(record.id)
++        except DeviceError as exc:
++            if self._abort.is_set():
++                raise
++            if not blind_left[0]:
++                self.manager.log(f"No plate solution ({exc})", "warn")
++                return None
++            blind_left[0] = False
++            self.manager.log(
++                f"No solution within the search radius ({exc}); "
++                "trying one blind solve, then the tight radius again", "warn")
++            try:
++                return self._solve_wide(record)
++            except DeviceError as again:
++                if self._abort.is_set():
++                    raise
++                self.manager.log(f"The blind solve failed ({again})", "warn")
++                return None
++
++    def _offset_slew(self, mount: Any, target_ra: float, target_dec: float,
++                     result: SolveResult, east: float, north: float) -> float:
++        """Slew to target − (solved − target). Returns that slew in degrees.
++
++        The same arithmetic as aim = target + (target − solved). Worked from
++        the target every time: adding the error onto the last aim walked the
++        mount off the field. The mount is not synced. TheSky's
++        SyncToCoordinates throws a null reference, and a thrown sync is not
++        a pointing model.
++        """
++        # Signed shortest RA error, in hours, so a solve just west of 0h does
++        # not aim twenty-three hours the other way.
++        delta_ra = ((result.ra - target_ra + 12.0) % 24.0) - 12.0
++        delta_dec = result.dec - target_dec
++        aim_ra = astro.normalise_ra_hours(target_ra - delta_ra)
++        aim_dec = max(-90.0, min(90.0, target_dec - delta_dec))
++        self._pointing_offset = (delta_ra, delta_dec)
++        commanded = astro.separation_degrees(result.ra, result.dec, aim_ra, aim_dec)
++        self.manager.log(
++            f"Pointing offset RA {delta_ra * 15.0 * 60.0 * math.cos(math.radians(target_dec)):+.2f}', "
++            f"Dec {delta_dec * 60.0:+.2f}' "
++            f"(solved - target); slewing to RA {aim_ra:.5f}h  Dec {aim_dec:+.4f}° "
++            f"by RA {-east:+.2f}', Dec {-north:+.2f}'")
++        self._set("correcting",
++                  f"{result.separation:.2f}' out — slewing by the pointing offset")
++        mount.slew_to(aim_ra, aim_dec)
++        self._wait_for_slew(mount)
++        return commanded
++
+     # -- centring ----------------------------------------------------------
+     def _center(self, ra: float | None, dec: float | None,
+                 rotation: float | None = None) -> None:
+         mount = self.manager.require("mount")
+-        if not mount.can_sync:
+-            raise DeviceError("centring needs a mount that can be synced")
+ 
+         target_ra = astro.normalise_ra_hours(ra) if ra is not None else mount.ra
+         target_dec = dec if dec is not None else mount.dec
+@@ -519,14 +644,21 @@
+ 
+         self.manager.log(
+             f"Centring on RA {target_ra:.5f}h  Dec {target_dec:+.4f}° "
+-            f"(within {tolerance:g}')")
++            f"(within {tolerance:g}'); corrections are a pointing offset, "
++            "not a mount sync")
+ 
+         if ra is not None or dec is not None:
+             self._set("slewing", "slewing to the target")
+             mount.slew_to(target_ra, target_dec)
+             self._wait_for_slew(mount)
+ 
+-        can_sync = True
++        # One blind solve for the whole centring, after the hint has failed.
++        # The attempts after it go back to the configured radius.
++        blind_left = [True]
++        accepted: dict[str, float] | None = None
++        commanded_deg: float | None = None
++        last_valid: float | None = None
++
+         for attempt in range(1, attempts + 1):
+             if self._abort.is_set():
+                 raise DeviceError("centring aborted")
+@@ -546,10 +678,26 @@
+             finally:
+                 self.capture.resume_saving()
+ 
+-            result = self._solve_image(record.id)
++            result = self._solve_for_centring(record, blind_left)
++            if result is None:
++                self.manager.log(
++                    f"Centre attempt {attempt}/{attempts}: no usable solution")
++                continue
++
++            reason = self._centring_outlier(
++                result, target_ra, target_dec, accepted, commanded_deg)
++            if reason:
++                self.manager.log(
++                    f"Centre attempt {attempt}/{attempts}: rejected — {reason}. "
++                    "The mount was not moved.", "warn")
++                continue
++
+             result.separation = astro.separation_degrees(
+                 result.ra, result.dec, target_ra, target_dec) * 60.0
+             self._report(result)
++            last_valid = result.separation
++            accepted = {"ra": result.ra, "dec": result.dec,
++                        "rotation": float(result.rotation)}
+ 
+             centred = result.separation <= tolerance
+             # Where it landed against where it was sent, in arcminutes on the
+@@ -570,7 +718,7 @@
+             # pointing also says which way up it is, so correcting both from one
+             # frame costs nothing beyond the moving. Only when a framing angle
+             # was actually asked for — a plain re-centre must not start turning
+-            # a rotator nobody mentioned.
++            # a rotator nobody mentioned. Only an accepted solve turns it.
+             turned = False
+             if rotation is not None and attempt < attempts:
+                 turned = self._correct_rotation(rotation, result.rotation)
+@@ -590,42 +738,12 @@
+             # angle, but the pointing may be fine — re-slewing a centred mount
+             # would only spoil it.
+             if not centred:
+-                self._set("correcting",
+-                          f"{result.separation:.2f}' out — syncing and re-slewing")
+-                synced = False
+-                if can_sync:
+-                    try:
+-                        mount.sync_to(result.ra, result.dec)
+-                        synced = True
+-                    except Exception as exc:      # noqa: BLE001 - the driver's refusal
+-                        # Some drivers will not take a sync - TheSky's throws
+-                        # a null reference at it - and a centring that gave
+-                        # up there left every panel wherever the mount first
+-                        # put it. Not asked again this centring.
+-                        can_sync = False
+-                        self.manager.log(f"The mount would not sync ({exc}); nudging "
+-                                         "the slew by the measured error instead", "warn")
+-                if synced:
+-                    self.manager.log("Synced the mount to the solve; slewing to the "
+-                                     "target again")
+-                    mount.slew_to(target_ra, target_dec)
+-                else:
+-                    # The error is known, so the slew is nudged by it: ask for
+-                    # the target plus however far short of it the mount
+-                    # landed. Always from the *target*, never from the last
+-                    # nudged aim - compounding the nudge each attempt walked
+-                    # the mount steadily away from the field.
+-                    aim_ra = astro.normalise_ra_hours(target_ra + (target_ra - result.ra))
+-                    aim_dec = max(-90.0, min(90.0, target_dec + (target_dec - result.dec)))
+-                    self.manager.log(f"Nudging the slew by RA {-east:+.2f}', Dec {-north:+.2f}' "
+-                                     f"to RA {aim_ra:.5f}h  Dec {aim_dec:+.4f}°")
+-                    mount.slew_to(aim_ra, aim_dec)
+-                self._wait_for_slew(mount)
++                commanded_deg = self._offset_slew(
++                    mount, target_ra, target_dec, result, east, north)
+ 
+-        last = self._result.separation if self._result else None
+         raise DeviceError(
+-            f"still {last:.2f}' from the target after {attempts} attempts"
+-            if last is not None else f"could not centre after {attempts} attempts")
++            f"still {last_valid:.2f}' from the target after {attempts} attempts"
++            if last_valid is not None else f"could not centre after {attempts} attempts")
+ 
+     def _wait_for_slew(self, mount: Any, timeout: float = 300.0) -> None:
+         """Block until the mount stops moving.
+@@ -826,19 +944,30 @@
+         return result
+ 
+     # -- one solve ---------------------------------------------------------
+-    def _solve_image(self, image_id: str | None) -> SolveResult:
+-        record = self._pick_record(image_id)
++    def _solve_record(self, record: Any, *, radius: float | None = None,
++                      hint_position: bool = True) -> SolveResult:
+         started = time.monotonic()
+         self._set("solving", f"solving {record.filename}")
+-
+         with tempfile.TemporaryDirectory(prefix="astrocontrol-solve-") as workspace:
+             source = self._fits_for(record, Path(workspace))
+-            ini = self._run_astap(source, Path(workspace) / "solution", record)
+-
++            ini = self._run_astap(source, Path(workspace) / "solution", record,
++                                  radius=radius, hint_position=hint_position)
+         result = self._interpret(ini, record)
+         result.seconds = round(time.monotonic() - started, 2)
+         return result
+ 
++    def _solve_wide(self, record: Any) -> SolveResult:
++        """One solve with no position hint, over the whole sky.
++
++        Used once when the configured radius finds nothing. The field size is
++        still passed: the frame came off this camera, and a scale hint is not
++        the lie a wrong sky position is.
++        """
++        return self._solve_record(record, radius=180.0, hint_position=False)
++
++    def _solve_image(self, image_id: str | None) -> SolveResult:
++        return self._solve_record(self._pick_record(image_id))
++
+     def _pick_record(self, image_id: str | None) -> Any:
+         if image_id:
+             return self.capture.record(image_id)
+@@ -884,7 +1013,9 @@
+         return ra, dec, fov
+ 
+     def _run_astap(self, source: Path, output: Path, record: Any,
+-                   track: bool = True, blind: bool = False) -> dict[str, str]:
++                   track: bool = True, blind: bool = False,
++                   radius: float | None = None,
++                   hint_position: bool = True) -> dict[str, str]:
+         """Run the solver.
+ 
+         `track` publishes the process so `abort` can kill it; a background
+@@ -902,8 +1033,20 @@
+         if executable is None:
+             raise DeviceError("ASTAP was not found")
+ 
+-        ra, dec, fov = (None, None, None) if blind else self._hints(record)
+-        radius = float(self.config.get("solver", "searchRadius", 15.0))
++        if blind:
++            ra, dec, fov = None, None, None
++        else:
++            ra, dec, fov = self._hints(record)
++            if not hint_position:
++                ra, dec = None, None
++        if radius is None:
++            # No place to look means the whole sky. A hinted solve uses the
++            # configured radius, which is what keeps a mirrored false match
++            # out when the telescope is already near the target.
++            radius = (180.0 if blind or not hint_position
++                      else float(self.config.get("solver", "searchRadius", 15.0)))
++        else:
++            radius = float(radius)
+         downsample = int(self.config.get("solver", "downsample", 0))
+         max_stars = int(self.config.get("solver", "maxStars", 500))
+         timeout = float(self.config.get("solver", "timeout", 120.0))
+@@ -915,7 +1058,7 @@
+             args += ["-ra", f"{astro.normalise_ra_hours(ra):.6f}",
+                      "-spd", f"{dec + 90.0:.6f}", "-r", f"{radius:g}"]
+         else:
+-            args += ["-r", "180"]                # blind solve: search everywhere
++            args += ["-r", f"{radius:g}"]        # no position hint: this radius, or the whole sky
+         if fov:
+             args += ["-fov", f"{fov:.4f}"]
+         if downsample:
+diff -ruN --exclude __pycache__ --exclude '*.pyc' a/tools/check_centring.py b/tools/check_centring.py
+--- a/tools/check_centring.py	2026-11-04 17:43:50.000000000 +0000
++++ b/tools/check_centring.py	2026-11-06 03:54:01.798643025 +0000
+@@ -1,13 +1,14 @@
+-"""Centring on a mount that will not take a sync.
++"""Centring by a pointing offset, never by SyncToCoordinates.
+ 
+     python tools/check_centring.py
+ 
+-Found on a real night: TheSky's ASCOM driver throws at SyncToCoordinates.
+-The first fallback nudged the slew by the measured error - but from the
+-last nudged aim rather than from the target, so each attempt added the
+-error again and the mount walked steadily away from the field, a tenth of
+-a degree a time, until the attempts ran out. The nudge has to be worked
+-out from the target every time.
++TheSky's ASCOM driver throws a null reference at SyncToCoordinates. Centring
++does not call it. After each accepted solve the slew goes to
++target + (target - solved), which is the target minus (solved - target).
++A flipped or jumped solve is discarded before that slew. One blind solve
++covers a near-hint miss, then the tight radius is used again. When the
++attempts run out, the sequencer fails that target instead of focusing and
++imaging where the mount happens to be.
+ 
+ No test framework, for the same reason as the other checks here.
+ """
+@@ -21,7 +22,10 @@
+ sys.path.insert(0, str(ROOT))
+ os.environ.setdefault("ASTRO_DATA_DIR", tempfile.mkdtemp())
+ 
++from astrocontrol import astro                                      # noqa: E402
+ from astrocontrol.config import Config                              # noqa: E402
++from astrocontrol.devices.base import DeviceError                    # noqa: E402
++from astrocontrol.sequencer import Sequencer, _CentreFailed          # noqa: E402
+ from astrocontrol.solving import Solver, SolveResult                 # noqa: E402
+ 
+ results = []
+@@ -125,26 +129,27 @@
+     return abs(a[0] - b[0]) < tol and abs(a[1] - b[1]) < tol
+ 
+ 
+-case("...by one nudge of exactly the measured error, from the target",
++case("...by one offset slew of exactly the measured error, from the target",
+      len(mount.slews) == 2 and near(mount.slews[1], (TARGET[0] - 0.03, TARGET[1] + 0.02)),
+      str(mount.slews))
+-case("...and the sync is not asked for again once refused",
+-     sum(1 for level, m in solver.manager.logged if "would not sync" in m) == 1)
++case("...and SyncToCoordinates is never called",
++     mount.syncs == [] and not any("would not sync" in m for _, m in solver.manager.logged),
++     str(mount.syncs))
+ attempts_logged = [m for _, m in solver.manager.logged if m.startswith("Centre attempt")]
+ case("...every attempt says how far off it landed, split into RA and Dec",
+      len(attempts_logged) == 2 and "RA " in attempts_logged[0] and "Dec " in attempts_logged[0]
+      and "within tolerance" in attempts_logged[1], str(attempts_logged))
+-case("...and the nudge says how far it moved the aim",
+-     any(m.startswith("Nudging the slew by") for _, m in solver.manager.logged))
++case("...and the offset slew says where it aimed",
++     any("Pointing offset" in m and "slewing to" in m for _, m in solver.manager.logged))
+ case("...landing within tolerance",
+      abs(mount.ra - TARGET[0]) < 1e-6 and abs(mount.dec - TARGET[1]) < 1e-6,
+      f"{mount.ra:.5f}h {mount.dec:.4f}")
+ 
+ solver, mount = build(refuses_sync=False)
+ solver._center(*TARGET)
+-case("a mount that syncs is synced once and sent to the target again",
+-     len(mount.syncs) == 1 and len(mount.slews) == 2
+-     and all(near(s, TARGET) for s in mount.slews),
++case("a mount that would accept a sync is still not synced",
++     mount.syncs == [] and len(mount.slews) == 2
++     and near(mount.slews[1], (TARGET[0] - 0.03, TARGET[1] + 0.02)),
+      f"syncs {mount.syncs}, slews {mount.slews}")
+ 
+ # The runaway. A mount whose error grows with how far off-target it is
+@@ -171,5 +176,182 @@
+      furthest <= 0.05 and len(mount.slews) >= 4,
+      f"furthest aim {furthest * 60:.1f}' from the target over {len(mount.slews)} slews")
+ 
++
++def solved(ra, dec, rotation):
++    return SolveResult(ra=ra, dec=dec, rotation=rotation, scale=2.0,
++                       fov_width=5.3, fov_height=3.5, flipped=False,
++                       image_id="frame", filename="frame.fits")
++
++
++def scripted(frames):
++    """A solver that returns the next scripted frame, ignoring the mount."""
++    pending = list(frames)
++
++    def solve(image_id):
++        ra, dec, rotation = pending.pop(0)
++        return solved(ra, dec, rotation)
++    return solve
++
++
++# The M31 night: a flipped false match ~24° away must not be slewed to,
++# and the following good solve must aim at target + (target - solved).
++M31 = (0.71167, 41.2667)
++solver, mount = build(refuses_sync=True)
++solver.config.update("optics", {"rotation": 95.65})
++solver.config.update("solver", {"attempts": 4, "tolerance": 1.0})
++solver._solve_image = scripted([
++    (22.72276, 41.27, -84.49),   # false match, rotation flipped
++    (0.68769, 41.2667, 95.65),   # real field, ~16' off
++    (M31[0], M31[1], 95.65),     # on target after the offset slew
++])
++try:
++    solver._center(*M31)
++    m31_ended = "centred"
++except Exception as exc:                                 # noqa: BLE001
++    m31_ended = f"{type(exc).__name__}: {exc}"
++case("a flipped solve is rejected and does not slew toward 2.7h",
++     m31_ended == "centred" and mount.syncs == []
++     and all(ra < 3.0 for ra, _ in mount.slews)
++     and near(mount.slews[1], (0.73565, M31[1]), tol=1e-3),
++     str(mount.slews))
++case("...the rejection is logged and the mount was not moved for it",
++     any("rejected" in m and "flipped" in m for _, m in solver.manager.logged))
++
++# A large model error, the right way up, is the case the blind/wide radius
++# exists for. It must be kept and corrected, not thrown out as a flip.
++solver, mount = build(refuses_sync=True)
++solver.config.update("optics", {"rotation": 95.65})
++solver._solve_image = scripted([
++    (M31[0] + 1.2, M31[1], 95.65),
++    (M31[0], M31[1], 95.65),
++])
++solver._center(*M31)
++case("a large same-angle model error is corrected, not rejected",
++     mount.syncs == [] and len(mount.slews) == 2
++     and near(mount.slews[1], (astro.normalise_ra_hours(M31[0] - 1.2), M31[1]), tol=1e-3)
++     and not any("rejected" in m for _, m in solver.manager.logged),
++     str(mount.slews))
++
++# Near-hint miss: one blind solve, then the tight radius again.
++solver, mount = build(refuses_sync=True)
++solver.config.update("optics", {"rotation": 95.65})
++tight_calls = {"n": 0}
++wide_calls = {"n": 0}
++
++
++def tight_then(image_id):
++    tight_calls["n"] += 1
++    if tight_calls["n"] == 1:
++        raise DeviceError("ASTAP did not solve: no stars")
++    return solved(M31[0], M31[1], 95.65)
++
++
++def wide(record):
++    wide_calls["n"] += 1
++    return solved(M31[0] + 0.02, M31[1], 95.65)
++
++
++solver._solve_image = tight_then
++solver._solve_wide = wide
++solver._center(*M31)
++case("a near-hint miss falls back to one blind solve, then tight again",
++     wide_calls["n"] == 1 and tight_calls["n"] == 2 and mount.syncs == [],
++     f"tight {tight_calls['n']}, wide {wide_calls['n']}, slews {mount.slews}")
++case("...and that one blind solve is not repeated",
++     wide_calls["n"] == 1 and any("blind solve" in m for _, m in solver.manager.logged),
++     f"wide {wide_calls['n']}")
++# The blind answer was 0.02h off, so the second slew is the offset, and the
++# tight solve after it is what centres.
++case("...then the tight solve is what finishes the centring",
++     len(mount.slews) == 2 and near(mount.slews[1], (M31[0] - 0.02, M31[1]), tol=1e-3),
++     str(mount.slews))
++
++# Every solve flipped: nothing is slewed except the opening goto, and the
++# centring fails rather than walking off.
++solver, mount = build(refuses_sync=True)
++solver.config.update("optics", {"rotation": 95.65})
++solver.config.update("solver", {"attempts": 4})
++solver._solve_image = scripted([(22.72, 41.27, -84.5)] * 4)
++try:
++    solver._center(*M31)
++    exhausted = "centred"
++except DeviceError as exc:
++    exhausted = str(exc)
++case("flipped solves exhaust centring without an offset slew or a sync",
++     exhausted.startswith("could not centre") and len(mount.slews) == 1
++     and mount.syncs == [] and near(mount.slews[0], M31),
++     f"{exhausted}; slews {mount.slews}")
++
++
++# Sequencer: a failed centre fails the target and still runs the next one.
++class Rig:
++    id = "fsq"
++    name = "FSQ106"
++    role = "master"
++
++    def __init__(self, config):
++        self.config = config
++        self.manager = Manager(mount)
++        self.capture = Capture()
++        self.solver = types.SimpleNamespace(
++            executable=lambda: Path("astap"),
++            start=lambda *a, **k: None,
++            abort=lambda: None,
++            busy=False,
++            status=lambda: {"error": "still 83.43' from the target after 10 attempts",
++                            "state": "idle"},
++        )
++
++
++class Rigs:
++    def __init__(self, rig):
++        self.master = rig
++        self.all = [rig]
++
++    def imaging(self):
++        return self.all
++
++
++config = Config(Path(tempfile.mkdtemp()) / "settings.json")
++mount.connected = True
++mount.tracking = True
++rig = Rig(config)
++seq = Sequencer(Rigs(rig), config, None, None)
++seq._home_mount = lambda: None
++seq._slew = lambda m, ra, dec, label: m
++seq._wait_for_mount = lambda m, timeout=0: None
++seq._record_overhead = lambda *a, **k: None
++focused = []
++seq._maybe_focus = lambda **k: focused.append("focus")
++try:
++    seq._goto({"ra": M31[0], "dec": M31[1]}, "M31")
++    centre_fail = ""
++except _CentreFailed as exc:
++    centre_fail = str(exc)
++case("exhausted centring raises a target failure before focus",
++     "83.43" in centre_fail and "not started" in centre_fail and focused == [],
++     centre_fail)
++
++seen = []
++
++
++def run_entry(entry, target, reframed=False):
++    seen.append(entry["name"])
++    if entry["name"] == "M31":
++        raise _CentreFailed("centring failed on M31")
++
++
++seq._run_entry = run_entry
++seq._why_not_now = lambda *a, **k: ""
++seq._walk_plan(
++    {"entries": [{"id": "a", "name": "M31", "targetId": "t1"},
++                 {"id": "b", "name": "M33", "targetId": "t2"}]},
++    {"t1": {"id": "t1", "type": "target"}, "t2": {"id": "t2", "type": "target"}},
++)
++case("the failed target does not finish, and the next target still runs",
++     seen == ["M31", "M33"] and seq._error is None
++     and "a" not in seq._finished_entries,
++     str(seen))
++
+ print(f"\n{sum(results)}/{len(results)} passed")
+ sys.exit(0 if all(results) else 1)

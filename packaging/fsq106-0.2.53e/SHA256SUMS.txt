@@ -1,0 +1,2 @@
+b0e23893b14cf173e4561063e2757ff0cc774de0c3ecb6dc1aa1435c10a14882  Starfront-0.2.53e-from-fee0656.patch
+57db6b209624abae30e2fb23cbedf8a13bfac69668b3409fb1e782a98ff59181  Starfront-0.2.53e-source.zip
