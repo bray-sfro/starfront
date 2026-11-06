@@ -1,0 +1,9 @@
+python3 tools/check_autoupload.py
+46/46 passed
+
+End-to-end (STARFRONT_SERVER_TREE) was not run: no collab-server checkout
+with server/agentuploads.py was available. The unit checks cover the quota
+507 path against an in-memory uploads API.
+
+Baseline before this change, same command on unmodified 0.2.53f: 30/30 passed.
+The 16 new checks are the quota-versus-disk cases.

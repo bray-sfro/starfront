@@ -1,0 +1,429 @@
+diff -ruN --exclude __pycache__ --exclude '*.pyc' a/astrocontrol/autoupload.py b/astrocontrol/autoupload.py
+--- a/astrocontrol/autoupload.py	2026-11-04 17:43:50.000000000 +0000
++++ b/astrocontrol/autoupload.py	2026-11-06 06:25:21.588058281 +0000
+@@ -24,10 +24,12 @@
+   collaboration light calls `light_saved()`, which appends it to the queue
+   and wakes the worker; there is no folder scan and no batch. A frame
+   younger than `SETTLE_SECONDS` is retried as soon as it has settled.
+-* **The server is obeyed.** 429 waits the `Retry-After`; 507 (the server's
+-  disk or the project's quota is full) pauses everything for as long as it
+-  says; a refusal of the frame itself (wrong target, no task) takes that one
+-  item off the queue with the reason kept.
++* **The server is obeyed.** 429 waits the `Retry-After`. A 507 pauses for
++  as long as it says, but only as widely as the failure: a project's storage
++  quota pauses that project, and the server's disk pauses every project.
++  Which pause is which is written to ``pauses.json`` beside the queue, and
++  is still there after a restart. A refusal of the frame itself (wrong
++  target, no task) takes that one item off the queue with the reason kept.
+ * **Resumable.** Each file is hashed once, sent in chunks at the offsets the
+   server confirms, and an upload cut off carries on where it stopped - after
+   a dropped connection, a reboot, or the next day.
+@@ -86,6 +88,109 @@
+     """Try this file again later (network, server hiccup)."""
+ 
+ 
++# A 507 detail that means this collaboration's quota, not the host disk.
++_QUOTA_WORDS = (
++    "quota",
++    "project storage",
++    "storage quota",
++    "storage limit",
++    "project is full",
++    "this project is full",
++)
++# A 507 detail that means the uploads host itself is out of room.
++_DISK_WORDS = (
++    "disk",
++    "no room",
++    "keeping its last",
++    "free space",
++    "filesystem",
++    "inode",
++    "infrastructure",
++    "no space left",
++)
++_PROJECT_SCOPES = {"project", "collaboration", "collab"}
++_SERVER_SCOPES = {"server", "all", "global", "infrastructure"}
++_QUOTA_REASONS = {"quota", "project_quota", "storage_quota"}
++_DISK_REASONS = {"disk", "disk_full", "infrastructure", "filesystem"}
++
++
++def _detail_fields(body: dict) -> tuple[str, dict]:
++    """The human text of a response, and a dict if ``detail`` is an object."""
++    raw = body.get("detail")
++    if isinstance(raw, dict):
++        return str(raw.get("message") or raw.get("detail") or ""), raw
++    return ("" if raw is None else str(raw)), {}
++
++
++def pause_scope_for_507(body: dict | None, headers: dict | None = None) -> str:
++    """``project`` pauses one collaboration; ``all`` pauses every upload.
++
++    The collab server should say which, so this client can stop guessing.
++    Send the same choice in each of these (JSON wins over the header, and
++    both win over the wording):
++
++    * JSON ``scope`` ``"project"`` or ``"server"``, on the body or inside
++      ``detail`` when ``detail`` is an object. ``reason`` ``"quota"`` or
++      ``"disk"`` in the same place.
++    * Header ``X-Starfront-Pause-Scope: project`` or ``server``.
++
++    A project quota 507::
++
++        {"detail": "this project's storage quota is full (40 GiB)",
++         "scope": "project", "reason": "quota"}
++
++    A server disk 507::
++
++        {"detail": "the server is keeping its last 25 GB free; uploads are paused",
++         "scope": "server", "reason": "disk"}
++
++    Until that arrives, the detail text is read. Quota words pause that
++    project only. Disk and free-space words pause every project. A 507
++    that says neither stays global, so an unfamiliar disk-full message
++    still holds the rig. ``scope`` is checked before ``reason``.
++    """
++    body = body if isinstance(body, dict) else {}
++    text, extra = _detail_fields(body)
++    sources = [body]
++    if extra:
++        sources.append(extra)
++    for src in sources:
++        scope = str(src.get("scope") or "").strip().lower()
++        if scope in _PROJECT_SCOPES:
++            return "project"
++        if scope in _SERVER_SCOPES:
++            return "all"
++    for src in sources:
++        reason = str(src.get("reason") or "").strip().lower()
++        if reason in _QUOTA_REASONS:
++            return "project"
++        if reason in _DISK_REASONS:
++            return "all"
++    headers = {str(k).lower(): str(v).strip().lower() for k, v in (headers or {}).items()}
++    header = headers.get("x-starfront-pause-scope", "")
++    if header in _PROJECT_SCOPES:
++        return "project"
++    if header in _SERVER_SCOPES:
++        return "all"
++    low = text.lower()
++    if any(word in low for word in _QUOTA_WORDS):
++        return "project"
++    if any(word in low for word in _DISK_WORDS):
++        return "all"
++    return "all"
++
++
++def _short_why(why: str) -> str:
++    """A few words for the status line; the full reason stays on the item."""
++    text = (why or "").lower()
++    if "quota" in text:
++        return "quota full"
++    if any(word in text for word in ("disk", "no room", "keeping its last", "free space")):
++        return "disk full"
++    compact = " ".join((why or "").split())
++    return (compact[:80] if compact else "paused")
++
++
+ def _below_normal_priority() -> None:
+     """This thread, and its disk reads, behind everything else on the PC."""
+     try:
+@@ -157,6 +262,7 @@
+         self.folder = Path(folder) if folder else data_root() / "collab-uploads"
+         self.folder.mkdir(parents=True, exist_ok=True)
+         self.path = self.folder / "queue.json"
++        self.pause_path = self.folder / "pauses.json"
+         self._lock = threading.RLock()
+         self._wake = threading.Event()
+         self._stop = threading.Event()
+@@ -165,6 +271,7 @@
+         self.paused_until = 0.0
+         self.paused_why = ""
+         self.project_paused: dict[str, tuple[float, str]] = {}
++        self._load_pauses()
+         self.last_error = ""
+         self.sent_bytes = 0
+         self.current: dict[str, Any] | None = None
+@@ -214,6 +321,46 @@
+             tmp.write_text(json.dumps(self.items, indent=0), "utf-8")
+             os.replace(tmp, self.path)
+ 
++    def _load_pauses(self) -> None:
++        """Global and per-project pauses, written beside the queue.
++
++        The queue file stays a list of frames. Pauses live in ``pauses.json``
++        so a restart still knows which collaboration is full and which pause
++        holds every project.
++        """
++        try:
++            data = json.loads(self.pause_path.read_text("utf-8"))
++        except (OSError, ValueError):
++            return
++        if not isinstance(data, dict):
++            return
++        now = self.clock()
++        until = float(data.get("paused_until") or 0)
++        if until > now:
++            self.paused_until = until
++            self.paused_why = str(data.get("paused_why") or "")
++        projects = data.get("projects") or {}
++        if not isinstance(projects, dict):
++            return
++        for project, row in projects.items():
++            if not isinstance(row, dict):
++                continue
++            end = float(row.get("until") or 0)
++            if end > now:
++                self.project_paused[str(project)] = (end, str(row.get("why") or ""))
++
++    def _save_pauses(self) -> None:
++        now = self.clock()
++        with self._lock:
++            projects = {p: {"until": u, "why": w}
++                        for p, (u, w) in self.project_paused.items() if u > now}
++            payload = {"paused_until": self.paused_until if self.paused_until > now else 0.0,
++                       "paused_why": self.paused_why if self.paused_until > now else "",
++                       "projects": projects}
++            tmp = self.pause_path.with_suffix(".tmp")
++            tmp.write_text(json.dumps(payload, indent=0), "utf-8")
++            os.replace(tmp, self.pause_path)
++
+     def _has(self, project: str, path: str, kind: str) -> bool:
+         return any(i["path"] == path and i["project"] == project and i["kind"] == kind
+                    for i in self.items)
+@@ -295,13 +442,15 @@
+ 
+     def due(self) -> dict[str, Any] | None:
+         now = self.clock()
++        if self.paused_until > now:
++            return None
+         with self._lock:
+             for item in self.items:
+                 if item["state"] not in ("queued", "sending", "retry"):
+                     continue
+                 if float(item.get("nextTry") or 0) > now:
+                     continue
+-                until, _ = self.project_paused.get(item["project"], (0.0, ""))
++                until, _ = self.project_paused.get(str(item.get("project") or ""), (0.0, ""))
+                 if until > now:
+                     continue
+                 return item
+@@ -334,8 +483,12 @@
+         with self._lock:
+             times = [float(i.get("nextTry") or 0) for i in self.items
+                      if i["state"] in ("queued", "sending", "retry")]
+-        times = [t for t in times if t > now]
+-        return max(0.2, min([300.0] + [t - now for t in times]))
++            pauses = [u for u, _why in self.project_paused.values() if u > now]
++        times = [t - now for t in times if t > now]
++        if self.paused_until > now:
++            pauses.append(self.paused_until)
++        pauses = [u - now for u in pauses]
++        return max(0.2, min([300.0] + times + pauses))
+ 
+     def _mark(self, item: dict[str, Any], **values: Any) -> None:
+         with self._lock:
+@@ -364,11 +517,13 @@
+             self._say(f"Auto-upload: {path.name} not sent - {exc}", "warn")
+         except Pause as exc:
+             until = self.clock() + exc.seconds
+-            if exc.scope == "project":
+-                self.project_paused[item["project"]] = (until, str(exc))
+-            else:
+-                self.paused_until, self.paused_why = until, str(exc)
++            with self._lock:
++                if exc.scope == "project":
++                    self.project_paused[str(item.get("project") or "")] = (until, str(exc))
++                else:
++                    self.paused_until, self.paused_why = until, str(exc)
+             self._mark(item, state="queued", error=str(exc))
++            self._save_pauses()
+         except (Retry, OSError, urllib.error.URLError, TimeoutError, ValueError) as exc:
+             attempts = int(item.get("attempts") or 0) + 1
+             delay = min(BACKOFF_MAX, BACKOFF_MIN * 2 ** (attempts - 1)) * (0.8 + 0.4 * random.random())
+@@ -432,7 +587,15 @@
+         if code == 429:
+             raise Pause(retry_after or 60.0, detail)
+         if code == 507:
+-            raise Pause(retry_after or 6 * 3600.0, detail)
++            # Quota is one project (the 409 path). Disk / infrastructure holds
++            # every project. See pause_scope_for_507 for the body the collab
++            # server should send, and the text rule used until it does.
++            text, _extra = _detail_fields(body)
++            shown = text or detail
++            scope = pause_scope_for_507(body, headers)
++            if scope == "project" and "quota" not in shown.lower():
++                shown = f"project quota full: {shown}" if shown else "project quota full"
++            raise Pause(retry_after or 6 * 3600.0, shown, scope=scope)
+         if code == 409:
+             # The collaboration is not taking uploads (off, closed, not this rig).
+             raise Pause(OFF_PAUSE, detail, scope="project")
+@@ -501,24 +664,48 @@
+         with self._lock:
+             counts: dict[str, int] = {}
+             pending = 0
++            proj_counts: dict[str, int] = {}
+             for i in self.items:
+                 state = "waiting" if i["state"] == "retry" else i["state"]
+                 counts[state] = counts.get(state, 0) + 1
+                 if i.get("status") == "pending":
+                     pending += 1
++                if i["state"] in ("queued", "sending", "retry"):
++                    project = str(i.get("project") or "")
++                    proj_counts[project] = proj_counts.get(project, 0) + 1
+             queued = counts.get("queued", 0) + counts.get("waiting", 0) + counts.get("sending", 0)
+             refused = [{"file": Path(i["path"]).name, "why": i.get("error") or ""}
+                        for i in self.items if i["state"] == "refused"][-5:]
++            active = {p: (u, w) for p, (u, w) in self.project_paused.items() if u > now}
+         if not s["enabled"]:
+             line = "Auto-upload is off"
+         elif self.paused_until > now:
+             line = f"Auto-upload paused: {self.paused_why} (until {time.strftime('%H:%M', time.localtime(self.paused_until))})"
++        elif active:
++            # One full project is not the whole rig. Name it, and count the
++            # queue still moving for the others. The Collab tab shows this line.
++            bits = []
++            if self.current is not None:
++                bits.append(f"sending {Path(self.current['path']).name}")
++            for project, (until, why) in sorted(active.items()):
++                n = proj_counts.get(project, 0)
++                clock = time.strftime("%H:%M", time.localtime(until))
++                bits.append(f"{project} paused ({n} queued, {_short_why(why)}, until {clock})")
++            for project, n in sorted(proj_counts.items()):
++                if project not in active:
++                    bits.append(f"{project} {n} queued")
++            line = "Auto-upload: " + " · ".join(bits)
+         elif self.current is not None:
+             line = f"Auto-upload: sending {Path(self.current['path']).name}, {queued} in the queue"
+         elif self.paused_why:
+             line = f"Auto-upload: {queued} queued, {self.paused_why}"
+         else:
+             line = f"Auto-upload: {queued} queued" if queued else "Auto-upload: up to date"
++        project_counts = {}
++        for project in set(proj_counts) | set(active):
++            until, why = active.get(project, (0.0, ""))
++            project_counts[project] = {"queued": proj_counts.get(project, 0), "paused": project in active,
++                                       "until": until or None, "why": why}
+         sent = counts.get("sent", 0) + counts.get("already", 0)
+         line += f" · {sent} sent"
+         if pending:
+@@ -530,6 +717,7 @@
+                 "counts": counts, "pendingCalibration": pending, "line": line,
+                 "pausedUntil": self.paused_until or None, "pausedWhy": self.paused_why,
+                 "projectsPaused": {p: {"until": u, "why": w} for p, (u, w) in self.project_paused.items() if u > now},
++                "projectCounts": project_counts,
+                 "sentBytes": self.sent_bytes, "lastError": self.last_error, "refused": refused}
+ 
+     def _say(self, message: str, level: str = "info") -> None:
+diff -ruN --exclude __pycache__ --exclude '*.pyc' a/tools/check_autoupload.py b/tools/check_autoupload.py
+--- a/tools/check_autoupload.py	2026-11-04 17:43:50.000000000 +0000
++++ b/tools/check_autoupload.py	2026-11-06 06:25:07.940255139 +0000
+@@ -30,7 +30,7 @@
+ sys.path.insert(0, str(ROOT))
+ 
+ from astrocontrol import autoupload                               # noqa: E402
+-from astrocontrol.autoupload import AutoUploader, Bucket          # noqa: E402
++from astrocontrol.autoupload import AutoUploader, Bucket, pause_scope_for_507  # noqa: E402
+ from astrocontrol.capture import CaptureService                   # noqa: E402
+ 
+ results: list[tuple[bool, str]] = []
+@@ -204,7 +204,8 @@
+     u, s = fresh("a.fits")
+     s.answer_start = (507, {"detail": "the server is keeping its last 25 GB free; uploads are paused"}, {"retry-after": "21600"})
+     u.step()
+-    check(u.paused_until >= clock.t + 21000 and "paused" in u.status()["line"], "507 pauses everything for the Retry-After")
++    check(u.paused_until >= clock.t + 21000 and u.status()["line"].startswith("Auto-upload paused:"),
++          "disk 507 pauses everything for the Retry-After")
+     calls = len(s.calls)
+     u.step()
+     check(len(s.calls) == calls, "while paused nothing is sent")
+@@ -221,6 +222,89 @@
+     u.step()
+     check(u.paused_until and u.paused_until - clock.t <= 31, "429 waits the Retry-After")
+ 
++    # Quota 507 is one project. Disk 507 is the rig. Wording is the fallback
++    # until the collab server sends scope/reason.
++    check(pause_scope_for_507({"detail": "this project's storage quota is full (40 GiB)"}) == "project",
++          "507 text: a quota sentence is that project only")
++    check(pause_scope_for_507({"detail": "the server is keeping its last 25 GB free; uploads are paused"}) == "all",
++          "507 text: disk free-space is every project")
++    check(pause_scope_for_507({"detail": "insufficient storage"}) == "all",
++          "507 text: an unclassified 507 stays server-wide")
++    check(pause_scope_for_507({"detail": "the server is keeping its last 25 GB free",
++                               "scope": "project", "reason": "quota"}) == "project",
++          "507 JSON scope=project wins over disk wording")
++    check(pause_scope_for_507({"detail": {"message": "full", "scope": "project", "reason": "quota"}}) == "project",
++          "507 detail object scope=project is that project")
++    check(pause_scope_for_507({"detail": "paused", "reason": "disk"}) == "all",
++          "507 JSON reason=disk is every project")
++    check(pause_scope_for_507({"detail": "quota full"}, {"x-starfront-pause-scope": "server"}) == "all",
++          "507 header scope wins over quota wording when JSON scope is absent")
++    check(pause_scope_for_507({"detail": "disk full", "scope": "project"},
++                              {"x-starfront-pause-scope": "server"}) == "project",
++          "507 JSON scope wins over the header")
++
++    # Tonight: m42's quota is full. M31 on the other rigs must keep uploading.
++    m42 = tmp / "M42_Ha_0001.fits"
++    m31 = tmp / "M31_Ha_0001.fits"
++    m42.write_bytes(fits_bytes({**LIGHT, "DATE-OBS": "2026-11-06T01:00:00"}))
++    m31.write_bytes(fits_bytes({**LIGHT, "DATE-OBS": "2026-11-06T02:00:00"}))
++    qfolder = tmp / "q-quota"
++    quota = AutoUploader(Conf(autoUpload=True), None, None, folder=qfolder, clock=clock)
++    qserver = FakeServer()
++
++    def quota_http(method, path, body):
++        if method == "POST" and path == "/api/v1/agent/uploads" and isinstance(body, dict) \
++                and body.get("project") == "m42 horse test mosaic":
++            return (507, {"detail": "this project's storage quota is full (40 GiB)"},
++                    {"retry-after": "21600"})
++        return qserver(method, path, body)
++
++    quota.http = quota_http
++    quota.add(m42, "m42 horse test mosaic", "light", "t-m42", "vsd100")
++    quota.add(m31, "m31", "light", "t-m31", "twin")
++    quota.step()
++    check("m42 horse test mosaic" in quota.project_paused and not (quota.paused_until > clock.t),
++          "quota 507 pauses m42 only, not the rig")
++    check(quota.items[0]["state"] == "queued" and quota.due()["project"] == "m31",
++          "m31 stays queued and is the next upload")
++    status = quota.status()
++    line = status["line"]
++    m42count = status["projectCounts"]["m42 horse test mosaic"]
++    m31count = status["projectCounts"]["m31"]
++    check(line.startswith("Auto-upload: ") and not line.startswith("Auto-upload paused")
++          and "m42 horse test mosaic paused (1 queued, quota full, until " in line
++          and "m31 1 queued" in line and m42count["paused"] and m42count["queued"] == 1
++          and m31count["paused"] is False and m31count["queued"] == 1,
++          f"the status line names the paused project and the other queue ({line})")
++    quota.step()
++    check(m31.name in qserver.files and m42.name not in qserver.files,
++          "m31 is sent while m42's quota pause holds")
++    resumed = AutoUploader(Conf(autoUpload=True), None, None, folder=qfolder, clock=clock)
++    check("m42 horse test mosaic" in resumed.project_paused and not (resumed.paused_until > clock.t)
++          and resumed.due() is None,
++          "the project pause is still there after a restart, and it is not global")
++    check("m42 horse test mosaic" in json.loads((qfolder / "pauses.json").read_text("utf-8"))["projects"],
++          "pauses.json keeps the project pause beside the queue")
++
++    # The same two projects, but the disk is full: nobody uploads.
++    disk_dir = tmp / "q-disk"
++    disk = AutoUploader(Conf(autoUpload=True), None, None, folder=disk_dir, clock=clock)
++    dserver = FakeServer()
++    dserver.answer_start = (507, {"detail": "the server is keeping its last 25 GB free; uploads are paused"},
++                            {"retry-after": "21600"})
++    disk.http = dserver
++    disk.add(m42, "m42 horse test mosaic", "light", "t-m42", "vsd100")
++    disk.add(m31, "m31", "light", "t-m31", "twin")
++    disk.step()
++    calls = len(dserver.calls)
++    disk.step()
++    check(disk.paused_until >= clock.t + 21000 and len(dserver.calls) == calls
++          and "m42 horse test mosaic" not in disk.project_paused,
++          "disk 507 still pauses every project")
++    restored = AutoUploader(Conf(autoUpload=True), None, None, folder=disk_dir, clock=clock)
++    check(restored.paused_until >= clock.t + 21000 and restored.due() is None,
++          "a server-wide pause survives a restart and still holds m31")
++
+     # The daytime window.
+     site = {"latitude": 30.5, "longitude": -98.3}
+     night = 1793767200.0    # 2026-11-04 00:00 CST: dark at Rockwood
