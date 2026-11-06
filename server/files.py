@@ -895,6 +895,23 @@ _PAGE = r"""<!doctype html>
   #viewerBar button { pointer-events: auto; background: #1a2130dd; color: #fff; border: 1px solid #2a3344; border-radius: 8px; min-width: 40px; height: 36px; font-size: 16px; cursor: pointer; }
   #viewerBar #viewerTools { pointer-events: auto; display: inline-flex; flex-wrap: wrap; gap: 8px; max-width: 100%; min-width: 0; }
   #viewerTools:empty { display: none; }
+  /* Contrast: a display-only CSS filter on the two preview <img> elements.
+     Never a canvas re-encode, never a request: the bytes on disk and the
+     downloads are untouched. The value is one number for the page's life,
+     shared by the embedded preview and the full-screen viewer, and it
+     survives switching images (see applyContrast). */
+  #hero .shot img, #hero .shot .ghost { filter: var(--img-contrast, contrast(1)); }
+  #viewerImg { filter: var(--img-contrast, contrast(1)); }
+  .contrast { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; }
+  .contrast label { font-size: 13px; font-weight: 600; color: #dbe3ee; white-space: nowrap; }
+  .contrast input[type="range"] { width: clamp(96px, 24vw, 200px); height: 44px; margin: 0; accent-color: #7ee7a5; cursor: pointer; touch-action: pan-y; }
+  .contrast input[type="range"]:focus-visible { outline: 2px solid #9fe4bd; outline-offset: 2px; }
+  .contrast output { min-width: 4ch; font-size: 13px; font-variant-numeric: tabular-nums; color: #dbe3ee; }
+  #viewerBar .contrast { pointer-events: auto; background: #1a2130dd; border: 1px solid #2a3344; border-radius: 8px; padding: 0 8px; }
+  #viewerBar .contrast button { font-size: 13px; min-width: 44px; height: 42px; }
+  #hero .contrast { background: #141a25; border: 1px solid #2a3344; border-radius: 8px; padding: 0 10px; }
+  #hero .contrast button { background: transparent; border: 1px solid #2a3344; border-radius: 6px; color: #dbe3ee; font-size: 13px; min-width: 44px; min-height: 32px; cursor: pointer; }
+  @media (max-width: 520px) { .contrast input[type="range"] { width: clamp(88px, 26vw, 160px); } }
   .seg { display: inline-flex; border: 1px solid #2a3344; border-radius: 8px; overflow: hidden; vertical-align: middle; background: #141a25; }
   .seg button, #viewerBar .seg button { background: transparent; color: #c3ccd9; border: 0; border-radius: 0; min-width: 0; height: auto; min-height: 32px; padding: 4px 14px; font-size: 13px; font-weight: 500; cursor: pointer; }
   .seg button + button { border-left: 1px solid #2a3344; }
@@ -1117,6 +1134,7 @@ _PAGE = r"""<!doctype html>
   <div id="viewerBar">
     <button type="button" data-z="in" aria-label="Zoom in">+</button><button type="button" data-z="out" aria-label="Zoom out">−</button><button type="button" data-z="fit" aria-label="Fit to screen">Fit</button>
     <span id="viewerTools"></span>
+    <span class="contrast" id="viewerContrast"></span>
     <span id="viewerNote"></span>
     <span class="muted">Scroll or pinch to zoom · drag to pan · double-tap to zoom · S: stars on/off · [ ]: image · Esc to close</span>
   </div>
@@ -1127,6 +1145,37 @@ _PAGE = r"""<!doctype html>
 (function () {
   const $ = (id) => document.getElementById(id);
   const state = { projects: [], allowed: [], kinds: [], project: null, owned: false, running: false, queue: [], picking: 'light' };
+
+  // -- Contrast (Bray, 2026-11-06) ----------------------------------------
+  // Display only: a CSS contrast() filter on the preview images. 100% is the
+  // image exactly as published. Nothing is written, fetched or re-encoded;
+  // downloads and the files on the server are byte for byte the same. The
+  // value is kept in this variable for the life of the page, so it carries
+  // across images (Color / Ha / stars-starless, another release) and across
+  // the embedded preview and the full-screen viewer. It is deliberately not
+  // stored: a new tab starts at 100%.
+  let contrastPct = 100;
+  function applyContrast(pct) {
+    contrastPct = Math.min(300, Math.max(50, Math.round(Number(pct) || 100)));
+    const f = contrastPct === 100 ? '' : `contrast(${contrastPct / 100})`;
+    document.getElementById('hero').style.setProperty('--img-contrast', f);
+    document.getElementById('viewer').style.setProperty('--img-contrast', f);
+    document.querySelectorAll('[data-contrast]').forEach((r) => {
+      if (Number(r.value) !== contrastPct) r.value = String(contrastPct);
+      r.setAttribute('aria-valuetext', `${contrastPct} percent`);
+      const out = r.closest('.contrast').querySelector('output');
+      if (out) out.textContent = contrastPct + '%';
+    });
+  }
+  // Two labelled sliders (embedded preview, full-screen viewer), one value.
+  function contrastControl(which) {
+    return `<span class="contrast"><label for="contrast${which}">Contrast</label>` +
+      `<input type="range" id="contrast${which}" data-contrast min="50" max="300" step="5" value="${contrastPct}" aria-describedby="contrastHint${which}">` +
+      `<output id="contrastHint${which}" for="contrast${which}">${contrastPct}%</output>` +
+      `<button type="button" data-contrast-reset title="Back to the image as published (100%)">Reset</button></span>`;
+  }
+  document.addEventListener('input', (e) => { if (e.target && e.target.dataset && 'contrast' in e.target.dataset) applyContrast(e.target.value); });
+  document.addEventListener('click', (e) => { if (e.target && e.target.dataset && 'contrastReset' in e.target.dataset) applyContrast(100); });
   const label = (k) => (state.kinds.find((x) => x.id === k) || { label: k }).label;
   const kindSummary = (kinds) => Object.entries(kinds || {}).map(([k, n]) => `${n} ${label(k).toLowerCase()}`).join(', ');
 
@@ -1251,6 +1300,8 @@ _PAGE = r"""<!doctype html>
   window.starfrontViewer = { open: viewerOpen, close: viewerClose, zoom: (f, x, y) => vZoom(f, x == null ? innerWidth / 2 : x, y == null ? innerHeight / 2 : y), refresh: () => V.open && vLoad() };
   (function wireViewer() {
     const stage = $('viewerStage');
+    $('viewerContrast').innerHTML = contrastControl('Viewer');
+    applyContrast(contrastPct);
     $('viewerClose').addEventListener('click', viewerClose);
     document.addEventListener('keydown', (e) => {
       if (!V.open) return;
@@ -1457,8 +1508,10 @@ _PAGE = r"""<!doctype html>
         <div><p class="ttl">${esc([name, rel.version, date].filter(Boolean).join(' · '))}</p><p class="sub">${esc(sub)}</p></div>
         <div class="acts"><button type="button" class="btn quiet" id="heroView">View full size</button><a class="btn quiet" href="#sec-release">Masters &amp; contributors</a></div>
         <div class="htools" id="heroTools"></div>
+        ${contrastControl('Hero')}
       </figcaption></figure>`;
     box.hidden = false;
+    applyContrast(contrastPct);
     drawStarTools();
     // The starless twin's 2400 px: fetch it once the page has settled.
     setTimeout(() => { const v = views[viewIdx]; if (v && v.starless) preload(v.starless.src); }, 1500);
