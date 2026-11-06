@@ -905,7 +905,10 @@ _PAGE = r"""<!doctype html>
   .contrast label { font-size: 13px; font-weight: 600; color: #dbe3ee; white-space: nowrap; }
   .contrast input[type="range"] { width: clamp(96px, 24vw, 200px); height: 44px; margin: 0; accent-color: #7ee7a5; cursor: pointer; touch-action: pan-y; }
   .contrast input[type="range"]:focus-visible { outline: 2px solid #9fe4bd; outline-offset: 2px; }
-  .contrast output { min-width: 4ch; font-size: 13px; font-variant-numeric: tabular-nums; color: #dbe3ee; }
+  .contrast output { min-width: 9ch; font-size: 13px; font-variant-numeric: tabular-nums; color: #dbe3ee; }
+  .contrast .ends { display: flex; justify-content: space-between; gap: 6px; font-size: 10px; line-height: 1.1; color: #8f9bb0; margin-top: -12px; padding-bottom: 2px; }
+  .contrast .ends span { pointer-events: none; }
+  .contrast .bpwrap { display: flex; flex-direction: column; justify-content: center; }
   #starfrontDisplayFilters { position: absolute; width: 0; height: 0; overflow: hidden; }
   #viewerBar .contrast { pointer-events: auto; background: #1a2130dd; border: 1px solid #2a3344; border-radius: 8px; padding: 0 8px; }
   #viewerBar .contrast button { font-size: 13px; min-width: 44px; height: 42px; }
@@ -1175,30 +1178,36 @@ _PAGE = r"""<!doctype html>
   // the embedded preview and the full-screen viewer. It is deliberately not
   // stored: a new tab starts at 100%.
   let contrastPct = 100;
-  // Black point, as a fraction of full range (0-0.5). Same display-only idea:
-  // an inline SVG feComponentTransfer linear stretch, referenced from the CSS
-  // filter alongside contrast(), so the two combine in one pass.
+  // Blacks, as a signed fraction of full range (-0.5 .. +0.5). Neutral at 0.
+  // Positive crushes (out = (in - v) / (1 - v)); negative lifts the shadow
+  // floor (out = in * (1 - |v|) + |v|, so black becomes |v| and white stays
+  // white). Same display-only inline SVG feComponentTransfer linear stretch,
+  // referenced from the CSS filter alongside contrast(), in one pass.
   let blackPoint = 0;
   function applyDisplay() {
     // Contrast first (CSS's own contrast is about mid grey), then the black
     // point stretch; both off means the image exactly as published.
     const parts = [];
     if (contrastPct !== 100) parts.push(`contrast(${contrastPct / 100})`);
-    if (blackPoint > 0) parts.push('url(#sfBlackPoint)');
+    if (blackPoint !== 0) parts.push('url(#sfBlackPoint)');
     const f = parts.join(' ');
-    const slope = String(1 / (1 - blackPoint)), intercept = String(-blackPoint / (1 - blackPoint));
+    const v = blackPoint, lift = Math.abs(Math.min(0, v));
+    const slope = String(v >= 0 ? 1 / (1 - v) : 1 - lift);
+    const intercept = String(v >= 0 ? -v / (1 - v) : lift);
     for (const id of ['sfBpR', 'sfBpG', 'sfBpB']) {
       const fn = document.getElementById(id);
       if (fn) { fn.setAttribute('slope', slope); fn.setAttribute('intercept', intercept); }
     }
     document.getElementById('hero').style.setProperty('--img-filter', f);
     document.getElementById('viewer').style.setProperty('--img-filter', f);
+    const bpPct = Math.round(blackPoint * 100);
+    const bpText = bpPct === 0 ? 'Neutral' : (bpPct > 0 ? `+${bpPct}% darker` : `${-bpPct}% lifted`);
     const readouts = [['[data-contrast]', contrastPct, contrastPct + '%'],
-                      ['[data-blackpoint]', Math.round(blackPoint * 100), Math.round(blackPoint * 100) + '%']];
+                      ['[data-blackpoint]', bpPct, bpText]];
     for (const [sel, value, text] of readouts) {
       document.querySelectorAll(sel).forEach((r) => {
         if (Number(r.value) !== value) r.value = String(value);
-        r.setAttribute('aria-valuetext', text.replace('%', ' percent'));
+        r.setAttribute('aria-valuetext', sel === '[data-blackpoint]' ? text : text.replace('%', ' percent'));
         const out = r.closest('.contrast').querySelector('output');
         if (out) out.textContent = text;
       });
@@ -1209,7 +1218,7 @@ _PAGE = r"""<!doctype html>
     applyDisplay();
   }
   function applyBlackPoint(pct) {
-    blackPoint = Math.min(50, Math.max(0, Math.round(Number(pct) || 0))) / 100;
+    blackPoint = Math.min(50, Math.max(-50, Math.round(Number(pct) || 0))) / 100;
     applyDisplay();
   }
   // Two labelled sliders (embedded preview, full-screen viewer), one value.
@@ -1219,10 +1228,11 @@ _PAGE = r"""<!doctype html>
       `<input type="range" id="contrast${which}" data-contrast min="50" max="300" step="5" value="${contrastPct}" aria-describedby="contrastHint${which}">` +
       `<output id="contrastHint${which}" for="contrast${which}">${contrastPct}%</output>` +
       `<button type="button" data-contrast-reset aria-label="Reset contrast" title="Reset contrast to the published image (100%)">Reset</button></span>` +
-      `<span class="contrast"><label for="blackpoint${which}">Black point</label>` +
-      `<input type="range" id="blackpoint${which}" data-blackpoint min="0" max="50" step="1" value="${Math.round(blackPoint * 100)}" aria-describedby="blackpointHint${which}">` +
-      `<output id="blackpointHint${which}" for="blackpoint${which}">${Math.round(blackPoint * 100)}%</output>` +
-      `<button type="button" data-blackpoint-reset aria-label="Reset black point" title="Reset black point to 0% (no clipping)">Reset</button></span>`;
+      `<span class="contrast"><label for="blackpoint${which}">Blacks</label>` +
+      `<span class="bpwrap"><input type="range" id="blackpoint${which}" data-blackpoint min="-50" max="50" step="1" value="${Math.round(blackPoint * 100)}" aria-describedby="blackpointHint${which}" aria-label="Blacks: left lifts the shadows, right darkens them">` +
+      `<span class="ends" aria-hidden="true"><span>Lift blacks</span><span>Darken blacks</span></span></span>` +
+      `<output id="blackpointHint${which}" for="blackpoint${which}">Neutral</output>` +
+      `<button type="button" data-blackpoint-reset aria-label="Reset blacks to neutral" title="Back to neutral: no lift, no crush">Reset</button></span>`;
   }
   document.addEventListener('input', (e) => {
     const d = e.target && e.target.dataset;
