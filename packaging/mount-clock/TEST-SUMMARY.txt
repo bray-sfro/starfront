@@ -1,0 +1,15 @@
+python3 tools/check_mount_clock.py
+36/36 passed
+
+python3 tools/check_warnings.py
+53/53 passed
+
+On a tree with this patch and the quota-507 patch both applied:
+
+python3 tools/check_mount_clock.py
+36/36 passed
+
+python3 tools/check_autoupload.py
+46/46 passed
+
+No rig was connected. The checks use a mock mount. End-to-end against TheSky was not run.
