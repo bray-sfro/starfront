@@ -1,0 +1,43 @@
+0.2.53h. Full sweep of tools/check_*.py after the backfill-root fix.
+
+New checks inside tools/check_autoupload.py (75/75):
+
+  a blank capture.rootDirectory still resolves to data_root()/captures
+  CaptureService.root_dir and AutoUploader backfill call the same function
+  two targets named "m42 horse test mosaic" (declined task b9412d46f576
+    listed first, accepted task 481536614589) queue the master light for
+    481536614589 only
+  with no current task and no header task, that folder is skipped and logged
+    as ambiguous, not given to the first stamp
+  the follower frame in the same folder is still skipped
+  the log names the root and scanned/matched/queued/skipped
+
+Also passed, same as 0.2.53g unless noted:
+
+  check_mount_clock.py        36/36   (version is now 0.2.53h)
+  check_follower_quiet.py      7/7
+  check_calib_roof_closed.py  34/34
+  check_filter_settle.py       9/9
+  check_roof_open.py          44/44
+  check_roof_status.py         8/8
+  check_warnings.py           53/53
+  check_safety.py             28/28
+  check_safety_alpaca.py      57/57
+  check_flats.py              40/40
+  check_night.py             113/113
+  check_recovery.py           50/50
+  check_recovery_real.py      11/11   (238s; the earlier 180s cap had stopped it)
+  check_server.py            162/162
+
+Pre-existing failures, same as unmodified 0.2.53b (not introduced here):
+
+  check_controls.py         2 FAIL  (livestack controls absent on this tree)
+  check_livestack.py        1 FAIL
+  check_night_rollover.py   8 FAIL
+  check_reference.py        2 FAIL
+  check_fleet.py, check_live_link.py, check_rig_isolation.py
+                            import httpx, which this environment does not have
+  check_imagestack.py       crashes after its passing cases on a missing
+                            livestack status key
+
+No new assertion failure.

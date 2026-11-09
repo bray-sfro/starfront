@@ -1,0 +1,2 @@
+9025eeea1b42f9ade53c4b30114e075a14ee785d95477dccd8b113d13a76b802  Starfront-0.2.53h-source.zip
+1e65b4dfbf87c7be66d79ec1dd483ac631762e1d50cf7d701d7536578f56df4c  Starfront-0.2.53h-from-0.2.53g.patch
