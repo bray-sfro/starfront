@@ -23,5 +23,7 @@ def test_viewer_takes_every_labelled_preview(world):  # noqa: F811
     # The manifest can also pin the hero and name the starless twin by file name.
     assert 'previews.find((x) => x.hero)' in html
     assert "typeof p.starless === 'string'" in html
-    # Deep link by label: #view=Ha%20(continuum-subtracted).
-    assert '[v.key, v.kind, v.filter].some' in html
+    # Deep link by label: #view=Ha%20(continuum-subtracted). A continuum-
+    # subtracted image is now an option on its parent's tab (test_contsub_variants),
+    # and its old label still opens it there.
+    assert '[x.key, x.kind].some' in html and 'v.variants.some' in html

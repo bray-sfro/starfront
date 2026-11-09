@@ -942,6 +942,8 @@ _PAGE = r"""<!doctype html>
   .views .seg { flex: none; }
   .views .seg button { padding: 4px 11px; }
   .seg button:disabled { color: #566173; cursor: not-allowed; }
+  .vseg[hidden] { display: none; }
+  .opts { display: inline-flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   #viewerBar .views { max-width: 100%; }
   #hero .hbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px 24px; padding: 14px 18px; border-top: 1px solid #1f2634; }
   #hero .ttl { margin: 0; font-size: 16px; font-weight: 600; color: #e6ebf2; letter-spacing: .01em; }
@@ -1287,6 +1289,8 @@ _PAGE = r"""<!doctype html>
     const h = location.hash.slice(1);
     const target = h.startsWith('release-') ? $('sec-release') : (h.startsWith('sec-') ? $(h) : null);
     if (!target || target.hidden) return false;
+    // #release-<id>&view=<label>: the link is to an image, which the preview shows; stay on it.
+    if (/&(view|stars)=/.test(h)) return true;
     setOpen(target, true);
     target.scrollIntoView({ block: 'start' });
     return true;
@@ -1359,7 +1363,7 @@ _PAGE = r"""<!doctype html>
     if (!$('heroImg')) return;
     V.open = true; $('viewer').hidden = false; document.body.style.overflow = 'hidden';
     delete vImg().dataset.base; vLoad(); $('viewerClose').focus();
-    setTimeout(() => { const v = views[viewIdx]; if (v && v.starless) preload(v[curMode() === 'stars' ? 'starless' : 'stars'].full); }, 2000);
+    setTimeout(() => { const s = cur(views[viewIdx]); if (s && s.starless && s.stars) preload(s[curMode() === 'stars' ? 'starless' : 'stars'].full); }, 2000);
     document.dispatchEvent(new CustomEvent('starfront:viewer', { detail: { open: true } }));
   }
   function viewerClose() {
@@ -1380,6 +1384,7 @@ _PAGE = r"""<!doctype html>
       else if (e.key === '-') vZoom(1 / 1.5, innerWidth / 2, innerHeight / 2);
       else if (e.key === '0') vFit();
       else if ((e.key === 't' || e.key === 'T' || e.key === 's' || e.key === 'S') && !e.ctrlKey && !e.metaKey && !e.altKey) setStars(curMode() === 'stars' ? 'starless' : 'stars');
+      else if ((e.key === 'c' || e.key === 'C') && !e.ctrlKey && !e.metaKey && !e.altKey) { const v = views[viewIdx]; if (v && v.variants.length) setVariant(v.variants[0].label); }
       else if ((e.key === '[' || e.key === ']') && views.length > 1) setView((viewIdx + (e.key === ']' ? 1 : views.length - 1)) % views.length);
     });
     $('viewerBar').addEventListener('click', (e) => {
@@ -1435,8 +1440,18 @@ _PAGE = r"""<!doctype html>
   // where stars/starless are { src, full, alt, title } (starless null when there is
   // no twin). The picker shows when there are two or more; Stars/Starless when any
   // has a twin. The choice lives in the URL hash: #view=Ha&stars=0.
-  let views = [], viewIdx = 0, wantStarless = false;
-  const curMode = () => { const v = views[viewIdx]; return v && v.starless && wantStarless ? 'starless' : 'stars'; };
+  //
+  // Variants (Bray, 2026-11-09): an alternative rendering of a view - e.g. the
+  // continuum-subtracted Ha or OIII - is not a tab of its own but an option on
+  // its parent's tab ("Continuum-subtracted"). Each view carries `variants`, a
+  // list of { key, label, kind, title, stars, starless } (either image may be
+  // null: a variant published only starless shows starless). The variant that
+  // is on is `wantVariant` (its label, lower case); like Stars/Starless it
+  // carries across tabs, applying wherever the current view has one by that
+  // label. What is on screen is cur(view): the variant when on, else the view.
+  let views = [], viewIdx = 0, wantStarless = false, wantVariant = '';
+  const cur = (v) => (v && wantVariant && v.variants && v.variants.find((x) => x.label.toLowerCase() === wantVariant)) || v;
+  const curMode = () => { const s = cur(views[viewIdx]); if (!s) return 'stars'; if (!s.stars) return 'starless'; return s.starless && wantStarless ? 'starless' : 'stars'; };
   let swapTok = 0;
   // Swap #heroImg once the new image is in, with a short crossfade. The viewer follows (MutationObserver).
   function swapHero(m) {
@@ -1459,7 +1474,7 @@ _PAGE = r"""<!doctype html>
   }
   function writeHash() {
     const v = views[viewIdx]; if (!v) return;
-    history.replaceState(history.state, '', '#' + new URLSearchParams({ view: v.key, stars: wantStarless ? '0' : '1' }).toString());
+    history.replaceState(history.state, '', '#' + new URLSearchParams({ view: cur(v).key, stars: wantStarless ? '0' : '1' }).toString());
   }
   function readHash() {
     const h = location.hash.slice(1);
@@ -1469,24 +1484,37 @@ _PAGE = r"""<!doctype html>
   }
   function applyView(user) {
     const v = views[viewIdx]; if (!v) return;
-    const mode = curMode();
-    swapHero(v[mode]);
+    const s = cur(v), mode = curMode();
+    swapHero(s[mode]);
     document.querySelectorAll('[data-view]').forEach((b) => b.setAttribute('aria-pressed', String(+b.dataset.view === viewIdx)));
     document.querySelectorAll('[data-stars]').forEach((b) => {
       b.setAttribute('aria-pressed', String(b.dataset.stars === mode));
       if (b.dataset.stars === 'starless') {
-        b.disabled = !v.starless;
-        b.title = v.starless ? 'Stars removed (S)' : `No starless version of ${v.label}`;
+        b.disabled = !s.starless;
+        b.title = s.starless ? 'Stars removed (S)' : `No starless version of ${s.label}`;
+      } else {
+        b.disabled = !s.stars;
+        b.title = s.stars ? 'With stars (S)' : `${s.label} is published starless only`;
       }
+    });
+    // The variant options of this tab (none: the group hides).
+    document.querySelectorAll('[data-variants]').forEach((el) => {
+      el.innerHTML = v.variants.map((x) => `<button type="button" data-variant="${esc(x.label)}" aria-pressed="${x === s}" title="${esc(x.title || x.label)} (C)">${esc(x.label)}</button>`).join('');
+      el.hidden = !v.variants.length;
     });
     if (user) writeHash();
     // The other half of the pair, so the next flip is instant.
-    if (v.starless) { const o = v[mode === 'stars' ? 'starless' : 'stars']; preload(o.src); if (V.open) preload(o.full); }
+    if (s.starless && s.stars) { const o = s[mode === 'stars' ? 'starless' : 'stars']; preload(o.src); if (V.open) preload(o.full); }
   }
   function setStars(mode) {
-    const v = views[viewIdx]; if (!v) return;
-    if (mode === 'starless' && !v.starless) return;
+    const s = cur(views[viewIdx]); if (!s) return;
+    if (mode === 'starless' && !s.starless) return;
+    if (mode === 'stars' && !s.stars) return;
     wantStarless = mode === 'starless'; applyView(true);
+  }
+  function setVariant(label) {
+    const key = String(label || '').toLowerCase();
+    wantVariant = wantVariant === key ? '' : key; applyView(true);
   }
   function setView(i) {
     if (!views[i]) return;
@@ -1495,30 +1523,39 @@ _PAGE = r"""<!doctype html>
   }
   function fromHash() {
     const h = readHash(); if (!h || !views.length) return false;
-    const i = views.findIndex((v) => [v.key, v.kind, v.filter].some((k) => k && String(k).toLowerCase() === h.view));
-    if (i >= 0) viewIdx = i;
+    const hit = (x) => [x.key, x.kind].some((k) => k && String(k).toLowerCase() === h.view);
+    let i = views.findIndex(hit), variant = '';
+    if (i < 0) i = views.findIndex((v) => v.variants.some((x) => (hit(x) || x.keys.includes(h.view)) && (variant = x.label.toLowerCase())));
+    if (i < 0) i = views.findIndex((v) => v.filter && String(v.filter).toLowerCase() === h.view);
+    if (i >= 0) { viewIdx = i; wantVariant = variant; }
     if (h.stars != null) wantStarless = h.stars === '0';
     return true;
   }
   function drawStarTools() {
     const pick = views.length > 1;
-    const any = views.some((v) => v.starless);
+    const any = views.some((v) => v.starless || v.variants.some((x) => x.starless));
+    const anyVariant = views.some((v) => v.variants.length);
     const btn = (v, i) => `<button type="button" data-view="${i}" aria-pressed="${i === viewIdx}" title="${esc(v.title)}">${esc(v.label)}</button>`;
     const groups = [views.map((v, i) => [v, i]).filter(([v]) => !v.mono), views.map((v, i) => [v, i]).filter(([v]) => v.mono)].filter((g) => g.length);
     const picker = pick ? `<span class="views" role="group" aria-label="Which image">${groups.map((g) => `<span class="seg">${g.map(([v, i]) => btn(v, i)).join('')}</span>`).join('')}</span>` : '';
     const stars = any ? `<span class="seg" role="group" aria-label="Stars on or off"><button type="button" data-stars="stars" aria-pressed="true">Stars</button><button type="button" data-stars="starless" aria-pressed="false">Starless</button></span>` : '';
+    const variants = anyVariant ? '<span class="seg vseg" role="group" aria-label="Variant of this image" data-variants hidden></span>' : '';
     for (const id of ['heroTools', 'viewerTools']) {
       const el = $(id); if (!el) continue;
-      el.innerHTML = picker + stars;
+      el.innerHTML = picker + (variants || stars ? `<span class="opts">${variants}${stars}</span>` : '');
+      el.querySelectorAll('[data-variants]').forEach((g) => g.addEventListener('click', (e) => {
+        const b = e.target.closest('[data-variant]'); if (!b) return;
+        e.stopPropagation(); setVariant(b.dataset.variant);
+      }));
       el.querySelectorAll('[data-stars]').forEach((b) => {
         b.addEventListener('click', (e) => { e.stopPropagation(); setStars(b.dataset.stars); });
         // Hover or focus: fetch it ahead of a flip.
-        const warm = () => { const v = views[viewIdx]; const m = v && v[b.dataset.stars]; if (m) { preload(m.src); if (V.open) preload(m.full); } };
+        const warm = () => { const s = cur(views[viewIdx]); const m = s && s[b.dataset.stars]; if (m) { preload(m.src); if (V.open) preload(m.full); } };
         b.addEventListener('pointerenter', warm); b.addEventListener('focus', warm);
       });
       el.querySelectorAll('[data-view]').forEach((b) => {
         b.addEventListener('click', (e) => { e.stopPropagation(); setView(+b.dataset.view); });
-        const warm = () => { const v = views[+b.dataset.view]; const m = v && v[curMode() === 'starless' && v.starless ? 'starless' : 'stars']; if (m) { preload(m.src); if (V.open) preload(m.full); } };
+        const warm = () => { const s = cur(views[+b.dataset.view]); const m = s && (s[wantStarless && s.starless ? 'starless' : 'stars'] || s.starless); if (m) { preload(m.src); if (V.open) preload(m.full); } };
         b.addEventListener('pointerenter', warm); b.addEventListener('focus', warm);
       });
       const sc = el.querySelector('.views');
@@ -1553,19 +1590,55 @@ _PAGE = r"""<!doctype html>
     const order = (rel.filters || []).map((f) => f.filter);
     const isMono = (x) => x !== hero && (x.group ? x.group === 'filter' : (!!x.filter && (!x.kind || x.kind === x.filter)));
     const rank = (x) => x === hero ? -1 : (isMono(x) ? 1 : 0);
-    const seen = new Set();
-    for (const p of previews.slice().sort((a, b) => rank(a) - rank(b) || (rank(a) === 1 ? order.indexOf(a.filter) - order.indexOf(b.filter) : 0))) {
-      const label = p.label || (p === hero ? 'Color' : (p.kind || p.filter || nameKind(p.name)));
-      if (seen.has(label.toLowerCase())) continue; seen.add(label.toLowerCase());
+    // A variant of another view (see `cur`): explicitly, `variantOf` names the
+    // parent's label and `variantLabel` the option ("Continuum-subtracted");
+    // `variantStarless: true` says the image is starless (no stars twin).
+    // Without those, a continuum-subtracted image - kind ending in -contsub or
+    // -contsub-starless, or "continuum-subtracted" in its label - folds under
+    // the single-filter view with the same `filter`, so releases published
+    // before the field exist tidy up too.
+    const variantOf = (p) => {
+      if (p.variantOf) return { parent: String(p.variantOf).toLowerCase(), label: String(p.variantLabel || 'Variant'), starless: !!p.variantStarless };
+      const contsub = /-contsub(?:-starless)?$/i.test(p.kind || '') || /continuum[- ]subtracted/i.test(p.label || '');
+      if (!contsub || !p.filter) return null;
+      return { filter: String(p.filter).toLowerCase(), label: String(p.variantLabel || 'Continuum-subtracted'),
+               starless: /-starless$/i.test(p.kind || '') || /starless/i.test(p.label || '') };
+    };
+    const pics = (p) => {
       const f = fullOf(p);
       const tw = typeof p.starless === 'string' ? byName.get(p.starless) : null;
       const twf = tw ? ((f && typeof f.starless === 'string' && byName.get(f.starless)) || fullOf(tw)) : null;
-      views.push({ key: label, label, kind: p.kind || '', filter: p.filter || '', mono: isMono(p), title: p.title || label,
-        stars: { src: p.thumb || p.url, full: viewUrl(f), alt: p.title || 'Latest preview', title: p.title || '' },
-        starless: tw ? { src: tw.thumb || tw.url, full: viewUrl(twf), alt: tw.title || 'Latest preview, starless', title: tw.title || '' } : null });
+      return { stars: { src: p.thumb || p.url, full: viewUrl(f), alt: p.title || 'Latest preview', title: p.title || '' },
+        starless: tw ? { src: tw.thumb || tw.url, full: viewUrl(twf), alt: tw.title || 'Latest preview, starless', title: tw.title || '' } : null };
+    };
+    const seen = new Set(), later = [];
+    for (const p of previews.slice().sort((a, b) => rank(a) - rank(b) || (rank(a) === 1 ? order.indexOf(a.filter) - order.indexOf(b.filter) : 0))) {
+      const label = p.label || (p === hero ? 'Color' : (p.kind || p.filter || nameKind(p.name)));
+      if (p !== hero && variantOf(p)) { later.push([p, label]); continue; }
+      if (seen.has(label.toLowerCase())) continue; seen.add(label.toLowerCase());
+      views.push({ key: label, label, kind: p.kind || '', filter: p.filter || '', mono: isMono(p), title: p.title || label, variants: [], ...pics(p) });
+    }
+    for (const [p, label] of later) {
+      const w = variantOf(p);
+      const parent = w.parent != null ? views.find((v) => v.label.toLowerCase() === w.parent)
+        : (views.find((v) => v.mono && v.filter.toLowerCase() === w.filter) || views.find((v) => v.filter.toLowerCase() === w.filter));
+      const img = pics(p);
+      if (!parent) {
+        // Nothing to fold under: its own tab, as before.
+        if (seen.has(label.toLowerCase())) continue; seen.add(label.toLowerCase());
+        views.push({ key: label, label, kind: p.kind || '', filter: p.filter || '', mono: isMono(p), title: p.title || label, variants: [],
+          ...(w.starless && !img.starless ? { stars: null, starless: img.stars } : img) });
+        continue;
+      }
+      let x = parent.variants.find((y) => y.label.toLowerCase() === w.label.toLowerCase());
+      if (!x) { x = { key: label, label: w.label, kind: p.kind || '', title: p.title || label, stars: null, starless: null, keys: [] }; parent.variants.push(x); }
+      // A stars entry and a separate starless entry of one variant fill one option.
+      if (w.starless && !img.starless) { if (!x.starless) x.starless = img.stars; }
+      else { if (!x.stars) { x.stars = img.stars; x.key = label; x.kind = p.kind || x.kind; x.title = p.title || x.title; } if (img.starless && !x.starless) x.starless = img.starless; }
+      x.keys.push(label.toLowerCase(), String(p.kind || '').toLowerCase());
     }
     fromHash();
-    const first = views[viewIdx][curMode()];
+    const first = cur(views[viewIdx])[curMode()];
     const name = String(rel.title || '').replace(/\s+coadd\s+v\d+\s*$/i, '') || rel.projectName || '';
     const ymd = /^(\d{4})-(\d\d)-(\d\d)$/.exec(rel.released || '');
     const date = ymd ? new Date(+ymd[1], +ymd[2] - 1, +ymd[3]).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : (rel.released || '');
@@ -1584,7 +1657,7 @@ _PAGE = r"""<!doctype html>
     applyDisplay();
     drawStarTools();
     // The starless twin's 2400 px: fetch it once the page has settled.
-    setTimeout(() => { const v = views[viewIdx]; if (v && v.starless) preload(v.starless.src); }, 1500);
+    setTimeout(() => { const s = cur(views[viewIdx]); if (s && s.starless && s.stars) preload(s[curMode() === 'stars' ? 'starless' : 'stars'].src); }, 1500);
     // Phones: the frame takes the first image's shape (between 3:2 and 4:5); the others fit inside it.
     const hi = $('heroImg');
     const shape = () => { if (hi.naturalWidth) opener.style.setProperty('--ar', Math.min(1.5, Math.max(0.8, hi.naturalWidth / hi.naturalHeight)).toFixed(3)); };
@@ -1780,7 +1853,8 @@ _PAGE = r"""<!doctype html>
     url.searchParams.set('project', id);
     const keepView = /^#(view|stars)=/.test(url.hash) && (!prevCurrent || prevCurrent === id);
     if (url.hash && !keepView && !url.hash.startsWith('#release-') && !url.hash.startsWith('#sec-')) url.hash = '';
-    if (url.hash.startsWith('#release-') && url.hash.slice(9) !== id) url.hash = '';
+    // #release-<id> may carry &view=<label>&stars=0 for the preview (fromHash reads them).
+    if (url.hash.startsWith('#release-') && url.hash.slice(9).split('&')[0] !== id) url.hash = '';
     history[push ? 'pushState' : 'replaceState']({ project: id }, '', url);
     document.title = `${x.name} · Starfront Files`;
     drawSwitcher();
@@ -1838,7 +1912,7 @@ _PAGE = r"""<!doctype html>
     }
     const all = state.switch.open.concat(state.switch.closed);
     const url = new URL(location.href);
-    const hash = location.hash.slice(1).replace(/^release-/, '');
+    const hash = location.hash.slice(1).replace(/^release-/, '').split('&')[0];
     // First visit: a collab with a master out, then one taking frames, then anything open.
     const firstOpen = (state.switch.open.find((x) => x.release) || state.switch.open.find((x) => x.collecting)
                        || state.switch.open[0] || all[0] || {}).id;
