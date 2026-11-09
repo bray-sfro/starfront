@@ -162,6 +162,10 @@ class AgentUploads:
         self._busy_agents: set[str] = set()
         self._streams = 0
         self._swept = 0.0
+        # Personal projects (server/personal.py), set by app.py once built.
+        # Without it a personal project is refused like any project it
+        # cannot place.
+        self.personal: Any = None
         self._routes(app)
 
     # -- policy -----------------------------------------------------------
@@ -197,7 +201,15 @@ class AgentUploads:
             raise HTTPException(status_code=404, detail="no such collaboration")
         return project
 
-    def _check(self, project: dict[str, Any], rig: dict[str, Any]) -> dict[str, Any]:
+    def _check(self, project: dict[str, Any], rig: dict[str, Any],
+               user: dict[str, Any] | None = None) -> dict[str, Any]:
+        if project.get("scope") == "personal":
+            # One person's own target: no task, no allowlist; whether they
+            # may keep personal projects at all is personal.py's to say.
+            if self.personal is None or user is None:
+                raise HTTPException(status_code=404, detail="no such collaboration")
+            self.personal.check_upload(project, rig, user)
+            return {"id": ""}
         ok, why = self.enabled_for(project, rig)
         if not ok:
             raise HTTPException(status_code=409, detail=why)
@@ -280,7 +292,7 @@ class AgentUploads:
             if time.time() - self._swept > 3600:
                 self.sweep()
             project = self._project(body.project)
-            task = self._check(project, rig)
+            task = self._check(project, rig, user)
             kind = (body.kind or "light").strip().lower()
             if kind not in AGENT_KINDS:
                 raise HTTPException(status_code=400, detail="kind must be one of " + ", ".join(AGENT_KINDS))
@@ -307,13 +319,16 @@ class AgentUploads:
                     self.store.set_upload_received(resume["id"], have)
                 return {"already": False, "id": resume["id"], "offset": have,
                         "chunk": CHUNK_SIZE, "name": name}
-            quota = self.files.quota_of(project)
-            if quota == 0:
+            personal = project.get("scope") == "personal"
+            quota = (self.personal.quota_for(project, user) if personal
+                     else self.files.quota_of(project))
+            if quota == 0 and not personal:
                 raise HTTPException(status_code=409, detail="this collaboration is not taking files")
             held = int(self.store.file_totals(project["id"])["bytes"])
             replacing = int(existing["bytes"]) if existing is not None else 0
             if held - replacing + self.reserved(project["id"]) + body.bytes > quota:
-                raise self.full(f"this collaboration is at its storage limit "
+                raise self.full("your personal storage is full" if personal else
+                                f"this collaboration is at its storage limit "
                                 f"({quota / 1024 ** 3:g} GB)")
             free = self.files.stats()["free"]
             if free - self.reserved() - body.bytes < AGENT_KEEP_FREE:
@@ -390,7 +405,7 @@ class AgentUploads:
                 rig, user = self.agent(request)
                 row = owned(upload_id, rig)
                 project = self._project(row["project"])
-                self._check(project, rig)
+                self._check(project, rig, user)
                 return rig, user, row, project
             rig, user, row, project = await asyncio.to_thread(begin)
             part = self.part(upload_id)
@@ -460,10 +475,20 @@ class AgentUploads:
             its pending lights still need: the calibration it should send."""
             rig, user = self.agent(request)
             found = self._project(project)
-            enabled, why = self.enabled_for(found, rig)
-            task = self.store.agent_task_in(rig["id"], found["id"])
-            if task is None and enabled:
-                enabled, why = False, "this telescope has no accepted task on that collaboration"
+            task = None
+            if found.get("scope") == "personal":
+                if self.personal is None or str(found.get("owner_id") or "") != str(user["id"]):
+                    raise HTTPException(status_code=404, detail="no such collaboration")
+                try:
+                    self.personal.check_upload(found, rig, user)
+                    enabled, why = True, ""
+                except HTTPException as exc:
+                    enabled, why = False, str(exc.detail)
+            else:
+                enabled, why = self.enabled_for(found, rig)
+                task = self.store.agent_task_in(rig["id"], found["id"])
+                if task is None and enabled:
+                    enabled, why = False, "this telescope has no accepted task on that collaboration"
             label = self.label(rig)
             prefix = str(rig["id"])[:8] + "-"
             mine = [r for r in self.store.files_in(found["id"], user["id"])

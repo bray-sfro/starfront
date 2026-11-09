@@ -29,6 +29,8 @@ from typing import Any, Callable
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
+from server.personal import hidden_from
+
 STATUSES = ("idle", "running", "failed", "done")
 STEP_STATES = ("pending", "running", "done", "failed", "skipped")
 STALE_SECONDS = 15 * 60
@@ -194,13 +196,27 @@ class Jobs:
             return None
         return who
 
+    def _visible(self, project_id: str, request: Request) -> dict[str, Any]:
+        """The project, or 404: also for a personal project (server/personal.py)
+        asked about by anybody but its owner."""
+        project = self.store.project(project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="no such collaboration")
+        if project.get("scope") == "personal":
+            try:
+                who = self.who(request)
+            except HTTPException:
+                who = None
+            # The processing machine reports progress on the job token.
+            if hidden_from(project, who, self.owns_project) and not self._job_token_ok(request):
+                raise HTTPException(status_code=404, detail="no such collaboration")
+        return project
+
     def _routes(self, app: FastAPI) -> None:
         @app.get("/api/v1/releases/{project_id}/stack")
         def get_stack(project_id: str, request: Request) -> JSONResponse:
             """The stack button's state: whether you may press it, and the last request."""
-            project = self.store.project(project_id)
-            if project is None:
-                raise HTTPException(status_code=404, detail="no such collaboration")
+            project = self._visible(project_id, request)
             view = self.stack_view(project_id)
             view["canStack"] = self._owner(request, project) is not None
             return JSONResponse(view, headers={"Cache-Control": "private, no-store"})
@@ -208,9 +224,7 @@ class Jobs:
         @app.post("/api/v1/releases/{project_id}/stack")
         def post_stack(project_id: str, request: Request) -> JSONResponse:
             """The owner asks for a new stack. One at a time: 409 while one is queued or running."""
-            project = self.store.project(project_id)
-            if project is None:
-                raise HTTPException(status_code=404, detail="no such collaboration")
+            project = self._visible(project_id, request)
             who = self._owner(request, project)
             if who is None:
                 raise HTTPException(status_code=403, detail="only the collaboration's owner starts a stack")
@@ -230,9 +244,7 @@ class Jobs:
         @app.delete("/api/v1/releases/{project_id}/stack")
         def cancel_stack(project_id: str, request: Request) -> JSONResponse:
             """The owner takes back a request the stacking machine has not picked up yet."""
-            project = self.store.project(project_id)
-            if project is None:
-                raise HTTPException(status_code=404, detail="no such collaboration")
+            project = self._visible(project_id, request)
             if self._owner(request, project) is None:
                 raise HTTPException(status_code=403, detail="only the collaboration's owner cancels a stack")
             with self._lock:
@@ -246,17 +258,16 @@ class Jobs:
             return JSONResponse(view, headers={"Cache-Control": "private, no-store"})
 
         @app.get("/api/v1/releases/{project_id}/job")
-        def get_job(project_id: str) -> JSONResponse:
+        def get_job(project_id: str, request: Request) -> JSONResponse:
             """What the coordinator's processing job is doing. Public, cheap, cached a few seconds."""
-            if self.store.project(project_id) is None:
-                raise HTTPException(status_code=404, detail="no such collaboration")
-            return JSONResponse(self.read(project_id), headers={"Cache-Control": "public, max-age=5"})
+            project = self._visible(project_id, request)
+            private = project.get("scope") == "personal"
+            return JSONResponse(self.read(project_id), headers={
+                "Cache-Control": "private, no-store" if private else "public, max-age=5"})
 
         @app.put("/api/v1/releases/{project_id}/job")
         async def put_job(project_id: str, request: Request) -> dict[str, Any]:
-            project = self.store.project(project_id)
-            if project is None:
-                raise HTTPException(status_code=404, detail="no such collaboration")
+            project = self._visible(project_id, request)
             if not self._job_token_ok(request):
                 try:
                     who = self.who(request)
