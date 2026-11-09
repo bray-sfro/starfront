@@ -1,0 +1,121 @@
+0.2.53g tests, on the patched 0.2.53b tree.
+
+There is no single suite runner. Each tools/check_*.py is its own script.
+The "before" run is unmodified 0.2.53b, before httpx2 was installed, so several
+scripts died on `from fastapi.testclient import TestClient` (starlette asked
+for the httpx2 package). The "after" run is 0.2.53g with httpx2 installed.
+Those import failures are not new product failures. Assertion failures that
+are the same text before and after are pre-existing.
+
+New and touched checks (all passed):
+
+  tools/check_autoupload.py          64/64   was 30/30 on 0.2.53b
+    The extra checks are the quota-507 cases from PR #8, the 10 Mbit/s
+    default, and the follower/backfill cases.
+  tools/check_mount_clock.py         36/36   new (PR #9, version 0.2.53g)
+  tools/check_warnings.py            53/53   same as 0.2.53b
+  tools/check_roof_open.py           44/44   same as 0.2.53b
+  tools/check_roof_status.py          8/8    new
+  tools/check_calib_roof_closed.py   34/34   new
+  tools/check_filter_settle.py        9/9    new
+  tools/check_follower_quiet.py       7/7    new
+  tools/check_safety.py              28/28
+  tools/check_safety_alpaca.py       57/57
+  tools/check_flats.py               40/40
+  tools/check_filters.py             52/52
+  tools/check_header.py              26/26
+  tools/check_night.py              113/113
+  tools/check_recovery.py            50/50
+  tools/check_server.py             162/162
+  tools/check_recovery_real.py     camera_drop_1 passed (38s). The 11-case
+    file needs longer than the 180s budget used for the full sweep. On
+    0.2.53b, before httpx2, every case died at import.
+
+Full sweep of tools/check_*.py on 0.2.53g (180s cap per script), before
+check_follower_quiet.py existed: 59 scripts. Assertion FAILs that also
+failed on 0.2.53b, same counts:
+
+  check_controls.py         2 FAIL  (livestack controls not on this tree)
+  check_livestack.py        1 FAIL  (then KeyError livestack; same shape)
+  check_night_rollover.py   8 FAIL
+  check_reference.py        2 FAIL
+
+Exit 1 with no FAIL line, same cause before and after (import httpx, which
+is a different package from httpx2):
+
+  check_fleet.py  check_live_link.py  check_rig_isolation.py
+
+check_imagestack.py still crashes after its passing cases on a missing
+livestack status key. Same on 0.2.53b.
+
+No new assertion failure showed up in the sweep.
+
+Roof closed rule — where it is enforced
+----------------------------------------
+
+  astrocontrol/roofguard.py
+      needs_closed_roof     bias, dark, darkflat, panel flat (not sky flat)
+      begin / end           held for the whole closed-roof set
+      blocked               the reason an open must be refused
+      request_open          raises before dome.open_shutter
+  astrocontrol/calibrating.py
+      CalibrationRunner._set_on_rig        holds the guard
+      CalibrationRunner._shoot_set         re-checks the roof before frames
+      CalibrationRunner._require_roof_closed
+          closing: hold until closed or 30s, then abort
+          open, opening, error, anything else: abort, no frames
+          never calls OpenShutter
+      CalibrationRunner._require_cover_closed
+          a cover that exists must read closed
+      CalibrationRunner._one_filter        cover check after the cover is shut
+  astrocontrol/main.py
+      dome_shutter          409 if blocked(), before open_shutter
+  astrocontrol/sequencer.py
+      Sequencer._ensure_roof_open   calls request_open, not open_shutter
+  astrocontrol/devices/ascom.py    AscomDome.open_shutter
+  astrocontrol/devices/alpaca.py   AlpacaDome.open_shutter
+      both raise before the driver is asked
+
+tools/check_calib_roof_closed.py, mock dome, every command recorded:
+
+  bias, dark, panel flats, and an autocal recipe of all three:
+      zero "open" commands
+      an open request during the run raised and was not sent
+  roof already open: the dark run took no frames and sent no open
+  roof closing: the bias run held, then took the frame, and sent no open
+  sky flats are not under the guard
+
+Follower exclusion
+------------------
+
+  Not the capture folder. The gate is astrocontrol/autoupload.py
+  follower_frame / refuses_upload / allows_upload:
+
+    role == "follower"                         default: do not upload
+    colour / Bayer / instrument contains 6200MC, and not the master
+    camera.uploadCollab False is an explicit off
+    camera.uploadCollab True is an explicit opt-in (the tandem leaves it unset)
+    a missing identity is not treated as a follower (older rows still report)
+
+  Live lights: Capture.upload_identity() (role, rig id, camera name, Bayer)
+  passed to AutoUploader.light_saved. A follower is not queued.
+  AutoUploader.send refuses a follower item even if it was forced onto the
+  queue, and does not call the server.
+
+  Backfill: AutoUploader.backfill reads headers only. Project and task come
+  from the target whose name matches the capture folder or TARGET/OBJECT.
+  They are stored on the queue item. The file is not rewritten.
+  The 14 FSQ85 lights of 2026-11-05 with a blank PROJID match
+  project 97fcae827a9f, task 481536614589. The 27 Rokinon lights do not queue,
+  including one placed in the FSQ85 folder. A master frame placed in the
+  Rokinon folder still queues.
+
+  Session report: targets.add_panel_integration keeps a follower on its own
+  byTelescope slice and does not add those seconds to the tally that is
+  reported. collabclient.CollabClient.report_pending drops that slice and
+  does not POST it. A report that is sent includes instrument and that
+  camera's focalLength.
+
+  tools/check_follower_quiet.py: follower not queued, not sent, and a
+  12.25 h Rokinon L row is absent from the report. The FSQ85 row is sent
+  as 300 s with instrument ZWO ASI6200MM Pro and focalLength 455.
