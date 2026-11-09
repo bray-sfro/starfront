@@ -210,13 +210,13 @@ class Personal:
             "files": totals["count"], "bytes": totals["bytes"],
             "kinds": self.store.file_kinds(project["id"]),
             "lights": self.store.file_status_counts(project["id"]),
-            "telescopes": self.files._telescopes(project["id"], who["id"]),
+            # What the person's rigs reported: sessions, hours, telescopes, filters.
+            "reports": self.files._telescopes(project["id"], who["id"]),
         }
         if self.releases is not None:
             out["release"] = self.releases.summary(project["id"])
         if self.jobs is not None:
             out["stack"] = self.jobs.stack_view(project["id"])
-            out["job"] = self.jobs.read(project["id"])
         return out
 
     def _mine(self, request: Request) -> dict[str, Any]:

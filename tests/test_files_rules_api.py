@@ -128,7 +128,7 @@ def test_page_has_the_checklist(world):
     html = client.get("/files").text
     assert "Upload rules" in html and "Pending calibration" in html
     assert "Everything on this collaboration" not in html and 'id="all"' not in html
-    assert '<details class="view" id="sec-release"' in html and 'id="collabSel"' in html and 'Starfront Files</a>' in html
+    assert '<details class="view" id="sec-release"' in html and 'id="collabSel"' in html and 'class="sfnav"' in html and 'href="/collabs"' in html and 'id="topWho"' in html
 
 
 def test_darkflat_no_longer_offered_but_still_taken(world):

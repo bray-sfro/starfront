@@ -204,7 +204,28 @@ class Releases:
                 "hours": found.get("totalHours"),
                 "filters": [f.get("filter") for f in found.get("filters") or []],
                 "page": f"/files#release-{project_id}",
-                "api": f"/api/v1/releases/{project_id}"}
+                "api": f"/api/v1/releases/{project_id}",
+                "preview": self.preview_url(project_id, version, found)}
+
+    def preview_url(self, project_id: str, version: str, found: dict[str, Any]) -> str:
+        """One picture for a card: the release's first preview image that is
+        on disk, a with-stars one before a starless one. '' if none."""
+        base = self.folder / project_id / version
+        picks = []
+        for entry in found.get("files") or []:
+            name = str(entry.get("name") or "")
+            if not _NAME.match(name) or is_master(entry):
+                continue
+            image = os.path.splitext(name)[1].lower() in (".jpg", ".jpeg", ".png", ".webp")
+            if not image or entry.get("role") not in (None, "", "preview"):
+                continue
+            starless = "starless" in name.lower() or bool(entry.get("starless"))
+            variant = bool(entry.get("variantOf")) or "contsub" in name.lower()
+            picks.append((variant, starless, name))
+        for _variant, _starless, name in sorted(picks):
+            if (base / name).is_file():
+                return f"/releases/{project_id}/{version}/{name}"
+        return ""
 
     def _public(self, project_id: str, version: str, found: dict[str, Any],
                 access: dict[str, Any] | None = None) -> dict[str, Any]:

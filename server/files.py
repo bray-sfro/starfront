@@ -41,6 +41,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 
 from server import uploadrules
 from server.personal import hidden_from
+from server import site as site_nav
 
 #: What a light is. Compressed FITS (`.fits.fz`) ends in `.fz`; XISF is
 #: PixInsight's. Nothing else: a stray `.txt` or a `.jpg` of the result is
@@ -1037,11 +1038,8 @@ _PAGE = r"""<!doctype html>
     .ruleform { grid-template-columns: 1fr; }
   }
 </style></head>
-<body>
-<header class="topbar"><div class="tin">
-  <a class="brand" href="/files">Starfront Files</a>
-  <span class="tright" id="topWho"></span>
-</div></header>
+<body data-page="collabs">
+@@SFNAV@@
 <main>
 <section id="collabs" class="collabs" aria-label="Collaboration" hidden>
   <label class="clabel" for="collabSel">Collaboration</label>
@@ -2267,3 +2265,10 @@ _PAGE = r"""<!doctype html>
 </script>
 </main></body></html>
 """
+
+# The site's shared header (server/site.py), with this page's own sign-in box
+# in it: the page fills #topWho itself, so the shared script leaves it alone.
+_PAGE = (_PAGE
+         .replace("@@SFNAV@@", site_nav.NAV_HTML.replace('id="sfWho"', 'id="topWho" data-managed="1"'))
+         .replace("</style></head>", site_nav.NAV_CSS + "</style></head>", 1)
+         .replace("</main></body></html>", "</main><script>" + site_nav.NAV_JS + "</script></body></html>", 1))

@@ -48,6 +48,7 @@ from server.agentuploads import AgentUploads  # noqa: E402
 from server.ratelimit import Limiter, client_address           # noqa: E402
 from server.jobs import Jobs                                     # noqa: E402
 from server.personal import Personal                             # noqa: E402
+from server.site import Site                                     # noqa: E402
 from server.releases import Releases                             # noqa: E402
 from server.store import Store                                   # noqa: E402
 
@@ -2466,6 +2467,10 @@ releases = Releases(app, store, RELEASES_DIR, files.who, owns_project)
 personal = Personal(app, store, files, agent_uploads.agent, files.who, DISCORD.owners,
                     releases=releases, jobs=jobs)
 agent_uploads.personal = personal
+
+# The website around the files page: the front door (/), every collaboration
+# as cards (/collabs), and one person's own targets (/me). See server/site.py.
+site = Site(app, store, files, releases, personal, _figures)
 
 
 
