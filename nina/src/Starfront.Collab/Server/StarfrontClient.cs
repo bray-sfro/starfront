@@ -169,12 +169,17 @@ namespace Starfront.Collab.Server {
         public Task<PersonalStatus> PersonalStatusAsync(string agentToken, CancellationToken token) =>
             Call<PersonalStatus>(HttpMethod.Get, "/api/v1/agent/personal", null, agentToken, token);
 
-        public Task<PersonalProject> PersonalProjectAsync(string agentToken, string target, double? raDegrees, double? decDegrees, CancellationToken token) {
+        // A mosaic is one target with its panels under it. Pass the panel when
+        // the sequence knows it; otherwise the server reads it from the name
+        // N.I.N.A. gives the target ("M31 Panel 3"). Either way the returned
+        // Project is the panel's, to upload into, and Target is the mosaic's.
+        public Task<PersonalProject> PersonalProjectAsync(string agentToken, string target, double? raDegrees, double? decDegrees, CancellationToken token, string panel = null) {
             var body = new JObject { ["target"] = target ?? "" };
             if (raDegrees.HasValue && decDegrees.HasValue) {
                 body["ra"] = raDegrees.Value;
                 body["dec"] = decDegrees.Value;
             }
+            if (!string.IsNullOrWhiteSpace(panel)) body["panel"] = panel.Trim();
             return Call<PersonalProject>(HttpMethod.Post, "/api/v1/agent/personal", body, agentToken, token);
         }
 

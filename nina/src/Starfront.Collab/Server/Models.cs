@@ -33,6 +33,16 @@ namespace Starfront.Collab.Server {
         [JsonProperty("project")] public string Project { get; set; } = "";
         [JsonProperty("name")] public string Name { get; set; } = "";
         [JsonProperty("created")] public bool Created { get; set; }
+        /// <summary>The whole target's id: the same as Project unless this is a mosaic panel.</summary>
+        [JsonProperty("target")] public string Target { get; set; } = "";
+        /// <summary>Which part of the target this is (kind "panel", key "3"), or null for the whole target.</summary>
+        [JsonProperty("part")] public PersonalPart Part { get; set; }
+    }
+
+    public class PersonalPart {
+        [JsonProperty("kind")] public string Kind { get; set; } = "";
+        [JsonProperty("key")] public string Key { get; set; } = "";
+        [JsonProperty("label")] public string Label { get; set; } = "";
     }
 
     /// <summary>One cell of a telescope's own tiling of a project: cell i is panel i + 1.</summary>
