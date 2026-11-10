@@ -460,6 +460,16 @@ _ME = r"""
   .switch input::after { content: ""; position: absolute; top: 3px; left: 3px; width: 14px; height: 14px; border-radius: 50%; background: #dbe3ee; transition: left .15s; }
   .switch input:checked { background: var(--accent); } .switch input:checked::after { left: 17px; background: #0d1017; }
   .stack { font-size: 12.5px; color: var(--muted); text-align: right; }
+  .target { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+  .target > .row { border: 0; border-radius: 0; background: none; }
+  .parts { border-top: 1px solid var(--line); display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 1px; background: var(--line); }
+  .part { background: #121722; display: grid; grid-template-columns: 64px 1fr; gap: 12px; padding: 12px 14px; align-items: center; }
+  .part .pic { width: 64px; height: 64px; border-radius: 8px; background-size: cover; background-position: center; }
+  .part h3 { margin: 0 0 4px; font-size: 14px; }
+  .part .counts { font-size: 12px; gap: 10px; }
+  .part .foot { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 6px; }
+  .part .stack { text-align: left; font-size: 12px; }
+  .kind { font-size: 11.5px; font-weight: 600; letter-spacing: .02em; color: #9fb0c8; background: #1b2231; border: 1px solid var(--line); padding: 2px 8px; border-radius: 999px; vertical-align: middle; margin-left: 8px; }
   .intro { display: grid; grid-template-columns: 1.2fr 1fr; gap: 24px; align-items: start; }
   .state { display: flex; gap: 12px; align-items: center; margin: 14px 0 4px; }
   @media (max-width: 760px) {
@@ -518,7 +528,26 @@ function stackLine(p) {
   if (p.release) return `Stacked ${esc(when(p.release.released))} · ${esc(p.release.version)}`;
   return 'Not stacked yet';
 }
+function counts(L, bytes) {
+  return `<span class="ok"><b>${L.ready || 0}</b> ready</span>
+        <span class="wait"><b>${L.pending || 0}</b> waiting${bytes === undefined ? '' : ' for calibration'}</span>
+        ${L.quarantine ? `<span class="no"><b>${L.quarantine}</b> set aside</span>` : ''}
+        ${bytes === undefined ? '' : `<span><b>${gb(bytes)}</b></span>`}`;
+}
+function part(q) {
+  const pic = q.release && q.release.preview;
+  return `<div class="part" data-id="${esc(q.id)}">
+    <div class="pic ${pic ? '' : 'sky'}" ${pic ? `style="background-image:url('${encodeURI(pic)}')"` : ''}></div>
+    <div>
+      <h3>${esc((q.part || {}).label || q.name)}</h3>
+      <div class="counts">${counts(q.lights || {})}<span>${gb(q.bytes)}</span></div>
+      <div class="foot"><span class="stack">${stackLine(q)}</span>
+        <button class="btn small ghost" data-stack ${q.files && !(q.stack || {}).busy ? '' : 'disabled'}>Stack</button></div>
+    </div>
+  </div>`;
+}
 function row(p) {
+  if (p.parts && p.parts.length) return mosaic(p);
   const L = p.lights || {}; const R = p.reports || {};
   const pic = p.release && p.release.preview;
   const filters = (p.release && p.release.filters || []).join(' ');
@@ -526,12 +555,7 @@ function row(p) {
     <div class="pic ${pic ? '' : 'sky'}" ${pic ? `style="background-image:url('${encodeURI(pic)}')"` : ''}></div>
     <div class="mid">
       <h2>${esc(p.name)}</h2>
-      <div class="counts">
-        <span class="ok"><b>${L.ready || 0}</b> ready</span>
-        <span class="wait"><b>${L.pending || 0}</b> waiting for calibration</span>
-        ${L.quarantine ? `<span class="no"><b>${L.quarantine}</b> set aside</span>` : ''}
-        <span><b>${gb(p.bytes)}</b></span>
-      </div>
+      <div class="counts">${counts(L, p.bytes)}</div>
       <div class="small muted">${R.telescopes ? esc(R.telescopes) + ' telescope' + (R.telescopes === 1 ? '' : 's') + ' · ' : ''}${R.hours ? esc(Math.round(R.hours * 10) / 10) + ' h reported · ' : ''}since ${esc(when(p.created))}${filters ? ' · ' + esc(filters) : ''}</div>
     </div>
     <div class="side">
@@ -543,6 +567,28 @@ function row(p) {
       </div>
     </div>
   </article>`;
+}
+function mosaic(p) {
+  const L = p.lights || {};
+  const shown = p.parts.find((q) => q.release && q.release.preview);
+  const pic = (p.release && p.release.preview) || (shown && shown.release.preview);
+  const stacked = p.parts.filter((q) => q.release).length;
+  return `<div class="target">
+    <article class="row" data-id="${esc(p.id)}">
+      <div class="pic ${pic ? '' : 'sky'}" ${pic ? `style="background-image:url('${encodeURI(pic)}')"` : ''}></div>
+      <div class="mid">
+        <h2>${esc(p.name)}<span class="kind">Mosaic · ${p.parts.length} panel${p.parts.length === 1 ? '' : 's'}</span></h2>
+        <div class="counts">${counts(L, p.bytes)}</div>
+        <div class="small muted">since ${esc(when(p.created))}</div>
+      </div>
+      <div class="side">
+        <label class="switch"><input type="checkbox" data-auto ${p.autoProcess ? 'checked' : ''}> Process automatically</label>
+        <div class="stack">${stacked} of ${p.parts.length} panels stacked</div>
+        <div></div>
+      </div>
+    </article>
+    <div class="parts">${p.parts.map(part).join('')}</div>
+  </div>`;
 }
 async function load() {
   let d;
@@ -577,9 +623,10 @@ $('list').addEventListener('change', async (e) => {
 $('list').addEventListener('click', async (e) => {
   const b = e.target.closest('[data-stack]'); if (!b) return;
   const id = b.closest('[data-id]').dataset.id;
+  const label = b.textContent;
   b.disabled = true; b.textContent = 'Asking…';
   try { await api(`/api/v1/releases/${id}/stack`, { method: 'POST' }); await load(); }
-  catch (err) { b.textContent = 'Stack now'; b.disabled = false; alert(err.message); }
+  catch (err) { b.textContent = label; b.disabled = false; alert(err.message); }
 });
 load();
 """

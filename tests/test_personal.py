@@ -193,3 +193,63 @@ def test_owner_turns_auto_processing_on(tmp_path, monkeypatch):
     r = client.put(f"/api/v1/me/personal/{pid}", headers=BRAY, json={"autoProcess": True, "name": "Orion"})
     assert r.status_code == 200 and r.json()["autoProcess"] is True and r.json()["name"] == "Orion"
     assert client.put(f"/api/v1/me/personal/{pid}", headers=ZOE, json={"autoProcess": False}).status_code == 404
+
+
+def test_names_say_which_panel(tmp_path):
+    from server.personal import split_target
+    assert split_target("M31 Panel 3") == ("M31", ("panel", "3"))
+    assert split_target("M31_panel_03") == ("M31", ("panel", "3"))
+    assert split_target("M 31 - Tile B") == ("M 31", ("panel", "b"))
+    assert split_target("M31 P2") == ("M31", ("panel", "2"))
+    for whole in ("Sh2-101", "IC 1805", "M42p1", "Tadpoles Pa", "M31"):
+        assert split_target(whole) == (whole, None), whole
+
+
+def test_a_mosaic_is_one_target_with_panels_under_it(tmp_path, monkeypatch):
+    client, store, *_ = build(tmp_path, monkeypatch, enabled=True)
+    ask = lambda **body: client.post("/api/v1/agent/personal", headers=RIG, json=body).json()  # noqa: E731
+    p1 = ask(target="M31 Panel 1", ra=10.2, dec=41.0)
+    p2 = ask(target="M 31 panel 2", ra=11.1, dec=41.5)
+    again = ask(target="M31", panel="01")                       # the rig says the panel itself
+    whole = ask(target="M31")
+    assert p1["created"] and p2["created"] and not again["created"]
+    assert p1["target"] == p2["target"] == whole["project"] == whole["target"]
+    assert again["project"] == p1["project"] != p2["project"]
+    assert p1["part"] == {"kind": "panel", "key": "1", "label": "Panel 1"}
+    assert store.project(p1["project"])["parent"] == whole["project"]
+    # A panel checks its frames against its own pointing, not the target's.
+    assert store.project(p2["project"])["payload"]["region"]["ra"] == 11.1
+    assert "region" not in store.project(whole["project"])["payload"]
+    mine = client.get("/api/v1/me/personal", headers=BRAY).json()["projects"]
+    assert [p["id"] for p in mine] == [whole["project"]]          # panels are not targets of their own
+    assert mine[0]["kind"] == "mosaic"
+    assert [p["part"]["label"] for p in mine[0]["parts"]] == ["Panel 1", "Panel 2"]
+    # Turning processing on for the target turns it on for every panel.
+    client.put(f"/api/v1/me/personal/{whole['project']}", headers=BRAY, json={"autoProcess": True})
+    assert all(p["payload"]["autoProcess"] for p in store.parts_of(whole["project"]))
+
+
+def test_a_panels_frames_count_toward_the_target_and_the_quota(tmp_path, monkeypatch):
+    client, store, personal, _ = build(tmp_path, monkeypatch, enabled=True)
+    panel = client.post("/api/v1/agent/personal", headers=RIG,
+                        json={"target": "M42 Panel 1", "ra": 83.82, "dec": -5.39}).json()
+    r = send(client, panel["project"], "M42_L_0001.fits", light(tmp_path, "a.fits", FILTER="L"))
+    assert r.status_code == 200, r.text
+    mine = client.get("/api/v1/me/personal", headers=BRAY).json()
+    target = mine["projects"][0]
+    assert target["files"] == 1 and target["lights"] and target["parts"][0]["files"] == 1
+    assert mine["usedBytes"] == target["bytes"] == personal.used("u-bray") > 0
+    # Somebody else's view of the panel is a plain 404, like the target's.
+    assert client.get(f"/api/v1/me/personal/{panel['project']}", headers=ZOE).status_code == 404
+
+
+def test_another_name_for_the_same_spot_is_the_same_target(tmp_path, monkeypatch):
+    client, store, *_ = build(tmp_path, monkeypatch, enabled=True)
+    ask = lambda **body: client.post("/api/v1/agent/personal", headers=RIG, json=body).json()  # noqa: E731
+    m42 = ask(target="M42", ra=83.82, dec=-5.39)
+    ngc = ask(target="NGC 1976", ra=83.85, dec=-5.40)            # two arcminutes off
+    assert ngc["project"] == m42["project"] and not ngc["created"]
+    assert ask(target="ngc1976")["project"] == m42["project"]   # remembered as an alias
+    m81 = ask(target="M81", ra=148.89, dec=69.07)
+    m82 = ask(target="M82", ra=148.97, dec=69.68)                # 0.6 degrees away: its own
+    assert m81["project"] != m82["project"]
