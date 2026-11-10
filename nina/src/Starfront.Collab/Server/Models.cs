@@ -12,6 +12,39 @@ namespace Starfront.Collab.Server {
         [JsonProperty("rotation")] public double Rotation { get; set; }
     }
 
+    /// <summary>
+    /// Whether this telescope's owner may keep personal projects (their own
+    /// imaging of a target, private to them), and how much room they have.
+    /// GET /api/v1/agent/personal. Not offered in the UI yet.
+    /// </summary>
+    public class PersonalStatus {
+        [JsonProperty("available")] public bool Available { get; set; }
+        [JsonProperty("why")] public string Why { get; set; } = "";
+        [JsonProperty("plan")] public string Plan { get; set; } = "";
+        [JsonProperty("storageBytes")] public long StorageBytes { get; set; }
+        [JsonProperty("usedBytes")] public long UsedBytes { get; set; }
+    }
+
+    /// <summary>
+    /// The personal project for a target, made on first use: its id is the
+    /// project a frame of that target is uploaded into. POST /api/v1/agent/personal.
+    /// </summary>
+    public class PersonalProject {
+        [JsonProperty("project")] public string Project { get; set; } = "";
+        [JsonProperty("name")] public string Name { get; set; } = "";
+        [JsonProperty("created")] public bool Created { get; set; }
+        /// <summary>The whole target's id: the same as Project unless this is a mosaic panel.</summary>
+        [JsonProperty("target")] public string Target { get; set; } = "";
+        /// <summary>Which part of the target this is (kind "panel", key "3"), or null for the whole target.</summary>
+        [JsonProperty("part")] public PersonalPart Part { get; set; }
+    }
+
+    public class PersonalPart {
+        [JsonProperty("kind")] public string Kind { get; set; } = "";
+        [JsonProperty("key")] public string Key { get; set; } = "";
+        [JsonProperty("label")] public string Label { get; set; } = "";
+    }
+
     /// <summary>One cell of a telescope's own tiling of a project: cell i is panel i + 1.</summary>
     public class Cell : Region {
         [JsonProperty("row")] public int Row { get; set; }
