@@ -197,6 +197,8 @@ class Store:
             if "parent" not in columns:
                 self._db.execute("ALTER TABLE projects ADD COLUMN parent "
                                  "TEXT NOT NULL DEFAULT ''")
+            self._db.execute("CREATE INDEX IF NOT EXISTS projects_by_parent"
+                             " ON projects (parent) WHERE parent != ''")
             # Where each telescope is pointing and what it is doing, as it
             # last said: what the group sees of each other on the chart.
             columns = {row[1] for row in self._db.execute("PRAGMA table_info(agents)")}

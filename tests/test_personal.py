@@ -253,3 +253,40 @@ def test_another_name_for_the_same_spot_is_the_same_target(tmp_path, monkeypatch
     m81 = ask(target="M81", ra=148.89, dec=69.07)
     m82 = ask(target="M82", ra=148.97, dec=69.68)                # 0.6 degrees away: its own
     assert m81["project"] != m82["project"]
+
+
+def test_renaming_keeps_the_old_name_working_and_panels_follow(tmp_path, monkeypatch):
+    client, store, *_ = build(tmp_path, monkeypatch, enabled=True)
+    ask = lambda **body: client.post("/api/v1/agent/personal", headers=RIG, json=body).json()  # noqa: E731
+    panel = ask(target="M31 Panel 1")
+    other = ask(target="M33")
+    r = client.put(f"/api/v1/me/personal/{panel['target']}", headers=BRAY, json={"name": "Andromeda"})
+    assert r.status_code == 200 and r.json()["name"] == "Andromeda"
+    assert store.project(panel["project"])["name"] == "Andromeda · Panel 1"
+    # The rig still saves as M31, and may now save as Andromeda: one target.
+    assert ask(target="M31 Panel 2")["target"] == ask(target="Andromeda")["project"] == panel["target"]
+    # A name another target answers to is a label only; it does not take that target's frames.
+    client.put(f"/api/v1/me/personal/{panel['target']}", headers=BRAY, json={"name": "M 33"})
+    assert ask(target="M33")["project"] == other["project"]
+    # A panel's name is its label.
+    r = client.put(f"/api/v1/me/personal/{panel['project']}", headers=BRAY, json={"name": "North-east"})
+    assert r.json()["part"] == {"kind": "panel", "key": "1", "label": "North-east"}
+    assert ask(target="M31 Panel 1")["project"] == panel["project"]
+
+
+def test_whole_field_frames_sit_on_the_mosaic_itself(tmp_path, monkeypatch):
+    client, *_ = build(tmp_path, monkeypatch, enabled=True)
+    ask = lambda **body: client.post("/api/v1/agent/personal", headers=RIG, json=body).json()  # noqa: E731
+    whole = ask(target="M42", ra=83.82, dec=-5.39)
+    ask(target="M42 Panel 1")
+    assert send(client, whole["project"], "w.fits", light(tmp_path, "w.fits", FILTER="L")).status_code == 200
+    target = client.get("/api/v1/me/personal", headers=BRAY).json()["projects"][0]
+    assert target["kind"] == "mosaic" and target["own"]["files"] == 1 and target["parts"][0]["files"] == 0
+
+
+def test_a_panel_is_a_plain_word(tmp_path, monkeypatch):
+    client, *_ = build(tmp_path, monkeypatch, enabled=True)
+    r = client.post("/api/v1/agent/personal", headers=RIG, json={"target": "M31", "panel": "<b>"})
+    assert r.status_code == 422
+    r = client.post("/api/v1/agent/personal", headers=RIG, json={"target": "M31", "panel": "R2-C3"})
+    assert r.status_code == 200 and r.json()["part"]["key"] == "r2-c3"

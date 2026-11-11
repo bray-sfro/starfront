@@ -50,6 +50,7 @@ import math
 import os
 import re
 import secrets
+import threading
 from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Request
@@ -146,7 +147,7 @@ class PersonalTarget(BaseModel):
     dec: float | None = Field(default=None, ge=-90, le=90)
     #: The mosaic panel this frame is of, when the rig knows it. Wins over a
     #: panel read from the name.
-    panel: str | None = Field(default=None, min_length=1, max_length=16)
+    panel: str | None = Field(default=None, min_length=1, max_length=16, pattern=r"^[0-9A-Za-z][0-9A-Za-z._\-]*$")
 
 
 class PersonalUpdate(BaseModel):
@@ -179,6 +180,9 @@ class Personal:
         # Set after construction where they are built later (see app.py).
         self.releases = releases
         self.jobs = jobs
+        # Finding-or-making is one step: two rigs starting the same target in
+        # the same second must get the same project, not one each.
+        self._making = threading.Lock()
         self._routes(app)
 
     # -- who may ------------------------------------------------------------
@@ -240,6 +244,12 @@ class Personal:
         The target is found by name, then by where the rig is pointing;
         made if neither. A panel (said by the rig, or read from the name)
         is then found or made under it."""
+        with self._making:
+            return self._find_or_make(user, target, ra, dec, panel)
+
+    def _find_or_make(self, user: dict[str, Any], target: str, ra: float | None,
+                      dec: float | None, panel: str | None
+                      ) -> tuple[dict[str, Any], bool, dict[str, Any] | None]:
         base, part = split_target(target)
         if panel:
             part = ("panel", part_key(panel))
@@ -331,6 +341,38 @@ class Personal:
                                        owner_id=str(user["id"]), scope=SCOPE, parent=target["id"])
         return child, True
 
+    def rename(self, project: dict[str, Any], name: str) -> None:
+        """Call a target, or one of its parts, something else.
+
+        A target keeps answering to its old name, so a rig still saving
+        under it keeps filling the same project, and answers to the new one
+        too unless another target already does. Its parts follow it. A part
+        takes the name as its label ("Panel 3" -> "North-east")."""
+        payload = dict(project.get("payload") or {})
+        if project.get("parent"):
+            parent = self.store.project(project["parent"]) or {"name": payload.get("target", "")}
+            payload["part"] = dict(payload.get("part") or {}, label=name)
+            self.store.set_project(project["id"], payload)
+            self.store.rename_project(project["id"], f"{parent['name']} · {name}"[:80])
+            return
+        key = target_key(name)
+        if not key:
+            raise HTTPException(status_code=400, detail="a name with letters or digits is expected")
+        others = [p for p in self.store.personal_projects_of(str(project.get("owner_id") or ""))
+                  if not p.get("parent") and p["id"] != project["id"]]
+        if key != payload.get("targetKey") and key not in (payload.get("aliases") or []) \
+                and self._by_name(others, key) is None:
+            payload["aliases"] = (payload.get("aliases") or []) + [key]
+        payload["target"] = name
+        self.store.set_project(project["id"], payload)
+        self.store.rename_project(project["id"], name)
+        for child in self.store.parts_of(project["id"]):
+            inner = dict(child.get("payload") or {})
+            inner["target"] = name
+            label = (inner.get("part") or {}).get("label") or child["name"]
+            self.store.set_project(child["id"], inner)
+            self.store.rename_project(child["id"], f"{name} · {label}"[:80])
+
     @staticmethod
     def _part_order(project: dict[str, Any]) -> tuple[int, str]:
         key = ((project.get("payload") or {}).get("part") or {}).get("key", "")
@@ -341,6 +383,9 @@ class Personal:
         with parts (a mosaic) lists them under `parts`, and its counts are
         the whole target's: its own frames and every part's."""
         out = self._view_one(project, who)
+        # What sits on the target itself, before its parts are added in: on
+        # a mosaic, frames of the whole field shot under the plain name.
+        out["own"] = {"files": out["files"], "bytes": out["bytes"], "lights": dict(out["lights"])}
         parts = sorted(self.store.parts_of(project["id"]), key=self._part_order)
         out["parts"] = [self._view_one(child, who) for child in parts]
         out["kind"] = "mosaic" if out["parts"] else "single"
@@ -442,7 +487,9 @@ class Personal:
             who = self._mine(request)
             project = self._own(project_id, who)
             if body.name is not None:
-                self.store.rename_project(project_id, body.name.strip())
+                with self._making:
+                    self.rename(self._own(project_id, who), body.name.strip())
+                project = self._own(project_id, who)
             if body.autoProcess is not None:
                 payload = dict(project.get("payload") or {})
                 payload["autoProcess"] = bool(body.autoProcess)

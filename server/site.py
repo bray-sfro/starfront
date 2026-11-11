@@ -462,13 +462,13 @@ _ME = r"""
   .stack { font-size: 12.5px; color: var(--muted); text-align: right; }
   .target { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
   .target > .row { border: 0; border-radius: 0; background: none; }
-  .parts { border-top: 1px solid var(--line); display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 1px; background: var(--line); }
-  .part { background: #121722; display: grid; grid-template-columns: 64px 1fr; gap: 12px; padding: 12px 14px; align-items: center; }
-  .part .pic { width: 64px; height: 64px; border-radius: 8px; background-size: cover; background-position: center; }
+  .parts { border-top: 1px solid var(--line); display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); background: #121722; overflow: hidden; }
+  .part { box-shadow: 1px 0 0 var(--line), 0 1px 0 var(--line); display: grid; grid-template-columns: 56px 1fr; gap: 6px 12px; padding: 12px 14px; align-items: start; }
+  .part .pic { width: 56px; height: 56px; border-radius: 8px; background-size: cover; background-position: center; }
   .part h3 { margin: 0 0 4px; font-size: 14px; }
   .part .counts { font-size: 12px; gap: 10px; }
-  .part .foot { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-top: 6px; }
-  .part .stack { text-align: left; font-size: 12px; }
+  .part .foot { grid-column: 1 / -1; display: flex; justify-content: flex-end; gap: 8px; }
+  .part .stack { text-align: left; font-size: 12px; margin-top: 4px; }
   .kind { font-size: 11.5px; font-weight: 600; letter-spacing: .02em; color: #9fb0c8; background: #1b2231; border: 1px solid var(--line); padding: 2px 8px; border-radius: 999px; vertical-align: middle; margin-left: 8px; }
   .intro { display: grid; grid-template-columns: 1.2fr 1fr; gap: 24px; align-items: start; }
   .state { display: flex; gap: 12px; align-items: center; margin: 14px 0 4px; }
@@ -536,13 +536,16 @@ function counts(L, bytes) {
 }
 function part(q) {
   const pic = q.release && q.release.preview;
+  const open = pic ? `<a class="btn small ghost" href="${encodeURI(pic)}" target="_blank" rel="noopener">Open</a>` : '';
   return `<div class="part" data-id="${esc(q.id)}">
     <div class="pic ${pic ? '' : 'sky'}" ${pic ? `style="background-image:url('${encodeURI(pic)}')"` : ''}></div>
     <div>
       <h3>${esc((q.part || {}).label || q.name)}</h3>
       <div class="counts">${counts(q.lights || {})}<span>${gb(q.bytes)}</span></div>
-      <div class="foot"><span class="stack">${stackLine(q)}</span>
-        <button class="btn small ghost" data-stack ${q.files && !(q.stack || {}).busy ? '' : 'disabled'}>Stack</button></div>
+      <div class="stack">${stackLine(q)}</div>
+    </div>
+    <div class="foot">${open}
+      <button class="btn small ghost" data-stack ${q.files && !(q.stack || {}).busy ? '' : 'disabled'}>Stack</button>
     </div>
   </div>`;
 }
@@ -573,6 +576,11 @@ function mosaic(p) {
   const shown = p.parts.find((q) => q.release && q.release.preview);
   const pic = (p.release && p.release.preview) || (shown && shown.release.preview);
   const stacked = p.parts.filter((q) => q.release).length;
+  // Frames shot under the plain name, of the field as a whole, sit on the
+  // target itself: shown as a part of their own so they can be stacked too.
+  const own = p.own || {};
+  const whole = own.files ? part({ id: p.id, part: { label: 'Whole field' }, lights: own.lights, bytes: own.bytes,
+    files: own.files, release: p.release, stack: p.stack }) : '';
   return `<div class="target">
     <article class="row" data-id="${esc(p.id)}">
       <div class="pic ${pic ? '' : 'sky'}" ${pic ? `style="background-image:url('${encodeURI(pic)}')"` : ''}></div>
@@ -587,7 +595,7 @@ function mosaic(p) {
         <div></div>
       </div>
     </article>
-    <div class="parts">${p.parts.map(part).join('')}</div>
+    <div class="parts">${whole}${p.parts.map(part).join('')}</div>
   </div>`;
 }
 async function load() {
