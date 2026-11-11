@@ -406,7 +406,7 @@ document.addEventListener('sf:me', (e) => {
   $('meNote').textContent = me.signedIn ? '' : 'Sign in with Discord to see your own targets.';
   if (/sign in/i.test(p.why || '')) { b.hidden = true; return; }
   b.hidden = false; b.className = 'badge warn';
-  b.textContent = /plan/.test(p.why || '') ? 'Needs a plan' : 'Coming soon';
+  b.textContent = 'Coming soon';
   $('meNote').textContent = me.signedIn ? '' : 'Sign in with Discord to see your own targets.';
   $('meGo').textContent = 'See what it will do';
 });
@@ -491,7 +491,7 @@ function card(c) {
       <h3>${esc(c.name)} ${c.owned ? '<span class="badge on">You run this</span>' : c.mine ? '<span class="badge">You contribute</span>' : ''}</h3>
       <div class="who">${c.coordinator ? 'Started by ' + esc(c.coordinator) : ''}${c.shape === 'single' ? ' · single field' : c.shape ? ' · mosaic' : ''}</div>
       ${c.notes ? `<div class="notes">${esc(c.notes)}</div>` : ''}
-      <div class="nums">${c.telescopes ? `<span><b>${esc(c.hours)} h</b> collected</span><span><b>${esc(c.telescopes)}</b> telescope${c.telescopes === 1 ? '' : 's'}</span>` : '<span>No nights reported yet</span>'}${c.files ? `<span><b>${gb(c.bytes)}</b> of frames</span>` : ''}</div>
+      <div class="nums">${c.telescopes ? `<span><b>${esc(c.hours)} h</b> collected</span><span><b>${esc(c.telescopes)}</b> telescope${c.telescopes === 1 ? '' : 's'}</span>` : '<span>No nights reported yet</span>'}</div>
       ${goalRows}
       <div class="acts">${acts.join('')}</div>
     </div>
@@ -524,8 +524,6 @@ api('/api/v1/site/collabs').then((d) => {
 
 _ME = r"""
   .head { display: flex; justify-content: space-between; gap: 18px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 20px; }
-  .meter { min-width: 260px; }
-  .meter .bar { height: 8px; margin: 6px 0 2px; }
   .list { display: flex; flex-direction: column; gap: 14px; }
   .row { display: grid; grid-template-columns: 168px 1fr auto; gap: 18px; background: var(--panel);
          border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
@@ -572,7 +570,6 @@ _ME = r"""
         <li>Every target your telescopes have shot, with its latest stacked image</li>
         <li>Which lights are ready, and which still wait for calibration</li>
         <li>Automatic processing, on or off for each target</li>
-        <li>How much of your storage you are using</li>
       </ul>
     </div>
   </div>
@@ -588,11 +585,6 @@ _ME = r"""
     <div>
       <h1>My imaging</h1>
       <p class="muted">Your own targets. Only you can see them.</p>
-    </div>
-    <div class="meter">
-      <div class="small"><b id="usedTxt">0</b> <span class="muted">of <span id="roomTxt">0</span> used</span></div>
-      <div class="bar"><i id="usedBar" style="width:0"></i></div>
-      <div class="small muted" id="planTxt"></div>
     </div>
   </div>
   <div class="list" id="list"></div>
@@ -611,8 +603,7 @@ function stackLine(p) {
 function counts(L, bytes) {
   return `<span class="ok"><b>${L.ready || 0}</b> ready</span>
         <span class="wait"><b>${L.pending || 0}</b> waiting${bytes === undefined ? '' : ' for calibration'}</span>
-        ${L.quarantine ? `<span class="no"><b>${L.quarantine}</b> set aside</span>` : ''}
-        ${bytes === undefined ? '' : `<span><b>${gb(bytes)}</b></span>`}`;
+        ${L.quarantine ? `<span class="no"><b>${L.quarantine}</b> set aside</span>` : ''}`;
 }
 function part(q) {
   const pic = q.release && q.release.preview;
@@ -621,7 +612,7 @@ function part(q) {
     <div class="pic ${pic ? '' : 'sky'}" ${pic ? `style="background-image:url('${encodeURI(pic)}')"` : ''}></div>
     <div>
       <h3>${esc((q.part || {}).label || q.name)}</h3>
-      <div class="counts">${counts(q.lights || {})}<span>${gb(q.bytes)}</span></div>
+      <div class="counts">${counts(q.lights || {})}</div>
       <div class="stack">${stackLine(q)}</div>
     </div>
     <div class="foot">${open}
@@ -688,15 +679,12 @@ async function load() {
   }
   if (!d.available) {
     $('intro').hidden = false;
-    $('introBadge').textContent = /plan/.test(d.why || '') ? 'Needs a plan' : 'Coming soon';
-    $('introWhy').textContent = d.why ? d.why[0].toUpperCase() + d.why.slice(1) + '.' : '';
+    // Nothing about plans or storage here yet: it is simply not open.
+    $('introBadge').textContent = 'Coming soon';
+    $('introWhy').textContent = 'Personal projects are not open yet.';
     if (!d.projects.length) return;
   }
   $('mine').hidden = false;
-  $('usedTxt').textContent = gb(d.usedBytes);
-  $('roomTxt').textContent = gb(d.storageBytes);
-  $('usedBar').style.width = Math.min(100, d.storageBytes ? 100 * d.usedBytes / d.storageBytes : 0) + '%';
-  $('planTxt').textContent = d.plan ? `Plan: ${d.plan}` : '';
   $('list').innerHTML = d.projects.map(row).join('');
   $('none').hidden = d.projects.length > 0;
 }
