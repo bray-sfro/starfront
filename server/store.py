@@ -182,6 +182,23 @@ class Store:
                 if "owner_id" not in columns:
                     self._db.execute(f"ALTER TABLE {table} ADD COLUMN owner_id "
                                      "TEXT NOT NULL DEFAULT ''")
+            # What a project is for: 'collab' (shared, listed, dealt out) or
+            # 'personal' (one person's own imaging of one target, private to
+            # them, never listed or dealt - see server/personal.py). Every
+            # project from before is a collaboration.
+            columns = {row[1] for row in self._db.execute("PRAGMA table_info(projects)")}
+            if "scope" not in columns:
+                self._db.execute("ALTER TABLE projects ADD COLUMN scope "
+                                 "TEXT NOT NULL DEFAULT 'collab'")
+            # A project can sit under another as one of its parts: today a
+            # mosaic panel under its personal target (server/personal.py),
+            # later anything else a target is split into. '' is a top-level
+            # project, which every project from before is.
+            if "parent" not in columns:
+                self._db.execute("ALTER TABLE projects ADD COLUMN parent "
+                                 "TEXT NOT NULL DEFAULT ''")
+            self._db.execute("CREATE INDEX IF NOT EXISTS projects_by_parent"
+                             " ON projects (parent) WHERE parent != ''")
             # Where each telescope is pointing and what it is doing, as it
             # last said: what the group sees of each other on the chart.
             columns = {row[1] for row in self._db.execute("PRAGMA table_info(agents)")}
@@ -350,12 +367,15 @@ class Store:
 
     # -- projects ----------------------------------------------------------
     def add_project(self, project_id: str, name: str, coordinator: str,
-                    payload: dict[str, Any], owner_id: str = "") -> dict[str, Any]:
+                    payload: dict[str, Any], owner_id: str = "",
+                    scope: str = "collab", parent: str = "") -> dict[str, Any]:
+        if scope not in ("collab", "personal"):
+            raise ValueError(f"unknown project scope {scope!r}")
         self._run(
             "INSERT INTO projects (id, name, coordinator, owner_id, created,"
-            " status, payload) VALUES (?, ?, ?, ?, ?, 'open', ?)",
+            " status, payload, scope, parent) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?)",
             project_id, name, coordinator, owner_id, time.time(),
-            json.dumps(payload))
+            json.dumps(payload), scope, parent)
         return self.project(project_id)
 
     # -- people ------------------------------------------------------------
@@ -611,14 +631,40 @@ class Store:
         return row
 
     def projects(self) -> list[dict[str, Any]]:
-        rows = self._all("SELECT * FROM projects ORDER BY created DESC")
+        """The collaborations. Personal projects are never in this list:
+        everything that lists, deals or summarises projects for other people
+        goes through here, so a private project cannot leak by being forgotten
+        in one of them. They are reached by id, or by personal_projects_of."""
+        rows = self._all("SELECT * FROM projects WHERE scope = 'collab'"
+                         " ORDER BY created DESC")
         for row in rows:
             row["payload"] = json.loads(row["payload"])
         return rows
 
     def projects_of(self, owner_id: str) -> list[dict[str, Any]]:
+        """The collaborations this person started."""
         rows = self._all("SELECT * FROM projects WHERE owner_id = ?"
-                         " ORDER BY created DESC", owner_id)
+                         " AND scope = 'collab' ORDER BY created DESC", owner_id)
+        for row in rows:
+            row["payload"] = json.loads(row["payload"])
+        return rows
+
+    def personal_projects_of(self, owner_id: str) -> list[dict[str, Any]]:
+        """This person's own personal projects, newest first: targets and
+        their parts (mosaic panels) alike. A part has `parent` set."""
+        if not owner_id:
+            return []
+        rows = self._all("SELECT * FROM projects WHERE owner_id = ?"
+                         " AND scope = 'personal' ORDER BY created DESC", owner_id)
+        for row in rows:
+            row["payload"] = json.loads(row["payload"])
+        return rows
+
+    def parts_of(self, project_id: str) -> list[dict[str, Any]]:
+        """The projects directly under this one (a mosaic's panels), oldest first."""
+        if not project_id:
+            return []
+        rows = self._all("SELECT * FROM projects WHERE parent = ? ORDER BY created", project_id)
         for row in rows:
             row["payload"] = json.loads(row["payload"])
         return rows
