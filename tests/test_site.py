@@ -58,7 +58,7 @@ def build(tmp_path, enabled=False):
 
 def test_pages_render_with_the_shared_header(tmp_path):
     client, _ = build(tmp_path)
-    for path, key in (("/", "home"), ("/collabs", "collabs"), ("/me", "me")):
+    for path, key in (("/", "home"), ("/collabs", "collabs"), ("/me", "me"), ("/telescopes", "telescopes")):
         r = client.get(path)
         assert r.status_code == 200 and f'data-page="{key}"' in r.text and 'class="sfnav"' in r.text, path
 
@@ -90,3 +90,32 @@ def test_signin_only_comes_back_to_our_pages(tmp_path):
     assert store._one("SELECT back FROM logins WHERE code = 'code1'")["back"] == "/me"
     client.get("/signin?back=https://evil.example")
     assert store._one("SELECT back FROM logins WHERE code = 'code2'")["back"] == "/"
+
+
+def test_my_telescopes_are_mine_alone_and_say_if_they_are_online(tmp_path):
+    client, store = build(tmp_path)
+    assert client.get("/api/v1/site/telescopes").status_code == 401
+    store.add_agent("aaaaaaaa1111", "rig-secret-a", "Telescope 1", "astrofalls", "u-bray")
+    store.add_agent("bbbbbbbb2222", "rig-secret-b", "Telescope 2", "astrofalls", "u-bray")
+    store.add_agent("zzzzzzzz9999", "rig-secret-z", "Redcat", "zoe", "u-zoe")
+    store.seen("aaaaaaaa1111",
+               {"name": "FSQ106", "focalLength": 530, "pixelSize": 3.76, "sensorWidth": 6248, "sensorHeight": 4176,
+                "filters": {"L": None, "Ha": 3.0}, "colour": False},
+               {"telescope": "FSQ106 pier 12", "state": "imaging", "target": "M31", "ra": 0.71, "dec": 41.27})
+    store.add_task({"id": "t1", "project": "aaaaaa000001", "agent": "aaaaaaaa1111", "state": "accepted",
+                    "version": 1, "issued": 1.0})
+    r = client.get("/api/v1/site/telescopes", headers=BRAY)
+    assert r.status_code == 200 and "rig-secret" not in r.text          # never the token
+    d = r.json()
+    assert [t["id"] for t in d["telescopes"]] == ["aaaaaaaa1111", "bbbbbbbb2222"] and d["online"] == 1
+    on, off = d["telescopes"]
+    assert on["online"] and on["name"] == "FSQ106 pier 12" and on["enrolledAs"] == "Telescope 1"
+    assert on["state"] == "imaging" and on["target"] == "M31"
+    assert on["equipment"]["scale"] == 1.46 and on["equipment"]["field"] == [2.54, 1.7]
+    assert on["equipment"]["filters"] == ["L", "Ha"]
+    assert on["work"] == [{"project": "aaaaaa000001", "name": "M42 horse", "state": "accepted", "personal": False}]
+    assert not off["online"] and off["seen"] is None and off["ageSeconds"] is None
+    # Long after its last check-in it is offline, with when it was last seen.
+    store._run("UPDATE agents SET seen = seen - 7200 WHERE id = 'aaaaaaaa1111'")
+    late = client.get("/api/v1/site/telescopes", headers=BRAY).json()["telescopes"][0]
+    assert not late["online"] and 7190 < late["ageSeconds"] < 7300

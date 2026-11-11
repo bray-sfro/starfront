@@ -21,6 +21,7 @@ routes, so a page can be cached and nothing personal is ever in its HTML.
 
 from __future__ import annotations
 
+import math
 import time
 from typing import Any, Callable
 
@@ -28,17 +29,31 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 #: Pages a sign-in may come back to.
-BACK = ("/", "/collabs", "/me", "/files")
+BACK = ("/", "/collabs", "/me", "/telescopes", "/files")
+
+#: How long since a check-in a telescope still counts as online, unless the
+#: server says otherwise (app.py passes its own ONLINE_SECONDS).
+ONLINE_SECONDS = 25 * 60
+
+
+def _num(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 class Site:
     def __init__(self, app: FastAPI, store: Any, files: Any, releases: Any, personal: Any,
-                 figures: Callable[[str, dict[str, Any]], tuple[dict[str, float], dict[str, Any]]]) -> None:
+                 figures: Callable[[str, dict[str, Any]], tuple[dict[str, float], dict[str, Any]]],
+                 online_seconds: float = ONLINE_SECONDS) -> None:
         self.store = store
         self.files = files
         self.releases = releases
         self.personal = personal
         self.figures = figures
+        self.online_seconds = float(online_seconds)
         self._routes(app)
 
     def _who(self, request: Request) -> dict[str, Any] | None:
@@ -46,6 +61,53 @@ class Site:
             return self.files.who(request)
         except HTTPException:
             return None
+
+    def telescope_card(self, agent: dict[str, Any], now: float) -> dict[str, Any]:
+        """One of a person's own telescopes: whether it is online, what it
+        last said it was doing, and the equipment it said it has. Never its
+        token."""
+        said = agent.get("presence") if isinstance(agent.get("presence"), dict) else {}
+        profile = agent.get("profile") if isinstance(agent.get("profile"), dict) else {}
+        seen = float(agent.get("seen") or 0.0)
+        focal, pixel = _num(profile.get("focalLength")), _num(profile.get("pixelSize"))
+        width, height = _num(profile.get("sensorWidth")), _num(profile.get("sensorHeight"))
+        binning = max(1.0, _num(profile.get("binning")) or 1.0)
+        scale = 206.265 * pixel * binning / focal if focal and pixel else None      # arcsec per pixel
+        field = None
+        if scale and width and height:
+            field = [round(width / binning * scale / 3600, 2), round(height / binning * scale / 3600, 2)]
+        filters = profile.get("filters") if isinstance(profile.get("filters"), dict) else {}
+        work = []
+        for task in self.store.tasks_for(agent["id"]):
+            project = self.store.project(str(task.get("project") or ""))
+            if project is None or project.get("status") != "open":
+                continue
+            work.append({"project": project["id"], "name": project["name"],
+                         "state": str(task.get("state") or ""),
+                         "personal": project.get("scope") == "personal"})
+        # The name the rig gives itself on each check-in, over the one it was
+        # enrolled under ("Telescope 1" on nearly every install).
+        called = str(said.get("telescope") or profile.get("name") or "").strip()[:60]
+        return {
+            "id": agent["id"], "name": called or agent.get("name") or "",
+            "enrolledAs": agent.get("name") or "",
+            "added": agent.get("created"),
+            "seen": seen or None,
+            "ageSeconds": round(max(0.0, now - seen)) if seen else None,
+            "online": bool(seen) and now - seen <= self.online_seconds,
+            "state": str(said.get("state") or "")[:40],
+            "target": str(said.get("target") or "")[:80],
+            "ra": _num(said.get("ra")), "dec": _num(said.get("dec")),      # RA in hours, as the rig says it
+            "equipment": {
+                "focalLength": focal, "pixelSize": pixel,
+                "sensor": [int(width), int(height)] if width and height else None,
+                "binning": int(binning), "colour": bool(profile.get("colour")),
+                "scale": round(scale, 2) if scale else None, "field": field,
+                "filters": [str(name)[:24] for name in list(filters)[:16]],
+                "rotation": _num(profile.get("rotation")),
+            },
+            "work": work,
+        }
 
     def collab_card(self, project: dict[str, Any], who: dict[str, Any] | None) -> dict[str, Any] | None:
         """One collaboration as a card: what it is, how far along, its picture."""
@@ -100,6 +162,18 @@ class Site:
                     "personal": {"available": allowed["personal"], "why": allowed["why"],
                                  "plan": allowed["plan"]}}
 
+        @app.get("/api/v1/site/telescopes")
+        def my_telescopes(request: Request) -> dict[str, Any]:
+            """The signed-in person's own telescopes, online ones first."""
+            who = self._who(request)
+            if who is None:
+                raise HTTPException(status_code=401, detail="sign in with Discord first")
+            now = time.time()
+            cards = [self.telescope_card(agent, now) for agent in self.store.agents_of(str(who["id"]))]
+            cards.sort(key=lambda c: (not c["online"], -(c["seen"] or 0), c["name"].lower()))
+            return {"telescopes": cards, "online": sum(1 for c in cards if c["online"]),
+                    "onlineSeconds": self.online_seconds, "time": now}
+
         @app.get("/signin")
         def signin(back: str = Query(default="/", max_length=40)):
             """A browser sign-in that comes back to the page it began on."""
@@ -119,6 +193,10 @@ class Site:
         @app.get("/me")
         def me_page() -> HTMLResponse:
             return HTMLResponse(page("My imaging · Starfront", "me", _ME))
+
+        @app.get("/telescopes")
+        def telescopes_page() -> HTMLResponse:
+            return HTMLResponse(page("My telescopes · Starfront", "telescopes", _TELESCOPES))
 
 
 # ---------------------------------------------------------------------------
@@ -147,7 +225,8 @@ NAV_CSS = r"""
   @media (max-width: 640px) {
     .sfnav .in { gap: 10px; padding: 0 12px; }
     .sfnav .brand span { display: none; }
-    .sfnav .links a { padding: 6px 8px; font-size: 13px; }
+    .sfnav .links a { padding: 6px 8px; font-size: 13px; white-space: nowrap; text-transform: capitalize; }
+    .sfnav .links .my { display: none; }
     .sfnav .who .nm { display: none; }
   }
 """
@@ -156,7 +235,8 @@ NAV_HTML = r"""<nav class="sfnav" aria-label="Starfront"><div class="in">
   <a class="brand" href="/"><i></i><span>Starfront</span></a>
   <div class="links">
     <a href="/collabs" data-nav="collabs">Collaborations</a>
-    <a href="/me" data-nav="me">My imaging</a>
+    <a href="/me" data-nav="me"><span class="my">My </span>imaging</a>
+    <a href="/telescopes" data-nav="telescopes"><span class="my">My </span>telescopes</a>
   </div>
   <div class="who" id="sfWho"></div>
 </div></nav>"""
@@ -637,4 +717,115 @@ $('list').addEventListener('click', async (e) => {
   catch (err) { b.textContent = label; b.disabled = false; alert(err.message); }
 });
 load();
+"""
+
+
+# ---------------------------------------------------------------------------
+# /telescopes  - one person's own telescopes
+# ---------------------------------------------------------------------------
+
+_TELESCOPES = r"""
+  .head { display: flex; justify-content: space-between; gap: 18px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+  .scope { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px 20px; display: flex; flex-direction: column; gap: 12px; }
+  .scope.on { border-color: #254a38; }
+  .scope .top { display: flex; gap: 12px; align-items: flex-start; }
+  .dot { flex: none; width: 12px; height: 12px; border-radius: 50%; background: #3a4558; margin-top: 6px; }
+  .on .dot { background: var(--accent); box-shadow: 0 0 0 4px #7ee7a522, 0 0 14px #7ee7a588; }
+  .scope h2 { margin: 0; overflow-wrap: anywhere; }
+  .scope .status { font-size: 13px; color: var(--muted); }
+  .on .status b { color: var(--accent); }
+  .scope .status b { color: #c3cddb; font-weight: 600; }
+  .doing { background: #121a26; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; font-size: 13.5px; }
+  .doing .k { color: var(--muted); font-size: 12px; display: block; }
+  .specs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 14px; font-size: 13px; margin: 0; }
+  .specs div { min-width: 0; } .specs dt { color: var(--muted); font-size: 12px; } .specs dd { margin: 0; color: var(--text); }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #1a2130; color: #c3cddb; }
+  .work { font-size: 13px; display: flex; flex-direction: column; gap: 4px; }
+  .work a { text-decoration: none; }
+  @media (max-width: 420px) { .grid { grid-template-columns: 1fr; } }
+<!--split-->
+<div class="head">
+  <div>
+    <h1>My telescopes</h1>
+    <p class="muted" id="sub">The telescopes connected to your Starfront account.</p>
+  </div>
+  <div class="small muted" id="fresh"></div>
+</div>
+<div class="grid" id="grid"></div>
+<div class="panel empty" id="signin" hidden>
+  <h3>Sign in to see your telescopes</h3>
+  <p class="small">They are listed under the Discord account they were connected with.</p>
+  <p><a class="btn" href="/signin?back=/telescopes">Sign in with Discord</a></p>
+</div>
+<div class="panel empty" id="none" hidden>
+  <h3>No telescopes connected yet</h3>
+  <p class="small">Connect one from the Starfront app or the N.I.N.A. plugin, signed in with this Discord account. It appears here on its first check-in.</p>
+  <p style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap"><a class="btn" href="/download">Get the Starfront app</a><a class="btn ghost" href="/nina">N.I.N.A. plugin</a></p>
+</div>
+<!--split-->
+function ago(s) {
+  if (s == null) return '';
+  if (s < 90) return 'just now';
+  if (s < 3600) return Math.round(s / 60) + ' min ago';
+  if (s < 86400 * 2) return Math.round(s / 3600) + ' h ago';
+  return Math.round(s / 86400) + ' days ago';
+}
+function coords(t) {
+  if (t.ra == null || t.dec == null) return '';
+  const h = Math.floor(t.ra), m = Math.round((t.ra - h) * 60);
+  const sign = t.dec < 0 ? '−' : '+', d = Math.abs(t.dec);
+  return `${h}h ${String(m === 60 ? 59 : m).padStart(2, '0')}m, ${sign}${d.toFixed(1)}°`;
+}
+const STATES = { imaging: 'Imaging', slewing: 'Slewing', idle: 'Idle', parked: 'Parked', focusing: 'Focusing',
+  guiding: 'Guiding', waiting: 'Waiting', flats: 'Taking flats', darks: 'Taking darks' };
+function card(t) {
+  const e = t.equipment || {};
+  const status = t.online ? `<b>Online</b> · checked in ${esc(ago(t.ageSeconds))}`
+    : t.seen ? `<b>Offline</b> · last seen ${esc(ago(t.ageSeconds))} (${esc(when(t.seen))})`
+    : '<b>Never checked in</b>';
+  const state = STATES[(t.state || '').toLowerCase()] || (t.state ? t.state[0].toUpperCase() + t.state.slice(1) : '');
+  const where = coords(t);
+  const doing = (state || t.target || where) ? `<div class="doing"><span class="k">${t.online ? 'Right now' : 'When last seen'}</span>
+      ${esc([state, t.target].filter(Boolean).join(' · ') || 'Pointing')}${where ? ` <span class="muted">(${esc(where)})</span>` : ''}</div>` : '';
+  const specs = [
+    e.focalLength ? ['Focal length', Math.round(e.focalLength) + ' mm'] : null,
+    e.sensor ? ['Camera', `${e.sensor[0]} × ${e.sensor[1]} px${e.pixelSize ? ', ' + e.pixelSize + ' µm' : ''}`] : null,
+    e.scale ? ['Image scale', e.scale + '″ per pixel' + (e.binning > 1 ? ` (bin ${e.binning})` : '')] : null,
+    e.field ? ['Field of view', `${e.field[0]}° × ${e.field[1]}°`] : null,
+    ['Sensor', e.colour ? 'One-shot colour' : 'Mono'],
+    e.rotation != null ? ['Camera angle', Math.round(e.rotation) + '° (fixed)'] : null,
+  ].filter(Boolean);
+  const known = e.focalLength || e.sensor || (e.filters || []).length;
+  const work = (t.work || []).map((w) => `<span>${w.state === 'accepted' ? 'Working on' : 'Offered'} ${
+    w.personal ? esc(w.name) : `<a href="/files?project=${encodeURIComponent(w.project)}">${esc(w.name)}</a>`}</span>`).join('');
+  return `<article class="scope ${t.online ? 'on' : ''}">
+    <div class="top"><span class="dot" aria-hidden="true"></span>
+      <div><h2>${esc(t.name || 'Telescope')}</h2><div class="status">${status}</div></div></div>
+    ${doing}
+    ${known ? `<dl class="specs">${specs.map(([k, v]) => `<div><dt>${esc(k)}</dt><dd>${esc(v)}</dd></div>`).join('')}</dl>`
+      : '<div class="small muted">No equipment details yet. They arrive with its next check-in.</div>'}
+    ${(e.filters || []).length ? `<div class="chips">${e.filters.map((f) => `<span class="chip">${esc(f)}</span>`).join('')}</div>` : ''}
+    ${work ? `<div class="work">${work}</div>` : ''}
+    <div class="small muted">Connected ${esc(when(t.added))}${t.enrolledAs && t.enrolledAs !== t.name ? ' as ' + esc(t.enrolledAs) : ''}</div>
+  </article>`;
+}
+async function load() {
+  let d;
+  try { d = await api('/api/v1/site/telescopes'); }
+  catch (e) {
+    if (e.status === 401) { $('signin').hidden = false; $('grid').innerHTML = ''; }
+    return;
+  }
+  $('signin').hidden = true;
+  $('grid').innerHTML = d.telescopes.map(card).join('');
+  $('none').hidden = d.telescopes.length > 0;
+  const n = d.telescopes.length;
+  $('sub').textContent = n ? `${d.online} of ${n} online. A telescope counts as online for ${Math.round(d.onlineSeconds / 60)} minutes after its last check-in.`
+    : 'The telescopes connected to your Starfront account.';
+  $('fresh').textContent = 'Updated ' + new Date().toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
+}
+load();
+setInterval(() => { if (!document.hidden) load(); }, 60000);
 """

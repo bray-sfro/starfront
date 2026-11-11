@@ -2470,7 +2470,7 @@ agent_uploads.personal = personal
 
 # The website around the files page: the front door (/), every collaboration
 # as cards (/collabs), and one person's own targets (/me). See server/site.py.
-site = Site(app, store, files, releases, personal, _figures)
+site = Site(app, store, files, releases, personal, _figures, online_seconds=ONLINE_SECONDS)
 
 
 
