@@ -1,0 +1,29 @@
+{% comment %}
+  Starfront auto-processing: carries the buyer's Starfront link code from the
+  address (?sf=...) onto the order line, so the collab server knows whose
+  subscription it is. Paste into a Custom liquid block on the auto-processing
+  product page only. The property name starts with "_" so the shop's cart and
+  checkout do not show it. A visitor who arrives without a code is pointed at
+  the My imaging page to sign in first.
+{% endcomment %}
+<p id="sf-link-note" hidden style="padding:12px 14px;border:1px solid currentColor;border-radius:8px">
+  To attach this plan to your Discord account, start from
+  <a href="https://collab.starfront.space/me">collab.starfront.space/me</a> and press Subscribe there.
+</p>
+<script>
+(function () {
+  var ok = /^sf1\.[A-Za-z0-9_-]{1,40}\.[0-9a-f]{16}$/;
+  var code = new URLSearchParams(location.search).get('sf') || '';
+  try {
+    if (ok.test(code)) sessionStorage.setItem('sfLink', code);
+    else code = sessionStorage.getItem('sfLink') || '';
+  } catch (e) { /* private window: the address alone decides */ }
+  if (!ok.test(code)) { document.getElementById('sf-link-note').hidden = false; return; }
+  document.querySelectorAll('form[action*="/cart/add"]').forEach(function (form) {
+    if (form.querySelector('input[name="properties[_starfront]"]')) return;
+    var input = document.createElement('input');
+    input.type = 'hidden'; input.name = 'properties[_starfront]'; input.value = code;
+    form.appendChild(input);
+  });
+})();
+</script>

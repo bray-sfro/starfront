@@ -27,8 +27,8 @@ all work on it unchanged. What this module adds:
   that target, and the new name is kept as one of its aliases.
 * **Who may.** `entitlement()` is the single place that answers "may this
   person keep personal projects, and how much room do they get". Today
-  that is a switch and a beta list; when payments arrive it reads the plan,
-  and nothing else in the server has to change.
+  that is a switch, a beta list and, with `STARFRONT_BILLING=1`, the
+  person's paid plan (server/billing.py). Nothing else in the server asks.
 * **Privacy.** `hidden_from()` is the rule every by-id route applies: a
   personal project is visible to its owner and the server's owners only,
   and is a plain 404 to anybody else.
@@ -41,7 +41,7 @@ anybody.
 |---|---|
 | `STARFRONT_PERSONAL_UPLOADS` | `1` to open personal projects at all (default off) |
 | `STARFRONT_PERSONAL_BETA` | Discord ids, comma-separated, allowed in before plans exist |
-| `STARFRONT_PERSONAL_STORAGE_GB` | room per person across all their personal projects (default 200) |
+| `STARFRONT_PERSONAL_STORAGE_GB` | room per person on the beta list (default 200); a plan says its own |
 """
 
 from __future__ import annotations
@@ -180,6 +180,9 @@ class Personal:
         # Set after construction where they are built later (see app.py).
         self.releases = releases
         self.jobs = jobs
+        #: Paid plans (server/billing.py), set by app.py. None, or switched
+        #: off, and a plan is never asked about.
+        self.billing: Any = None
         # Finding-or-making is one step: two rigs starting the same target in
         # the same second must get the same project, not one each.
         self._making = threading.Lock()
@@ -189,9 +192,10 @@ class Personal:
     def entitlement(self, user: dict[str, Any] | None) -> dict[str, Any]:
         """What this person may do with personal projects.
 
-        The one place payments plug in: today a server-wide switch and a
-        beta list; later, the person's plan (see the payments notes in
-        server/README.md). Everything else asks this and nothing else.
+        The one place payments plug in: a server-wide switch, then the
+        person's paid plan (server/billing.py, when it is on), then the
+        beta list. Everything else asks this and nothing else. A plan adds
+        `state`, `until` and `notice` to what is returned.
         """
         if not self.enabled:
             return {"personal": False, "plan": "", "storageBytes": 0,
@@ -200,9 +204,13 @@ class Personal:
             return {"personal": False, "plan": "", "storageBytes": 0,
                     "why": "sign in with Discord first"}
         uid = str(user.get("id") or "")
+        plan = self.billing.entitlement(uid) if self.billing is not None and self.billing.enabled else None
+        if plan is not None and plan["personal"]:
+            return plan
         if uid in self.owners or uid in self.beta:
             return {"personal": True, "plan": "beta", "storageBytes": self.storage, "why": ""}
-        # Payments: look up this person's plan here and return its room.
+        if plan is not None:
+            return plan                                    # had one; it has ended
         return {"personal": False, "plan": "", "storageBytes": 0,
                 "why": "personal projects need a Starfront plan"}
 
@@ -474,6 +482,8 @@ class Personal:
             return {"available": allowed["personal"], "why": allowed["why"],
                     "plan": allowed["plan"], "storageBytes": allowed["storageBytes"],
                     "usedBytes": sum(int(p["bytes"]) for p in projects),
+                    "billing": self.billing.view(who, allowed) if self.billing is not None
+                    else {"enabled": False},
                     "projects": projects}
 
         @app.get("/api/v1/me/personal/{project_id}")

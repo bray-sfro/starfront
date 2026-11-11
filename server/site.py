@@ -305,6 +305,18 @@ _BASE_CSS = r"""
              radial-gradient(1.5px 1.5px at 40% 70%, #cfe 50%, transparent 51%), radial-gradient(1px 1px at 85% 64%, #fff 50%, transparent 51%),
              radial-gradient(1px 1px at 25% 85%, #fff 50%, transparent 51%), radial-gradient(1px 1px at 55% 45%, #dfe 50%, transparent 51%); }
   .empty { text-align: center; padding: 40px 20px; color: var(--muted); }
+  .sffoot { max-width: 1080px; margin: 0 auto; padding: 0 20px 40px; display: flex; gap: 14px; flex-wrap: wrap;
+            align-items: center; font-size: 13px; color: var(--muted); }
+  .sffoot button { background: none; border: 0; padding: 0; color: #9fe4bd; font: inherit; cursor: pointer; text-decoration: underline; }
+  body:not([data-support]) [data-help] { display: none; }
+  dialog.sfhelp { background: var(--panel); color: var(--text); border: 1px solid var(--line2); border-radius: 14px;
+            padding: 22px; width: min(520px, calc(100vw - 32px)); }
+  dialog.sfhelp::backdrop { background: rgba(5,7,11,.7); }
+  dialog.sfhelp label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 4px; }
+  dialog.sfhelp input, dialog.sfhelp textarea, .linkform input { width: 100%; background: var(--bg); color: var(--text);
+            border: 1px solid var(--line2); border-radius: 8px; padding: 8px 10px; font: inherit; font-size: 14px; }
+  dialog.sfhelp textarea { min-height: 120px; resize: vertical; }
+  dialog.sfhelp .acts { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
   @media (max-width: 640px) { main { padding: 24px 16px 56px; } h1 { font-size: 24px; } }
 """
 
@@ -316,6 +328,41 @@ const gb = (b) => { b = Number(b) || 0; if (b >= 1024 ** 4) return (b / 1024 ** 
   return Math.max(0, Math.round(b / 1024)) + ' kB'; };
 const when = (t) => { if (!t) return ''; const d = typeof t === 'number' ? new Date(t * 1000) : new Date(t);
   return isNaN(d) ? String(t) : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' }); };
+// Get help: the footer's button, and any [data-help="<project id>"] on a page.
+(function () {
+  const foot = $('sfFoot'), dlg = $('sfHelpDlg');
+  if (!foot || !dlg) return;
+  let project = '';
+  fetch('/api/v1/support').then((r) => r.ok ? r.json() : {}).then((s) => {
+    if (s.helpUrl) { const a = $('sfHelpCentre'); a.href = s.helpUrl; a.hidden = false; foot.hidden = false; }
+    if (s.available) { document.body.dataset.support = '1'; $('sfHelpOpen').hidden = false; foot.hidden = false; }
+  }).catch(() => {});
+  document.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-help]'); if (!b) return;
+    e.preventDefault();
+    project = b.dataset.help || '';
+    $('sfHelpMsg').textContent = ''; $('sfHelpSend').disabled = false;
+    try { $('sfHelpEmail').value = $('sfHelpEmail').value || localStorage.getItem('sfHelpEmail') || ''; } catch (err) { /* private window */ }
+    dlg.showModal();
+  });
+  $('sfHelpCancel').addEventListener('click', () => dlg.close());
+  $('sfHelpForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const msg = $('sfHelpMsg'); $('sfHelpSend').disabled = true; msg.textContent = 'Sending…';
+    try {
+      const email = $('sfHelpEmail').value.trim();
+      const r = await api('/api/v1/support', { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ message: $('sfHelpText').value, email, project }) });
+      try { localStorage.setItem('sfHelpEmail', email); } catch (err) { /* private window */ }
+      $('sfHelpText').value = '';
+      msg.textContent = `Sent. We will answer by email (ticket ${r.ticket}).`;
+      setTimeout(() => dlg.close(), 2500);
+    } catch (err) {
+      msg.textContent = err.status === 401 ? 'Sign in with Discord first, then send again.' : err.message;
+      $('sfHelpSend').disabled = false;
+    }
+  });
+})();
 async function api(path, opts) {
   const r = await fetch(path, { credentials: 'same-origin', ...(opts || {}) });
   let body = {}; try { body = await r.json(); } catch (e) { /* empty */ }
@@ -325,13 +372,33 @@ async function api(path, opts) {
 """
 
 
+#: The foot of every page: Get help (a form, when server/support.py is on)
+#: and the help centre. Both hidden until /api/v1/support says they exist.
+_HELP_HTML = r"""<footer class="sffoot" id="sfFoot" hidden>
+  <span>Something not working?</span>
+  <button type="button" id="sfHelpOpen" data-help="" hidden>Get help</button>
+  <a id="sfHelpCentre" href="#" target="_blank" rel="noopener" hidden>Help centre</a>
+</footer>
+<dialog class="sfhelp" id="sfHelpDlg"><form id="sfHelpForm">
+  <h2>Get help</h2>
+  <p class="small muted">This goes to the Starfront support team. Your plan, telescopes and the state of your project are sent along, so you do not have to describe them.</p>
+  <label for="sfHelpText">What is going wrong?</label>
+  <textarea id="sfHelpText" required minlength="10" maxlength="4000"></textarea>
+  <label for="sfHelpEmail">Email to answer you at</label>
+  <input id="sfHelpEmail" type="email" required maxlength="254" autocomplete="email">
+  <p class="small muted" id="sfHelpMsg" role="status"></p>
+  <div class="acts"><button type="button" class="btn ghost" id="sfHelpCancel">Cancel</button>
+    <button class="btn" id="sfHelpSend">Send</button></div>
+</form></dialog>"""
+
+
 def page(title: str, key: str, body: str) -> str:
     """A whole page: the shared look and header around one page's own parts."""
     css, html, js = body.split("<!--split-->")
     return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
             "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
             f"<title>{title}</title><style>{_BASE_CSS}{NAV_CSS}{css}</style></head>"
-            f"<body data-page=\"{key}\">{NAV_HTML}<main>{html}</main>"
+            f"<body data-page=\"{key}\">{NAV_HTML}<main>{html}</main>{_HELP_HTML}"
             f"<script>{NAV_JS}{_COMMON_JS}{js}</script></body></html>")
 
 
@@ -552,6 +619,14 @@ _ME = r"""
   .kind { font-size: 11.5px; font-weight: 600; letter-spacing: .02em; color: #9fb0c8; background: #1b2231; border: 1px solid var(--line); padding: 2px 8px; border-radius: 999px; vertical-align: middle; margin-left: 8px; }
   .intro { display: grid; grid-template-columns: 1.2fr 1fr; gap: 24px; align-items: start; }
   .state { display: flex; gap: 12px; align-items: center; margin: 14px 0 4px; }
+  .plans { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; margin: 22px 0 8px; }
+  .plan { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 16px 18px; display: flex; flex-direction: column; gap: 6px; }
+  .plan .price { font-size: 20px; font-weight: 700; color: var(--hi); }
+  .plan .btn { margin-top: 8px; justify-content: center; }
+  .linkform { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 8px; }
+  .linkform input { width: 190px; }
+  .notice { color: var(--warn); }
+  #planActs a { margin-right: 10px; }
   @media (max-width: 760px) {
     .row { grid-template-columns: 1fr; } .row .pic { min-height: 150px; }
     .row .mid { padding: 0 16px; } .row .side { padding: 0 16px 16px; align-items: flex-start; }
@@ -576,6 +651,18 @@ _ME = r"""
       </ul>
     </div>
   </div>
+  <div id="buy" hidden>
+    <h2 style="margin-top:26px">Choose a plan</h2>
+    <p class="small muted">Billed monthly through the Starfront shop. Your Discord account is attached to the order, so it works here as soon as you have paid.</p>
+    <div class="plans" id="plans"></div>
+    <details class="small muted"><summary>Already subscribed, but it does not show here?</summary>
+      <form class="linkform" id="linkForm">
+        <input id="linkOrder" placeholder="Order number, e.g. #1234" required maxlength="20" aria-label="Order number">
+        <input id="linkEmail" type="email" placeholder="Email used at checkout" required maxlength="254" aria-label="Email used at checkout">
+        <button class="btn small">Link my order</button><span id="linkMsg" role="status"></span>
+      </form>
+    </details>
+  </div>
   <ol class="steps">
     <li><b>Turn it on in Starfront</b><span class="small muted">One switch: upload and process my own imaging.</span></li>
     <li><b>Image as usual</b><span class="small muted">Each target becomes its own project here, from any of your rigs.</span></li>
@@ -593,6 +680,8 @@ _ME = r"""
       <div class="small"><b id="usedTxt">0</b> <span class="muted">of <span id="roomTxt">0</span> used</span></div>
       <div class="bar"><i id="usedBar" style="width:0"></i></div>
       <div class="small muted" id="planTxt"></div>
+      <div class="small notice" id="planNote"></div>
+      <div class="small" id="planActs"></div>
     </div>
   </div>
   <div class="list" id="list"></div>
@@ -605,6 +694,7 @@ _ME = r"""
 function stackLine(p) {
   const s = p.stack || {};
   if (s.busy) return s.state === 'queued' ? 'Stack queued' : `Stacking${s.message ? ': ' + esc(s.message) : '…'}`;
+  if (s.job === 'failed' || s.state === 'failed') return `Last stack failed <a href="#" data-help="${esc(p.id)}">Get help</a>`;
   if (p.release) return `Stacked ${esc(when(p.release.released))} · ${esc(p.release.version)}`;
   return 'Not stacked yet';
 }
@@ -678,6 +768,33 @@ function mosaic(p) {
     <div class="parts">${whole}${p.parts.map(part).join('')}</div>
   </div>`;
 }
+function billing(d) {
+  const b = d.billing || {};
+  // Not on a plan: the plans on offer, each a link to the shop with this
+  // person's Discord account attached.
+  const plans = (b.plans || []).filter((p) => p.url);
+  $('buy').hidden = !(b.enabled && !d.available && plans.length);
+  $('plans').innerHTML = plans.map((p) => `<div class="plan"><h3>${esc(p.name)}</h3>
+      ${p.price ? `<div class="price">${esc(p.price)}</div>` : ''}
+      <div class="small muted">${gb(p.storageBytes)} of storage, stacking included</div>
+      <a class="btn" href="${esc(p.url)}">Subscribe</a></div>`).join('');
+  $('planNote').textContent = b.notice || '';
+  const acts = [];
+  if (b.manageUrl && b.state && b.state !== 'beta') acts.push(`<a href="${esc(b.manageUrl)}" target="_blank" rel="noopener">Manage plan</a>`);
+  if (b.enabled && (b.state === 'beta' || b.state === 'lapsed') && plans.length) acts.push('<a href="#buy" id="seePlans">See plans</a>');
+  $('planActs').innerHTML = acts.join('');
+  const see = $('seePlans');
+  if (see) see.addEventListener('click', () => { $('intro').hidden = false; $('buy').hidden = false; });
+}
+$('linkForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  $('linkMsg').textContent = 'Checking…';
+  try {
+    await api('/api/v1/me/billing/link', { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ order: $('linkOrder').value, email: $('linkEmail').value }) });
+    location.reload();
+  } catch (err) { $('linkMsg').textContent = err.message; }
+});
 async function load() {
   let d;
   try { d = await api('/api/v1/me/personal'); }
@@ -690,8 +807,10 @@ async function load() {
     $('intro').hidden = false;
     $('introBadge').textContent = /plan/.test(d.why || '') ? 'Needs a plan' : 'Coming soon';
     $('introWhy').textContent = d.why ? d.why[0].toUpperCase() + d.why.slice(1) + '.' : '';
+    billing(d);
     if (!d.projects.length) return;
   }
+  billing(d);
   $('mine').hidden = false;
   $('usedTxt').textContent = gb(d.usedBytes);
   $('roomTxt').textContent = gb(d.storageBytes);

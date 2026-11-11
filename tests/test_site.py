@@ -119,3 +119,12 @@ def test_my_telescopes_are_mine_alone_and_say_if_they_are_online(tmp_path):
     store._run("UPDATE agents SET seen = seen - 7200 WHERE id = 'aaaaaaaa1111'")
     late = client.get("/api/v1/site/telescopes", headers=BRAY).json()["telescopes"][0]
     assert not late["online"] and 7190 < late["ageSeconds"] < 7300
+
+
+def test_pages_carry_the_help_form_and_the_plan_controls(tmp_path):
+    client, _ = build(tmp_path)
+    me = client.get("/me").text
+    for part in ('id="sfHelpDlg"', 'id="sfFoot" hidden', 'id="plans"', 'id="linkForm"', "Manage plan",
+                 "/api/v1/me/billing/link", "/api/v1/support"):
+        assert part in me, part
+    assert 'id="sfHelpDlg"' in client.get("/telescopes").text

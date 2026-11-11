@@ -24,6 +24,8 @@ RULES: list[tuple[str, str, int, float]] = [
     ("GET", "/auth/discord/callback", 20, 60.0),
     ("GET", "/api/v1/auth/poll", 120, 60.0),
     ("GET", "/api/v1/lookup", 60, 60.0),
+    # Claiming a purchase by order number and email: a handful of tries.
+    ("POST", "/api/v1/me/billing/link", 10, 600.0),
     # Published coadds are public and each master is tens of MB: enough for
     # anybody fetching a release, not enough to empty the droplet's transfer.
     ("GET", "/releases", 60, 600.0),

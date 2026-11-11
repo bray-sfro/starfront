@@ -243,6 +243,35 @@ class Store:
                 " task TEXT NOT NULL DEFAULT '', created REAL NOT NULL,"
                 " updated REAL NOT NULL)")
             self._db.execute("CREATE INDEX IF NOT EXISTS uploads_by_agent ON uploads (agent)")
+            # Paid plans (server/billing.py). One row per subscription, keyed by
+            # the subscription's id at the shop; `user` is the Discord id it
+            # pays for, '' until it is known (a purchase made without one).
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS subscriptions ("
+                " contract TEXT PRIMARY KEY, user TEXT NOT NULL DEFAULT '',"
+                " plan TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'active',"
+                " paid_through REAL NOT NULL DEFAULT 0, failed_since REAL NOT NULL DEFAULT 0,"
+                " ended REAL NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT '',"
+                " customer TEXT NOT NULL DEFAULT '', email TEXT NOT NULL DEFAULT '',"
+                " order_name TEXT NOT NULL DEFAULT '', created REAL NOT NULL,"
+                " updated REAL NOT NULL, payload TEXT NOT NULL DEFAULT '{}')")
+            self._db.execute("CREATE INDEX IF NOT EXISTS subscriptions_by_user"
+                             " ON subscriptions (user)")
+            # Every billing message taken in, once: the shop sends a message
+            # again when it is not sure the first arrived.
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS billing_events ("
+                " id TEXT PRIMARY KEY, source TEXT NOT NULL, topic TEXT NOT NULL,"
+                " received REAL NOT NULL, contract TEXT NOT NULL DEFAULT '',"
+                " user TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '')")
+            # Requests for help sent on to the help desk (server/support.py).
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS support_requests ("
+                " id TEXT PRIMARY KEY, user TEXT NOT NULL, created REAL NOT NULL,"
+                " project TEXT NOT NULL DEFAULT '', subject TEXT NOT NULL DEFAULT '',"
+                " ticket TEXT NOT NULL DEFAULT '', state TEXT NOT NULL DEFAULT '')")
+            self._db.execute("CREATE INDEX IF NOT EXISTS support_requests_by_user"
+                             " ON support_requests (user, created)")
             self._db.execute("DROP INDEX IF EXISTS files_once")
             self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS files_once_per_kind"
                              " ON files (project, user, kind, name)")
@@ -681,6 +710,93 @@ class Store:
             self._run("UPDATE projects SET payload = ?, status = ? WHERE id = ?",
                       json.dumps(payload), status, project_id)
         return self.project(project_id)
+
+    # -- paid plans (server/billing.py) ---------------------------------------
+    _SUB_FIELDS = ("user", "plan", "status", "paid_through", "failed_since", "ended",
+                   "source", "customer", "email", "order_name")
+
+    def subscription(self, contract: str) -> dict[str, Any] | None:
+        return self._unpack_sub(self._one("SELECT * FROM subscriptions WHERE contract = ?", contract))
+
+    def subscriptions_of(self, user_id: str) -> list[dict[str, Any]]:
+        if not user_id:
+            return []
+        return [self._unpack_sub(row) for row in self._all(
+            "SELECT * FROM subscriptions WHERE user = ? ORDER BY created", user_id)]
+
+    def subscriptions(self, unlinked: bool = False) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM subscriptions" + (" WHERE user = ''" if unlinked else "")
+        return [self._unpack_sub(row) for row in self._all(sql + " ORDER BY created DESC")]
+
+    def put_subscription(self, contract: str, **fields: Any) -> dict[str, Any]:
+        """Make or change one subscription. Only the fields given change."""
+        now = time.time()
+        payload = fields.pop("payload", None)
+        unknown = set(fields) - set(self._SUB_FIELDS)
+        if unknown:
+            raise ValueError(f"unknown subscription fields {sorted(unknown)}")
+        with self._lock:
+            self._db.execute("INSERT OR IGNORE INTO subscriptions (contract, created, updated)"
+                             " VALUES (?, ?, ?)", (contract, now, now))
+            sets, args = ["updated = ?"], [now]
+            for key, value in fields.items():
+                sets.append(f"{key} = ?")
+                args.append(value)
+            if payload is not None:
+                sets.append("payload = ?")
+                args.append(json.dumps(payload))
+            self._db.execute(f"UPDATE subscriptions SET {', '.join(sets)} WHERE contract = ?",
+                             (*args, contract))
+            self._db.commit()
+        return self.subscription(contract)
+
+    def rename_subscription(self, old: str, new: str) -> None:
+        self._run("UPDATE subscriptions SET contract = ? WHERE contract = ?", new, old)
+
+    @staticmethod
+    def _unpack_sub(row: dict[str, Any] | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        row = dict(row)
+        try:
+            row["payload"] = json.loads(row.get("payload") or "{}")
+        except (TypeError, ValueError):
+            row["payload"] = {}
+        return row
+
+    def add_billing_event(self, event_id: str, source: str, topic: str) -> bool:
+        """Note a billing message. False when it was already taken in."""
+        try:
+            self._run("INSERT INTO billing_events (id, source, topic, received)"
+                      " VALUES (?, ?, ?, ?)", event_id, source, topic, time.time())
+        except sqlite3.IntegrityError:
+            return False
+        return True
+
+    def set_billing_event(self, event_id: str, contract: str, user: str, result: str) -> None:
+        self._run("UPDATE billing_events SET contract = ?, user = ?, result = ? WHERE id = ?",
+                  contract, user, result[:200], event_id)
+
+    def forget_billing_event(self, event_id: str) -> None:
+        self._run("DELETE FROM billing_events WHERE id = ?", event_id)
+
+    def billing_events(self, limit: int = 50) -> list[dict[str, Any]]:
+        return self._all("SELECT * FROM billing_events ORDER BY received DESC LIMIT ?", int(limit))
+
+    # -- requests for help (server/support.py) --------------------------------
+    def add_support_request(self, request_id: str, user_id: str, project: str,
+                            subject: str, created: float | None = None) -> None:
+        self._run("INSERT INTO support_requests (id, user, created, project, subject, state)"
+                  " VALUES (?, ?, ?, ?, ?, 'sending')", request_id, user_id,
+                  time.time() if created is None else created, project, subject[:200])
+
+    def set_support_request(self, request_id: str, state: str, ticket: str = "") -> None:
+        self._run("UPDATE support_requests SET state = ?, ticket = ? WHERE id = ?",
+                  state, ticket, request_id)
+
+    def support_requests_of(self, user_id: str, since: float = 0.0) -> list[dict[str, Any]]:
+        return self._all("SELECT * FROM support_requests WHERE user = ? AND created >= ?"
+                         " ORDER BY created DESC", user_id, since)
 
     # -- tasks -------------------------------------------------------------
     def add_task(self, task: dict[str, Any]) -> dict[str, Any]:
