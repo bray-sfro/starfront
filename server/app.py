@@ -47,6 +47,8 @@ from server.files import COOKIE, COOKIE_SECONDS, Files           # noqa: E402
 from server.agentuploads import AgentUploads  # noqa: E402
 from server.ratelimit import Limiter, client_address           # noqa: E402
 from server.jobs import Jobs                                     # noqa: E402
+from server.personal import Personal                             # noqa: E402
+from server.site import Site                                     # noqa: E402
 from server.releases import Releases                             # noqa: E402
 from server.store import Store                                   # noqa: E402
 
@@ -218,8 +220,18 @@ def owns_project(who: dict[str, Any], project: dict[str, Any]) -> bool:
     return bool(owner) and owner == who["id"]
 
 
-def _require_project_owner(who: dict[str, Any], project_id: str) -> dict[str, Any]:
+def _collab(project_id: str) -> dict[str, Any] | None:
+    """A collaboration by id, or None - also for a personal project
+    (server/personal.py), which the collaboration routes never touch: it
+    has its own, under /api/v1/me/personal and /api/v1/agent/personal."""
     project = store.project(project_id)
+    if project is None or project.get("scope") == "personal":
+        return None
+    return project
+
+
+def _require_project_owner(who: dict[str, Any], project_id: str) -> dict[str, Any]:
+    project = _collab(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="no such project")
     if not owns_project(who, project):
@@ -639,7 +651,7 @@ def project_depth(project_id: str,
     """The depth map of a project: everybody's seconds on every cell of the
     region, per filter, for the picture of the field on the Plan tab."""
     store.seen(agent["id"])
-    project = store.project(project_id)
+    project = _collab(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="no such project")
     answer = _depth_cached(project_id, project)
@@ -660,7 +672,7 @@ def project_people(project_id: str,
     its own under its enrolled name.
     """
     store.seen(agent["id"])
-    project = store.project(project_id)
+    project = _collab(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="no such project")
     people: dict[str, dict[str, Any]] = {}
@@ -1212,7 +1224,7 @@ def join_project(project_id: str, body: JoinRequest,
     The requirements are checked here, against the profile the rig last
     reported, rather than taken on the word of whoever is asking.
     """
-    project = store.project(project_id)
+    project = _collab(project_id)
     if project is None or project.get("status") != "open":
         raise HTTPException(status_code=404, detail="no such open project")
     payload = project.get("payload") or {}
@@ -1458,7 +1470,7 @@ def _redeal(project_id: str, nights: dict[str, str] | None = None,
     which is the signal its program watches for; one whose list held is
     left exactly alone, so an idle poll costs nothing.
     """
-    project = store.project(project_id)
+    project = _collab(project_id)
     if project is None:
         return 0
     payload = project.get("payload") or {}
@@ -2027,7 +2039,7 @@ def read_project(project_id: str,
     """One project. Signed-in people get every task and contribution;
     anonymous callers get a summary only - no telescope ids, Discord ids or
     per-night sky figures (Bortle, guiding RMS, HFR, footprints)."""
-    project = store.project(project_id)
+    project = _collab(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="no such project")
     if _optional_person(authorization) is not None:
@@ -2447,6 +2459,18 @@ RELEASES_DIR = Path(auth.setting("RELEASES") or FILES_DIR / "_releases")
 jobs = Jobs(app, store, RELEASES_DIR, files.who, owns_project, DATA / "job-token.txt",
             latest=lambda pid: releases.latest_version(pid))
 releases = Releases(app, store, RELEASES_DIR, files.who, owns_project)
+
+# Personal projects: one person's own imaging of one target, private to
+# them, uploaded by their own rigs through the same door as a collaboration.
+# Off unless STARFRONT_PERSONAL_UPLOADS=1; entitlement() in server/personal.py
+# is where a plan will decide who may. See server/personal.py.
+personal = Personal(app, store, files, agent_uploads.agent, files.who, DISCORD.owners,
+                    releases=releases, jobs=jobs)
+agent_uploads.personal = personal
+
+# The website around the files page: the front door (/), every collaboration
+# as cards (/collabs), and one person's own targets (/me). See server/site.py.
+site = Site(app, store, files, releases, personal, _figures, online_seconds=ONLINE_SECONDS)
 
 
 

@@ -40,6 +40,8 @@ from starlette.requests import ClientDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
 from server import uploadrules
+from server.personal import hidden_from
+from server import site as site_nav
 
 #: What a light is. Compressed FITS (`.fits.fz`) ends in `.fz`; XISF is
 #: PixInsight's. Nothing else: a stray `.txt` or a `.jpg` of the result is
@@ -333,10 +335,19 @@ class Files:
         out.sort(key=lambda x: (x["closed"], not x["collecting"], -x["bytes"], x["name"].lower()))
         return out
 
-    def _project(self, project_id: str) -> dict[str, Any]:
+    def _project(self, project_id: str, request: Request | None = None) -> dict[str, Any]:
+        """A project by id, as this caller may see it: a personal project
+        (server/personal.py) is a 404 to everybody but its owner."""
         project = self.store.project(project_id)
         if project is None:
             raise HTTPException(status_code=404, detail="no such collaboration")
+        if project.get("scope") == "personal":
+            try:
+                who = self.who(request) if request is not None else None
+            except HTTPException:
+                who = None
+            if hidden_from(project, who, self.owns_project):
+                raise HTTPException(status_code=404, detail="no such collaboration")
         return project
 
     # -- the routes --------------------------------------------------------
@@ -431,7 +442,7 @@ class Files:
             """What has arrived: everything, to the coordinator; your own,
             to you."""
             who = self.require(request)
-            project = self._project(project_id)
+            project = self._project(project_id, request)
             owned = self.owns_project(who, project)
             rows = self.store.files_in(project_id, None if owned else who["id"])
             names: dict[str, str] = {}
@@ -450,10 +461,10 @@ class Files:
                     "myTelescopes": self._telescopes(project_id, who["id"])}
 
         @app.get("/api/v1/projects/{project_id}/upload-rules")
-        def get_rules(project_id: str) -> dict[str, Any]:
+        def get_rules(project_id: str, request: Request) -> dict[str, Any]:
             """The rules a collaboration's uploads are held to. Public: a
             contributor should be able to read them before signing in."""
-            return self.rules_view(self._project(project_id))
+            return self.rules_view(self._project(project_id, request))
 
         @app.put("/api/v1/projects/{project_id}/collecting")
         async def put_collecting(project_id: str, request: Request) -> dict[str, Any]:
@@ -461,7 +472,7 @@ class Files:
             `collectFiles` (uploads accepted at all) and `autoUpload` (rigs may
             send their lights on their own, as they are captured)."""
             who = self.require(request)
-            project = self._project(project_id)
+            project = self._project(project_id, request)
             if who.get("kind") == "agent" or not self.owns_project(who, project):
                 raise HTTPException(status_code=403,
                                     detail="only the collaboration's coordinator turns collection on or off")
@@ -485,7 +496,7 @@ class Files:
             defaults are kept; every file on the collaboration is judged again
             on the stored header facts (no file is re-read)."""
             who = self.require(request)
-            project = self._project(project_id)
+            project = self._project(project_id, request)
             if who.get("kind") == "agent" or not self.owns_project(who, project):
                 raise HTTPException(status_code=403,
                                     detail="only the collaboration's coordinator sets its upload rules")
@@ -519,7 +530,7 @@ class Files:
             each one's header is read (header only) and every file judged.
             Nothing is deleted or moved on disk."""
             who = self.require(request)
-            project = self._project(project_id)
+            project = self._project(project_id, request)
             if who.get("kind") == "agent" or not self.owns_project(who, project):
                 raise HTTPException(status_code=403, detail="only the coordinator can recheck")
             read = missing = 0
@@ -562,7 +573,7 @@ class Files:
             def prepare() -> tuple[dict[str, Any], dict[str, Any], str, str, int,
                                    Path, dict[str, Any] | None]:
                 who = self.require(request)
-                project = self._project(project_id)
+                project = self._project(project_id, request)
                 if project.get("status") != "open":
                     raise HTTPException(status_code=409, detail="that collaboration is closed")
                 if not self.collecting(project) and not self.owns_project(who, project):
@@ -696,7 +707,7 @@ class Files:
         def download(project_id: str, user_id: str, kind: str, name: str, request: Request):
             """A file back out: the coordinator's, or your own."""
             who = self.require(request)
-            project = self._project(project_id)
+            project = self._project(project_id, request)
             if who["id"] != user_id and not self.owns_project(who, project):
                 raise HTTPException(status_code=403, detail="not your file")
             clean = clean_name(name)
@@ -714,7 +725,7 @@ class Files:
             coordinator, anybody's. Calibration is rechecked once per
             contributor at the end, not once per file."""
             who = self.require(request)
-            project = self._project(project_id)
+            project = self._project(project_id, request)
             try:
                 body = await request.json()
             except ValueError:
@@ -755,7 +766,7 @@ class Files:
                    kind: str = Query(default="light", max_length=12)) -> dict[str, Any]:
             """Take a file off: your own, or, as the coordinator, anybody's."""
             who = self.require(request)
-            project = self._project(project_id)
+            project = self._project(project_id, request)
             target = user or who["id"]
             if target != who["id"] and not self.owns_project(who, project):
                 raise HTTPException(status_code=403, detail="not your file")
@@ -1027,11 +1038,8 @@ _PAGE = r"""<!doctype html>
     .ruleform { grid-template-columns: 1fr; }
   }
 </style></head>
-<body>
-<header class="topbar"><div class="tin">
-  <a class="brand" href="/files">Starfront Files</a>
-  <span class="tright" id="topWho"></span>
-</div></header>
+<body data-page="collabs">
+@@SFNAV@@
 <main>
 <section id="collabs" class="collabs" aria-label="Collaboration" hidden>
   <label class="clabel" for="collabSel">Collaboration</label>
@@ -2257,3 +2265,10 @@ _PAGE = r"""<!doctype html>
 </script>
 </main></body></html>
 """
+
+# The site's shared header (server/site.py), with this page's own sign-in box
+# in it: the page fills #topWho itself, so the shared script leaves it alone.
+_PAGE = (_PAGE
+         .replace("@@SFNAV@@", site_nav.NAV_HTML.replace('id="sfWho"', 'id="topWho" data-managed="1"'))
+         .replace("</style></head>", site_nav.NAV_CSS + "</style></head>", 1)
+         .replace("</main></body></html>", "</main><script>" + site_nav.NAV_JS + "</script></body></html>", 1))

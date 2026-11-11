@@ -50,6 +50,8 @@ from typing import Callable
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, Response
 
+from server.personal import hidden_from
+
 #: What a version and a file name may look like. Anything else is a 404
 #: before the disk is touched.
 _VERSION = re.compile(r"^v\d{1,4}$")
@@ -94,6 +96,19 @@ class Releases:
         self.owns_project = owns_project or (lambda who, project: False)
         self._cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
         self._routes()
+
+    def _visible(self, project_id: str, request: Request | None) -> None:
+        """404 for a personal project (server/personal.py) to anybody but
+        its owner: its releases are theirs alone."""
+        project = self.store.project(project_id)
+        if project is None or project.get("scope") != "personal":
+            return
+        try:
+            who = self.who(request) if request is not None else None
+        except HTTPException:
+            who = None
+        if hidden_from(project, who, self.owns_project):
+            raise HTTPException(status_code=404, detail="nothing published for this collaboration yet")
 
     # -- who may fetch the masters -------------------------------------------
     def contributor_projects(self, project: dict[str, Any]) -> list[str]:
@@ -189,7 +204,28 @@ class Releases:
                 "hours": found.get("totalHours"),
                 "filters": [f.get("filter") for f in found.get("filters") or []],
                 "page": f"/files#release-{project_id}",
-                "api": f"/api/v1/releases/{project_id}"}
+                "api": f"/api/v1/releases/{project_id}",
+                "preview": self.preview_url(project_id, version, found)}
+
+    def preview_url(self, project_id: str, version: str, found: dict[str, Any]) -> str:
+        """One picture for a card: the release's first preview image that is
+        on disk, a with-stars one before a starless one. '' if none."""
+        base = self.folder / project_id / version
+        picks = []
+        for entry in found.get("files") or []:
+            name = str(entry.get("name") or "")
+            if not _NAME.match(name) or is_master(entry):
+                continue
+            image = os.path.splitext(name)[1].lower() in (".jpg", ".jpeg", ".png", ".webp")
+            if not image or entry.get("role") not in (None, "", "preview"):
+                continue
+            starless = "starless" in name.lower() or bool(entry.get("starless"))
+            variant = bool(entry.get("variantOf")) or "contsub" in name.lower()
+            picks.append((variant, starless, name))
+        for _variant, _starless, name in sorted(picks):
+            if (base / name).is_file():
+                return f"/releases/{project_id}/{version}/{name}"
+        return ""
 
     def _public(self, project_id: str, version: str, found: dict[str, Any],
                 access: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -229,7 +265,7 @@ class Releases:
             if short is None:
                 continue
             project = self.store.project(folder.name)
-            if project is None:
+            if project is None or project.get("scope") == "personal":
                 continue
             out.append({"project": folder.name, "name": project.get("name") or "", **short})
         return sorted(out, key=lambda r: str(r.get("released") or ""), reverse=True)
@@ -254,6 +290,7 @@ class Releases:
         def latest_release(project_id: str, request: Request) -> JSONResponse:
             """A collaboration's latest published coadd. Public; which masters
             the asker may fetch is in `access` and each file's `locked`."""
+            self._visible(project_id, request)
             version = self.latest_version(project_id)
             found = self.manifest(project_id, version) if version else None
             if found is None:
@@ -265,6 +302,7 @@ class Releases:
 
         @app.get("/api/v1/releases/{project_id}/{version}")
         def one_release(project_id: str, version: str, request: Request) -> JSONResponse:
+            self._visible(project_id, request)
             found = self.manifest(project_id, version)
             if found is None:
                 raise HTTPException(status_code=404, detail="no such release")
@@ -307,6 +345,7 @@ class Releases:
         def release_file(project_id: str, version: str, name: str, request: Request):
             """One file of a release. Only names the release lists are served;
             the masters only to contributors."""
+            self._visible(project_id, request)
             found = self.manifest(project_id, version)
             if found is None or not _NAME.match(name or ""):
                 raise HTTPException(status_code=404, detail="no such file")
@@ -328,7 +367,8 @@ class Releases:
             inline = kind.startswith("image/") or kind.startswith("text/")
             return FileResponse(real, media_type=kind,
                                 filename=None if inline else name,
-                                headers={"Cache-Control": ("private, max-age=86400" if master
+                                headers={"Cache-Control": ("private, max-age=86400"
+                                                           if master or (self.store.project(project_id) or {}).get("scope") == "personal"
                                                            else "public, max-age=86400, immutable")})
 
         @app.get("/releases/page.js")
