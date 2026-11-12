@@ -118,6 +118,21 @@ class CameraHealth:
                 self._log(f"not reconnecting while a frame is being read out ({reason})",
                           "warn")
                 return False
+            gate = getattr(self.capture, "gate", None)
+            if gate is not None and gate.quarantined():
+                grace = 5.0
+                config = getattr(self.capture, "config", None)
+                if config is not None and hasattr(config, "section"):
+                    with contextlib.suppress(Exception):
+                        raw = config.section("recovery").get("cameraQuarantineSeconds")
+                        if raw is not None:
+                            grace = float(raw)
+                if not gate.wait_clear(grace):
+                    self._log(
+                        "not reconnecting: a camera call is still inside the "
+                        "driver and cannot be cancelled ("
+                        + (gate.quarantined() or reason) + ")", "error")
+                    return False
             if self.reconnect is None:
                 self._log(self.plain(reason) + "; there is no remembered driver to "
                           "reconnect it with", "error")
@@ -243,6 +258,10 @@ class CameraWatch:
         for rig in list(self._rigs()):
             health = getattr(rig, "camera_health", None)
             if health is None or health.busy or health.gave_up:
+                continue
+            capture = getattr(rig, "capture", None)
+            blocked = getattr(capture, "blocks_recovery", None)
+            if callable(blocked) and blocked():
                 continue
             with contextlib.suppress(Exception):
                 if not self._idle(rig):

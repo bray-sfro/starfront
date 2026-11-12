@@ -22,6 +22,7 @@ from typing import Any
 import numpy as np
 
 from . import astro
+from .cameragate import CameraGate
 from .config import Config, data_root, effective_site
 from .devices.base import CameraLostError, DeviceError, read_slot
 from .devices.manager import DeviceManager
@@ -205,6 +206,9 @@ class CaptureService:
         self._directory_override: Path | None = None
         self._previews: OrderedDict[str, tuple[np.ndarray, int]] = OrderedDict()
         self._start_lock = threading.Lock()
+        # One mutating camera call at a time. A timeout does not cancel the
+        # driver call; it quarantines it (0.2.53d).
+        self.gate = CameraGate()
         # calib-layout: True when the override already names the telescope, so
         # `session_dir` must not add the per-telescope subfolder to it.
         self._directory_exact = False
@@ -367,6 +371,15 @@ class CaptureService:
     @property
     def busy(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
+
+    def blocks_recovery(self) -> str | None:
+        """Why a reconnect or power change must not start, or None."""
+        reason = self.gate.quarantined()
+        if reason:
+            return reason
+        if self._state in ("exposing", "downloading", "saving", "recovering") and self.busy:
+            return f"a frame is {self._state}"
+        return None
 
     def status(self) -> dict[str, Any]:
         elapsed = None
@@ -642,17 +655,21 @@ class CaptureService:
     def abort(self) -> None:
         self._loop = False
         self._abort.set()
-        camera = self.manager.get("camera")
-        if camera is not None and camera.connected:
-            try:
-                camera.abort_exposure()
-            except Exception as exc:
-                self.manager.log(f"Abort failed: {exc}", "warn")
-                # A driver that will not even take an Abort is stuck; the
-                # capture is not left waiting on it (0.2.52e). Its thread is
-                # given up on and the camera is free for a reconnect.
-                with contextlib.suppress(Exception):
-                    self.release_stuck()
+        # An exposure or download still inside the driver cannot be aborted
+        # from here. Sending AbortExposure would only run later, on top of it.
+        stuck = self.gate.quarantined()
+        if stuck:
+            self.manager.log(
+                "Capture cancelled. AbortExposure was not sent: " + stuck, "warn")
+        else:
+            camera = self.manager.get("camera")
+            if camera is not None and camera.connected:
+                try:
+                    self.gate.call(camera.abort_exposure, 5.0, "abort")
+                except Exception as exc:
+                    self.manager.log(f"Abort failed: {exc}", "warn")
+                    with contextlib.suppress(Exception):
+                        self.release_stuck()
         self._state = "idle"
         self.manager.log("Capture aborted", "warn")
 
@@ -678,6 +695,16 @@ class CaptureService:
         settings = self.config.section("recovery") if hasattr(self.config, "section") else {}
         if not settings.get("enabled", True) or not settings.get("reconnectManualCaptures", True):
             return False
+        # One retry, and only when the failed call has actually left the driver.
+        reason = self.gate.quarantined()
+        if reason:
+            raw = settings.get("cameraQuarantineSeconds")
+            grace = 5.0 if raw is None else float(raw)
+            if not self.gate.wait_clear(grace):
+                self.manager.log(
+                    "Camera call still inside the driver; not reconnecting and "
+                    "not starting another exposure. " + reason, "error")
+                return False
         self.manager.log(f"Camera failed ({exc}); disconnecting and reconnecting it, "
                          "then trying the frame again", "warn")
         self._state = "recovering"
@@ -823,7 +850,10 @@ class CaptureService:
             f"Exposing {exposure:g}s {frame_type}"
             + (f" [{metadata['filter']}]" if metadata.get("filter") else ""))
         try:
-            camera.start_exposure(exposure, light=frame_type in LIGHT_PATH_TYPES)
+            start_budget = max(60.0, float(exposure) + 60.0)
+            self.gate.call(
+                lambda: camera.start_exposure(exposure, light=frame_type in LIGHT_PATH_TYPES),
+                start_budget, "exposure", cancel=self._abort.is_set)
         except CameraLostError as exc:
             # Lost between the check and the shutter: not sent, so nothing is
             # stuck. Reconnected once here, then the frame is started again.
@@ -837,19 +867,39 @@ class CaptureService:
                 wanted = self._ensure_settings(camera)
             self._exposure_started = time.time()
             metadata["startedAt"] = self._exposure_started
-            camera.start_exposure(exposure, light=frame_type in LIGHT_PATH_TYPES)
+            self.gate.call(
+                lambda: camera.start_exposure(exposure, light=frame_type in LIGHT_PATH_TYPES),
+                max(60.0, float(exposure) + 60.0), "exposure",
+                cancel=self._abort.is_set)
 
         # Wait for the driver, with an allowance for download. A camera that
         # has not said it is done this long after it should have is treated
         # as failed, so the reconnect can happen instead of a wait for ever.
+        # Each ImageReady read is itself bounded: a wedged property read must
+        # not hold this loop for the driver's own three-minute COM timeout.
         try:
             hung = float(self.config.get("recovery", "hungSeconds", 120.0) or 120.0)
         except Exception:                         # noqa: BLE001 - a bare config
             hung = 120.0
+        try:
+            poll = float(self.config.get("recovery", "imageReadyTimeoutSeconds", 15.0)
+                         or 15.0)
+        except Exception:                         # noqa: BLE001 - a bare config
+            poll = 15.0
         deadline = time.monotonic() + exposure + max(30.0, hung)
-        while not camera.image_ready:
+        while True:
             if self._abort.is_set():
+                self._state = "idle"
                 return
+            try:
+                ready = bool(self.gate.call(
+                    lambda: camera.image_ready, poll, "readout",
+                    cancel=self._abort.is_set))
+            except DeviceError:
+                self._state = "idle"
+                raise
+            if ready:
+                break
             lost = getattr(camera, "lost_reason", None)
             if isinstance(lost, str) and lost:
                 # A driver box closed on the camera's thread (driverdialogs):
@@ -861,10 +911,12 @@ class CaptureService:
                     raise CameraLostError(health.plain(lost))
                 return self._capture_one(exposure, frame_type, again=False)
             if time.monotonic() > deadline:
+                self._state = "idle"
                 raise DeviceError(f"the camera has not finished its exposure "
                                   f"{hung:g}s after it should have")
             time.sleep(0.05)
         if self._abort.is_set():
+            self._state = "idle"
             return
 
         # Timed from the shutter closing to the frame being on disk. This is
@@ -882,11 +934,19 @@ class CaptureService:
                              or 0.0)
         except Exception:                         # noqa: BLE001 - a bare config
             download = 120.0
-        from .recovery import call_with_timeout
-        frame = call_with_timeout(camera.get_image, download, "the camera download")
+        try:
+            frame = self.gate.call(camera.get_image, download, "download",
+                                   cancel=self._abort.is_set)
+        except DeviceError:
+            # Not saved, not uploaded. The driver call, if still inside the
+            # camera, is quarantined and its late pixels are discarded.
+            self._state = "idle"
+            raise
         if self._abandoned():
+            self._state = "idle"
             raise DeviceError("the frame was given up on while it downloaded")
-        if frame is None or frame.size == 0:
+        if frame is None or getattr(frame, "size", 0) == 0:
+            self._state = "idle"
             raise DeviceError("camera returned an empty frame")
 
         self._state = "saving"
