@@ -404,14 +404,10 @@ case("the first failure gets a plain reconnect and the power is left alone",
      outcome["connected"] == ["camera"] and switch.log == [] and rigset.plain_calls == ["rasa1"],
      str(switch.log))
 
-# 2. A second automatic reconnect does not cut power. The hand button does.
+# 2. The same camera again inside the window: straight to the mains.
 said = []
-del switch.log[:]
-outcome = rigset.reconnect_camera(r1, progress=said.append)
-case("a repeated automatic reconnect does not power-cycle",
-     switch.log == [] and outcome["connected"] == ["camera"], str(switch.log))
 started = time.monotonic()
-outcome = rigset.power_cycle_camera(r1, "asked for by hand", progress=said.append)
+outcome = rigset.reconnect_camera(r1, progress=said.append)
 elapsed = time.monotonic() - started
 off = [(i, v) for i, v, t in switch.log if v == 0.0]
 on = [(i, v) for i, v, t in switch.log if v == 1.0]
@@ -422,7 +418,7 @@ case("...off for the configured time, then the boot wait",
      1.4 <= elapsed <= 3.0 and switch.log[-1][2] - switch.log[0][2] >= 1.0, f"{elapsed:.2f}s")
 case("...the camera is closed before the power goes and reconnected after",
      ("info", "disconnect camera") in r1.manager.lines and outcome["connected"] == ["camera"]
-     and rigset.plain_calls == ["rasa1", "rasa1", "rasa1"])
+     and rigset.plain_calls == ["rasa1", "rasa1"])
 case("...the other outlets are untouched",
      all(i in (1, 3) for i, v, t in switch.log) and switch.values[6] == 40.0)
 case("...progress names what is being waited for",
@@ -441,13 +437,12 @@ case("a third failure right after a cycle gets a plain reconnect, not another cy
 # 4. A plain reconnect that fails outright goes to the mains at once.
 rigset, switch = build()
 r2 = rigset.rigs_by_name["rasa2"]
-rigset.plain_outcomes = [{"connected": [], "failed": ["camera: gone"]}]
+rigset.plain_outcomes = [{"connected": [], "failed": ["camera: ASIOpenCamera failed (invalid id)"]}]
 outcome = rigset.reconnect_camera(r2)
-case("a reconnect that fails does not power-cycle",
-     switch.log == [] and outcome["failed"] == ["camera: gone"]
-     and rigset.plain_calls == ["rasa2"],
-     f"{switch.log} {outcome} {rigset.plain_calls}")
-case("...and nobody else's outlets", switch.log == [])
+case("a reconnect that fails is followed by a power cycle and a second reconnect",
+     rigset.plain_calls == ["rasa2", "rasa2"] and outcome["connected"] == ["camera"]
+     and sorted(i for i, v, t in switch.log if v == 0.0) == [2, 4], str(switch.log))
+case("...and nobody else's outlets", all(i in (2, 4) for i, v, t in switch.log))
 
 # 5. Switched off in the settings: never touched, however often it fails.
 config.update("recovery", {"powerCycleCameras": False})
@@ -480,8 +475,7 @@ rigset._reconnects[r1.id] = [time.time()]
 config.update("recovery", {"powerCycleOffSeconds": 30.0, "powerCycleBootSeconds": 30.0})
 stop_at = time.monotonic() + 0.6
 started = time.monotonic()
-rigset.power_cycle_camera(r1, "asked for by hand",
-                          stop=lambda: time.monotonic() > stop_at)
+rigset.reconnect_camera(r1, stop=lambda: time.monotonic() > stop_at)
 elapsed = time.monotonic() - started
 case("a Stop during the off wait puts the power back at once",
      elapsed < 3.0 and switch.values[1] == 1.0 and switch.values[3] == 1.0, f"{elapsed:.2f}s")
@@ -505,7 +499,7 @@ def set_value(index, value):
 
 switch.set_value = set_value
 try:
-    rigset.power_cycle_camera(r1, "asked for by hand")
+    rigset.reconnect_camera(r1)
     case("an outlet that will not come back on raises", False)
 except DeviceError as exc:
     case("an outlet that will not come back on raises", "could not restore power" in str(exc)
