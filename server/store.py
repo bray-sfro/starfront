@@ -703,6 +703,16 @@ class Store:
             " ORDER BY issued", agent_id, *states)
         return [json.loads(row["payload"]) for row in rows]
 
+    def last_sent_by_project(self, agent_id: str) -> dict[str, dict[str, Any]]:
+        """When this telescope last reported a night on each project: the
+        latest `received` and the latest night it named. Evidence that it is
+        really shooting a project, which an accepted task alone is not."""
+        rows = self._all(
+            "SELECT project, MAX(received) AS received, MAX(night) AS night"
+            " FROM contributions WHERE agent = ? GROUP BY project", agent_id)
+        return {str(row["project"]): {"received": float(row["received"] or 0.0),
+                                      "night": str(row["night"] or "")} for row in rows}
+
     def tasks_in(self, project_id: str) -> list[dict[str, Any]]:
         rows = self._all("SELECT payload FROM tasks WHERE project = ?"
                          " ORDER BY issued", project_id)

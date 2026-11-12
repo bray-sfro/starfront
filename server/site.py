@@ -35,6 +35,20 @@ BACK = ("/", "/collabs", "/me", "/telescopes", "/files")
 #: server says otherwise (app.py passes its own ONLINE_SECONDS).
 ONLINE_SECONDS = 25 * 60
 
+#: A joined collaboration counts as being worked on when the telescope has
+#: reported a night on it this recently (or says it is on it right now).
+#: Joined and silent longer than this, it is "joined", not "working on".
+WORKING_SECONDS = 14 * 86400
+
+#: Not seen for this long, a telescope goes under "not seen lately" rather
+#: than among the ones in use.
+STALE_SECONDS = 30 * 86400
+
+#: An enrolment that stopped checking in no later than this after a newer,
+#: identical one of the same owner's was made, was replaced by it: the same
+#: telescope connected again (a reinstall, a new profile, a lost token).
+REPLACED_SLACK_SECONDS = 15 * 60
+
 
 def _num(value: Any) -> float | None:
     try:
@@ -77,13 +91,25 @@ class Site:
         if scale and width and height:
             field = [round(width / binning * scale / 3600, 2), round(height / binning * scale / 3600, 2)]
         filters = profile.get("filters") if isinstance(profile.get("filters"), dict) else {}
+        # A task the server holds as accepted is not proof the rig is on it:
+        # removing the target from the rig's plan leaves the collaboration
+        # joined on the server, which goes on dealing it panels every night.
+        # So "working on" needs the rig to have said so - it is pointed at it
+        # now, or it reported a night on it lately - and the rest is "joined".
+        sent = self.store.last_sent_by_project(agent["id"])
         work = []
         for task in self.store.tasks_for(agent["id"]):
             project = self.store.project(str(task.get("project") or ""))
             if project is None or project.get("status") != "open":
                 continue
+            last = sent.get(project["id"]) or {}
+            received = last.get("received") or None
+            active = (str(said.get("project") or "") == project["id"]
+                      or bool(received and now - received <= WORKING_SECONDS))
             work.append({"project": project["id"], "name": project["name"],
                          "state": str(task.get("state") or ""),
+                         "active": active, "lastSent": received,
+                         "lastNight": last.get("night") or None,
                          "personal": project.get("scope") == "personal"})
         # The name the rig gives itself on each check-in, over the one it was
         # enrolled under ("Telescope 1" on nearly every install).
@@ -107,7 +133,61 @@ class Site:
                 "rotation": _num(profile.get("rotation")),
             },
             "work": work,
+            "_fingerprint": self._fingerprint(agent, profile),
+            "_created": float(agent.get("created") or 0.0),
         }
+
+    @staticmethod
+    def _fingerprint(agent: dict[str, Any], profile: dict[str, Any]) -> tuple[Any, ...] | None:
+        """What makes two enrolments the same telescope connected twice: the
+        name it was enrolled under and the optics it reported. None when it
+        never reported optics, so empty profiles are never folded together."""
+        focal, pixel = _num(profile.get("focalLength")), _num(profile.get("pixelSize"))
+        if not focal or not pixel:
+            return None
+        return (str(agent.get("name") or "").strip().lower(), round(focal, 1), round(pixel, 2),
+                bool(profile.get("colour")), str(profile.get("client") or ""))
+
+    def fold_replaced(self, cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Fold enrolments that were replaced into the one that replaced them.
+
+        Connecting the same telescope again (the N.I.N.A. plugin after a
+        reinstall or a new profile, say) makes a new enrolment and leaves the
+        old one behind, never to check in again; each used to be a card of its
+        own. An enrolment is folded into a newer identical one when it had
+        stopped checking in by the time the newer one was made, so two real
+        telescopes with the same optics, both in use, stay two cards. Nothing
+        is deleted; the survivor says how many earlier enrolments it stands for.
+        """
+        ordered = sorted(cards, key=lambda c: c["_created"])
+        heads: dict[int, dict[str, Any]] = {}        # id(card) -> the card it folds into
+        for i, old in enumerate(ordered):
+            if old["_fingerprint"] is None:
+                continue
+            for new in ordered[i + 1:]:
+                if (new["_fingerprint"] == old["_fingerprint"]
+                        and (old["seen"] or old["_created"]) <= new["_created"] + REPLACED_SLACK_SECONDS):
+                    heads[id(old)] = new
+                    break
+        kept = []
+        for card in ordered:
+            if id(card) in heads:
+                continue
+            kept.append(card)
+        for card in ordered:
+            if id(card) not in heads:
+                continue
+            head = card
+            while id(head) in heads:
+                head = heads[id(head)]
+            head.setdefault("replaces", []).append(card["id"])
+            head["firstAdded"] = min(head.get("firstAdded") or head["added"] or 0, card["added"] or 0)
+        for card in kept:
+            card.setdefault("replaces", [])
+            card.setdefault("firstAdded", card["added"])
+            card.pop("_fingerprint", None)
+            card.pop("_created", None)
+        return kept
 
     def collab_card(self, project: dict[str, Any], who: dict[str, Any] | None) -> dict[str, Any] | None:
         """One collaboration as a card: what it is, how far along, its picture."""
@@ -169,10 +249,19 @@ class Site:
             if who is None:
                 raise HTTPException(status_code=401, detail="sign in with Discord first")
             now = time.time()
-            cards = [self.telescope_card(agent, now) for agent in self.store.agents_of(str(who["id"]))]
+            cards = self.fold_replaced([self.telescope_card(agent, now)
+                                        for agent in self.store.agents_of(str(who["id"]))])
             cards.sort(key=lambda c: (not c["online"], -(c["seen"] or 0), c["name"].lower()))
-            return {"telescopes": cards, "online": sum(1 for c in cards if c["online"]),
-                    "onlineSeconds": self.online_seconds, "time": now}
+            # Not seen in a month and working on nothing lately: listed apart,
+            # so the page leads with the telescopes in use.
+            stale = [c for c in cards if not c["online"]
+                     and now - (c["seen"] or c["added"] or 0) > STALE_SECONDS
+                     and not any(w["active"] for w in c["work"])]
+            cards = [c for c in cards if c not in stale]
+            return {"telescopes": cards, "notSeenLately": stale,
+                    "online": sum(1 for c in cards if c["online"]),
+                    "onlineSeconds": self.online_seconds, "staleSeconds": STALE_SECONDS,
+                    "time": now}
 
         @app.get("/signin")
         def signin(back: str = Query(default="/", max_length=40)):
@@ -732,6 +821,8 @@ _TELESCOPES = r"""
   .chip { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: #1a2130; color: #c3cddb; }
   .work { font-size: 13px; display: flex; flex-direction: column; gap: 4px; }
   .work a { text-decoration: none; }
+  .stale { margin-top: 22px; } .stale summary { cursor: pointer; margin-bottom: 14px; font-size: 14px; }
+  .stale .scope { opacity: .75; }
   @media (max-width: 420px) { .grid { grid-template-columns: 1fr; } }
 <!--split-->
 <div class="head">
@@ -742,6 +833,7 @@ _TELESCOPES = r"""
   <div class="small muted" id="fresh"></div>
 </div>
 <div class="grid" id="grid"></div>
+<details id="stale" class="stale" hidden><summary class="muted" id="staleN"></summary><div class="grid" id="staleGrid"></div></details>
 <div class="panel empty" id="signin" hidden>
   <h3>Sign in to see your telescopes</h3>
   <p class="small">They are listed under the Discord account they were connected with.</p>
@@ -786,8 +878,12 @@ function card(t) {
     e.rotation != null ? ['Camera angle', Math.round(e.rotation) + '° (fixed)'] : null,
   ].filter(Boolean);
   const known = e.focalLength || e.sensor || (e.filters || []).length;
-  const work = (t.work || []).map((w) => `<span>${w.state === 'accepted' ? 'Working on' : 'Offered'} ${
-    w.personal ? esc(w.name) : `<a href="/files?project=${encodeURIComponent(w.project)}">${esc(w.name)}</a>`}</span>`).join('');
+  const verb = (w) => w.state !== 'accepted' ? 'Offered'
+    : w.active ? 'Working on' : 'Joined';
+  const quiet = (w) => w.state !== 'accepted' || w.active ? ''
+    : ` <span class="muted">· ${w.lastNight ? 'nothing sent since ' + esc(w.lastNight) : 'nothing sent yet'}</span>`;
+  const work = (t.work || []).map((w) => `<span>${verb(w)} ${
+    w.personal ? esc(w.name) : `<a href="/files?project=${encodeURIComponent(w.project)}">${esc(w.name)}</a>`}${quiet(w)}</span>`).join('');
   return `<article class="scope ${t.online ? 'on' : ''}">
     <div class="top"><span class="dot" aria-hidden="true"></span>
       <div><h2>${esc(t.name || 'Telescope')}</h2><div class="status">${status}</div></div></div>
@@ -796,7 +892,8 @@ function card(t) {
       : '<div class="small muted">No equipment details yet. They arrive with its next check-in.</div>'}
     ${(e.filters || []).length ? `<div class="chips">${e.filters.map((f) => `<span class="chip">${esc(f)}</span>`).join('')}</div>` : ''}
     ${work ? `<div class="work">${work}</div>` : ''}
-    <div class="small muted">Connected ${esc(when(t.added))}${t.enrolledAs && t.enrolledAs !== t.name ? ' as ' + esc(t.enrolledAs) : ''}</div>
+    <div class="small muted">Connected ${esc(when(t.added))}${t.enrolledAs && t.enrolledAs !== t.name ? ' as ' + esc(t.enrolledAs) : ''}${
+      (t.replaces || []).length ? ` · connected again ${t.replaces.length} time${t.replaces.length === 1 ? '' : 's'} since ${esc(when(t.firstAdded))}` : ''}</div>
   </article>`;
 }
 async function load() {
@@ -808,7 +905,11 @@ async function load() {
   }
   $('signin').hidden = true;
   $('grid').innerHTML = d.telescopes.map(card).join('');
-  $('none').hidden = d.telescopes.length > 0;
+  const stale = d.notSeenLately || [];
+  $('stale').hidden = !stale.length;
+  $('staleN').textContent = `${stale.length} telescope${stale.length === 1 ? '' : 's'} not seen in ${Math.round((d.staleSeconds || 0) / 86400)} days`;
+  $('staleGrid').innerHTML = stale.map(card).join('');
+  $('none').hidden = d.telescopes.length + stale.length > 0;
   const n = d.telescopes.length;
   $('sub').textContent = n ? `${d.online} of ${n} online. A telescope counts as online for ${Math.round(d.onlineSeconds / 60)} minutes after its last check-in.`
     : 'The telescopes connected to your Starfront account.';
