@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.0.33
+
+- *Wait for the target to rise*, on by default, on the *Starfront collaboration* container. If a dealt field is still below the project's altitude floor or your horizon when its turn comes, the container now sits until it is up (and far enough from a Moon that is up), then shoots it, instead of ending and leaving a gap in the sequence. Fields that are already up are still shot first. The wait is checked once a minute and stops at astronomical dawn, or at once if the sequence is cancelled. Untick the box on the container to keep the old skip-and-move-on behaviour.
+
+
 ## 1.0.0.32
 
 - **Your collaboration lights go to the server as they are saved, on by default.** Every light the *Starfront collaboration* container takes is handed to an upload queue the moment N.I.N.A. saves it (its image-saved event) and sent in the background to collab.starfront.space, where the coordinator stacks it. Nothing waits on it: the queue is a thread of its own, an upload cut off carries on where it stopped, and a collaboration that is not taking files is left alone for an hour. Your files are only read, never moved, changed or deleted. Switch it off under Options > Plugins > Starfront > *Upload my collaboration lights*.
