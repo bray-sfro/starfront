@@ -156,6 +156,33 @@ namespace Starfront.Collab.Server {
         public Task<JObject> DepthAsync(string agentToken, string projectId, CancellationToken token) =>
             Call<JObject>(HttpMethod.Get, $"/api/v1/agent/projects/{Q(projectId)}/depth", null, agentToken, token);
 
+        // -- a telescope: personal projects (not offered in the UI yet) --------
+        //
+        // A personal project is the owner's own imaging of one target, private
+        // to them. The server makes one per target on first use and the frames
+        // then go through the same resumable upload as a collaboration's
+        // (/api/v1/agent/uploads), with the personal project's id as the
+        // project. The server answers 403 while personal projects are not open
+        // and 402 when the owner has no plan for them: both mean "do not send",
+        // never "try again".
+
+        public Task<PersonalStatus> PersonalStatusAsync(string agentToken, CancellationToken token) =>
+            Call<PersonalStatus>(HttpMethod.Get, "/api/v1/agent/personal", null, agentToken, token);
+
+        // A mosaic is one target with its panels under it. Pass the panel when
+        // the sequence knows it; otherwise the server reads it from the name
+        // N.I.N.A. gives the target ("M31 Panel 3"). Either way the returned
+        // Project is the panel's, to upload into, and Target is the mosaic's.
+        public Task<PersonalProject> PersonalProjectAsync(string agentToken, string target, double? raDegrees, double? decDegrees, CancellationToken token, string panel = null) {
+            var body = new JObject { ["target"] = target ?? "" };
+            if (raDegrees.HasValue && decDegrees.HasValue) {
+                body["ra"] = raDegrees.Value;
+                body["dec"] = decDegrees.Value;
+            }
+            if (!string.IsNullOrWhiteSpace(panel)) body["panel"] = panel.Trim();
+            return Call<PersonalProject>(HttpMethod.Post, "/api/v1/agent/personal", body, agentToken, token);
+        }
+
         /// <summary>Log a server call's failure once, at the right level: being offline is a warning, a refusal is an error.</summary>
         public static void Log(string what, Exception ex) {
             if (ex is ServerException se && se.Status == 0) Logger.Warning($"Starfront: {what} - {ex.Message}");
