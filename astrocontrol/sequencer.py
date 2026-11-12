@@ -45,7 +45,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import allsky, astro, capture, filters, plans, roofguard, schedule
+from . import allsky, astro, capture, coverprep, filters, plans, roofguard, schedule
 from .devices.base import DeviceError, read_slot
 from .recovery import (FAILED as RIG_FAILED, OK as RIG_OK, RECOVERING as RIG_RECOVERING,
                        ProgressJournal, RigRecovery, backoff, call_with_timeout)
@@ -1046,6 +1046,7 @@ class Sequencer:
         if panel is None:
             return "nothing to centre on (the run carries on with what it has)"
         label = f"{(entry or {}).get('name') or 'the target'}"
+        self._ensure_sky_cover(label)
         ra, dec = astro.normalise_ra_hours(panel["ra"]), float(panel["dec"])
         self._set("slewing", f"auto-restart: slewing to {label}")
         mount = self._slew(self._mount_ready(), ra, dec, label)
@@ -1500,8 +1501,13 @@ class Sequencer:
                        + ", ".join(e.get("name", "?") for e in stored["entries"][:8])
                        + ("…" if len(stored["entries"]) > 8 else ""))
             self._prepare_cameras()
-            if any(not plans.is_calibration(e) for e in stored["entries"]):
-                self._open_cover()
+            # The cover is not opened here. A plan that starts with darks,
+            # bias or panel flats must keep it shut; a light target opens it
+            # in _goto, before the slew and before any centring or autofocus
+            # frame. Opening here used to run whenever any later entry was a
+            # light, including in front of the darks, and it trusted a
+            # has_cover flag latched at connect so an Unknown Alnitak never
+            # moved.
             self._walk_plan(stored, known)
 
             self._set(IDLE, "sequence finished")
@@ -1696,35 +1702,54 @@ class Sequencer:
                   else "Mount stopped moving but does not report being at home",
                   "success" if mount.at_home else "warn")
 
-    def _open_cover(self) -> None:
-        """Open the flat panel's cover before the first slew, light off.
+    def _ensure_sky_cover(self, label: str) -> None:
+        """Open and verify every connected cover before `label` looks at the sky.
+
+        Re-reads the driver. Does nothing during a dark, bias or panel-flat
+        run (the roof guard is held for those). Does not command the roof.
+        """
+        if coverprep.guard_blocks_open():
+            return
+        rigs = self.rigs.imaging() if hasattr(self.rigs, "imaging") else [self.master]
+        for rig in rigs:
+            panel = None
+            with contextlib.suppress(Exception):
+                panel = rig.manager.get("flatpanel")
+            if panel is None or not getattr(panel, "connected", False):
+                continue
+            self._open_cover(panel, label)
+
+    def _open_cover(self, panel: Any = None, label: str = "the first slew") -> None:
+        """Open one flat panel's cover and wait until it reports Open.
 
         A cover closed at the end of one night stays closed until something
-        opens it, and nothing did: the next night's frames were of the inside
-        of the lid. A cover that will not open ends the night here rather than
-        after an hour of those.
+        opens it. `has_cover` latched at connect is not consulted: CoverState
+        is read now, and Unknown on a connected CoverCalibrator is opened.
+        A cover that does not report Open holds the run instead of letting
+        a centring frame or an autofocus frame shoot through the lid.
         """
-        panel = self.manager.get("flatpanel")
-        if panel is None or not panel.connected:
+        if coverprep.guard_blocks_open():
             return
-        with contextlib.suppress(Exception):
-            panel.turn_off()
-        if not getattr(panel, "has_cover", False):
-            return
-        if panel.cover_state in ("open", "notpresent"):
+        if panel is None:
+            panel = self.manager.get("flatpanel")
+        if panel is None or not getattr(panel, "connected", False):
             return
         self._set("homing", "opening the cover")
-        self._say("Opening the flat panel's cover")
-        panel.open_cover()
-        deadline = time.monotonic() + float(
-            self._settings().get("coverTimeoutSeconds") or 120.0)
-        while panel.cover_state == "moving" and time.monotonic() < deadline:
-            self._check()
-            time.sleep(0.5)
-        if panel.cover_state != "open":
-            raise DeviceError(f"the flat panel's cover is {panel.cover_state}, "
-                              "not open")
-        self._say("Cover open", "success")
+
+        def log(message: str, level: str = "info") -> None:
+            text = message
+            if message.startswith("Opening the cover"):
+                text = f"Opening the cover before {label} — {message}"
+            self._say(text, level)
+
+        try:
+            coverprep.ensure_open(
+                panel, timeout=coverprep.timeout_seconds(self.config),
+                log=log, check=self._check,
+                command=coverprep.auto_cover(self.config))
+        except coverprep.CoverHeld:
+            self._set("waiting", f"holding: the cover is not open before {label}")
+            raise
 
     def _walk_plan(self, stored: dict[str, Any], known: dict[str, Any]) -> None:
         """Work through the plan in order, finishing each target before the next.
@@ -2101,6 +2126,7 @@ class Sequencer:
             return
 
         self._wait_for_start(entry)
+        self._ensure_sky_cover(entry.get("name") or "the all-sky survey")
         if not self._ensure_roof_open(entry.get("name") or "the all-sky survey", entry):
             return
         settings = {**self.config.section("allsky"), **(parameters.get("plan") or {})}
@@ -2362,6 +2388,10 @@ class Sequencer:
         latitude, longitude = site
 
         self._wait_for_start(entry)
+        # The cover first, and whether or not the roof is already open. The
+        # Twin FSQ left the lid shut through centring and autofocus because
+        # nothing re-read CoverState until a later light frame.
+        self._ensure_sky_cover(entry.get("name") or "the target")
         # 0.2.53b: the roof opened before anything moves or exposes - at the
         # start of the sequence (its first target) and before every target
         # after it, if it is not open by then.
@@ -2674,7 +2704,11 @@ class Sequencer:
         and a centring has lost its star, and its corrections fight the sync
         and the nudges. `_run_entry` starts it again once the panel is
         centred and focused.
+
+        The cover is verified before the home and the slew, so a centring
+        frame cannot be the first thing that asks the lid to move.
         """
+        self._ensure_sky_cover(label)
         self._home_mount()
         guider = self.manager.get("guider")
         if guider is not None and guider.connected and guider.guiding:
@@ -2924,6 +2958,9 @@ class Sequencer:
                      entry: dict[str, Any] | None = None) -> None:
         """Focus every telescope at once, if any of them is due.
 
+        The cover is verified before the first autofocus frame. A sweep
+        through a closed lid measures nothing and used to run anyway.
+
         They go together because a focus sweep defocuses the stars on purpose:
         while one telescope is sweeping, nothing else on the mount can be taking
         a usable frame anyway.  Doing them in series would double the time the
@@ -2964,6 +3001,8 @@ class Sequencer:
         if not reasons:
             return
 
+        # Before the first autofocus exposure, not merely before a light.
+        self._ensure_sky_cover(label or "autofocus")
         first = next(iter(reasons.values()))
         for rig in rigs:
             self._refocus_reason.pop(rig.id, None)
@@ -3249,6 +3288,11 @@ class Sequencer:
                 time.sleep(0.3)
 
         if settings.get("flipSolve", True) and self.solver.executable() is not None:
+            # A full sequencer re-checks the cover before the post-flip solve.
+            # A rotator-only stand-in used by the flip check has no cover.
+            ensure = getattr(self, "_ensure_sky_cover", None)
+            if ensure is not None:
+                ensure("the re-centre after the flip")
             self._set("flipping", "re-centring after the flip")
             try:
                 # With the panel's angle, so the solve measures the frame's
@@ -5226,6 +5270,9 @@ class Sequencer:
                     self._say(f"{rig.name}: " + "; ".join(outcome["failed"]), "warn")
                 elif outcome["connected"]:
                     self._say(f"{rig.name}: the camera is back", "success")
+                    # The lid may have dropped with the USB. Re-read it before
+                    # the next centring, autofocus or light frame.
+                    self._ensure_sky_cover(f"{rig.name} after the camera reconnect")
             except Exception as exc:              # noqa: BLE001 - reported, not fatal
                 self._say(f"{rig.name}: could not reconnect the camera — {exc}",
                           "warn")

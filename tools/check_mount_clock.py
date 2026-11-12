@@ -136,7 +136,7 @@ def method_body(path, name):
 
 
 # ---------------------------------------------------------------- the wiring
-case("version is 0.2.53h", __version__ == "0.2.53h", __version__)
+case("version is 0.2.53i", __version__ == "0.2.53i", __version__)
 case("the clock check is on the watchdog",
      any(fn.__name__ == "mount_clock" for fn in warnings.CHECKS))
 main_text = (ROOT / "astrocontrol/main.py").read_text()

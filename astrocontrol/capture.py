@@ -21,7 +21,7 @@ from typing import Any
 
 import numpy as np
 
-from . import astro
+from . import astro, coverprep
 from .config import Config, data_root, effective_site
 from .devices.base import CameraLostError, DeviceError, read_slot
 from .devices.manager import DeviceManager
@@ -325,6 +325,11 @@ class CaptureService:
         # for the activity line at the top of the screen.
         self._frame_type = ""
         self._current_filter = ""
+        # Set when a cover was confirmed open for the frame about to be taken,
+        # so the downloaded light can be rejected if it is still a bias.
+        self._cover_must_show_sky = False
+        # Set after a camera reconnect, so the next sky frame says it re-checked.
+        self._cover_recheck = False
 
     # -- where frames go ---------------------------------------------------
     @staticmethod
@@ -697,6 +702,9 @@ class CaptureService:
             self.manager.log("The camera did not come back", "error")
             return False
         self.manager.log("The camera is back", "success")
+        # The cover may have been power-cycled with the camera. The retried
+        # frame re-reads CoverState before the shutter opens.
+        self._cover_recheck = True
         return True
 
     def _run(self, exposure: float, frame_type: str, count: int) -> None:
@@ -725,51 +733,47 @@ class CaptureService:
         """Put the panel out and open the cover, for a frame that needs sky.
 
         Called before every light frame — a manual capture, a sequence sub, a
-        focus exposure, a plate solve — because all of them are ruined in the
-        same way by a shut cover, and because the alternative is remembering.
-        Calibration deliberately closes the cover for the darks and lights the
-        panel for the flats; this is what undoes both, at the moment it matters
-        rather than at the end of a run that may have been stopped half way.
+        focus exposure, a plate solve — and before a sky flat. Darks, bias and
+        panel flats do not come through here.
 
-        Anything the driver refuses is logged and carried past: a frame taken
-        through a stuck cover is a wasted frame, but a night that stops dead
-        because a cover reported the wrong state is a wasted night.
+        The cover is re-read now. A `has_cover` flag latched at connect is
+        ignored: an Alnitak that said Unknown at connect used to skip this
+        for the whole night, and the centring frames were of the inside of
+        the lid. Unknown is asked to open. NotPresent is left alone.
+
+        If the cover does not report Open within the timeout, this raises.
+        The frame is not taken. A night that images through a closed cover
+        is the failure this used to allow ("taking the frame anyway").
         """
         done: dict[str, Any] = {"panel": False, "cover": False}
-        if not self.config.get("calibration", "autoCover", True):
-            return done
+        self._cover_must_show_sky = False
+        blocked = coverprep.guard_blocks_open()
+        if blocked:
+            raise coverprep.CoverHeld(blocked)
         panel = self.manager.get("flatpanel")
-        if panel is None or not panel.connected:
+        if panel is None or not getattr(panel, "connected", False):
             return done
+        recheck = self._cover_recheck
+        self._cover_recheck = False
+        if recheck:
+            self.manager.log("Re-checking the cover after reconnect", "warn")
 
-        try:
-            if panel.light_on:
-                panel.turn_off()
-                done["panel"] = True
-                self.manager.log("Flat panel switched off for a light frame")
+        def log(message: str, level: str = "info") -> None:
+            self.manager.log(message, level)
 
-            # "notpresent" and "unknown" are left alone: there is either no
-            # cover or no way to tell, and driving one blind is worse.
-            if panel.has_cover and panel.cover_state in ("closed", "moving"):
-                if panel.cover_state == "closed":
-                    self.manager.log("Opening the cover for a light frame")
-                    panel.open_cover()
-                timeout = float(self.config.get("calibration",
-                                                "coverTimeoutSeconds", 180.0))
-                deadline = time.monotonic() + timeout
-                while panel.cover_state != "open":
-                    if self._abort.is_set():
-                        return done
-                    if time.monotonic() > deadline:
-                        self.manager.log(
-                            f"The cover is still {panel.cover_state} after "
-                            f"{timeout:g}s; taking the frame anyway", "warn")
-                        return done
-                    time.sleep(0.5)
-                done["cover"] = True
-                self.manager.log("Cover open", "success")
-        except Exception as exc:                  # noqa: BLE001 - never lose a night
-            self.manager.log(f"Could not open the light path: {exc}", "warn")
+        def check() -> None:
+            if self._abort.is_set():
+                raise DeviceError("aborted")
+
+        result = coverprep.ensure_open(
+            panel, timeout=coverprep.timeout_seconds(self.config),
+            log=log, check=check,
+            command=coverprep.auto_cover(self.config),
+            announce_open=recheck)
+        done["panel"] = True
+        if result == "open":
+            done["cover"] = True
+            self._cover_must_show_sky = True
         return done
 
     def _capture_one(self, exposure: float, frame_type: str,
@@ -891,6 +895,11 @@ class CaptureService:
             f"{'Saved' if record.saved else 'Captured (not saved)'} {record.filename}  "
             f"median {record.stats.get('median')} ADU, max {record.stats.get('max')}",
             "success")
+        if frame_type == "light" and self._cover_must_show_sky:
+            # The driver said Open. On the Twin FSQ it then saved a 503 ADU
+            # frame, which is a bias through a lid that had not moved.
+            coverprep.judge_sky_frame(
+                record.stats, getattr(camera, "offset", None))
 
     # -- gain and offset (0.2.53) ------------------------------------------
     def _wanted(self) -> dict[str, Any] | None:

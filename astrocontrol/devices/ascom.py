@@ -1142,7 +1142,9 @@ class AscomFlatPanel(_AscomDevice, FlatPanel):
         self._set("Connected", True)
         self._connected = True
         self.max_brightness = int(self._get("MaxBrightness", 100) or 100)
-        self.has_cover = self.cover_state not in ("notpresent", "unknown")
+        # CoverState is not latched here. An Alnitak often reports Unknown
+        # until it is asked, and a failed read used to be stored as "no cover"
+        # for the rest of the night.
 
     def disconnect(self) -> None:
         try:
@@ -1156,12 +1158,64 @@ class AscomFlatPanel(_AscomDevice, FlatPanel):
 
     @property
     def light_on(self) -> bool:
-        # CalibratorStatus: 1 = Off, 3 = Ready.
-        return int(self._get("CalibratorState", 1) or 1) == 3
+        # CalibratorStatus: 1 = Off, 3 = Ready. A failed read is off, not on.
+        return self.calibrator_state == "ready"
+
+    @property
+    def calibrator_state(self) -> str:
+        from .. import coverprep
+        missing = object()
+        value = self._get("CalibratorState", missing)
+        if value is missing or value is None:
+            return "unknown"
+        return coverprep.map_calibrator(value)
 
     @property
     def cover_state(self) -> str:
-        return self._COVER_STATES.get(int(self._get("CoverState", 0) or 0), "unknown")
+        # 0 is CoverStatus.NotPresent, a real answer. A failed read must not
+        # use that number, or a panel whose cover cannot be read is treated
+        # as a lamp with no cover and OpenCover is never sent.
+        from .. import coverprep
+        missing = object()
+        value = self._get("CoverState", missing)
+        if value is missing or value is None:
+            return "unread"
+        return coverprep.map_cover(value)
+
+    def probe_cover(self, timeout: float = 1.5) -> dict:
+        """One bounded cover/light read for the status cache. Not for commands."""
+        from .. import coverprep
+        error = ""
+        try:
+            raw_cover = self._read("CoverState", timeout)
+            state = coverprep.map_cover(raw_cover)
+        except Exception as exc:                     # noqa: BLE001 - cached, not raised
+            state = "unread"
+            error = str(exc)
+        try:
+            raw_cal = self._read("CalibratorState", timeout)
+            calibrator = coverprep.map_calibrator(raw_cal)
+        except Exception as exc:                     # noqa: BLE001
+            calibrator = "unknown"
+            error = error or str(exc)
+        try:
+            brightness = int(self._read("Brightness", timeout) or 0)
+        except Exception as exc:                     # noqa: BLE001
+            brightness = None
+            error = error or str(exc)
+        has = False if state == "notpresent" else (
+            True if state in ("closed", "moving", "open", "error") else None)
+        return {
+            "connected": True,
+            "coverState": state,
+            "hasCover": has,
+            "lightOn": calibrator == "ready",
+            "calibratorState": calibrator,
+            "brightness": brightness,
+            "maxBrightness": self.max_brightness,
+            "error": error,
+            "stale": state == "unread",
+        }
 
     def turn_on(self, brightness: int) -> None:
         self._require()
@@ -1180,15 +1234,22 @@ class AscomFlatPanel(_AscomDevice, FlatPanel):
         self._invoke("CloseCover")
 
     def status(self) -> dict[str, Any]:
+        # The cache only. CoverState on a stuck Alnitak must not run inside
+        # the status request; the probe thread fills the cache.
         if not self._connected:
             return {"connected": False}
+        from .. import coverstatus
+        snap = coverstatus.cached(self)
         return {
             "connected": True,
-            "brightness": self.brightness,
-            "maxBrightness": self.max_brightness,
-            "lightOn": self.light_on,
-            "hasCover": self.has_cover,
-            "coverState": self.cover_state,
+            "brightness": snap.get("brightness"),
+            "maxBrightness": snap.get("maxBrightness", self.max_brightness),
+            "lightOn": snap.get("lightOn"),
+            "calibratorState": snap.get("calibratorState") or "",
+            "hasCover": snap.get("hasCover"),
+            "coverState": snap.get("coverState") or "unknown",
+            "readAt": snap.get("readAt"),
+            "stale": snap.get("stale", True),
         }
 
 

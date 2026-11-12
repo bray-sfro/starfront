@@ -800,7 +800,7 @@ class AlpacaFlatPanel(_AlpacaDevice, FlatPanel):
     def connect(self) -> None:
         super().connect()
         self.max_brightness = int(self._client.get("maxbrightness") or 100)
-        self.has_cover = self.cover_state not in ("notpresent", "unknown")
+        # Cover state is re-read when a sky frame needs it. Not latched here.
 
     @property
     def brightness(self) -> int:
@@ -808,12 +808,60 @@ class AlpacaFlatPanel(_AlpacaDevice, FlatPanel):
 
     @property
     def light_on(self) -> bool:
-        return int(self._client.get_cached("calibratorstate", 1.0, 1) or 1) == 3
+        return self.calibrator_state == "ready"
+
+    @property
+    def calibrator_state(self) -> str:
+        from .. import coverprep
+        missing = object()
+        value = self._client.get_cached("calibratorstate", 1.0, missing)
+        if value is missing or value is None:
+            return "unknown"
+        return coverprep.map_calibrator(value)
 
     @property
     def cover_state(self) -> str:
-        value = self._client.get_cached("coverstate", 1.0, 0)
-        return self._COVER_STATES.get(int(value or 0), "unknown")
+        # A missing read is unread. 0 is NotPresent only when the driver said 0.
+        from .. import coverprep
+        missing = object()
+        value = self._client.get_cached("coverstate", 1.0, missing)
+        if value is missing or value is None:
+            return "unread"
+        return coverprep.map_cover(value)
+
+    def probe_cover(self, timeout: float = 1.5) -> dict:
+        """Bounded cover/light read for the status cache."""
+        from .. import coverprep
+        error = ""
+        try:
+            state = coverprep.map_cover(self._client.get("coverstate", timeout=timeout))
+        except Exception as exc:                     # noqa: BLE001
+            state = "unread"
+            error = str(exc)
+        try:
+            calibrator = coverprep.map_calibrator(
+                self._client.get("calibratorstate", timeout=timeout))
+        except Exception as exc:                     # noqa: BLE001
+            calibrator = "unknown"
+            error = error or str(exc)
+        try:
+            brightness = int(self._client.get("brightness", timeout=timeout) or 0)
+        except Exception as exc:                     # noqa: BLE001
+            brightness = None
+            error = error or str(exc)
+        has = False if state == "notpresent" else (
+            True if state in ("closed", "moving", "open", "error") else None)
+        return {
+            "connected": True,
+            "coverState": state,
+            "hasCover": has,
+            "lightOn": calibrator == "ready",
+            "calibratorState": calibrator,
+            "brightness": brightness,
+            "maxBrightness": self.max_brightness,
+            "error": error,
+            "stale": state == "unread",
+        }
 
     def turn_on(self, brightness: int) -> None:
         self._require()
@@ -834,13 +882,18 @@ class AlpacaFlatPanel(_AlpacaDevice, FlatPanel):
     def status(self) -> dict[str, Any]:
         if not self._connected:
             return {"connected": False}
+        from .. import coverstatus
+        snap = coverstatus.cached(self)
         return {
             "connected": True,
-            "brightness": self.brightness,
-            "maxBrightness": self.max_brightness,
-            "lightOn": self.light_on,
-            "hasCover": self.has_cover,
-            "coverState": self.cover_state,
+            "brightness": snap.get("brightness"),
+            "maxBrightness": snap.get("maxBrightness", self.max_brightness),
+            "lightOn": snap.get("lightOn"),
+            "calibratorState": snap.get("calibratorState") or "",
+            "hasCover": snap.get("hasCover"),
+            "coverState": snap.get("coverState") or "unknown",
+            "readAt": snap.get("readAt"),
+            "stale": snap.get("stale", True),
         }
 
 
