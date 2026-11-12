@@ -107,6 +107,8 @@ namespace Starfront.Collab.Services {
                 : new JValue(double.IsNaN(settings.CameraAngle) ? 0.0 : Math.Round(settings.CameraAngle, 2));
 
             var body = new JObject {
+                // Shown on the chart. The server stores it and does not file by it;
+                // a light is filed under the scope id the uploader sends.
                 ["name"] = settings.TelescopeName,
                 ["focalLength"] = focal > 0 ? new JValue(focal) : JValue.CreateNull(),
                 ["pixelSize"] = pixel > 0 ? new JValue(pixel) : JValue.CreateNull(),

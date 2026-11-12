@@ -113,6 +113,10 @@ class CollabClient:
         self._reached: float = 0.0
         self._server: dict[str, Any] = {}
         self._compatibility: dict[str, Any] | None = None
+        #: Scopes the server last listed for this agent, and the display name
+        #: it sent with hello. Ids only; names are looked up when drawn.
+        self._scopes: list[dict[str, Any]] = []
+        self._display_name: str = ""
 
     # -- settings ----------------------------------------------------------
     def settings(self) -> dict[str, Any]:
@@ -393,6 +397,12 @@ class CollabClient:
             self._agent_id = str(answer.get("agent") or "")
             self._reached = time.time()
             self._error = None
+            self._remember_scopes(answer)
+        # GET /scopes is authoritative when the server has it. A server that
+        # does not is left on whatever hello just said.
+        with _quiet():
+            self.refresh_scopes()
+        with self._lock:
             # How far this PC's clock is from the server's. A wrong clock
             # puts every timestamp and every plan time out by the same
             # amount, and nothing else in the program can tell.
@@ -703,7 +713,42 @@ class CollabClient(CollabClient):  # noqa: E0102 - continued below
                 "agentId": self._agent_id,
                 "presence": dict(self._presence),
                 "clockSkew": self._clock_skew,
+                "scopes": list(self._scopes),
+                "displayName": self._display_name,
             }
+
+    def known_scopes(self) -> list[dict[str, Any]]:
+        """Scopes the server last returned. Empty until hello or GET /scopes."""
+        with self._lock:
+            return list(self._scopes)
+
+    def _remember_scopes(self, payload: Any) -> None:
+        """Take scopes from a hello or GET body. Caller holds ``_lock`` when the body is hello."""
+        from . import scopes
+        if not isinstance(payload, dict):
+            return
+        if "scopes" in payload:
+            self._scopes = scopes.parse_scope_list(payload)
+        display = payload.get("displayName")
+        if display:
+            self._display_name = str(display)[:120]
+
+    def refresh_scopes(self) -> list[dict[str, Any]]:
+        """``GET /api/v1/scopes`` on the agent token. A failure leaves the last list."""
+        from . import scopes
+        try:
+            answer = self._call("GET", "/api/v1/scopes")
+        except RuntimeError:
+            with self._lock:
+                return list(self._scopes)
+        with self._lock:
+            if isinstance(answer, dict) and "scopes" in answer:
+                self._scopes = scopes.parse_scope_list(answer)
+            elif isinstance(answer, list):
+                self._scopes = scopes.parse_scope_list(answer)
+            if isinstance(answer, dict) and answer.get("displayName"):
+                self._display_name = str(answer["displayName"])[:120]
+            return list(self._scopes)
 
 
 class _quiet:

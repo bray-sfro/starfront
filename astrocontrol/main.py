@@ -25,6 +25,7 @@ from . import (allsky, astro, autoplan, autoupload, calibrating, calibration, ca
                overheads,
                piercam, plans, safety, schedule, solarsystem, survey)
 from . import collab
+from . import scopes
 from . import autorestart
 from .tasks import DeviceTasks, TaskBusy, TaskFailed
 from . import filters
@@ -625,6 +626,9 @@ class CollabSettingsRequest(BaseModel):
     autoUploadRigs: list[str] | None = Field(default=None, max_length=20)
     autoUploadMbit: float | None = Field(default=None, ge=0, le=1000)
     autoUploadDaytimeOnly: bool | None = None
+    # On, uploads carry a scope id and the collab tab lists the server's
+    # scopes. Off is the previous path (no scope id).
+    registeredScopes: bool | None = None
 
 
 class CollabTaskRequest(BaseModel):
@@ -3064,6 +3068,67 @@ def collab_respond(body: CollabTaskRequest) -> dict[str, Any]:
             "plan": plan.raw() if adopted else None}
 
 
+def _scope_view() -> dict[str, Any]:
+    """The dropdown: the server's scopes, and the id stored on each telescope.
+
+    Bound scopes come first. The label is ``displayName``. The stored value
+    is the id, so a rename on the server changes the label the next time the
+    list is read and nothing else.
+    """
+    enabled = scopes.registered_scopes_enabled(config)
+    known = collab_client.known_scopes()
+    choices = scopes.dropdown_choices(known)
+    telescopes = []
+    for rig in rigs.all:
+        scope_id = ""
+        with contextlib.suppress(Exception):
+            scope_id = equipment.scope_id(rig.id)
+        telescopes.append({
+            "id": rig.id,
+            "name": rig.name,
+            "scopeId": scope_id,
+            "displayName": scopes.label_for(known, scope_id),
+        })
+    return {
+        "enabled": enabled,
+        "choices": choices,
+        "telescopes": telescopes,
+        "registerUrl": scopes.REGISTER_URL,
+        "displayName": str(collab_client.status().get("displayName") or ""),
+    }
+
+
+class ScopeSelection(BaseModel):
+    rig: str = Field(min_length=1, max_length=40)
+    scopeId: str = Field(default="", max_length=80)
+
+
+@app.post("/api/collab/scope")
+def set_collab_scope(body: ScopeSelection) -> dict[str, Any]:
+    """Remember which registered scope one equipment telescope files under.
+
+    The id has to be one the server listed. Registering or binding is a
+    person's action on the server; this does not do either, and it does not
+    invent an id. Blank clears the choice and the server resolves the bind.
+    """
+    if not scopes.registered_scopes_enabled(config):
+        raise HTTPException(status_code=400,
+                            detail="registered scopes are off")
+    _rig(body.rig)
+    known = collab_client.known_scopes()
+    if body.scopeId.strip() and not known:
+        with contextlib.suppress(Exception):
+            known = collab_client.refresh_scopes()
+    try:
+        chosen = scopes.accept_scope_id(known, body.scopeId)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _guard(equipment.set_scope_id, body.rig, chosen)
+    with contextlib.suppress(Exception):
+        uploader.release_held(body.rig)
+    return _collab_state()
+
+
 def _collab_state() -> dict[str, Any]:
     """The client's status, plus what this machine has done about it.
 
@@ -3116,6 +3181,7 @@ def _collab_state() -> dict[str, Any]:
         "pollMinutes": float(config.get("collab", "pollMinutes", 10) or 10),
         "sharePosition": bool(config.get("collab", "sharePosition", True)),
         "telescope": rigs.master.name,
+        "scopes": _scope_view(),
         "defaultServer": collab.DEFAULT_SERVER,
         # Whether the server offers Discord sign-in at all. Known from the
         # last health check; None until the server has answered once.
@@ -3366,10 +3432,11 @@ def _presence_hint() -> dict[str, Any]:
     the name of the target being shot - never the observatory's location.
     """
     said: dict[str, Any] = {}
-    # What this telescope is called, for the chart. The equipment profile's
-    # name when one is loaded - "fsq106", "RASA 8" - because the rig's own
-    # name is "Telescope 1" on nearly every install, and three dots all
-    # labelled Telescope 1 tell nobody anything.
+    # What this telescope is called, for the chart only. The server stores
+    # this and does not file by it (0.2.55 files by the scope id). The
+    # equipment profile's name when one is loaded - "fsq106", "RASA 8" -
+    # because the rig's own name is "Telescope 1" on nearly every install,
+    # and three dots all labelled Telescope 1 tell nobody anything.
     with contextlib.suppress(Exception):
         profile_name = str((equipment.active() or {}).get("name") or "").strip()
         said["telescope"] = (profile_name or rigs.master.name)[:60]

@@ -183,6 +183,14 @@ class Rig:
         self.capture.wanted_settings = self.camera_settings_wanted
         self.capture.note_settings = self.note_camera_settings
 
+    @property
+    def scope_id(self) -> str:
+        """The registered scope stored for this telescope. The id, not the name."""
+        try:
+            return self.store.scope_id(self.id)
+        except Exception:                          # noqa: BLE001 - a missing rig stores nothing
+            return ""
+
     # -- the camera's running settings -------------------------------------
     def note_camera_settings(self, gain: int | None = None, offset: int | None = None,
                              source: str = "") -> None:

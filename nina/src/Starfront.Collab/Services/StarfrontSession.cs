@@ -142,6 +142,7 @@ namespace Starfront.Collab.Services {
                 var presenceSaid = settings.SharePosition ? RigProfile.Presence(host, settings, Run, reporter) : null;
                 var hello = await client.HelloAsync(agentToken, profile, presenceSaid, token).ConfigureAwait(false);
                 if (hello.ServerTime > 0) ClockSkewSeconds = Math.Round(DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0 - hello.ServerTime, 1);
+                await RememberScopesAsync(agentToken, hello, token).ConfigureAwait(false);
 
                 var moon = MoonTonight();
                 var answer = await client.TaskAsync(agentToken, Tonight, moon?.Illumination, moon?.UpFraction, token).ConfigureAwait(false);
@@ -182,6 +183,23 @@ namespace Starfront.Collab.Services {
                 RaisePropertyChanged(nameof(StatusText));
                 Updated?.Invoke(this, EventArgs.Empty);
             }
+        }
+
+        /// <summary>
+        /// Scopes from GET /scopes when the server has them, else the list hello
+        /// just returned. A failure leaves whatever was already remembered.
+        /// </summary>
+        private async Task RememberScopesAsync(string agentToken, HelloAnswer hello, CancellationToken token) {
+            try {
+                var listed = await client.ScopesAsync(agentToken, token).ConfigureAwait(false);
+                if (listed.Count > 0) {
+                    ScopeDirectory.Replace(listed);
+                    return;
+                }
+            } catch (ServerException ex) {
+                Logger.Debug($"Starfront: could not list scopes - {ex.Message}");
+            }
+            if (hello?.Scopes != null && hello.Scopes.Count > 0) ScopeDirectory.Replace(hello.Scopes);
         }
 
         /// <summary>Send every panel shot and not yet recorded by the server, and remember which it took.</summary>
