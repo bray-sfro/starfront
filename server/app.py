@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import logging
 import math
 import os
 import re
@@ -43,9 +44,68 @@ from astrocontrol import catalog, collab, filters                # noqa: E402
 from astrocontrol.config import data_root                        # noqa: E402
 from server import auth                                          # noqa: E402
 from server.files import COOKIE, COOKIE_SECONDS, Files           # noqa: E402
+from server.agentuploads import AgentUploads  # noqa: E402
+from server.ratelimit import Limiter, client_address           # noqa: E402
+from server.billing import Billing                               # noqa: E402
+from server import billing as billing_module, support as support_module  # noqa: E402
+from server.jobs import Jobs                                     # noqa: E402
+from server.support import Support                               # noqa: E402
+from server.personal import Personal                             # noqa: E402
+from server.site import Site                                     # noqa: E402
+from server.releases import Releases                             # noqa: E402
 from server.store import Store                                   # noqa: E402
 
-app = FastAPI(title="Starfront collaboration server", version="0.1.0")
+# No public API map: /docs, /redoc and /openapi.json are off in production.
+# STARFRONT_DOCS=1 turns them back on for a local test server.
+_DOCS = os.environ.get("STARFRONT_DOCS", "") == "1"
+app = FastAPI(title="Starfront collaboration server", version="0.1.0",
+              docs_url="/docs" if _DOCS else None,
+              redoc_url="/redoc" if _DOCS else None,
+              openapi_url="/openapi.json" if _DOCS else None)
+
+limiter = Limiter()
+
+#: Which requests this process answers. Uploads run in their own process
+#: (starfront-uploads.service, port 8801, Caddy routes them there) so a
+#: stream of files can never queue a telescope's or a coordinator's call:
+#:   all      - everything (the default; a laptop, the tests)
+#:   control  - everything but uploads, which are told to go round
+#:   uploads  - only uploads, and /api/v1/health for the health check
+ROLE = os.environ.get("STARFRONT_ROLE", "all").strip().lower() or "all"
+_UPLOAD_PATH = re.compile(r"^/api/v1/projects/[^/]+/files/[^/]+$")
+
+
+def is_upload(method: str, path: str) -> bool:
+    """A file's bytes coming in: the files page's PUT, or a telescope's
+    resumable upload (all of /api/v1/agent/uploads, whose throttles are
+    kept in memory and so must all live in one process)."""
+    if path == "/api/v1/agent/uploads" or path.startswith("/api/v1/agent/uploads/"):
+        return True
+    return method == "PUT" and bool(_UPLOAD_PATH.match(path))
+
+
+@app.middleware("http")
+async def _role(request: Request, call_next):
+    if ROLE != "all":
+        upload = is_upload(request.method, request.url.path)
+        if ROLE == "control" and upload:
+            return JSONResponse(status_code=503, headers={"Retry-After": "30"},
+                                content={"detail": "uploads are taken by the upload service"})
+        if ROLE == "uploads" and not upload and request.url.path != "/api/v1/health":
+            return JSONResponse(status_code=404, content={"detail": "not here"})
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def _rate_limit(request: Request, call_next):
+    allowed, wait = limiter.allow(request.method, request.url.path,
+                                  client_address(request))
+    if not allowed:
+        return JSONResponse(status_code=429,
+                            content={"detail": "too many requests; try again shortly"},
+                            headers={"Retry-After": str(int(wait))})
+    return await call_next(request)
+
 
 # Beside everything else the rig keeps, and through the same function, so a
 # machine that still has its folder under the old name is not left with its
@@ -163,8 +223,18 @@ def owns_project(who: dict[str, Any], project: dict[str, Any]) -> bool:
     return bool(owner) and owner == who["id"]
 
 
-def _require_project_owner(who: dict[str, Any], project_id: str) -> dict[str, Any]:
+def _collab(project_id: str) -> dict[str, Any] | None:
+    """A collaboration by id, or None - also for a personal project
+    (server/personal.py), which the collaboration routes never touch: it
+    has its own, under /api/v1/me/personal and /api/v1/agent/personal."""
     project = store.project(project_id)
+    if project is None or project.get("scope") == "personal":
+        return None
+    return project
+
+
+def _require_project_owner(who: dict[str, Any], project_id: str) -> dict[str, Any]:
+    project = _collab(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="no such project")
     if not owns_project(who, project):
@@ -426,9 +496,12 @@ class ProjectRequest(BaseModel):
     goals: dict[str, float] = Field(default_factory=dict)
     notes: str = Field(default="", max_length=2000)
     # Whether contributors' lights are collected on this server (the files
-    # page, and in time the programs themselves), for the coordinator to
-    # stack. Off unless asked: gigabytes a night are nobody's by accident.
-    collectFiles: bool = False
+    # page and the programs themselves), for the coordinator to stack, and
+    # whether the telescopes send them on their own as each is captured.
+    # Both on for a new collaboration unless the request says otherwise
+    # (2026-11-04); the coordinator switches either off on the files page.
+    collectFiles: bool = True
+    autoUpload: bool = True
 
 
 class TaskRequest(BaseModel):
@@ -509,6 +582,25 @@ def _one_task_per_project(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return kept + list(newest.values())
 
 
+def _open_project_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only the shares whose collaboration is still open.
+
+    Closing a project takes it off the browse list but used to leave every
+    accepted task in place, so GET /api/v1/agent/task and the dealer kept
+    handing out panels for work nobody is collecting. Those leftovers ate a
+    rig's nightly plan — four six-hour shares in one night, two of them on
+    dead collabs — and joining something new looked broken. A missing
+    project is treated the same way: it cannot be shot.
+    """
+    kept: list[dict[str, Any]] = []
+    for task in tasks:
+        project = store.project(str(task.get("project") or ""))
+        if project is None or project.get("status") != "open":
+            continue
+        kept.append(task)
+    return kept
+
+
 @app.get("/api/v1/agent/task")
 def current_task(agent: dict[str, Any] = Depends(agent_from),
                  night: str = Query(default="", max_length=16),
@@ -533,7 +625,7 @@ def current_task(agent: dict[str, Any] = Depends(agent_from),
     rig has to say.
     """
     store.seen(agent["id"])
-    tasks = _one_task_per_project(store.tasks_for(agent["id"]))
+    tasks = _open_project_tasks(_one_task_per_project(store.tasks_for(agent["id"])))
     if not tasks:
         return {"task": None, "tasks": [], "version": 0,
                 "protocol": collab.PROTOCOL}
@@ -552,7 +644,10 @@ def current_task(agent: dict[str, Any] = Depends(agent_from),
     for project_id in {task["project"] for task in tasks}:
         _redeal(project_id, {agent["id"]: night.strip()} if night.strip() else None,
                 moon=sky)
-    tasks = store.tasks_for(agent["id"])
+    tasks = _open_project_tasks(store.tasks_for(agent["id"]))
+    if not tasks:
+        return {"task": None, "tasks": [], "version": 0,
+                "protocol": collab.PROTOCOL}
     task = tasks[0]
     project = store.project(task["project"])
     return {
@@ -581,14 +676,13 @@ def project_depth(project_id: str,
     """The depth map of a project: everybody's seconds on every cell of the
     region, per filter, for the picture of the field on the Plan tab."""
     store.seen(agent["id"])
-    project = store.project(project_id)
+    project = _collab(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="no such project")
-    grid = _depth_grid(project_id, project.get("payload") or {})
-    if grid is None:
+    answer = _depth_cached(project_id, project)
+    if answer is None:
         raise HTTPException(status_code=409, detail="this project has no region to map")
-    return {"project": project_id, "name": project["name"], **grid,
-            "progress": _progress(project_id, project.get("payload") or {})}
+    return answer
 
 
 @app.get("/api/v1/agent/projects/{project_id}/people")
@@ -603,7 +697,7 @@ def project_people(project_id: str,
     its own under its enrolled name.
     """
     store.seen(agent["id"])
-    project = store.project(project_id)
+    project = _collab(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="no such project")
     people: dict[str, dict[str, Any]] = {}
@@ -817,6 +911,50 @@ def _figures(project_id: str, payload: dict[str, Any]
     return collected, progress
 
 
+_depth_cache: dict[str, tuple[Any, dict[str, Any] | None]] = {}
+_depth_lock = threading.Lock()
+
+
+def _depth_stamp(project_id: str, project: dict[str, Any]) -> Any:
+    """What the depth map is made of: the contributions (how many, how many
+    accepted, the latest arrival and the latest verdict change) and the
+    project's region, goals and kind. Any change to one of them is a new map."""
+    payload = project.get("payload") or {}
+    row = store._one(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(accepted), 0) AS a,"
+        " COALESCE(MAX(received), 0) AS r, COALESCE(SUM(seconds), 0) AS s,"
+        " COALESCE(SUM(CASE WHEN accepted THEN seconds * (rowid % 9973 + 1) ELSE 0 END), 0) AS k"
+        " FROM contributions WHERE project = ?", project_id) or {}
+    return (int(row.get("n") or 0), int(row.get("a") or 0),
+            float(row.get("r") or 0.0), float(row.get("s") or 0.0),
+            float(row.get("k") or 0.0), str(project.get("name") or ""),
+            json.dumps({"goals": payload.get("goals"), "region": payload.get("region"),
+                        "kind": payload.get("kind")}, sort_keys=True, default=str))
+
+
+def _depth_cached(project_id: str, project: dict[str, Any]) -> dict[str, Any] | None:
+    """The depth map answer, built once per change of what it is made of.
+
+    Every telescope with the Plan tab open asks for this, and building it
+    walks every accepted frame's footprint over the whole grid; on a
+    one-CPU server that is the CPU. So it is kept until a contribution
+    lands, a verdict changes or the project's region or goals move.
+    """
+    stamp = _depth_stamp(project_id, project)
+    with _depth_lock:
+        held = _depth_cache.get(project_id)
+        if held is not None and held[0] == stamp:
+            return held[1]
+    payload = project.get("payload") or {}
+    grid = _depth_grid(project_id, payload)
+    answer = None if grid is None else {
+        "project": project_id, "name": project["name"], **grid,
+        "progress": _progress(project_id, payload)}
+    with _depth_lock:
+        _depth_cache[project_id] = (stamp, answer)
+    return answer
+
+
 def _goals(goals: dict[str, float]) -> dict[str, float]:
     """Depth wanted per filter, keyed by the one spelling of each name."""
     out: dict[str, float] = {}
@@ -824,6 +962,77 @@ def _goals(goals: dict[str, float]) -> dict[str, float]:
         key = filters.canonical(name) or str(name)
         out[key] = out.get(key, 0.0) + float(hours)
     return out
+
+
+def _goal_keys(goals: dict[str, Any]) -> set[str]:
+    """The channels a project has a positive goal for, as compared.
+
+    2026-11-04 (CST): the M42 horse mosaic allowed L, R, G, B, H, O and S in
+    its requirements but set goals only for L, R, G, B and H. The dealer
+    built every rig's filters from the allowed list, gave O and S a
+    placeholder hour each, and sent vsd100 and others out for a night of
+    OIII nobody had asked for. A filter is dealt only when its project wants
+    hours in it; "allowed" says what may be uploaded, not what to shoot.
+    """
+    out: set[str] = set()
+    for name, hours in (goals or {}).items():
+        try:
+            if float(hours) <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        if str(name).strip().lower() in collab.COLOUR_FILTERS:
+            out.update(("r", "g", "b"))
+        out.add(collab._key(name))
+        # And the channels a task entry by that name counts towards: a
+        # goal of "OSC" is an entry whose seconds count as OSC-RGB.
+        try:
+            out.update(collab.FilterTask.read({"filter": str(name)}).keys())
+        except Exception:  # noqa: BLE001 - a junk name is just its key
+            pass
+    return out
+
+
+def _wanted_from_goals(wants: collab.Requirements,
+                       goals: dict[str, Any]) -> dict[str, float | None]:
+    """The channels to deal, each with its bandpass limit: the goals.
+
+    Built from the project's goals, in the order the requirements list them
+    (the coordinator's order, which a tied deal falls back to), with each
+    channel's bandpass limit taken from the requirements when they give one.
+    A channel the requirements allow with no goal is not here. A project
+    with no positive goal at all is dealt what its requirements list, as
+    before - there is nothing else to go on.
+    """
+    keys = _goal_keys(goals)
+    if not keys:
+        return collab.wanted_channels(wants) if wants.filters else {}
+    allowed = collab.wanted_channels(wants) if wants.filters else {}
+    out: dict[str, float | None] = {k: v for k, v in allowed.items() if k in keys}
+    for name, hours in (goals or {}).items():
+        key = collab._key(name)
+        if key not in keys or key in out:
+            continue
+        if str(name).strip().lower() in collab.COLOUR_FILTERS:
+            for letter in ("r", "g", "b"):
+                out.setdefault(letter, allowed.get(letter))
+            continue
+        # A colour band the project has switched off stays off.
+        if collab._is_osc(key):
+            narrow = "+" in key
+            if not wants.acceptColour:
+                continue
+            if narrow and not wants.acceptOscNarrowband:
+                continue
+            if not narrow and not wants.acceptOscRgb:
+                continue
+        out[key] = allowed.get(key)
+    return out
+
+
+def _dealable(entry: "collab.FilterTask", keys: set[str]) -> bool:
+    """Whether a task filter delivers any channel the project has a goal for."""
+    return not keys or bool(set(entry.keys()) & keys)
 
 
 #: How finely a region is cut when progress is measured across it: the
@@ -1040,7 +1249,7 @@ def join_project(project_id: str, body: JoinRequest,
     The requirements are checked here, against the profile the rig last
     reported, rather than taken on the word of whoever is asking.
     """
-    project = store.project(project_id)
+    project = _collab(project_id)
     if project is None or project.get("status") != "open":
         raise HTTPException(status_code=404, detail="no such open project")
     payload = project.get("payload") or {}
@@ -1086,6 +1295,18 @@ def join_project(project_id: str, body: JoinRequest,
     # B on an H, O, R, G, B project is dealt R, G and B and nothing else, and
     # the deal sends the H and O to the rigs that have them.
     names = list(verdict.get("usable") or []) or list(wants.filters) or list(goals) or ["L"]
+    # Only filters the project has a goal for; one it merely allows is not
+    # dealt (see `_goal_keys`).
+    goal_keys = _goal_keys(goals)
+    if goal_keys:
+        names = [name for name in names
+                 if {collab._key(c) for c in (profile.delivers(name) or [name])} & goal_keys
+                 or collab._key(name) in goal_keys]
+        if not names:
+            raise HTTPException(
+                status_code=409,
+                detail="this telescope carries none of the filters the project "
+                       "has a goal for")
     fallback = body.exposure or _middle_exposure(wants)
     # The rig's own exposure per filter first: that is the length its darks
     # are built for, and a light with no dark of its own length is a light
@@ -1274,13 +1495,16 @@ def _redeal(project_id: str, nights: dict[str, str] | None = None,
     which is the signal its program watches for; one whose list held is
     left exactly alone, so an idle poll costs nothing.
     """
-    project = store.project(project_id)
-    if project is None:
+    project = _collab(project_id)
+    if project is None or project.get("status") != "open":
         return 0
     payload = project.get("payload") or {}
     wants = collab.Requirements.read(payload.get("requirements") or {})
     goals = {str(name): float(hours)
              for name, hours in (payload.get("goals") or {}).items()}
+    goal_keys = _goal_keys(goals)
+    # The goals the deal weighs are the positive ones; a zero goal is no goal.
+    goals = {name: hours for name, hours in goals.items() if hours > 0} if goal_keys else goals
 
     tasks = [task for task in store.tasks_in(project_id)
              if task.get("state") in ("offered", "accepted")]
@@ -1368,10 +1592,44 @@ def _redeal(project_id: str, nights: dict[str, str] | None = None,
             able = [f for f in filters if collab._key(f.filter) in carried]
             if able:
                 filters = able
+        # Never a filter the project has no goal for, whatever an older task
+        # list still carries (see `_goal_keys`). A rig left with nothing the
+        # project wants is dealt no panels rather than a night of the wrong
+        # filter.
+        if goal_keys:
+            filters = [f for f in filters if _dealable(f, goal_keys)]
+            if not filters:
+                if held or task.get("visit"):
+                    task["share"] = []
+                    task["visit"] = {}
+                    task["version"] = int(task.get("version") or 1) + 1
+                    changed += 1
+                task["assignedAt"] = now
+                task["assignedNight"] = asked if asked is not None else made_for
+                store.set_task(task)
+                continue
         night_goals = goals
         chosen = None
         need = None
-        if (task.get("kind") or "mosaic") == "mosaic" and len(filters) > 1:
+        # A mount whose telescopes each carry one filter they cannot change
+        # (a triple RASA: R, G and B in three drawers) shoots all of them at
+        # once on every panel. It is dealt every one of those the project
+        # wants, together - not one filter for the lot, which asked two of
+        # the three telescopes for a filter they do not have.
+        together_keys = {collab._key(name) for name in profile.simultaneous()}
+        together = [f for f in filters if collab._key(f.filter) in together_keys]
+        at_once = (task.get("kind") or "mosaic") == "mosaic" and bool(together)
+        if at_once:
+            filters = together
+            channels = {key for f in together for key in f.keys()}
+            night_goals = {name: value for name, value in goals.items()
+                           if collab._key(name) in channels}
+            if not night_goals:
+                night_goals = {f.filter: f.hours for f in together}
+            share, visit = collab.assign_together(cells, night_goals, depth,
+                                                  mine.get(agent_id, {}), tonight, hours,
+                                                  filters, wants.minFramesPerVisit)
+        elif (task.get("kind") or "mosaic") == "mosaic" and len(filters) > 1:
             # A mosaic night is one filter per telescope, and which one is
             # the collaboration's call: the filter thinnest across the field
             # once what the other rigs are putting in tonight is counted.
@@ -1394,9 +1652,10 @@ def _redeal(project_id: str, nights: dict[str, str] | None = None,
             # every rig's night and the first thing dawn cut.
             need = collab.night_need(filters, goals, depth, cells, spoken,
                                      moon if asked is not None else None)
-        share, visit = collab.assign(cells, night_goals, depth, mine.get(agent_id, {}),
-                                     tonight, hours, filters,
-                                     wants.minFramesPerVisit, need)
+        if not at_once:
+            share, visit = collab.assign(cells, night_goals, depth, mine.get(agent_id, {}),
+                                         tonight, hours, filters,
+                                         wants.minFramesPerVisit, need)
         if chosen is not None:
             visit["filter"] = chosen.filter
         if need is not None and visit.get("frames"):
@@ -1441,13 +1700,15 @@ def _sync_task_filters(task: dict[str, Any], wants: collab.Requirements,
     of what the project takes - and a filter the project dropped is
     dropped. True when anything changed.
     """
-    names = list(wants.filters) or list(goals)
-    if not names:
+    # The channels the project wants, with their bandpass limits: built from
+    # its goals, not from the filters its requirements allow (see
+    # `_goal_keys`). A goal with no filter entry wants its channel with no
+    # limit.
+    wanted = _wanted_from_goals(wants, goals) if _goal_keys(goals) else (
+        collab.wanted_channels(wants) if wants.filters else {
+            collab._key(name): None for name in goals})
+    if not wanted:
         return False
-    # The channels the project wants, with their bandpass limits; a goal
-    # with no filter entry wants its channel with no limit.
-    wanted = collab.wanted_channels(wants) if wants.filters else {
-        collab._key(name): None for name in goals}
     goal_of = {collab._key(name): float(hours) for name, hours in goals.items()}
     held = list(task.get("filters") or [])
     by_key = {collab._key(f.get("filter")): f for f in held}
@@ -1563,10 +1824,19 @@ def report(body: ReportRequest,
     for raw in body.contributions:
         entry = collab.Contribution.read({**raw, "agent": agent["id"]})
         task = store.task(entry.task) if entry.task else None
-        if task is not None and task["agent"] != agent["id"]:
+        # Hours count only against a task this telescope was dealt, in the
+        # project it names; seconds are self-reported, so a report with no
+        # task behind it could pad anybody's project.
+        if task is None:
+            raise HTTPException(status_code=403,
+                                detail="a report must name a task dealt to this telescope")
+        if task["agent"] != agent["id"]:
             raise HTTPException(status_code=403,
                                 detail="that task belongs to another agent")
-        if task is not None and not entry.project:
+        if entry.project and entry.project != task["project"]:
+            raise HTTPException(status_code=403,
+                                detail="that task is in a different project")
+        if not entry.project:
             entry.project = task["project"]
 
         project = store.project(entry.project) if entry.project else None
@@ -1644,6 +1914,7 @@ def create_project(body: ProjectRequest,
         "goals": _goals(body.goals),
         "notes": body.notes,
         "collectFiles": bool(body.collectFiles),
+        "autoUpload": bool(body.autoUpload),
     }
     # The name on it is the person's Discord name unless the owner, on the
     # admin token, chose to write one.
@@ -1663,6 +1934,10 @@ class ProjectUpdateRequest(BaseModel):
     goals: dict[str, float] | None = None
     notes: str | None = Field(default=None, max_length=2000)
     collectFiles: bool | None = None
+    # Telescopes may send their lights on their own (server/agentuploads.py),
+    # optionally only the rigs listed by agent id.
+    autoUpload: bool | None = None
+    autoUploadAgents: list[str] | None = Field(default=None, max_length=500)
     # open | closed. Closing takes it off everybody's list without deleting
     # the record of what was collected.
     status: str | None = Field(default=None, pattern="^(open|closed)$")
@@ -1696,6 +1971,10 @@ def update_project(project_id: str, body: ProjectUpdateRequest,
         payload["notes"] = body.notes
     if body.collectFiles is not None:
         payload["collectFiles"] = bool(body.collectFiles)
+    if body.autoUpload is not None:
+        payload["autoUpload"] = bool(body.autoUpload)
+    if body.autoUploadAgents is not None:
+        payload["autoUploadAgents"] = [str(a)[:64] for a in body.autoUploadAgents if str(a).strip()]
     if body.name is not None:
         store.rename_project(project_id, body.name.strip())
     updated = store.set_project(project_id, payload, body.status)
@@ -1730,10 +2009,25 @@ def redeal_project(project_id: str,
     return {"project": project_id, "forgotten": forgotten}
 
 
+def _optional_person(authorization: str) -> dict[str, Any] | None:
+    """Who is asking, if they are signed in at all; nobody otherwise."""
+    return _person(_bearer(authorization))
+
+
+def _public_project(project: dict[str, Any]) -> dict[str, Any]:
+    """A project as anyone on the internet may see it: what it is and how
+    far along, without whose Discord account started it."""
+    return {k: v for k, v in project.items() if k != "owner_id"}
+
+
 @app.get("/api/v1/projects")
-def list_projects() -> dict[str, Any]:
-    """Open to anyone: browsing is how people find a collab to join."""
-    return {"projects": store.projects()}
+def list_projects(authorization: str = Header(default="")) -> dict[str, Any]:
+    """Open to anyone: browsing is how people find a collab to join.
+    Anonymous callers do not get the owners' Discord ids."""
+    rows = store.projects()
+    if _optional_person(authorization) is None:
+        rows = [_public_project(p) for p in rows]
+    return {"projects": rows}
 
 
 @app.get("/api/v1/lookup")
@@ -1765,12 +2059,42 @@ def lookup_object(name: str = Query(default="", max_length=80),
 
 
 @app.get("/api/v1/projects/{project_id}")
-def read_project(project_id: str) -> dict[str, Any]:
-    project = store.project(project_id)
+def read_project(project_id: str,
+                 authorization: str = Header(default="")) -> dict[str, Any]:
+    """One project. Signed-in people get every task and contribution;
+    anonymous callers get a summary only - no telescope ids, Discord ids or
+    per-night sky figures (Bortle, guiding RMS, HFR, footprints)."""
+    project = _collab(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="no such project")
-    return {"project": project, "tasks": store.tasks_in(project_id),
-            "contributions": store.contributions(project_id)}
+    if _optional_person(authorization) is not None:
+        return {"project": project, "tasks": store.tasks_in(project_id),
+                "contributions": store.contributions(project_id),
+                "release": releases.summary(project_id)}
+    rows = store.contributions(project_id)
+    collected, progress = _figures(project_id, project.get("payload") or {})
+    return {"project": _public_project(project), "tasks": [], "contributions": [],
+            "summary": True,
+            "telescopes": len({r.get("agent") for r in rows}),
+            "nights": len(rows),
+            "acceptedHours": round(sum(float(r.get("seconds") or 0.0)
+                                       for r in rows if r.get("accepted")) / 3600.0, 2),
+            "collected": collected, "progress": progress,
+            "release": releases.summary(project_id)}
+
+
+def _may_offer_to(who: dict[str, Any], project_id: str, agent: dict[str, Any]) -> bool:
+    """A task may go to a telescope the caller owns, or one that already
+    joined (holds or held a task in) or contributed to this project. The
+    server owner may offer to any telescope."""
+    if who.get("admin"):
+        return True
+    owner = str(agent.get("owner_id") or "")
+    if owner and owner == who.get("id"):
+        return True
+    if any(t.get("agent") == agent["id"] for t in store.tasks_in(project_id)):
+        return True
+    return bool(store.contributions(project_id, agent["id"]))
 
 
 @app.post("/api/v1/projects/{project_id}/tasks")
@@ -1778,8 +2102,15 @@ def create_task(project_id: str, body: TaskRequest,
                 who: dict[str, Any] = Depends(person_from)) -> dict[str, Any]:
     """Delegate a chunk of sky to one telescope."""
     project = _require_project_owner(who, project_id)
-    if store.agent(body.agent) is None:
+    target = store.agent(body.agent)
+    if target is None:
         raise HTTPException(status_code=404, detail="no such agent")
+    if not _may_offer_to(who, project_id, target):
+        # Any member may start a project, and telescope ids are not secret,
+        # so without this anybody could push work onto a stranger's rig.
+        raise HTTPException(status_code=403,
+                            detail="that telescope has not joined this collaboration "
+                                   "and is not yours")
 
     task = collab.Task(
         id=collab.new_id(), project=project_id, projectName=project["name"],
@@ -2138,6 +2469,51 @@ FILES_DIR = Path(auth.setting("FILES") or DATA / "files")
 files = Files(app, store, FILES_DIR, _person, owns_project, DISCORD.owners,
               DISCORD.public_url, auth.new_login_code)
 
+# Published coadds: the latest master of a collaboration, public, read-only.
+# On the files volume, in a folder no project id can be named like ("_" is
+# not hex), so a full set of masters has the big disk's room. The files
+# page's quotas count uploads only. See server/releases.py.
+# Telescopes sending their collaboration lights on their own, resumable and
+# checked by sha256; off on every collaboration until its owner turns it on.
+# See server/agentuploads.py.
+agent_uploads = AgentUploads(app, store, files)
+
+RELEASES_DIR = Path(auth.setting("RELEASES") or FILES_DIR / "_releases")
+# The coordinator's processing job (stacking, rendering), shown on the files page.
+# Before Releases: its GET /api/v1/releases/{project}/{version} would take /job.
+jobs = Jobs(app, store, RELEASES_DIR, files.who, owns_project, DATA / "job-token.txt",
+            latest=lambda pid: releases.latest_version(pid))
+releases = Releases(app, store, RELEASES_DIR, files.who, owns_project)
+
+# Personal projects: one person's own imaging of one target, private to
+# them, uploaded by their own rigs through the same door as a collaboration.
+# Off unless STARFRONT_PERSONAL_UPLOADS=1; entitlement() in server/personal.py
+# is where a plan will decide who may. See server/personal.py.
+personal = Personal(app, store, files, agent_uploads.agent, files.who, DISCORD.owners,
+                    releases=releases, jobs=jobs)
+agent_uploads.personal = personal
+jobs.personal = personal
+
+# Paid plans, as the shop tells them: what entitlement() reads once
+# STARFRONT_BILLING=1. Its secrets are in the environment or billing.env
+# beside the database. See server/billing.py.
+support_module.load_env_file(DATA, billing_module.ENV_FILE)
+billing = Billing(app, store, files.who, DATA)
+personal.billing = billing
+if ROLE != "uploads":
+    billing.run_nightly()
+
+# The website around the files page: the front door (/), every collaboration
+# as cards (/collabs), and one person's own targets (/me). See server/site.py.
+site = Site(app, store, files, releases, personal, _figures, online_seconds=ONLINE_SECONDS)
+
+# Get help: a person's question becomes a help desk ticket with their plan,
+# project and telescopes attached. Off unless STARFRONT_SUPPORT=1 and
+# zendesk.env beside the database is filled in. See server/support.py.
+support_module.load_env_file(DATA)
+support = Support(app, store, files.who, personal, site, jobs)
+
+
 
 # ---------------------------------------------------------------------------
 # Everything else
@@ -2154,6 +2530,8 @@ def health() -> dict[str, Any]:
             "adminConfigured": bool(ADMIN_TOKEN),
             "discord": DISCORD.configured(),
             "roleRequired": False,
+            # control, uploads or all: which process answered (see ROLE).
+            "role": ROLE,
             # The N.I.N.A. plugin releases this server offers, so a deploy
             # can be checked from outside.
             "ninaPlugins": [f'{m.get("Name")} {".".join(str(m["Version"][k]) for k in ("Major", "Minor", "Patch", "Build"))}'
@@ -2162,7 +2540,14 @@ def health() -> dict[str, Any]:
             "download": (_latest_setup() or {}).get("version")}
 
 
+_log = logging.getLogger("starfront.server")
+
+
 @app.exception_handler(Exception)
-async def _unhandled(_request, exc: Exception) -> JSONResponse:
+async def _unhandled(request, exc: Exception) -> JSONResponse:
+    # The details go to the journal, not to whoever asked.
+    reference = secrets.token_hex(4)
+    _log.error("unhandled error %s on %s %s", reference, request.method,
+               request.url.path, exc_info=exc)
     return JSONResponse(status_code=500,
-                        content={"detail": f"{type(exc).__name__}: {exc}"})
+                        content={"detail": f"internal server error (ref {reference})"})

@@ -151,7 +151,9 @@ class Discord:
             "redirect_uri": self.settings.redirect_uri(),
             "scope": SCOPES,
             "state": state,
-            "prompt": "none",
+            # Always show Discord's consent screen, so a sign-in link someone
+            # else made cannot complete silently in a victim's browser.
+            "prompt": "consent",
         })
         return f"{self.settings.authorize}?{query}"
 

@@ -31,6 +31,28 @@ class CameraLostError(DeviceError):
     """
 
 
+def read_slot(wheel) -> tuple[int | None, bool]:
+    """(slot or None, driver said moving). Works for a real wheel or a test double.
+
+    A double that only has ``position`` is trusted when that position is a
+    slot. One that can ``confirmed_position`` (three reads, so a stuck
+    "moving" flag with a valid slot still counts) uses that.
+    """
+    fn = getattr(wheel, "confirmed_position", None)
+    if callable(fn):
+        try:
+            return fn()
+        except Exception:                              # noqa: BLE001
+            return None, True
+    try:
+        pos = int(wheel.position)
+    except Exception:                                  # noqa: BLE001
+        return None, True
+    if pos >= 0:
+        return pos, bool(getattr(wheel, "moving", False))
+    return None, True
+
+
 # Device kinds understood by the application.
 #: `piercam` is an ordinary camera in a different job: it watches the telescope
 #: rather than the sky, so it shares every backend's camera class and differs
@@ -233,6 +255,15 @@ class Mount(Device):
         """
         return None
 
+    def reported_clock(self) -> dict[str, Any]:
+        """UTC and local sidereal time the driver is using. Read-only.
+
+        ``utc`` is a datetime, an ISO-8601 string, or None. ``lst`` is hours,
+        or None. A backend that has no clock leaves both empty. This must
+        not set the time, sync, slew, or change tracking.
+        """
+        return {"utc": None, "lst": None}
+
     def slew_to(self, ra_hours: float, dec_deg: float) -> None:
         raise NotImplementedError
 
@@ -326,6 +357,28 @@ class FilterWheel(Device):
     @property
     def moving(self) -> bool:
         return self.position < 0
+
+    def confirmed_position(self) -> tuple[int | None, bool]:
+        """A slot index we will trust, and whether a read said "moving".
+
+        ASCOM uses position -1 for "moving". The ZWO EFW driver returns -1
+        from a poll that overlaps its own status even when the wheel is
+        sitting on a slot, and the next read is that slot. Three reads: if
+        every read that is a real slot agrees, that slot is the position,
+        including when another of the reads was -1. All -1, or two different
+        slots, is not a filter we will write down. Nothing here guesses.
+        """
+        reads: list[int] = []
+        for _ in range(3):
+            try:
+                reads.append(int(self.position))
+            except Exception:                          # noqa: BLE001 - a failed read is not a slot
+                reads.append(-1)
+        valid = [pos for pos in reads if pos >= 0]
+        said_moving = any(pos < 0 for pos in reads)
+        if valid and len(set(valid)) == 1:
+            return valid[0], said_moving
+        return None, True
 
     def current_name(self) -> str:
         names = self.names
@@ -447,7 +500,34 @@ class FlatPanel(Device):
     kind = "flatpanel"
 
     max_brightness: int = 100
-    has_cover: bool = False
+    @property
+    def has_cover(self) -> bool | None:
+        """True when the driver has shown a cover, False when it reports none.
+
+        None when the state is unknown or the read failed. Unknown is not
+        "no cover", and a failed read is not "no cover".
+        """
+        state = str(self.cover_state or "unread")
+        if state == "notpresent":
+            return False
+        if state in ("closed", "moving", "open", "error"):
+            return True
+        return None
+
+    def cover_prepare(self) -> str:
+        """What a light-path prep may do. Never a physical cap position.
+
+        "skip" — driver says open, or NotPresent (lamp only: do not command).
+        "unreadable" — CoverState could not be read. Do not command, do not
+        pretend there is no cover.
+        "open" — closed, moving, unknown, or a cover error. Ask OpenCover.
+        """
+        state = str(self.cover_state or "unread")
+        if state in ("open", "notpresent"):
+            return "skip"
+        if state == "unread":
+            return "unreadable"
+        return "open"
 
     @property
     def brightness(self) -> int:
@@ -542,6 +622,63 @@ class Dome(Device):
 
     def set_slaved(self, on: bool) -> None:
         raise DeviceError("dome cannot slave itself")
+
+    # A driver word is not a roof sensor. Nothing in this program may set
+    # shutterVerified true: ASCOM ShutterStatus is the driver's claim.
+    SHUTTER_NOTE = (
+        "Driver-reported only. Starfront has no roof position sensor and "
+        "does not treat this reading as physically open or closed."
+    )
+    _shutter_command: str | None = None
+    _shutter_command_pending: bool = False
+    _shutter_command_error: str | None = None
+    _shutter_conflict: str | None = None
+
+    def begin_shutter_command(self, command: str) -> None:
+        """Record that a command was accepted by us, not that the roof moved."""
+        self._shutter_command = command
+        self._shutter_command_pending = True
+        self._shutter_command_error = None
+
+    def fail_shutter_command(self, error: str) -> None:
+        self._shutter_command_pending = False
+        self._shutter_command_error = str(error)
+
+    def note_shutter_conflict(self, text: str | None) -> None:
+        self._shutter_conflict = text or None
+
+    def shutter_report(self, state: str | None = None) -> dict[str, Any]:
+        """Driver state plus the limits of that state. `shutterVerified` is false."""
+        if state is None:
+            try:
+                state = str(self.shutter_state or "unknown")
+            except Exception:                     # noqa: BLE001 - a fault is not open
+                state = "error"
+        pending = bool(getattr(self, "_shutter_command_pending", False))
+        error = getattr(self, "_shutter_command_error", None)
+        conflict = getattr(self, "_shutter_conflict", None)
+        if state in ("unknown", "notpresent"):
+            quality = "unknown"
+        elif error or state == "error":
+            quality = "error"
+        elif conflict:
+            quality = "conflict"
+        elif pending or state in ("opening", "closing"):
+            quality = "pending"
+        else:
+            quality = "driver"
+        return {
+            "shutterState": state,
+            "shutterVerified": False,
+            "shutterQuality": quality,
+            "shutterCommand": getattr(self, "_shutter_command", None),
+            "shutterCommandPending": pending,
+            "shutterCommandError": error,
+            "shutterConflict": conflict,
+            "shutterAgeSeconds": None,
+            "shutterLastDriver": None,
+            "shutterNote": self.SHUTTER_NOTE,
+        }
 
 
 class SwitchBank(Device):

@@ -260,6 +260,13 @@ input[type="checkbox"] { accent-color: var(--accent); }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .readout b.alert { color: var(--warn); }
+.readout b.roof-driver-open,
+.readout b.roof-pending { color: var(--warn); }
+.readout b.roof-driver-closed,
+.readout b.roof-unknown { color: var(--muted); }
+.readout b.roof-conflict,
+.readout b.roof-error { color: #ffb4a8; }
+#domeShutterNote { margin: -6px 0 8px; }
 
 .progress {
   height: 4px; background: var(--panel-2); border-radius: 3px;
@@ -376,6 +383,14 @@ table.survey-fields tr:hover td { background: var(--panel-2); }
 .activity-icon { font-size: 13px; line-height: 1; }
 .activity-verb { letter-spacing: 0.2px; }
 .activity-detail { color: var(--muted); min-width: 0; }
+.roof-badge {
+  font-size: 12px; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--panel-2); white-space: nowrap;
+}
+.roof-badge.moving { color: var(--blue); border-color: var(--blue); }
+.roof-badge.open { color: var(--good); border-color: var(--good); }
+.roof-badge.closed { color: var(--muted); }
+.roof-badge.locked, .roof-badge.error { color: var(--warn); border-color: var(--warn); }
 /* Working on something that takes a moment. */
 .activity.busy { background: linear-gradient(90deg, rgba(91, 141, 217, 0.16), transparent 55%); }
 .activity.busy .activity-icon { color: var(--blue); animation: activity-pulse 1.6s infinite; }

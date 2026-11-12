@@ -2,7 +2,29 @@
 # renewed on its own, and everything proxied to the service on loopback.
 # The install script replaces COLLAB_HOSTS with your hostname - and, while
 # telescopes still point at an older address, that one too.
+#
+# Two processes behind it. File uploads (the files page's PUT of a frame,
+# and a telescope's resumable /api/v1/agent/uploads) go to
+# starfront-uploads.service on 8801; everything else - opening and closing
+# collaborations, task offers, reports, the pages - to starfront.service on
+# 8800. An upload stream therefore never sits in the queue of a control call.
 COLLAB_HOSTS {
     encode gzip
-    reverse_proxy 127.0.0.1:8800
+
+    @uploads {
+        path /api/v1/agent/uploads /api/v1/agent/uploads/*
+    }
+    @webupload {
+        method PUT
+        path_regexp webupload ^/api/v1/projects/[^/]+/files/[^/]+$
+    }
+    handle @uploads {
+        reverse_proxy 127.0.0.1:8801
+    }
+    handle @webupload {
+        reverse_proxy 127.0.0.1:8801
+    }
+    handle {
+        reverse_proxy 127.0.0.1:8800
+    }
 }

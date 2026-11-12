@@ -3,6 +3,7 @@
 A rig fails in two ways. Loudly - an exception, a device that refuses - which
 the sequencer already reports. And quietly: the cooler that never reached
 its setpoint, the mount whose site is a hundred miles from the observatory,
+the mount whose clock is an hour away from this PC,
 the cover that stayed shut, the disk with two frames' worth of room, the
 frames that have had no stars in them since the cloud came over. Nothing
 throws, the night runs to the end, and the morning finds it was wasted.
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import filters as filternames
+from . import mountclock
 from .focushealth import bogus_reading
 
 LEVELS = ("critical", "warning", "notice")
@@ -336,6 +338,22 @@ def mount_site_disagrees(board: WarningBoard, ctx: Context) -> None:
                          "Every slew and every plan is wrong by the difference.",
                          "Set the mount's location in its driver, or untick "
                          "'take the site from the mount' in Site & Optics.")
+
+
+@check
+def mount_clock(board: WarningBoard, ctx: Context) -> None:
+    """The driver's UTC and sidereal time against this PC.
+
+    Raised when the difference is more than a minute. With no mount, the
+    result is a skip and the board stays quiet. The watchdog runs this with
+    the others, so it happens at startup and again after a mount connects.
+    The driver is only read.
+    """
+    report = mountclock.observe(ctx)
+    if report.get("state") != "warn":
+        return
+    board.raise_(mountclock.WARNING_KEY, "warning", report["title"],
+                 report["detail"], report["fix"])
 
 
 @check
@@ -807,10 +825,25 @@ def light_path(board: WarningBoard, ctx: Context) -> None:
     panel = ctx.device("flatpanel")
     if panel is not None:
         with contextlib.suppress(Exception):
-            if getattr(panel, "has_cover", False) and panel.cover_state in ("closed", "moving"):
+            state = str(getattr(panel, "cover_state", "unread"))
+            if state == "unread":
+                board.raise_("panel.cover", "critical",
+                             "The flat panel cover could not be read",
+                             "A failed cover reading is not a lamp-only panel, and it "
+                             "is not an open cap.",
+                             "Check the flip-flat driver. OpenCover is not sent until "
+                             "CoverState can be read.")
+            elif state == "unknown" or panel.has_cover is None:
+                board.raise_("panel.cover", "critical",
+                             "The flat panel cover state is unknown",
+                             "Unknown is not 'no cover', and it is not a physical "
+                             "cap position.",
+                             "The next light-path prep asks the driver to open. "
+                             "Confirm the cap by eye before trusting the sky.")
+            elif panel.has_cover and state in ("closed", "moving"):
                 board.raise_("panel.cover", "critical", "The cover is shut while imaging",
-                             f"The flat panel's cover is {panel.cover_state} and a light "
-                             "frame is running.",
+                             f"The driver reports the flat panel cover {state} during a light "
+                             "frame. That is the driver's word, not a physical check.",
                              "Open the cover from the flat panel panel; check 'open the "
                              "cover before any light frame' under Calibrate.")
             elif panel.light_on:
@@ -971,22 +1004,20 @@ def sequence_health(board: WarningBoard, ctx: Context) -> None:
             offset = float(recent[0].offset or 0)
             medians = [float((r.stats or {}).get("median") or 0.0) for r in recent]
             if all(m <= offset * 10 + 30 for m in medians) and all(m < 300 for m in medians):
-                # 0.2.53b: say so when the roof is the reason. The sequencer
-                # holds every light while a connected roof is not open.
+                # Dark frames are an optical-path fact. They do not say whether
+                # the roof, a cap, cloud, or the exposure is the cause.
                 roof = ""
                 with contextlib.suppress(Exception):
                     dome = ctx.rigs.master.manager.get("dome")
                     if dome is not None and dome.connected and getattr(dome, "can_shutter", False):
                         state = str(dome.shutter_state)
                         if state != "open":
-                            roof = f" The roof reads {state}."
+                            roof = f" The driver reports the roof {state}."
                 board.raise_("frames.black", "critical", "The frames are black",
                              f"The last {len(recent)} lights have a median of "
                              f"{medians[-1]:.0f} ADU: nothing is reaching the sensor.{roof}",
-                             ("The roof is not open: the run holds its lights until it "
-                              "reads open." if roof else
-                              "A cover still on, the panel's cover shut, or a dark filter "
-                              "slot. Check the light path."))
+                             "The light path is blocked or dark. That can be a cap, "
+                             "the roof, cloud, or the exposure. This is not a roof position.")
             elif all(m > 60000 for m in medians):
                 board.raise_("frames.white", "critical", "The frames are saturated",
                              f"The last {len(recent)} lights are at {medians[-1]:.0f} ADU.",

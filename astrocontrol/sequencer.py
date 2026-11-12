@@ -26,7 +26,7 @@ Two events interrupt imaging and are handled rather than avoided:
   * **the meridian** - a German equatorial mount cannot track through it.
     Imaging stops before the target gets there, the mount is sent back to the
     same coordinates (which makes the driver flip), the new pointing is plate
-    solved and synced, and imaging resumes.
+    solved and corrected by the pointing offset, and imaging resumes.
   * **focus drift** - temperature moves, filters are not parfocal, and hours
     pass.  A focus run is triggered on whichever of those comes first.
 
@@ -45,8 +45,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import allsky, astro, capture, filters, plans, schedule
-from .devices.base import DeviceError
+from . import allsky, astro, capture, filters, plans, roofguard, schedule
+from .devices.base import DeviceError, read_slot
 from .recovery import (FAILED as RIG_FAILED, OK as RIG_OK, RECOVERING as RIG_RECOVERING,
                        ProgressJournal, RigRecovery, backoff, call_with_timeout)
 from .imaging import stars
@@ -408,6 +408,8 @@ class Sequencer:
                 "filter": self._rig_state.get(self.master.id, {}).get("filter", ""),
                 "frame": self._rig_state.get(self.master.id, {}).get("frame", 0),
                 "frameCount": self._rig_state.get(self.master.id, {}).get("frames", 0),
+                # The technician-lock text, for the roof badge. Display only.
+                "roofLocked": self._roof_locked or "",
             }
 
     def _set(self, state: str, message: str = "") -> None:
@@ -1701,27 +1703,41 @@ class Sequencer:
         opens it, and nothing did: the next night's frames were of the inside
         of the lid. A cover that will not open ends the night here rather than
         after an hour of those.
+
+        ASCOM CoverStatus.NotPresent is the only "no cover" answer. Unknown is
+        not that answer, and a failed read is not that answer either. A
+        lamp-only panel that reports NotPresent is not commanded.
         """
         panel = self.manager.get("flatpanel")
         if panel is None or not panel.connected:
             return
         with contextlib.suppress(Exception):
             panel.turn_off()
-        if not getattr(panel, "has_cover", False):
+        action = panel.cover_prepare() if hasattr(panel, "cover_prepare") else (
+            "skip" if str(getattr(panel, "cover_state", "")) in ("open", "notpresent")
+            or not getattr(panel, "has_cover", False) else "open")
+        if action == "skip":
             return
-        if panel.cover_state in ("open", "notpresent"):
-            return
+        state = str(getattr(panel, "cover_state", "unread"))
+        if action == "unreadable":
+            raise DeviceError(
+                "CoverState could not be read — the panel is not being treated "
+                "as coverless, and OpenCover was not sent")
         self._set("homing", "opening the cover")
-        self._say("Opening the flat panel's cover")
-        panel.open_cover()
+        self._say(f"Opening the flat panel's cover (driver reports {state})", "warn")
+        try:
+            panel.open_cover()
+        except Exception as exc:                  # noqa: BLE001 - show the driver error
+            raise DeviceError(f"OpenCover failed while the driver reported {state}: {exc}") from exc
         deadline = time.monotonic() + float(
             self._settings().get("coverTimeoutSeconds") or 120.0)
-        while panel.cover_state == "moving" and time.monotonic() < deadline:
+        while str(panel.cover_state) != "open" and time.monotonic() < deadline:
             self._check()
             time.sleep(0.5)
         if panel.cover_state != "open":
             raise DeviceError(f"the flat panel's cover is {panel.cover_state}, "
-                              "not open")
+                              "not open — OpenCover was sent and the driver "
+                              "did not report open")
         self._say("Cover open", "success")
 
     def _walk_plan(self, stored: dict[str, Any], known: dict[str, Any]) -> None:
@@ -1797,6 +1813,10 @@ class Sequencer:
                         self._say(f"{entry['name']}: the deal changed under the run - "
                                   "starting over on what the plan says now", "warn")
                     continue
+                except _CentreFailed as exc:
+                    self._say(f"{entry['name']}: {exc}", "error")
+                    self._tell("failure", f"{entry['name']}: centring failed",
+                               str(exc))
                 except _Skipped:
                     self._say(f"Skipped {entry['name']}", "warn")
                 break
@@ -2723,16 +2743,21 @@ class Sequencer:
                 self._solve_failures = 0
                 self._unwarn("solver.failing")
             except DeviceError as exc:
-                # A failed centre is not a reason to abandon the night; the frame
-                # is still usable, just not perfectly framed.
-                self._say(f"Could not centre on {label}: {exc}", "warn")
+                # Centring ran out. Focusing and exposing anyway is how a night
+                # shoots a field it is not on. This target stops; the next one
+                # is still tried. The night is not closed out for it.
                 self._solve_failures += 1
+                self._say(f"Could not centre on {label}: {exc}. "
+                          "Not focusing or imaging this target.", "error")
                 if self._solve_failures >= 3:
                     self._warn("solver.failing", "warning", "Plate solving keeps failing",
                                f"{self._solve_failures} centring solves in a row have failed; "
                                f"last: {exc}",
                                "Cloud, focus, or a wrong focal length in Site & Optics. "
-                               "Targets are being shot where the mount put them.")
+                               "This target was not imaged.")
+                raise _CentreFailed(
+                    f"{label} was not centred ({exc}); autofocus and imaging "
+                    "were not started") from exc
 
         # Slew, settle and centre together: what one panel costs before a single
         # frame of it is taken, which on a mosaic is paid once per panel.
@@ -3256,7 +3281,11 @@ class Sequencer:
                                   float(rotation) if rotating else None)
                 self._wait_for_solver()
             except DeviceError as exc:
-                self._say(f"Could not re-centre after the flip: {exc}", "warn")
+                self._say(f"Could not re-centre after the flip: {exc}. "
+                          "Not imaging this target from here.", "error")
+                raise _CentreFailed(
+                    f"{label} was not re-centred after the flip ({exc}); "
+                    "imaging was stopped") from exc
 
         if guiding:
             self._say("Restarting guiding")
@@ -3367,10 +3396,19 @@ class Sequencer:
         # gets reported, panel by panel, rather than the target's total.
         if not guide_lost:
             with contextlib.suppress(Exception):
+                camera = rig.manager.get("camera")
+                instrument = str(getattr(camera, "name", "") or "") if camera is not None else ""
+                bayer = str(getattr(camera, "bayer_pattern", "") or "") if camera is not None else ""
+                focal = rig.config.get("optics", "focalLength", None)
+                colour = bool(bayer) or bool(rig.config.get("camera", "colour", False))
                 self.targets.add_panel_integration(
                     entry["targetId"], rig.capture.night_name(),
                     int(panel.get("index", 0) or 0), filter_name, record.exposure,
-                    hfr=entry_row["hfr"], guide_rms=entry_row["guideRms"])
+                    hfr=entry_row["hfr"], guide_rms=entry_row["guideRms"],
+                    telescope=rig.name, instrument=instrument,
+                    focal_length=float(focal) if focal else None,
+                    role=getattr(rig, "role", "") or "",
+                    colour=colour, bayer=bayer)
 
         with self._lock:
             self._frames_log.append(entry_row)
@@ -3881,6 +3919,8 @@ class Sequencer:
     # that stays up, and the run stopped the ordinary way (park, warm).
 
     ROOF_POLL_SECONDS = 2.0
+    #: How long a filter change may take before the lights are held.
+    FILTER_SETTLE_SECONDS = 120.0
     #: Consecutive "error" reads during an open before it counts as failed;
     #: one bad read over COM is a glitch, not the driver's "Error".
     ROOF_ERROR_READS = 3
@@ -3911,11 +3951,20 @@ class Sequencer:
 
     @staticmethod
     def _roof_state(dome) -> str:
-        """open, closed, opening, closing, error - a read that fails is error."""
+        """Driver word. A failed read is error. Unknown is not open."""
         try:
-            return str(dome.shutter_state or "error").lower()
+            refresh = getattr(dome, "refresh_shutter", None)
+            if refresh is not None:
+                return str(refresh() or "unknown").lower()
+            return str(dome.shutter_state or "unknown").lower()
         except Exception:                         # noqa: BLE001 - a fault is not open
             return "error"
+
+    @staticmethod
+    def _note_roof_conflict(dome, text: str | None) -> None:
+        note = getattr(dome, "note_shutter_conflict", None)
+        if note is not None:
+            note(text)
 
     def _safety_watching(self) -> bool:
         watcher = getattr(self, "safety", None)
@@ -3969,6 +4018,11 @@ class Sequencer:
         if dome is None:
             return True
         if self._roof_state(dome) == "open":
+            # Already-reported open is the driver's word. Do not send another
+            # OpenShutter, and do not call it verified.
+            self._say(
+                f"Driver already reports the roof open before {label} — "
+                "not verified. No OpenShutter sent.", "warn")
             return True
         if self._roof_locked:
             raise DeviceError(f"the roof is treated as locked ({self._roof_locked}); "
@@ -4002,11 +4056,13 @@ class Sequencer:
             raise DeviceError("the roof was not opened: 'Require safety monitor to "
                               "open' is on and there is no safety monitor")
         else:
-            title = "Roof opened with no safety monitor - nothing will close it for weather"
-            detail = (f"{getattr(dome, 'name', 'The roof')} is being opened for {label} "
-                      "with no safety monitor connected or configured. Starfront "
-                      "closes it at the end of the run, but nothing will close it "
-                      "if the weather turns.")
+            title = ("Roof commanded open with no safety monitor"
+                     " — nothing will close it for weather")
+            detail = (f"{getattr(dome, 'name', 'The roof')} is being commanded open "
+                      f"for {label} with no safety monitor connected or configured. "
+                      "The command has not been carried out yet. Starfront asks the "
+                      "driver to close at the end of the run, but nothing will close "
+                      "it if the weather turns.")
             self._warn("roof.nosafety", "warning", title, detail,
                        "Connect a safety monitor (Equipment → Safety), or watch the sky.")
             self._roof_alert(title, detail)
@@ -4016,7 +4072,7 @@ class Sequencer:
         self._set("homing", "opening the roof")
         self._say(f"Opening the roof ({getattr(dome, 'name', 'dome')}) before {label}", "warn")
         try:
-            dome.open_shutter()
+            roofguard.request_open(dome)
         except Exception as exc:                  # noqa: BLE001 - a refused open
             self._roof_lock(dome, f"OpenShutter failed: {exc}")
         self._roof_opened_by_run = True
@@ -4035,7 +4091,9 @@ class Sequencer:
                 self._roof_lock(dome, f"not open after {timeout:.0f} s (it reads {state})")
             self._sleep(self.ROOF_POLL_SECONDS)
             state = self._roof_state(dome)
-        self._say("Roof open", "success")
+        self._say(
+            "Driver reports the roof open — not verified. "
+            "Starfront has no roof sensor and did not see the roof move.", "warn")
         self._unwarn("roof.closed")
         return True
 
@@ -4059,27 +4117,29 @@ class Sequencer:
             return
         started = time.monotonic()
         alerted = False
-        self._say(f"Holding the lights: the roof reads {state}", "warn")
+        self._say(f"Holding the lights: the driver reports the roof {state}", "warn")
         while state != "open":
-            self._set("waiting", f"lights held: the roof reads {state}")
+            self._set("waiting", f"lights held: the driver reports {state}")
             if not alerted and time.monotonic() - started >= 60.0:
                 alerted = True
-                title = "Lights held: the roof is not open"
+                title = "Lights held: the driver does not report the roof open"
                 detail = (f"{getattr(dome, 'name', 'The roof')} has read {state} for a "
-                          "minute. No light is taken until it reads open"
+                          "minute. No light is taken while the driver reports that. "
+                          "This is the driver's word, not a physical position."
                           + (f" (treated as locked: {self._roof_locked})"
-                             if self._roof_locked else "") + ".")
+                             if self._roof_locked else ""))
                 self._warn("roof.closed", "critical", title, detail,
                            "Open the roof, or stop the sequence.")
                 self._roof_alert(title, detail)
-            reason = self._past_deadline(None, None)
-            if reason:
-                self._say(f"{reason} while the lights were held for the roof", "warn")
+            end = self._past_deadline(None, None)
+            if end:
+                self._say(f"{end} while the lights were held for the roof", "warn")
                 raise _Skipped()
             self._sleep(5.0)
             state = self._roof_state(dome)
         self._unwarn("roof.closed")
-        self._say("The roof reads open again: carrying on", "success")
+        self._say("Driver reports the roof open again — not verified. Carrying on.",
+                  "warn")
 
     def _close_roof_after_run(self) -> None:
         """Shut the roof this run opened, once the mount is parked (0.2.53b)."""
@@ -4129,18 +4189,45 @@ class Sequencer:
             return
 
         self._set("parking", "closing the roof")
-        dome.close_shutter()
+        try:
+            dome.close_shutter()
+        except Exception as exc:                  # noqa: BLE001 - the driver's word
+            raise DeviceError(f"CloseShutter failed: {exc}") from exc
+        # 0.2.53b returned on the first read. HakosRoof was still reporting
+        # open for about a second, then opening, then closed. Wait the timeout.
+        no_change = float(self._settings().get("roofCloseNoChangeSeconds") or 30.0)
         deadline = time.monotonic() + timeout
-        while dome.shutter_state in ("closing", "opening") \
-                and time.monotonic() < deadline:
+        started = time.monotonic()
+        last = self._roof_state(dome)
+        changed_at = started
+        alerted = False
+        while time.monotonic() < deadline:
+            state = self._roof_state(dome)
+            if state == "closed":
+                self._say("Driver reports the roof closed — not independently verified",
+                          "warn")
+                self._unwarn("roof.nosafety")
+                if getattr(dome, "can_park", False) and not dome.at_park:
+                    with contextlib.suppress(Exception):
+                        dome.park()
+                return
+            if state != last:
+                last = state
+                changed_at = time.monotonic()
+            elif not alerted and time.monotonic() - changed_at >= no_change:
+                alerted = True
+                detail = (f"Close still pending: the driver still reports {state} "
+                          f"{no_change:.0f}s after CloseShutter. Not verified.")
+                self._say(detail, "error")
+                self._note_roof_conflict(dome, detail)
+                self._warn("roof.close", "critical",
+                           "The driver has not reported the roof closed",
+                           detail, "Look at the roof. Do not treat the driver word as proof.")
             time.sleep(1.0)
-        if dome.shutter_state != "closed":
-            raise DeviceError(f"the roof is {dome.shutter_state}")
-        self._say("Roof closed", "success")
-        self._unwarn("roof.nosafety")
-        if getattr(dome, "can_park", False) and not dome.at_park:
-            with contextlib.suppress(Exception):
-                dome.park()
+        state = self._roof_state(dome)
+        raise DeviceError(
+            f"the driver still reports {state} {timeout:.0f}s after CloseShutter"
+            " — not verified closed")
 
     def _abort_cameras(self) -> None:
         for stop in list(self.extra_aborts):
@@ -4161,7 +4248,9 @@ class Sequencer:
             return
         with contextlib.suppress(Exception):
             panel.turn_off()
-        if not getattr(panel, "has_cover", False):
+        # Close only a cover the driver has shown us. Unknown is not a
+        # command to move, and NotPresent is a lamp with no cover.
+        if panel.has_cover is not True:
             return
         if panel.cover_state == "closed":
             return
@@ -4741,6 +4830,8 @@ class Sequencer:
                 self._goto(panel, label)
                 recovered = True
                 break
+            except _CentreFailed:
+                raise
             except DeviceError as exc:
                 self._say(f"Could not get back on target (attempt {attempt} of "
                           f"{attempts}): {exc}", "warn")
@@ -5182,8 +5273,12 @@ class Sequencer:
                                 False)
                 return
         if self.solver is not None and self.solver.executable() is not None:
-            with contextlib.suppress(Exception):
+            try:
                 self._goto(panel, label)
+            except _CentreFailed:
+                raise
+            except Exception:
+                pass
         if not tracking:
             self._recovered("mount", "Tracking again", True)
 
@@ -5246,6 +5341,21 @@ class Sequencer:
                 self._say(f"{rig.name}: could not select {name} before the focus "
                           f"run — {exc}", "warn")
 
+    def _hold_unknown_filter(self, rig, name: str, why: str) -> None:
+        """Do not take a light through a filter the wheel has not confirmed.
+
+        Raises. The slot loop holds and tries again. FILTER is not guessed
+        and a blank card is not written, because the exposure never starts.
+        """
+        title = f"{rig.name}: the filter is not known"
+        detail = (f"Asked for {name or 'the filter'}. {why}. No light is taken "
+                  "until the wheel reports that slot. Nothing is guessed.")
+        self._warn("filter.unknown", "critical", title, detail,
+                   "Check the filter wheel. The run holds; it does not shoot "
+                   "a blank FILTER.")
+        self._say(f"{title} — {why}", "error")
+        raise DeviceError(f"{rig.name}: filter {name or '?'} did not settle ({why})")
+
     def _select_filter(self, rig, name: str) -> bool:
         """Put a telescope's wheel on the named filter.  True if it moved."""
         # In the one spelling, whatever asked: the wheel's names already are.
@@ -5272,18 +5382,34 @@ class Sequencer:
         # Matched in the one spelling on both sides: a wheel that reports its
         # own names through a driver that never folded them still lines up.
         names = [filters.canonical(n) or str(n) for n in (wheel.names or [])]
-        if name not in names:
+        index = names.index(name) if name in names else None
+        if index is None:
+            slot, _said = read_slot(wheel)
+            if slot is None:
+                self._hold_unknown_filter(rig, name, "the wheel has no filter by that name "
+                                          "and is not reporting a slot")
             self._say(f"{rig.name}: the wheel has no filter called {name}; "
                       "shooting with what is loaded", "warn")
             return False
-        if names.index(name) == wheel.position:
-            return False
         self._set_rig(rig, state=f"selecting {name}")
         started = time.monotonic()
-        wheel.set_position(names.index(name))
-        deadline = time.monotonic() + 120
-        while wheel.moving and time.monotonic() < deadline:
+        slot, said_moving = read_slot(wheel)
+        if slot != index:
+            wheel.set_position(index)
+        deadline = time.monotonic() + float(self.FILTER_SETTLE_SECONDS)
+        while True:
             self._check()
+            slot, said_moving = read_slot(wheel)
+            if slot == index:
+                if said_moving:
+                    self._say(f"{rig.name}: the wheel reported moving, but the "
+                              f"position read is {name}; using that", "warn")
+                break
+            if time.monotonic() >= deadline:
+                self._hold_unknown_filter(
+                    rig, name,
+                    f"it did not report slot {index} ({name}) within "
+                    f"{self.FILTER_SETTLE_SECONDS:.0f}s")
             time.sleep(0.2)
         moved_focus = self._apply_filter_offset(rig, name)
         # What a change really costs on this wheel, focus offset included.
@@ -5502,9 +5628,17 @@ class Sequencer:
                 [(rig, lambda rig=rig: self._select_filter(rig, frames[rig.id]["filter"]))
                  for rig in active], "filter",
                 timeout=float(self._recovery_settings().get("recoveryStepSeconds") or 180.0))
-            for rig_id, message in changed["errors"].items():
-                self._say(f"{self._name(rig_id)}: could not select a filter — "
-                          f"{message}", "warn")
+            unsettled = [rig for rig in active if rig.id in changed["errors"]]
+            if unsettled:
+                # A wheel that has not settled holds the slot. The frame is not
+                # taken, and the queue is not advanced, so the same slot is
+                # tried again. Stop still ends it.
+                names = ", ".join(rig.name for rig in unsettled)
+                self._set("waiting", f"holding the lights: filter not settled ({names})")
+                self._say(f"Holding the lights: {names} — the filter wheel has not "
+                          "settled, so nothing is exposed", "warn")
+                self._sleep(5.0)
+                continue
             self._maybe_focus(filter_changed=changed["results"])
 
             # Between frames is the only safe place to put any of this right: a
@@ -5583,6 +5717,15 @@ class Sequencer:
                 self._dither(entry)
 
         return True
+
+
+class _CentreFailed(Exception):
+    """Centring ran out of attempts. This target is not focused or imaged.
+
+    The rest of the plan still runs. Raising DeviceError here would end the
+    night, which is what a failed slew does, and swallowing it is what used
+    to start autofocus on a field the telescope was not on.
+    """
 
 
 class _Stopped(Exception):

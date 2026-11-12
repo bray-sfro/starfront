@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from astrocontrol import autoupload                               # noqa: E402
-from astrocontrol.autoupload import AutoUploader, Bucket          # noqa: E402
+from astrocontrol.autoupload import AutoUploader, Bucket, pause_scope_for_507  # noqa: E402
 from astrocontrol.capture import CaptureService                   # noqa: E402
 
 results: list[tuple[bool, str]] = []
@@ -204,7 +204,8 @@ def units(tmp: Path) -> None:
     u, s = fresh("a.fits")
     s.answer_start = (507, {"detail": "the server is keeping its last 25 GB free; uploads are paused"}, {"retry-after": "21600"})
     u.step()
-    check(u.paused_until >= clock.t + 21000 and "paused" in u.status()["line"], "507 pauses everything for the Retry-After")
+    check(u.paused_until >= clock.t + 21000 and u.status()["line"].startswith("Auto-upload paused:"),
+          "disk 507 pauses everything for the Retry-After")
     calls = len(s.calls)
     u.step()
     check(len(s.calls) == calls, "while paused nothing is sent")
@@ -220,6 +221,89 @@ def units(tmp: Path) -> None:
     s.answer_start = (429, {"detail": "one upload at a time"}, {"retry-after": "30"})
     u.step()
     check(u.paused_until and u.paused_until - clock.t <= 31, "429 waits the Retry-After")
+
+    # Quota 507 is one project. Disk 507 is the rig. Wording is the fallback
+    # until the collab server sends scope/reason.
+    check(pause_scope_for_507({"detail": "this project's storage quota is full (40 GiB)"}) == "project",
+          "507 text: a quota sentence is that project only")
+    check(pause_scope_for_507({"detail": "the server is keeping its last 25 GB free; uploads are paused"}) == "all",
+          "507 text: disk free-space is every project")
+    check(pause_scope_for_507({"detail": "insufficient storage"}) == "all",
+          "507 text: an unclassified 507 stays server-wide")
+    check(pause_scope_for_507({"detail": "the server is keeping its last 25 GB free",
+                               "scope": "project", "reason": "quota"}) == "project",
+          "507 JSON scope=project wins over disk wording")
+    check(pause_scope_for_507({"detail": {"message": "full", "scope": "project", "reason": "quota"}}) == "project",
+          "507 detail object scope=project is that project")
+    check(pause_scope_for_507({"detail": "paused", "reason": "disk"}) == "all",
+          "507 JSON reason=disk is every project")
+    check(pause_scope_for_507({"detail": "quota full"}, {"x-starfront-pause-scope": "server"}) == "all",
+          "507 header scope wins over quota wording when JSON scope is absent")
+    check(pause_scope_for_507({"detail": "disk full", "scope": "project"},
+                              {"x-starfront-pause-scope": "server"}) == "project",
+          "507 JSON scope wins over the header")
+
+    # Tonight: m42's quota is full. M31 on the other rigs must keep uploading.
+    m42 = tmp / "M42_Ha_0001.fits"
+    m31 = tmp / "M31_Ha_0001.fits"
+    m42.write_bytes(fits_bytes({**LIGHT, "DATE-OBS": "2026-11-06T01:00:00"}))
+    m31.write_bytes(fits_bytes({**LIGHT, "DATE-OBS": "2026-11-06T02:00:00"}))
+    qfolder = tmp / "q-quota"
+    quota = AutoUploader(Conf(autoUpload=True), None, None, folder=qfolder, clock=clock)
+    qserver = FakeServer()
+
+    def quota_http(method, path, body):
+        if method == "POST" and path == "/api/v1/agent/uploads" and isinstance(body, dict) \
+                and body.get("project") == "m42 horse test mosaic":
+            return (507, {"detail": "this project's storage quota is full (40 GiB)"},
+                    {"retry-after": "21600"})
+        return qserver(method, path, body)
+
+    quota.http = quota_http
+    quota.add(m42, "m42 horse test mosaic", "light", "t-m42", "vsd100")
+    quota.add(m31, "m31", "light", "t-m31", "twin")
+    quota.step()
+    check("m42 horse test mosaic" in quota.project_paused and not (quota.paused_until > clock.t),
+          "quota 507 pauses m42 only, not the rig")
+    check(quota.items[0]["state"] == "queued" and quota.due()["project"] == "m31",
+          "m31 stays queued and is the next upload")
+    status = quota.status()
+    line = status["line"]
+    m42count = status["projectCounts"]["m42 horse test mosaic"]
+    m31count = status["projectCounts"]["m31"]
+    check(line.startswith("Auto-upload: ") and not line.startswith("Auto-upload paused")
+          and "m42 horse test mosaic paused (1 queued, quota full, until " in line
+          and "m31 1 queued" in line and m42count["paused"] and m42count["queued"] == 1
+          and m31count["paused"] is False and m31count["queued"] == 1,
+          f"the status line names the paused project and the other queue ({line})")
+    quota.step()
+    check(m31.name in qserver.files and m42.name not in qserver.files,
+          "m31 is sent while m42's quota pause holds")
+    resumed = AutoUploader(Conf(autoUpload=True), None, None, folder=qfolder, clock=clock)
+    check("m42 horse test mosaic" in resumed.project_paused and not (resumed.paused_until > clock.t)
+          and resumed.due() is None,
+          "the project pause is still there after a restart, and it is not global")
+    check("m42 horse test mosaic" in json.loads((qfolder / "pauses.json").read_text("utf-8"))["projects"],
+          "pauses.json keeps the project pause beside the queue")
+
+    # The same two projects, but the disk is full: nobody uploads.
+    disk_dir = tmp / "q-disk"
+    disk = AutoUploader(Conf(autoUpload=True), None, None, folder=disk_dir, clock=clock)
+    dserver = FakeServer()
+    dserver.answer_start = (507, {"detail": "the server is keeping its last 25 GB free; uploads are paused"},
+                            {"retry-after": "21600"})
+    disk.http = dserver
+    disk.add(m42, "m42 horse test mosaic", "light", "t-m42", "vsd100")
+    disk.add(m31, "m31", "light", "t-m31", "twin")
+    disk.step()
+    calls = len(dserver.calls)
+    disk.step()
+    check(disk.paused_until >= clock.t + 21000 and len(dserver.calls) == calls
+          and "m42 horse test mosaic" not in disk.project_paused,
+          "disk 507 still pauses every project")
+    restored = AutoUploader(Conf(autoUpload=True), None, None, folder=disk_dir, clock=clock)
+    check(restored.paused_until >= clock.t + 21000 and restored.due() is None,
+          "a server-wide pause survives a restart and still holds m31")
 
     # The daytime window.
     site = {"latitude": 30.5, "longitude": -98.3}
@@ -415,10 +499,227 @@ def end_to_end(tmp: Path, tree: Path) -> None:
         proc.wait(10)
 
 
+def follower_and_backfill(tmp: Path) -> None:
+    """The Rokinon / ASI6200MC never queues or sends. The 14 FSQ85 lights do.
+
+    Identity is the camera and the rig role. A follower frame filed under the
+    master's folder is still skipped, and a master frame filed under the
+    follower's folder is still queued. The FITS bytes are not rewritten.
+    """
+    from astrocontrol.autoupload import allows_upload, identity_from_header
+
+    project, task = "97fcae827a9f", "481536614589"
+    master = {"role": "master", "camera": "ZWO ASI6200MM Pro", "colour": False,
+              "mono": True, "upload": None, "name": "FSQ85"}
+    follower = {"role": "follower", "camera": "ZWO ASI6200MC Pro", "bayer": "RGGB",
+                "colour": True, "mono": False, "upload": None, "name": "Rokinon 135mm"}
+    check(allows_upload(master), "the master uploads by default")
+    check(not allows_upload(follower), "the follower does not upload by default")
+    check(allows_upload({**follower, "upload": True}) is True,
+          "camera.uploadCollab True is an explicit per-rig opt-in")
+    check(allows_upload(follower) is False, "unset follower stays off")
+
+    clock = Clock()
+    up = AutoUploader(Conf(autoUploadMbit=0), SimpleNamespace(_ready=lambda: None),
+                      folder=tmp / "queue", clock=clock)
+    check(up.settings()["mbit"] == 10.0, "0 Mbit/s is the 10 Mbit/s default")
+    check(up.settings()["daytimeOnly"] is False or "daytimeOnly" in up.settings(),
+          "daytime-only is still a setting")
+    bad = up.light_saved(str(tmp / "rokinon.fits"),
+                         {"collabProject": project, "collabTask": task},
+                         "Rokinon 135mm", None, identity=follower)
+    good = up.light_saved(str(tmp / "fsq.fits"),
+                          {"collabProject": project, "collabTask": task},
+                          "FSQ85", None, identity=master)
+    check(bad is False and good is True, "a follower light is not queued; the master's is")
+    check(all("rokinon" not in Path(i["path"]).name.lower() for i in up.items),
+          "the queue has no Rokinon frame")
+
+    # Backfill. 2 master lights missing PROJID, 2 follower lights missing
+    # PROJID (one of them sitting in the master's folder), 1 master light
+    # that already has PROJID. Only the two master lights without PROJID queue.
+    root = tmp / "captures"
+    samples = [
+        (root / "m42_horse_test_mosaic" / "2026-11-05" / "FSQ85" / "m42_P20_5s_0001.fits",
+         {"IMAGETYP": "Light", "INSTRUME": "ZWO ASI6200MM Pro", "TELESCOP": "FSQ85",
+          "FILTER": "", "EXPTIME": 5}),
+        (root / "m42_horse_test_mosaic" / "2026-11-05" / "Rokinon_135mm" / "m42_P20_L_5s_0001.fits",
+         {"IMAGETYP": "Light", "INSTRUME": "ZWO ASI6200MC Pro", "TELESCOP": "Rokinon 135mm",
+          "BAYERPAT": "RGGB", "FILTER": "L", "EXPTIME": 5}),
+        # Follower bytes stored under the master folder. The folder must not win.
+        (root / "m42_horse_test_mosaic" / "2026-11-05" / "FSQ85" / "m42_P20_L_5s_0002.fits",
+         {"IMAGETYP": "Light", "INSTRUME": "ZWO ASI6200MC Pro", "TELESCOP": "Rokinon 135mm",
+          "BAYERPAT": "RGGB", "FILTER": "L", "EXPTIME": 5}),
+        # Master bytes stored under the follower folder. The folder must not exclude it.
+        (root / "m42_horse_test_mosaic" / "2026-11-05" / "Rokinon_135mm" / "m42_P13_5s_0001.fits",
+         {"IMAGETYP": "Light", "INSTRUME": "ASI Camera (1) ? CamID 1, ZWO ASI6200MM Pro",
+          "TELESCOP": "FSQ85", "FILTER": "", "EXPTIME": 5}),
+        (root / "m42_horse_test_mosaic" / "2026-11-05" / "FSQ85" / "already.fits",
+         {"IMAGETYP": "Light", "INSTRUME": "ZWO ASI6200MM Pro", "TELESCOP": "FSQ85",
+          "PROJID": project, "EXPTIME": 300}),
+    ]
+    from astrocontrol.imaging.fits import write as write_fits
+    import numpy as np
+    originals = {}
+    blank = np.zeros((4, 4), dtype=np.uint16)
+    for path, cards in samples:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        header = {key: value for key, value in cards.items() if value not in ("", None)}
+        write_fits(path, blank, header)
+        originals[path] = path.read_bytes()
+
+    targets = [{"name": "m42 horse test mosaic",
+                "collab": {"project": project, "task": task,
+                           "projectName": "m42 horse test mosaic"}}]
+    report = up.backfill(root, targets, [
+        {"name": "FSQ85", "role": "master", "camera": "ZWO ASI6200MM Pro", "upload": None},
+        {"name": "Rokinon 135mm", "role": "follower", "camera": "ZWO ASI6200MC Pro",
+         "colour": True, "upload": None},
+    ])
+    names = set(report["queuedNames"])
+    check(names == {"m42_P20_5s_0001.fits", "m42_P13_5s_0001.fits"},
+          f"backfill queues only the master lights missing PROJID ({sorted(names)})")
+    check("m42_P20_L_5s_0001.fits" in report["skippedNames"]
+          and "m42_P20_L_5s_0002.fits" in report["skippedNames"],
+          "both Rokinon frames are skipped, including the one in the FSQ85 folder")
+    queued_paths = [i["path"] for i in up.items]
+    check(not any("L_5s" in Path(path).name for path in queued_paths),
+          "no Rokinon frame is queued, even the one saved in the FSQ85 folder")
+    for item in up.items:
+        if "5s" in Path(item["path"]).name:
+            check(item["project"] == project and item["task"] == task,
+                  f"{Path(item['path']).name} carries project {project} and task {task}")
+    check(all(path.read_bytes() == originals[path] for path in originals),
+          "backfill does not rewrite the FITS files")
+    ident = identity_from_header({"INSTRUME": "ZWO ASI6200MC Pro", "BAYERPAT": "RGGB",
+                                  "TELESCOP": "Rokinon 135mm"})
+    check(not allows_upload(ident, strict=True),
+          "a colour header is a follower even before the rig list is consulted")
+
+    # Sending: a follower item that was forced onto the queue is refused and
+    # the server is not asked. A master item is.
+    forced = tmp / "forced_rokinon.fits"
+    write_fits(forced, blank, {"IMAGETYP": "Light", "INSTRUME": "ZWO ASI6200MC Pro",
+                               "BAYERPAT": "RGGB", "TELESCOP": "Rokinon 135mm",
+                               "FILTER": "L", "EXPTIME": 5})
+    up.add(forced, project, "light", task, "Rokinon 135mm", identity=follower)
+    server = FakeServer()
+    up.http = server
+    clock.t += 10
+    item = next(i for i in up.items if i["path"].endswith("forced_rokinon.fits"))
+    up.send(item)
+    check(item["state"] == "refused" and "does not upload" in item["error"],
+          "a queued follower frame is refused at send")
+    check(not any(call[0] == "POST" and str(forced.name) in str(call) for call in server.calls)
+          or server.calls == [] or all("forced_rokinon" not in str(call) for call in server.calls),
+          "the server is not asked for the Rokinon frame")
+    master_item = next(i for i in up.items if i["path"].endswith("m42_P20_5s_0001.fits"))
+    # Settle the file's mtime so send does not wait.
+    os.utime(master_item["path"], (clock.t - 30, clock.t - 30))
+    before = len(server.calls)
+    up.send(master_item)
+    check(len(server.calls) > before and master_item["state"] in ("sent", "sending", "already"),
+          f"the master frame is sent ({master_item['state']})")
+
+
+def blank_root_and_duplicate_name(tmp: Path) -> None:
+    """A blank capture.rootDirectory still scans data_root()/captures.
+
+    Two targets named 'm42 horse test mosaic' are not resolved by whichever
+    is first. The folder belongs to the task this PC is on
+    (481536614589), not the declined one (b9412d46f576). With no exact
+    task, the folder is skipped. The follower is still not queued.
+    """
+    import os
+    from astrocontrol.capture import CaptureService, capture_root
+    from astrocontrol.config import Config
+    from astrocontrol.imaging.fits import write as write_fits
+    import numpy as np
+
+    previous = os.environ.get("ASTRO_DATA_DIR")
+    data = tmp / "eagle-data"
+    os.environ["ASTRO_DATA_DIR"] = str(data)
+    try:
+        config = Config(data / "settings.json")
+        # The installed settings leave this blank. Capture and backfill must
+        # agree on the fallback.
+        check(config.get("capture", "rootDirectory", "") == "",
+              "the default capture root is blank")
+        root = capture_root(config)
+        check(root == data / "captures", f"blank rootDirectory is {root}")
+        capture = CaptureService(SimpleNamespace(), config)
+        check(capture.root_dir == root, "backfill and capture share capture_root")
+
+        folder = root / "m42_horse_test_mosaic" / "2026-11-05" / "FSQ85"
+        folder.mkdir(parents=True)
+        blank = np.zeros((4, 4), dtype=np.uint16)
+        master = folder / "m42_P20_5s_26C_0001.fits"
+        follower_dir = root / "m42_horse_test_mosaic" / "2026-11-05" / "Rokinon_135mm"
+        follower_dir.mkdir(parents=True)
+        follower = follower_dir / "m42_P20_L_5s_0001.fits"
+        write_fits(master, blank, {"IMAGETYP": "Light", "INSTRUME": "ZWO ASI6200MM Pro",
+                                   "TELESCOP": "FSQ85", "EXPTIME": 5})
+        write_fits(follower, blank, {"IMAGETYP": "Light", "INSTRUME": "ZWO ASI6200MC Pro",
+                                     "BAYERPAT": "RGGB", "TELESCOP": "Rokinon 135mm",
+                                     "FILTER": "L", "EXPTIME": 5})
+        project = "97fcae827a9f"
+        accepted = "481536614589"
+        declined = "b9412d46f576"
+        targets = [
+            {"name": "m42 horse test mosaic",
+             "collab": {"project": project, "projectName": "m42 horse test mosaic",
+                        "task": declined}},
+            {"name": "m42 horse test mosaic",
+             "collab": {"project": project, "projectName": "m42 horse test mosaic",
+                        "task": accepted}},
+        ]
+        rigs = [
+            {"name": "FSQ85", "role": "master", "camera": "ZWO ASI6200MM Pro", "upload": None},
+            {"name": "Rokinon 135mm", "role": "follower", "camera": "ZWO ASI6200MC Pro",
+             "colour": True, "upload": None},
+        ]
+        logs: list[str] = []
+        up = AutoUploader(config, SimpleNamespace(
+            _ready=lambda: None,
+            status=lambda: {"task": {"id": accepted}}),
+            folder=tmp / "blank-queue", log=lambda message, level="info": logs.append(message))
+        report = up.backfill(targets=targets, rigs=rigs)
+        check(Path(report["root"]) == root, f"backfill scanned {report['root']}")
+        check(report["scanned"] == 2 and report["matched"] == 2 and report["queued"] == 1,
+              f"blank root found the frames ({report})")
+        queued = [item for item in up.items if item["path"].endswith("m42_P20_5s_26C_0001.fits")]
+        check(len(queued) == 1 and queued[0]["task"] == accepted and queued[0]["project"] == project,
+              "the duplicate name resolves to the current task, not the first stamp")
+        check(all(item["task"] != declined for item in up.items),
+              "the declined task was not guessed")
+        check(report["skippedBy"].get("follower") == 1
+              and not any(item["path"].endswith("L_5s_0001.fits") for item in up.items),
+              "the follower is still excluded")
+        check(any("scanned 2" in line and "queued 1" in line and str(root) in line for line in logs),
+              "the log names the root and the counts")
+
+        # No current task, and the header does not name one: do not pick a stamp.
+        up2 = AutoUploader(config, SimpleNamespace(_ready=lambda: None, status=lambda: {}),
+                           folder=tmp / "blank-queue-2",
+                           log=lambda message, level="info": logs.append(message))
+        report2 = up2.backfill(targets=targets, rigs=rigs)
+        check(report2["queued"] == 0 and report2["skippedBy"].get("ambiguous", 0) >= 1,
+              f"without an exact task the duplicate name is skipped ({report2['skippedBy']})")
+        check(any("ambiguous" in line for line in logs),
+              "the ambiguous folder is logged")
+    finally:
+        if previous is None:
+            os.environ.pop("ASTRO_DATA_DIR", None)
+        else:
+            os.environ["ASTRO_DATA_DIR"] = previous
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         units(Path(tmp))
         per_frame(Path(tmp))
+        follower_and_backfill(Path(tmp))
+        blank_root_and_duplicate_name(Path(tmp))
         tree = os.environ.get("STARFRONT_SERVER_TREE")
         if tree:
             end_to_end(Path(tmp), Path(tree))

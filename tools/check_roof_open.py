@@ -82,6 +82,15 @@ class Dome:
     def shutter_state(self):
         if self._open_at is not None and CLOCK.t >= self._open_at:
             self.state, self._open_at = "open", None
+        mark = getattr(self, "_close_mark", None)
+        if mark is not None:
+            elapsed = CLOCK.t - mark
+            if elapsed >= 50:
+                self.state = "closed"
+            elif elapsed >= 5:
+                self.state = "opening"
+            else:
+                self.state = "open"
         return self.state
 
     def open_shutter(self):
@@ -101,6 +110,15 @@ class Dome:
 
     def close_shutter(self):
         self.commands.append("close")
+        if self.mode == "slow-close":
+            # Stays open, then reports opening, then closed. The Nov 4 close
+            # did this; 0.2.53b failed on the first still-open read.
+            self._close_mark = CLOCK.t
+            self.state = "open"
+            return
+        if self.mode == "stay-open":
+            self.state = "open"
+            return
         self.state = "closed"
 
 
@@ -215,9 +233,12 @@ case("normal open marks the run as the opener", s._roof_opened_by_run)
 case("no safety monitor: warning stays up + alert sent",
      "roof.nosafety" in s.warnings.up and any("no safety monitor" in subj for _, subj in s.told),
      str(s.told))
-case("the warning text is the agreed one",
+case("the warning text is the command, not a completed open",
      s.warnings.up.get("roof.nosafety", ("", ""))[1]
-     == "Roof opened with no safety monitor - nothing will close it for weather")
+     == "Roof commanded open with no safety monitor — nothing will close it for weather")
+case("a finished open is not logged as a bare verified open",
+     any("not verified" in msg for _, msg in LOG)
+     and not any(msg == "Roof open" for _, msg in LOG))
 # then a light: the gate lets it straight through
 before = CLOCK.t
 s._roof_gate_lights()
@@ -227,6 +248,8 @@ case("open roof: lights pass the gate at once", CLOCK.t == before)
 d = Dome(state="open")
 s = build(d)
 case("already open: nothing sent", s._ensure_roof_open("m42") and d.commands == [])
+case("already open is labelled unverified",
+     any("not verified" in msg and "No OpenShutter" in msg for _, msg in LOG))
 
 # 3. open timeout = locked: no retry, no lights, no close-back
 d = Dome(mode="lock")
@@ -327,8 +350,8 @@ t0 = CLOCK.t
 s._roof_gate_lights()
 CLOCK.hooks.clear()
 case("closed mid-run: lights held until it reads open", CLOCK.t - t0 >= 150.0)
-case("closed mid-run: alerted (once) while held", sum("roof is not open" in subj
-                                                       for _, subj in s.told) == 1, str(s.told))
+case("closed mid-run: alerted (once) while held",
+     sum("does not report the roof open" in subj for _, subj in s.told) == 1, str(s.told))
 case("closed mid-run: the gate never sends a roof command", d.commands == [])
 case("closed mid-run: warning cleared once open", "roof.closed" not in s.warnings.up)
 
@@ -387,21 +410,32 @@ s._roof_locked = "not open after 180 s"
 why = raises(s.restart_unpark)
 case("auto-restart: a latched lock is never opened against", why and d.commands == [], why)
 
-# 13. ASCOM ShutterStatus 0 is open (0.2.53a read it as error)
+# 13. ASCOM ShutterStatus 0 is the driver's open. A missing value is unknown,
+# never open. The live cache is exercised in check_roof_status.py.
 from astrocontrol.devices.ascom import AscomDome               # noqa: E402
-ad = AscomDome.__new__(AscomDome)
-ad.can_shutter = True
-reads = {}
-ad._get = lambda name, default=None: reads.get(name, default)
-got = {}
-for value, want in [(0, "open"), (1, "closed"), (2, "opening"), (3, "closing"), (4, "error")]:
-    reads["ShutterStatus"] = value
-    got[value] = ad.shutter_state
-reads.clear()
-got["none"] = ad.shutter_state
-case("ASCOM dome: 0=open 1=closed 2=opening 3=closing 4=error, no answer=error",
-     got == {0: "open", 1: "closed", 2: "opening", 3: "closing", 4: "error", "none": "error"},
+got = {value: AscomDome._map_shutter_status(value)
+       for value in (0, 1, 2, 3, 4)}
+got["none"] = AscomDome._map_shutter_status(None)
+case("ASCOM dome: 0=open 1=closed 2=opening 3=closing 4=error, no answer=unknown",
+     got == {0: "open", 1: "closed", 2: "opening", 3: "closing", 4: "error",
+             "none": "unknown"},
      str(got))
+
+# 13b. Close waits. A driver that is still open on the first read is not a failure.
+d = Dome(state="open", mode="slow-close")
+s = build(d, roofTimeoutSeconds=120, roofCloseNoChangeSeconds=30)
+s._close_roof()
+case("close waits out a still-open read and a later opening report",
+     d.commands == ["close"] and d.state == "closed", f"{d.commands} {d.state}")
+case("close success is driver-reported, not verified",
+     any("not independently verified" in msg for _, msg in LOG))
+d = Dome(state="open", mode="stay-open")
+s = build(d, roofTimeoutSeconds=12, roofCloseNoChangeSeconds=5)
+t0 = CLOCK.t
+why = raises(lambda: s._close_roof())
+case("close that stays open fails at the timeout, not on the first read",
+     why and "still reports open" in why and 11 <= CLOCK.t - t0 <= 14,
+     f"{why} after {CLOCK.t - t0:.1f}s")
 
 # 14. the settings route takes the new fields
 from astrocontrol.main import SequencerSettingsRequest         # noqa: E402
@@ -414,6 +448,8 @@ seqd = DEFAULTS["sequencer"]
 case("defaults: open on, require off, 180 s, gate on, close at end on",
      (seqd["openRoofAtStart"], seqd["requireSafetyToOpen"], seqd["roofOpenTimeoutSeconds"],
       seqd["pauseLightsUnlessRoofOpen"], seqd["closeRoofAtEnd"]) == (True, False, 180.0, True, True))
+case("close no-change warning defaults to 30 s",
+     seqd["roofCloseNoChangeSeconds"] == 30.0)
 
 # 15. order inside a real target: the roof is open before the first slew/home
 d = Dome()

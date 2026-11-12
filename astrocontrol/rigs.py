@@ -141,6 +141,9 @@ class Rig:
                                      channel=self.id, config=self.config)
         self.capture = CaptureService(self.manager, self.config)
         self.capture.telescope = self.name
+        self.capture.role = self.role
+        self.capture.rig_key = self.id
+        self.capture.upload_collab = self._upload_collab_setting()
         # One library serves every telescope — the masters are told apart by
         # what is in their headers, not by which folder they sit in.
         self.capture.library = library
@@ -369,6 +372,23 @@ class Rig:
         return chosen, ("byName" if chosen else "none")
 
     # -- identity ----------------------------------------------------------
+    def _upload_collab_setting(self):
+        """Explicit camera.uploadCollab, or None for the role default.
+
+        The master uploads unless the key is set off. A follower does not,
+        unless that follower's own overlay sets the key on. The shared
+        default is not copied onto the follower: a missing key stays missing.
+        """
+        if self.is_master:
+            section = self.config.section("camera")
+            if "uploadCollab" in section:
+                return bool(section["uploadCollab"])
+            return None
+        overlay = self.store.rig_settings(self.id, "camera") or {}
+        if "uploadCollab" in overlay:
+            return bool(overlay["uploadCollab"])
+        return None
+
     @property
     def is_master(self) -> bool:
         return self.role == "master"
@@ -618,41 +638,31 @@ class RigSet:
         Recovery).  `stop` is asked between waits so a Stop press is not
         held up by a boot; `progress` is told what is being waited for.
         """
-        settings = self.config.section("recovery")
+        capture = getattr(rig, "capture", None)
+        blocked = None
+        ask = getattr(capture, "blocks_recovery", None)
+        if callable(ask):
+            blocked = ask()
+        if blocked:
+            rig.manager.log(
+                "Not reconnecting the camera and not switching its power: "
+                + str(blocked), "error")
+            return {"connected": [], "failed": [str(blocked)]}
+
+        # Driver reconnect only. Cutting the camera's outlets from here raced
+        # an idle reconnect and a Stop flag that was already set, and skipped
+        # the boot wait. A person can still power-cycle from the button.
         now = time.time()
         recent = [t for t in self._reconnects.get(rig.id, [])
                   if now - t < self.POWER_CYCLE_WINDOW_SECONDS]
         self._reconnects[rig.id] = recent + [now]
-
-        cycle_wanted = (bool(settings.get("enabled", True))
-                        and bool(settings.get("powerCycleCameras", True)))
-        channels, _source = rig.power_channels(self.master.manager.get("switch")) \
-            if cycle_wanted else ([], "none")
-        too_soon = (now - self._cycled_at.get(self._slot(rig, "camera"), 0.0)
-                    < self.POWER_CYCLE_MIN_GAP_SECONDS)
-        threshold = int(settings.get("powerCycleAfterReconnects", 1) or 0)
-        # Straight to the mains when this camera has already had its plain
-        # reconnect(s) recently: the last time it "came back" it failed the
-        # next frame, and the night is running out while that repeats.
-        repeat = len(recent) >= threshold
-        if channels and not too_soon and repeat:
-            self._power_cycle(rig, channels, "it has been reconnected "
-                              f"{len(recent)} time(s) in the last "
-                              f"{self.POWER_CYCLE_WINDOW_SECONDS // 60} minutes",
-                              stop, progress)
-            return self._plain_reconnect(rig)
-
         outcome = self._plain_reconnect(rig)
-        if "camera" in outcome["connected"] or not channels or too_soon:
-            return outcome
-        if stop is not None and stop():
-            return outcome
-        first = outcome["failed"][0] if outcome["failed"] else "it did not come back"
-        self._power_cycle(rig, channels, f"the reconnect failed ({first})", stop, progress)
-        again = self._plain_reconnect(rig)
-        # Both attempts' failures are worth reading in the morning.
-        again["failed"] = outcome["failed"] + again["failed"] if again["failed"] else []
-        return again
+        if "camera" not in outcome["connected"]:
+            rig.manager.log(
+                "Camera reconnect failed. Its power was not cycled. "
+                + (outcome["failed"][0] if outcome["failed"] else "it did not come back"),
+                "error")
+        return outcome
 
     def _plain_reconnect(self, rig: Rig) -> dict[str, list[str]]:
         outcome = self.connect_remembered(rig, ("camera",))

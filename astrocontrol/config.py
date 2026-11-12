@@ -595,6 +595,10 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # abort that never finishes is an abort that never parked.
         "coverTimeoutSeconds": 120.0,
         "roofTimeoutSeconds": 300.0,
+        # After CloseShutter, how long the driver may keep reporting the same
+        # word before that is called a conflict. The close keeps waiting until
+        # roofTimeoutSeconds. 0.2.53b gave up on the first still-open read.
+        "roofCloseNoChangeSeconds": 30.0,
         # 0.2.53b - the roof at the start of a target. Open it (lead telescope
         # only) before the first home/slew/focus/light of every target if it
         # is not open; acts only when a dome/roof with a shutter is connected.
@@ -721,6 +725,13 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # has not returned in this long is treated as hung - 2026-10-14 02:24
         # was a download that never came back, and nothing timed it out.
         "downloadTimeoutSeconds": 120.0,
+        # How long one ImageReady poll may sit in the driver. A poll that
+        # overruns is quarantined; it is not cancelled, and nothing else is
+        # sent to that camera until the call returns.
+        "imageReadyTimeoutSeconds": 15.0,
+        # After a timed-out camera call, how long a reconnect may wait for
+        # that call to actually return before it refuses to touch the camera.
+        "cameraQuarantineSeconds": 5.0,
         # Slack on top of exposure + hungSeconds + downloadTimeoutSeconds
         # before a telescope's frame is given up on and its thread abandoned.
         "slotGraceSeconds": 60.0,
@@ -905,7 +916,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "autoUpload": True,
         # Only these rigs (by name); empty means every rig on this PC.
         "autoUploadRigs": [],
-        # The most it may use of the uplink, in megabits a second (0 = no cap).
+        # The most it may use of the uplink, in megabits a second.
+        # 0, missing or invalid is 10 Mbit/s (0.2.53g), not "no cap".
         "autoUploadMbit": 0.0,
         # Only between dawn and dusk at this site, never while imaging.
         "autoUploadDaytimeOnly": False,

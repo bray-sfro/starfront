@@ -2311,6 +2311,53 @@ function updateGuider(guider) {
   $('btnGuide').classList.toggle('active', !!guider.guiding);
 }
 
+/* A driver word is never drawn as a verified open or closed. */
+function roofReadout(dome) {
+  const driver = String(dome.shutterState || 'unknown');
+  const quality = dome.shutterQuality || (driver === 'unknown' ? 'unknown' : 'driver');
+  const pending = !!dome.shutterCommandPending || quality === 'pending';
+  const command = dome.shutterCommand === 'close' ? 'close' : 'open';
+  const note = dome.shutterConflict
+    || dome.shutterCommandError
+    || dome.shutterNote
+    || 'Driver-reported only. Not a physical roof check.';
+  if (quality === 'stale') {
+    const last = dome.shutterLastDriver ? ` Last driver word was ${dome.shutterLastDriver}.` : '';
+    return {
+      text: 'STALE',
+      kind: 'roof-unknown',
+      note: `No fresh driver reading.${last} Not a current open or closed. ${note}`,
+    };
+  }
+  if (quality === 'unknown' || driver === 'unknown' || driver === 'notpresent') {
+    return {
+      text: driver === 'notpresent' ? 'NO SHUTTER' : 'UNKNOWN',
+      kind: 'roof-unknown',
+      note,
+    };
+  }
+  if (quality === 'error' || driver === 'error' || dome.shutterCommandError) {
+    return { text: 'DRIVER ERROR', kind: 'roof-error', note };
+  }
+  if (quality === 'conflict') {
+    return { text: `CONFLICT — driver says ${driver}`, kind: 'roof-conflict', note };
+  }
+  if (pending || driver === 'opening' || driver === 'closing') {
+    return {
+      text: `PENDING ${command} — driver says ${driver}`,
+      kind: 'roof-pending',
+      note,
+    };
+  }
+  if (driver === 'open') {
+    return { text: 'DRIVER: OPEN — not verified', kind: 'roof-driver-open', note };
+  }
+  if (driver === 'closed') {
+    return { text: 'DRIVER: CLOSED — not verified', kind: 'roof-driver-closed', note };
+  }
+  return { text: `DRIVER: ${driver} — not verified`, kind: 'roof-pending', note };
+}
+
 /* ------------------------------------------------------------- observatory */
 
 /* The building, not the telescope. Weather first and largest, because it is the
@@ -2352,11 +2399,16 @@ function updateObservatory(status) {
   $('domeRow').hidden = !haveDome;
   $('domeControls').hidden = !haveDome;
   if (haveDome) {
-    setText('domeShutter', dome.shutterState || '—');
+    const roof = roofReadout(dome);
+    setText('domeShutter', roof.text);
+    const note = $('domeShutterNote');
+    if (note) note.textContent = roof.note;
     setText('domeAz', dome.azimuth === null || dome.azimuth === undefined
       ? (dome.atPark ? 'parked' : '—') : `${dome.azimuth.toFixed(0)}°`);
     const shutterNode = $('domeShutter');
-    if (shutterNode) shutterNode.classList.toggle('alert', dome.shutterState === 'error');
+    if (shutterNode) {
+      shutterNode.className = roof.kind;
+    }
     // Opening is refused while unsafe by the server; disabling it here as well
     // means the button says so rather than the error doing it.
     $('btnRoofOpen').disabled = !dome.canShutter || safety.safe === false;
@@ -2668,6 +2720,22 @@ function frameDetail(status, capture) {
   return bits.join('  ·  ');
 }
 
+/* The roof, in the top bar, whenever one is connected. The text is the
+   status payload's, including "Roof opening… 12s" and the technician lock.
+   This does not send an open or a close. */
+function updateRoof(status) {
+  const badge = $('roofBadge');
+  if (!badge) return;
+  const roof = (status && status.roof) || {};
+  if (!roof.connected || !roof.text) {
+    badge.hidden = true;
+    return;
+  }
+  badge.hidden = false;
+  badge.className = `roof-badge ${roof.tone || ''}`;
+  badge.textContent = roof.text;
+}
+
 function updateActivity(status) {
   const bar = $('activityBar');
   if (!bar) return;
@@ -2891,6 +2959,7 @@ function applyStatus(status) {
   updateOutput(capture);
   updateSequenceBanner(status);
   updateActivity(status);
+  updateRoof(status);
   updateRecoveryBar(status);
   updateWarnings(status);
   updateRunPanel(status);
@@ -4019,6 +4088,7 @@ const EQUIPMENT_FIELDS = [
   ['sequencer', 'openRoofAtStart', 'seqOpenRoof', 'check'],
   ['sequencer', 'requireSafetyToOpen', 'seqRoofNeedsSafety', 'check'],
   ['sequencer', 'roofOpenTimeoutSeconds', 'seqRoofOpenTimeout', 'number'],
+  ['sequencer', 'roofCloseNoChangeSeconds', 'seqRoofCloseNoChange', 'number'],
   ['sequencer', 'pauseLightsUnlessRoofOpen', 'seqRoofGate', 'check'],
   ['sequencer', 'closeRoofAtEnd', 'seqRoofCloseAtEnd', 'check'],
   ['sequencer', 'loopLeadMinutes', 'seqLoopLead', 'number'],
@@ -6437,14 +6507,16 @@ function bindControls() {
   // that can come down on it.
   $('btnRoofOpen').addEventListener('click', async () => {
     const ok = await confirmAction(
-      'Open the roof? Check nothing is in the way of the shutter.',
-      { title: 'Open roof', confirmLabel: 'Open', danger: true });
+      'Send OpenShutter? The driver will be asked to open. Its later status '
+      + 'is not a physical check that the roof moved.',
+      { title: 'Ask the driver to open', confirmLabel: 'Send open', danger: true });
     if (ok) send('/api/dome/shutter', 'POST', { open: true });
   });
   $('btnRoofClose').addEventListener('click', async () => {
     const ok = await confirmAction(
-      'Close the roof? Make sure the telescope is parked clear of the shutter.',
-      { title: 'Close roof', confirmLabel: 'Close', danger: true });
+      'Send CloseShutter? Make sure the telescope is parked clear of the shutter. '
+      + 'A driver status of closed afterwards is not a physical check.',
+      { title: 'Ask the driver to close', confirmLabel: 'Send close', danger: true });
     if (ok) send('/api/dome/shutter', 'POST', { open: false });
   });
   $('btnOffsetsRun').addEventListener('click', async () => {
