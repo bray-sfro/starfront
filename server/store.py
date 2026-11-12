@@ -150,12 +150,20 @@ class Store:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._db = sqlite3.connect(str(self.path), check_same_thread=False)
+        # timeout is SQLite's busy_timeout: the upload process
+        # (starfront-uploads.service) writes to the same file, and a writer
+        # that finds the other mid-commit waits for it instead of failing.
+        self._db = sqlite3.connect(str(self.path), check_same_thread=False, timeout=10.0)
         self._db.row_factory = sqlite3.Row
         # Write-ahead logging: readers do not block the writer, which is what
         # keeps a polling agent from ever waiting on a coordinator's edit.
         with self._lock:
             self._db.execute("PRAGMA journal_mode=WAL")
+            self._db.execute("PRAGMA busy_timeout=10000")
+            # With WAL, NORMAL is durable against an application crash and
+            # only loses the last commits on a power cut; it saves an fsync
+            # per write, which on the files volume is what a write costs.
+            self._db.execute("PRAGMA synchronous=NORMAL")
             self._db.execute("PRAGMA foreign_keys=ON")
             self._db.executescript(SCHEMA)
             # Columns added since the first release, on a database that may
@@ -174,6 +182,23 @@ class Store:
                 if "owner_id" not in columns:
                     self._db.execute(f"ALTER TABLE {table} ADD COLUMN owner_id "
                                      "TEXT NOT NULL DEFAULT ''")
+            # What a project is for: 'collab' (shared, listed, dealt out) or
+            # 'personal' (one person's own imaging of one target, private to
+            # them, never listed or dealt - see server/personal.py). Every
+            # project from before is a collaboration.
+            columns = {row[1] for row in self._db.execute("PRAGMA table_info(projects)")}
+            if "scope" not in columns:
+                self._db.execute("ALTER TABLE projects ADD COLUMN scope "
+                                 "TEXT NOT NULL DEFAULT 'collab'")
+            # A project can sit under another as one of its parts: today a
+            # mosaic panel under its personal target (server/personal.py),
+            # later anything else a target is split into. '' is a top-level
+            # project, which every project from before is.
+            if "parent" not in columns:
+                self._db.execute("ALTER TABLE projects ADD COLUMN parent "
+                                 "TEXT NOT NULL DEFAULT ''")
+            self._db.execute("CREATE INDEX IF NOT EXISTS projects_by_parent"
+                             " ON projects (parent) WHERE parent != ''")
             # Where each telescope is pointing and what it is doing, as it
             # last said: what the group sees of each other on the chart.
             columns = {row[1] for row in self._db.execute("PRAGMA table_info(agents)")}
@@ -194,6 +219,30 @@ class Store:
             if "kind" not in columns:
                 self._db.execute("ALTER TABLE files ADD COLUMN kind "
                                  "TEXT NOT NULL DEFAULT 'light'")
+            # What the upload rules made of each file (server/uploadrules.py):
+            # its status (ready, pending, quarantine; '' for a file from before
+            # the rules), the reasons shown to the contributor, and the header
+            # facts calibration is matched on, so a recheck never re-reads disk.
+            for column, default in (("status", "''"), ("reasons", "'[]'"), ("meta", "'{}'")):
+                if column not in columns:
+                    self._db.execute(f"ALTER TABLE files ADD COLUMN {column} "
+                                     f"TEXT NOT NULL DEFAULT {default}")
+            # Auto-upload from telescopes (server/agentuploads.py): the
+            # content hash a rig sent and the server checked, and which rig
+            # and task the file came from. '' for anything uploaded before.
+            for column in ("sha256", "agent", "task"):
+                if column not in columns:
+                    self._db.execute(f"ALTER TABLE files ADD COLUMN {column} "
+                                     "TEXT NOT NULL DEFAULT ''")
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS uploads ("
+                " id TEXT PRIMARY KEY, project TEXT NOT NULL, agent TEXT NOT NULL,"
+                " user TEXT NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL,"
+                " original TEXT NOT NULL DEFAULT '', bytes INTEGER NOT NULL,"
+                " sha256 TEXT NOT NULL, received INTEGER NOT NULL DEFAULT 0,"
+                " task TEXT NOT NULL DEFAULT '', created REAL NOT NULL,"
+                " updated REAL NOT NULL)")
+            self._db.execute("CREATE INDEX IF NOT EXISTS uploads_by_agent ON uploads (agent)")
             self._db.execute("DROP INDEX IF EXISTS files_once")
             self._db.execute("CREATE UNIQUE INDEX IF NOT EXISTS files_once_per_kind"
                              " ON files (project, user, kind, name)")
@@ -318,12 +367,15 @@ class Store:
 
     # -- projects ----------------------------------------------------------
     def add_project(self, project_id: str, name: str, coordinator: str,
-                    payload: dict[str, Any], owner_id: str = "") -> dict[str, Any]:
+                    payload: dict[str, Any], owner_id: str = "",
+                    scope: str = "collab", parent: str = "") -> dict[str, Any]:
+        if scope not in ("collab", "personal"):
+            raise ValueError(f"unknown project scope {scope!r}")
         self._run(
             "INSERT INTO projects (id, name, coordinator, owner_id, created,"
-            " status, payload) VALUES (?, ?, ?, ?, ?, 'open', ?)",
+            " status, payload, scope, parent) VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?)",
             project_id, name, coordinator, owner_id, time.time(),
-            json.dumps(payload))
+            json.dumps(payload), scope, parent)
         return self.project(project_id)
 
     # -- people ------------------------------------------------------------
@@ -404,16 +456,51 @@ class Store:
 
     # -- files -------------------------------------------------------------
     def add_file(self, file_id: str, project_id: str, user_id: str, name: str,
-                 size: int, telescope: str = "", kind: str = "light") -> dict[str, Any]:
+                 size: int, telescope: str = "", kind: str = "light",
+                 meta: dict[str, Any] | None = None) -> dict[str, Any]:
         """A file received, or received again: one row per project, person,
-        kind and name, at the latest size."""
+        kind and name, at the latest size. Its status is set by the upload
+        rules straight after (`set_file_status`)."""
         self._run(
-            "INSERT INTO files (id, project, user, kind, name, bytes, received, telescope)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO files (id, project, user, kind, name, bytes, received, telescope, meta)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT(project, user, kind, name) DO UPDATE SET bytes = excluded.bytes,"
-            " received = excluded.received, telescope = excluded.telescope",
-            file_id, project_id, user_id, kind, name, int(size), time.time(), telescope)
+            " received = excluded.received, telescope = excluded.telescope,"
+            " meta = excluded.meta",
+            file_id, project_id, user_id, kind, name, int(size), time.time(), telescope,
+            json.dumps(meta or {}))
         return self.file(project_id, user_id, name, kind)
+
+    def set_file_meta(self, file_id: str, meta: dict[str, Any]) -> None:
+        self._run("UPDATE files SET meta = ? WHERE id = ?", json.dumps(meta or {}), file_id)
+
+    def set_file_statuses(self, changes: list[tuple[str, str, list[str]]]) -> None:
+        """Many (id, status, reasons) at once, in one transaction."""
+        if not changes:
+            return
+        with self._lock:
+            self._db.executemany("UPDATE files SET status = ?, reasons = ? WHERE id = ?",
+                                 [(status, json.dumps(reasons), fid)
+                                  for fid, status, reasons in changes])
+            self._db.commit()
+
+    def file_status_counts(self, project_id: str, user_id: str | None = None,
+                           kind: str | None = "light") -> dict[str, int]:
+        """How many files (lights, by default) are in each upload-rule status."""
+        sql = "SELECT status, COUNT(*) AS count FROM files WHERE project = ?"
+        args: list[Any] = [project_id]
+        if user_id is not None:
+            sql += " AND user = ?"
+            args.append(user_id)
+        if kind is not None:
+            sql += " AND kind = ?"
+            args.append(kind)
+        rows = self._all(sql + " GROUP BY status", *args)
+        return {str(row["status"]): int(row["count"]) for row in rows}
+
+    def file_users(self, project_id: str) -> list[str]:
+        return [str(row["user"]) for row in
+                self._all("SELECT DISTINCT user FROM files WHERE project = ?", project_id)]
 
     def file(self, project_id: str, user_id: str, name: str,
              kind: str = "light") -> dict[str, Any] | None:
@@ -426,6 +513,54 @@ class Store:
                              project_id)
         return self._all("SELECT * FROM files WHERE project = ? AND user = ?"
                          " ORDER BY kind, name", project_id, user_id)
+
+    # -- auto-upload sessions (server/agentuploads.py) ----------------------
+    def set_file_origin(self, file_id: str, sha256: str, agent: str, task: str) -> None:
+        self._run("UPDATE files SET sha256 = ?, agent = ?, task = ? WHERE id = ?",
+                  sha256, agent, task, file_id)
+
+    def file_by_hash(self, project_id: str, user_id: str, kind: str,
+                     sha256: str) -> dict[str, Any] | None:
+        if not sha256:
+            return None
+        return self._one("SELECT * FROM files WHERE project = ? AND user = ? AND kind = ?"
+                         " AND sha256 = ?", project_id, user_id, kind, sha256)
+
+    def agent_task_in(self, agent_id: str, project_id: str,
+                      states: tuple[str, ...] = ("accepted", "done")) -> dict[str, Any] | None:
+        marks = ",".join("?" for _ in states)
+        return self._one(f"SELECT id, state FROM tasks WHERE agent = ? AND project = ?"
+                         f" AND state IN ({marks}) ORDER BY issued DESC LIMIT 1",
+                         agent_id, project_id, *states)
+
+    def add_upload(self, row: dict[str, Any]) -> dict[str, Any]:
+        now = time.time()
+        self._run("INSERT INTO uploads (id, project, agent, user, kind, name, original, bytes,"
+                  " sha256, received, task, created, updated) VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?)",
+                  row["id"], row["project"], row["agent"], row["user"], row["kind"],
+                  row["name"], row.get("original", ""), int(row["bytes"]), row["sha256"],
+                  row.get("task", ""), now, now)
+        return self.upload(row["id"])
+
+    def upload(self, upload_id: str) -> dict[str, Any] | None:
+        return self._one("SELECT * FROM uploads WHERE id = ?", upload_id)
+
+    def upload_for(self, agent_id: str, project_id: str, kind: str, name: str,
+                   sha256: str) -> dict[str, Any] | None:
+        return self._one("SELECT * FROM uploads WHERE agent = ? AND project = ? AND kind = ?"
+                         " AND name = ? AND sha256 = ?", agent_id, project_id, kind, name, sha256)
+
+    def set_upload_received(self, upload_id: str, received: int) -> None:
+        self._run("UPDATE uploads SET received = ?, updated = ? WHERE id = ?",
+                  int(received), time.time(), upload_id)
+
+    def remove_upload(self, upload_id: str) -> None:
+        self._run("DELETE FROM uploads WHERE id = ?", upload_id)
+
+    def uploads(self, project_id: str | None = None) -> list[dict[str, Any]]:
+        if project_id is None:
+            return self._all("SELECT * FROM uploads")
+        return self._all("SELECT * FROM uploads WHERE project = ?", project_id)
 
     def file_kinds(self, project_id: str) -> dict[str, int]:
         """How many files of each kind a project holds."""
@@ -442,6 +577,28 @@ class Store:
                             " FROM files WHERE project = ?", project_id)
         return {"count": int((row or {}).get("count") or 0),
                 "bytes": int((row or {}).get("bytes") or 0)}
+
+    def contribution_totals_of(self, project_id: str, user_id: str) -> dict[str, Any]:
+        """What one person's telescopes (agents whose owner_id is them) have
+        had accepted on a collaboration: sessions (night x filter x panel
+        reports), hours, how many telescopes, and the split per filter.
+        This is the contribution N.I.N.A./Starfront report, which never
+        shows up as a web upload in the files table."""
+        rows = self._all("SELECT c.filter AS filter, COUNT(*) AS sessions,"
+                         " COALESCE(SUM(c.seconds), 0) AS seconds"
+                         " FROM contributions c JOIN agents a ON a.id = c.agent"
+                         " WHERE c.project = ? AND a.owner_id = ? AND c.accepted"
+                         " GROUP BY c.filter ORDER BY seconds DESC", project_id, user_id)
+        scopes = self._one("SELECT COUNT(DISTINCT c.agent) AS n"
+                           " FROM contributions c JOIN agents a ON a.id = c.agent"
+                           " WHERE c.project = ? AND a.owner_id = ? AND c.accepted",
+                           project_id, user_id) or {}
+        seconds = sum(float(r["seconds"] or 0) for r in rows)
+        return {"sessions": sum(int(r["sessions"] or 0) for r in rows),
+                "hours": round(seconds / 3600.0, 2),
+                "telescopes": int(scopes.get("n") or 0),
+                "filters": [{"filter": r["filter"] or "?", "sessions": int(r["sessions"] or 0),
+                             "hours": round(float(r["seconds"] or 0) / 3600.0, 2)} for r in rows]}
 
     def file_totals_of(self, project_id: str, user_id: str) -> dict[str, Any]:
         row = self._one("SELECT COUNT(*) AS count, COALESCE(SUM(bytes), 0) AS bytes"
@@ -474,14 +631,40 @@ class Store:
         return row
 
     def projects(self) -> list[dict[str, Any]]:
-        rows = self._all("SELECT * FROM projects ORDER BY created DESC")
+        """The collaborations. Personal projects are never in this list:
+        everything that lists, deals or summarises projects for other people
+        goes through here, so a private project cannot leak by being forgotten
+        in one of them. They are reached by id, or by personal_projects_of."""
+        rows = self._all("SELECT * FROM projects WHERE scope = 'collab'"
+                         " ORDER BY created DESC")
         for row in rows:
             row["payload"] = json.loads(row["payload"])
         return rows
 
     def projects_of(self, owner_id: str) -> list[dict[str, Any]]:
+        """The collaborations this person started."""
         rows = self._all("SELECT * FROM projects WHERE owner_id = ?"
-                         " ORDER BY created DESC", owner_id)
+                         " AND scope = 'collab' ORDER BY created DESC", owner_id)
+        for row in rows:
+            row["payload"] = json.loads(row["payload"])
+        return rows
+
+    def personal_projects_of(self, owner_id: str) -> list[dict[str, Any]]:
+        """This person's own personal projects, newest first: targets and
+        their parts (mosaic panels) alike. A part has `parent` set."""
+        if not owner_id:
+            return []
+        rows = self._all("SELECT * FROM projects WHERE owner_id = ?"
+                         " AND scope = 'personal' ORDER BY created DESC", owner_id)
+        for row in rows:
+            row["payload"] = json.loads(row["payload"])
+        return rows
+
+    def parts_of(self, project_id: str) -> list[dict[str, Any]]:
+        """The projects directly under this one (a mosaic's panels), oldest first."""
+        if not project_id:
+            return []
+        rows = self._all("SELECT * FROM projects WHERE parent = ? ORDER BY created", project_id)
         for row in rows:
             row["payload"] = json.loads(row["payload"])
         return rows
@@ -519,6 +702,16 @@ class Store:
             f"SELECT payload FROM tasks WHERE agent = ? AND state IN ({marks})"
             " ORDER BY issued", agent_id, *states)
         return [json.loads(row["payload"]) for row in rows]
+
+    def last_sent_by_project(self, agent_id: str) -> dict[str, dict[str, Any]]:
+        """When this telescope last reported a night on each project: the
+        latest `received` and the latest night it named. Evidence that it is
+        really shooting a project, which an accepted task alone is not."""
+        rows = self._all(
+            "SELECT project, MAX(received) AS received, MAX(night) AS night"
+            " FROM contributions WHERE agent = ? GROUP BY project", agent_id)
+        return {str(row["project"]): {"received": float(row["received"] or 0.0),
+                                      "night": str(row["night"] or "")} for row in rows}
 
     def tasks_in(self, project_id: str) -> list[dict[str, Any]]:
         rows = self._all("SELECT payload FROM tasks WHERE project = ?"

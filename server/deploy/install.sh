@@ -133,7 +133,11 @@ fi
 
 echo "== service"
 install -m 644 "$HERE/server/deploy/starfront.service" "/etc/systemd/system/$SERVICE.service"
+# Uploads in their own process (port 8801), so they never slow the control calls.
+install -m 644 "$HERE/server/deploy/starfront-uploads.service" "/etc/systemd/system/$SERVICE-uploads.service"
 systemctl daemon-reload
+systemctl enable --now "$SERVICE-uploads" >/dev/null
+systemctl restart "$SERVICE-uploads"
 systemctl enable --now "$SERVICE" >/dev/null
 systemctl restart "$SERVICE"
 
