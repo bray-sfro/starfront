@@ -1424,6 +1424,32 @@
           </div>
         </div>
 
+        <!-- The scope this telescope files under. Chosen from the server's
+             list, never typed: registering a scope needs a person token, which
+             this page does not hold. The stored value is the id. -->
+        <div class="plan-box" id="colScopes">
+          <div class="row gap">
+            <b class="grow">Scope</b>
+            <label class="inline small" title="Off keeps the previous filing path: no scope id is sent, and the server uses the telescope name it already has.">
+              <input type="checkbox" id="colRegisteredScopes" checked> Use registered scopes</label>
+          </div>
+          <p class="small muted" id="colScopeNote">
+            Pick the scope this telescope files under. The names are the
+            server's, so a rename shows up here and does not change which
+            scope is selected. A telescope with several cameras, such as
+            RASA-L, RASA-A and RASA-R, has one choice each.
+          </p>
+          <p class="small muted" id="colScopeFallback" hidden>
+            Registered scopes are off. Uploads do not send a scope id, and the
+            server keeps filing by the telescope name it already has.
+          </p>
+          <div id="colScopeRows" class="col-scope-rows"></div>
+          <p class="small" id="colScopeRegisterLine">
+            <a id="colScopeRegister" href="https://collab.starfront.space"
+               target="_blank" rel="noopener">Register a scope on the server</a>
+          </p>
+        </div>
+
         <!-- ------------------------------------------------- 1. start one -->
         <details class="fold" id="colStartFold">
           <summary>Start a collaboration</summary>

@@ -35,6 +35,7 @@ namespace Starfront.Collab.Services {
         public static FrameLedger Ledger { get; private set; }
         public static FrameReporter Reporter { get; private set; }
         public static StarfrontSession Session { get; private set; }
+        public static Upload.LightUploader Uploader { get; private set; }
 
         public static void Ensure(HostServices host) {
             lock (Gate) {
@@ -46,6 +47,16 @@ namespace Starfront.Collab.Services {
                 Ledger = new FrameLedger(Path.Combine(Settings.DataFolder, "ledger.json"));
                 Ledger.Load();
                 Reporter = new FrameReporter(host.ImageSave, Ledger);
+                var settings = Settings;
+                Uploader = new Upload.LightUploader(Path.Combine(Settings.DataFolder, "uploads"),
+                    () => settings.AutoUpload && settings.Enrolled,
+                    new Upload.HttpUploadWire(() => settings.ServerUrl, () => settings.AgentToken),
+                    (level, text) => { if (level == "warn") Logger.Warning(text); else Logger.Info(text); },
+                    // More than one bind (rasa1 on RASA-L/A/R) has to name the scope.
+                    // One bind is resolved by the server. The flag off sends nothing.
+                    () => settings.RegisteredScopes ? settings.ScopeId : "",
+                    () => ScopeDirectory.BoundCount);
+                Reporter.Uploader = Uploader;
                 Session = new StarfrontSession(host, Settings, Client, Ledger, Reporter);
                 Ready = true;
             }
@@ -57,6 +68,7 @@ namespace Starfront.Collab.Services {
                 if (!Ready) return;
                 Reporter.Initialize();
                 Session.Start();
+                Uploader.Start();
             }
         }
 
@@ -64,6 +76,7 @@ namespace Starfront.Collab.Services {
             lock (Gate) {
                 if (!Ready) return;
                 try { Session.Stop(); } catch (Exception ex) { Logger.Error(ex); }
+                try { Uploader?.Dispose(); } catch (Exception ex) { Logger.Error(ex); }
                 try { Reporter.Dispose(); } catch (Exception ex) { Logger.Error(ex); }
                 try { Ledger.Save(); } catch (Exception ex) { Logger.Error(ex); }
                 Ready = false;

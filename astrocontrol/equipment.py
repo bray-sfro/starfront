@@ -130,13 +130,21 @@ def _clean_rig(raw: Any, fallback_index: int) -> dict[str, Any] | None:
     for section, values in (raw.get("settings") or {}).items():
         if section in RIG_SECTIONS and isinstance(values, dict):
             settings[section] = _canonical_filters(section, dict(values))
-    return {
+    scope_id = str(raw.get("scopeId") or "").strip()
+    if any(ch.isspace() for ch in scope_id) or len(scope_id) > 80:
+        scope_id = ""
+    cleaned = {
         "id": rig_id,
         "name": _clean(raw.get("name", "")) or f"Telescope {fallback_index}",
         "role": "master" if raw.get("role") == "master" else "slave",
         "devices": devices,
         "settings": settings,
     }
+    # The server's scope id, per telescope. Not the name: a rename on the
+    # server must not change what is stored here. Absent when none is chosen.
+    if scope_id:
+        cleaned["scopeId"] = scope_id
+    return cleaned
 
 
 class EquipmentStore:
@@ -235,6 +243,32 @@ class EquipmentStore:
                     "master first")
             self._data["rigs"] = [r for r in rigs if r["id"] != rig_id]
         self.save()
+
+    def scope_id(self, rig_id: str) -> str:
+        """The registered scope this telescope files under, or blank."""
+        with self._lock:
+            return str(self._find(rig_id).get("scopeId") or "")
+
+    def set_scope_id(self, rig_id: str, scope_id: str) -> str:
+        """Remember a scope id for one telescope. Blank clears it.
+
+        The caller has already checked the id against the server's list.
+        This does not invent one, and it does not write the shared collab
+        settings: the id belongs to this telescope and travels with it when
+        an equipment profile is saved.
+        """
+        clean = str(scope_id or "").strip()
+        if clean and (len(clean) > 80 or any(ch.isspace() for ch in clean)):
+            raise DeviceError("a scope id is the server's id, not a name")
+        with self._lock:
+            rig = self._find(rig_id)
+            if clean:
+                rig["scopeId"] = clean
+            else:
+                rig.pop("scopeId", None)
+            result = str(rig.get("scopeId") or "")
+        self.save()
+        return result
 
     def rename_rig(self, rig_id: str, name: str) -> dict[str, Any]:
         with self._lock:

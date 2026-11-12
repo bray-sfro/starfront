@@ -1,9 +1,24 @@
 # Changelog
 
+## 1.0.0.34
+
+Not released. Registered scopes, client only.
+
+- Options > Plugins > Starfront > This telescope has a *Registered scope* dropdown, one choice per N.I.N.A. profile, filled from the server's scope list. Bound scopes are listed first and the label is the server's display name. The stored value is the scope id, so a rename only changes the label. There is no way to type a new scope: registering or binding is done on the server, and the page links there.
+- Lights are no longer filed under the profile name. That name is still sent for the chart. When this agent is bound to more than one scope, the uploader sends the profile's scope id with the file.
+- A 409 because the scope is not bound, or the camera matches none of them, holds that file with the server's reason. It is not dropped and it does not pause the other files. A 400 for an unknown scope and a 403 for somebody else's scope are held the same way.
+- *Use registered scopes* defaults on. Off is the previous path: no scope id is sent.
+
 ## 1.0.0.33
 
 - *Wait for the target to rise*, on by default, on the *Starfront collaboration* container. If a dealt field is still below the project's altitude floor or your horizon when its turn comes, the container now sits until it is up (and far enough from a Moon that is up), then shoots it, instead of ending and leaving a gap in the sequence. Fields that are already up are still shot first. The wait is checked once a minute and stops at astronomical dawn, or at once if the sequence is cancelled. Untick the box on the container to keep the old skip-and-move-on behaviour.
 
+
+## 1.0.0.32
+
+- **Your collaboration lights go to the server as they are saved, on by default.** Every light the *Starfront collaboration* container takes is handed to an upload queue the moment N.I.N.A. saves it (its image-saved event) and sent in the background to collab.starfront.space, where the coordinator stacks it. Nothing waits on it: the queue is a thread of its own, an upload cut off carries on where it stopped, and a collaboration that is not taking files is left alone for an hour. Your files are only read, never moved, changed or deleted. Switch it off under Options > Plugins > Starfront > *Upload my collaboration lights*.
+- Each collaboration light carries a PROJID header with the collaboration's id, so the server files it without guessing from the pointing.
+- *Collect the lights on the server* starts ticked on a new collaboration.
 
 ## 1.0.0.31
 
