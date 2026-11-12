@@ -1,0 +1,63 @@
+0.2.53i. Cover status, buttons, and open-and-verify before any sky frame.
+Compared with a full tools/check_*.py sweep of the unmodified 0.2.53h tree
+in the same environment.
+
+New:
+
+  tools/check_cover_status.py          47/47
+    state mapping, badge text, status payload (including per rig),
+    /api/status returns in well under a second while CoverState sleeps,
+    Light on at max brightness, Light off,
+    Open Cover HTTP 409 during panel flats, during an exposure, a slew,
+    and autofocus. The driver records no open. No roof command.
+  tools/check_cover_open_on_start.py   37/37
+    Unknown opens even when has_cover was latched false, before home/slew.
+    A cover that stays closed holds the run and does not home, slew, or centre.
+    A ~503 ADU flat frame is rejected. Centring/autofocus open Unknown.
+    A reconnect re-reads and opens again.
+    Bias, dark, panel flat, and autocal do not open the cover or the roof.
+    Panel flats close the cover and turn the light on. Sky flats open it.
+
+Requested existing checks, same as 0.2.53h:
+
+  check_calib_roof_closed.py           34/34
+  check_roof_open.py                   44/44
+  check_roof_status.py                  8/8
+  check_autoupload.py                  75/75
+  check_follower_quiet.py               7/7
+  check_filter_settle.py                9/9
+
+Also the same as 0.2.53h:
+
+  check_mount_clock.py                 36/36   (version is now 0.2.53i)
+  check_flats.py                       40/40
+  check_night.py                      113/113
+  check_warnings.py                    53/53
+  check_safety.py                      28/28
+  check_safety_alpaca.py               57/57
+  check_server.py                     162/162
+  check_flip_rotator.py                 9/9
+
+Pre-existing failures, same counts as unmodified 0.2.53h in this environment
+and the same as the 0.2.53h note for the four known 0.2.53b failures:
+
+  check_controls.py                  2 FAIL   (3/5; livestack controls absent)
+  check_livestack.py                 1 FAIL   (HTTP 404 from the livestack check)
+  check_night_rollover.py            8 FAIL   (9/17)
+  check_reference.py                 2 FAIL   (44/46)
+
+Same on both trees here, not introduced by 0.2.53i:
+
+  check_fleet.py, check_live_link.py, check_rig_isolation.py
+                                         import httpx, which this environment
+                                         does not have
+  check_camera_health.py, check_focus_health.py, check_fsq_port.py,
+  check_gain_offset.py, check_hardening.py, check_safety_restart.py,
+  check_survey_failfast.py             import httpx2, which is not installed
+  check_imagestack.py                  crashes on a missing livestack status key
+  check_recovery_real.py               0/11 here on both trees (the child
+                                         process exits immediately). The 0.2.53h
+                                         note recorded 11/11 when that process
+                                         could start. The two logs are identical.
+
+No new assertion failure against the 0.2.53h tree.
