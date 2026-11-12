@@ -826,6 +826,27 @@ class AscomMount(_AscomDevice, Mount):
         return {"latitude": float(latitude), "longitude": float(longitude),
                 "elevation": float(self._get("SiteElevation", 0.0) or 0.0)}
 
+    def reported_clock(self) -> dict[str, Any]:
+        """UTCDate and SiderealTime. One read, and it does not write.
+
+        The same driver properties the status panel already uses for
+        sidereal time, plus the UTC clock beside them. Not urgent: a clock
+        check must not step in front of a stop or a park. Eight seconds is
+        as long as a quiet driver may take. Neither property is required.
+        """
+        def read() -> dict[str, Any]:
+            utc = lst = None
+            with contextlib.suppress(Exception):
+                utc = self._driver.UTCDate
+            with contextlib.suppress(Exception):
+                lst = self._driver.SiderealTime
+            return {"utc": utc, "lst": lst}
+
+        try:
+            return _com(self._channel).call(read, timeout=8.0, label="clock")
+        except Exception:
+            return {"utc": None, "lst": None}
+
     def slew_to(self, ra_hours: float, dec_deg: float) -> None:
         self._require()
         if self._get("CanSlewAsync", False):
@@ -1252,6 +1273,10 @@ class AscomDome(_AscomDevice, Dome):
 
     def open_shutter(self) -> None:
         self._require()
+        from ..roofguard import blocked
+        why = blocked()
+        if why:
+            raise DeviceError(f"{why}; OpenShutter was not sent")
         self._invoke("OpenShutter")
 
     def close_shutter(self) -> None:

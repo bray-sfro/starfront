@@ -1,0 +1,13 @@
+# Changelog
+
+## 0.2.53g
+
+Single-scope Namibia (EAGLE4PRO) build, on 0.2.53b.
+
+- Roof badge in the main window: opening and closing show elapsed time, then open or closed, or the error, timeout or technician-lock text. Display only.
+- Darks, bias and panel flats, including a calibration recipe run from the plan, keep the roof shut. They never send OpenShutter, they refuse an open while they run, and they hold or abort if the roof is not closed. The cover stays closed where there is one. Sky flats and lights are unchanged.
+- A project storage quota (HTTP 507) pauses that project only. A full disk still pauses every upload.
+- Warn when the mount clock is more than a minute off this PC. The clock is not set and the mount is not synced.
+- Auto-upload treats 0, missing or an invalid cap as 10 Mbit/s. Daytime-only is unchanged. The upload thread logs the queue, each result, pauses and the daytime wait.
+- Lights captured for a collaboration task but missing PROJID are queued for the master telescope on the next daytime window, without rewriting the FITS file. The follower (Rokinon 135mm / ASI6200MC) does not upload, and its frames are not included in the collaboration session report that counts toward project hours. A report that is sent names the camera (INSTRUME) and that camera's focal length.
+- A light is not taken while the filter wheel has not settled on the requested slot. A blank FILTER is not written and a filter is not guessed. A colour camera with no wheel is tagged OSC-RGB.

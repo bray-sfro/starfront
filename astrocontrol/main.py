@@ -30,6 +30,9 @@ from .tasks import DeviceTasks, TaskBusy, TaskFailed
 from . import filters
 from . import identify
 from . import ninaimport
+from . import mountclock
+from . import roofguard
+from . import roofstatus
 from . import warnings
 from .capture import clean_target
 from .capture import CaptureService
@@ -127,7 +130,8 @@ collab_client.start()
 # its own at low priority. Every rig's capture feeds the one queue.
 uploader = autoupload.AutoUploader(
     config, collab_client, library, log=rigs.log,
-    site=lambda: effective_site(config, rigs.master.manager))
+    site=lambda: effective_site(config, rigs.master.manager),
+    targets=targets, rigs=rigs)
 # On the class, so a rig added later feeds it too.
 CaptureService.shared_uploader = uploader
 uploader.start()
@@ -1417,6 +1421,16 @@ def _snapshot() -> dict[str, Any]:
     payload.setdefault("devices", {})
     payload.setdefault("rigs", [])
     payload["serverTime"] = time.time()
+    # Mount UTC and sidereal time against this PC. The watchdog fills it in;
+    # until a mount is connected it says the check was skipped. Reading it
+    # does not talk to the driver.
+    payload["mountClock"] = mountclock.latest()
+    # Roof badge. The shutter state was already read with the devices;
+    # this only turns it into a line. Nothing is sent to the roof.
+    seq = payload.get("sequence") or {}
+    payload["roof"] = roofstatus.observe(
+        (payload.get("devices") or {}).get("dome") or {},
+        str(seq.get("roofLocked") or ""), payload["serverTime"])
     payload["seq"] = next(_snapshot_seq)
     if errors:
         payload["sectionErrors"] = errors
@@ -3648,7 +3662,15 @@ def dome_shutter(body: DomeShutterRequest) -> dict[str, Any]:
         raise HTTPException(
             status_code=409,
             detail="the safety monitor says it is not safe to open")
-    _guard(dome.open_shutter if body.open else dome.close_shutter)
+    if body.open:
+        why = roofguard.blocked()
+        if why:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{why}; the roof was not opened")
+        _guard(dome.open_shutter)
+    else:
+        _guard(dome.close_shutter)
     rigs.log(f"Roof: {'opening' if body.open else 'closing'}", "warn")
     return {"ok": True}
 

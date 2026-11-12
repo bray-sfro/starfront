@@ -45,8 +45,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import allsky, astro, capture, filters, plans, schedule
-from .devices.base import DeviceError
+from . import allsky, astro, capture, filters, plans, roofguard, schedule
+from .devices.base import DeviceError, read_slot
 from .recovery import (FAILED as RIG_FAILED, OK as RIG_OK, RECOVERING as RIG_RECOVERING,
                        ProgressJournal, RigRecovery, backoff, call_with_timeout)
 from .imaging import stars
@@ -408,6 +408,8 @@ class Sequencer:
                 "filter": self._rig_state.get(self.master.id, {}).get("filter", ""),
                 "frame": self._rig_state.get(self.master.id, {}).get("frame", 0),
                 "frameCount": self._rig_state.get(self.master.id, {}).get("frames", 0),
+                # The technician-lock text, for the roof badge. Display only.
+                "roofLocked": self._roof_locked or "",
             }
 
     def _set(self, state: str, message: str = "") -> None:
@@ -3367,10 +3369,19 @@ class Sequencer:
         # gets reported, panel by panel, rather than the target's total.
         if not guide_lost:
             with contextlib.suppress(Exception):
+                camera = rig.manager.get("camera")
+                instrument = str(getattr(camera, "name", "") or "") if camera is not None else ""
+                bayer = str(getattr(camera, "bayer_pattern", "") or "") if camera is not None else ""
+                focal = rig.config.get("optics", "focalLength", None)
+                colour = bool(bayer) or bool(rig.config.get("camera", "colour", False))
                 self.targets.add_panel_integration(
                     entry["targetId"], rig.capture.night_name(),
                     int(panel.get("index", 0) or 0), filter_name, record.exposure,
-                    hfr=entry_row["hfr"], guide_rms=entry_row["guideRms"])
+                    hfr=entry_row["hfr"], guide_rms=entry_row["guideRms"],
+                    telescope=rig.name, instrument=instrument,
+                    focal_length=float(focal) if focal else None,
+                    role=getattr(rig, "role", "") or "",
+                    colour=colour, bayer=bayer)
 
         with self._lock:
             self._frames_log.append(entry_row)
@@ -3881,6 +3892,8 @@ class Sequencer:
     # that stays up, and the run stopped the ordinary way (park, warm).
 
     ROOF_POLL_SECONDS = 2.0
+    #: How long a filter change may take before the lights are held.
+    FILTER_SETTLE_SECONDS = 120.0
     #: Consecutive "error" reads during an open before it counts as failed;
     #: one bad read over COM is a glitch, not the driver's "Error".
     ROOF_ERROR_READS = 3
@@ -4016,7 +4029,7 @@ class Sequencer:
         self._set("homing", "opening the roof")
         self._say(f"Opening the roof ({getattr(dome, 'name', 'dome')}) before {label}", "warn")
         try:
-            dome.open_shutter()
+            roofguard.request_open(dome)
         except Exception as exc:                  # noqa: BLE001 - a refused open
             self._roof_lock(dome, f"OpenShutter failed: {exc}")
         self._roof_opened_by_run = True
@@ -5246,6 +5259,21 @@ class Sequencer:
                 self._say(f"{rig.name}: could not select {name} before the focus "
                           f"run — {exc}", "warn")
 
+    def _hold_unknown_filter(self, rig, name: str, why: str) -> None:
+        """Do not take a light through a filter the wheel has not confirmed.
+
+        Raises. The slot loop holds and tries again. FILTER is not guessed
+        and a blank card is not written, because the exposure never starts.
+        """
+        title = f"{rig.name}: the filter is not known"
+        detail = (f"Asked for {name or 'the filter'}. {why}. No light is taken "
+                  "until the wheel reports that slot. Nothing is guessed.")
+        self._warn("filter.unknown", "critical", title, detail,
+                   "Check the filter wheel. The run holds; it does not shoot "
+                   "a blank FILTER.")
+        self._say(f"{title} — {why}", "error")
+        raise DeviceError(f"{rig.name}: filter {name or '?'} did not settle ({why})")
+
     def _select_filter(self, rig, name: str) -> bool:
         """Put a telescope's wheel on the named filter.  True if it moved."""
         # In the one spelling, whatever asked: the wheel's names already are.
@@ -5272,18 +5300,34 @@ class Sequencer:
         # Matched in the one spelling on both sides: a wheel that reports its
         # own names through a driver that never folded them still lines up.
         names = [filters.canonical(n) or str(n) for n in (wheel.names or [])]
-        if name not in names:
+        index = names.index(name) if name in names else None
+        if index is None:
+            slot, _said = read_slot(wheel)
+            if slot is None:
+                self._hold_unknown_filter(rig, name, "the wheel has no filter by that name "
+                                          "and is not reporting a slot")
             self._say(f"{rig.name}: the wheel has no filter called {name}; "
                       "shooting with what is loaded", "warn")
             return False
-        if names.index(name) == wheel.position:
-            return False
         self._set_rig(rig, state=f"selecting {name}")
         started = time.monotonic()
-        wheel.set_position(names.index(name))
-        deadline = time.monotonic() + 120
-        while wheel.moving and time.monotonic() < deadline:
+        slot, said_moving = read_slot(wheel)
+        if slot != index:
+            wheel.set_position(index)
+        deadline = time.monotonic() + float(self.FILTER_SETTLE_SECONDS)
+        while True:
             self._check()
+            slot, said_moving = read_slot(wheel)
+            if slot == index:
+                if said_moving:
+                    self._say(f"{rig.name}: the wheel reported moving, but the "
+                              f"position read is {name}; using that", "warn")
+                break
+            if time.monotonic() >= deadline:
+                self._hold_unknown_filter(
+                    rig, name,
+                    f"it did not report slot {index} ({name}) within "
+                    f"{self.FILTER_SETTLE_SECONDS:.0f}s")
             time.sleep(0.2)
         moved_focus = self._apply_filter_offset(rig, name)
         # What a change really costs on this wheel, focus offset included.
@@ -5502,9 +5546,17 @@ class Sequencer:
                 [(rig, lambda rig=rig: self._select_filter(rig, frames[rig.id]["filter"]))
                  for rig in active], "filter",
                 timeout=float(self._recovery_settings().get("recoveryStepSeconds") or 180.0))
-            for rig_id, message in changed["errors"].items():
-                self._say(f"{self._name(rig_id)}: could not select a filter — "
-                          f"{message}", "warn")
+            unsettled = [rig for rig in active if rig.id in changed["errors"]]
+            if unsettled:
+                # A wheel that has not settled holds the slot. The frame is not
+                # taken, and the queue is not advanced, so the same slot is
+                # tried again. Stop still ends it.
+                names = ", ".join(rig.name for rig in unsettled)
+                self._set("waiting", f"holding the lights: filter not settled ({names})")
+                self._say(f"Holding the lights: {names} — the filter wheel has not "
+                          "settled, so nothing is exposed", "warn")
+                self._sleep(5.0)
+                continue
             self._maybe_focus(filter_changed=changed["results"])
 
             # Between frames is the only safe place to put any of this right: a

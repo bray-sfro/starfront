@@ -1213,6 +1213,9 @@ class Contribution:
     #: Shot on a one-shot colour camera: broadband RGB, whatever the filter
     #: name says, and judged against the project's colour-camera Moon rule.
     colour: bool = False
+    #: The camera that took the frames (FITS INSTRUME). A tandem reports one
+    #: row per camera so the server can tell the FSQ85 from the Rokinon.
+    instrument: str = ""
 
     def payload(self) -> dict[str, Any]:
         data = asdict(self)
@@ -1242,6 +1245,7 @@ class Contribution:
             calibrated=bool(data.get("calibrated", False)),
             bandpass=_number(data.get("bandpass")),
             colour=bool(data.get("colour", False)),
+            instrument=str(data.get("instrument") or data.get("INSTRUME") or ""),
         )
 
 

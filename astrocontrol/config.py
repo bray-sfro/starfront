@@ -900,7 +900,8 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "autoUpload": True,
         # Only these rigs (by name); empty means every rig on this PC.
         "autoUploadRigs": [],
-        # The most it may use of the uplink, in megabits a second (0 = no cap).
+        # The most it may use of the uplink, in megabits a second.
+        # 0, missing or invalid is 10 Mbit/s (0.2.53g), not "no cap".
         "autoUploadMbit": 0.0,
         # Only between dawn and dusk at this site, never while imaging.
         "autoUploadDaytimeOnly": False,

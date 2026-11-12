@@ -31,6 +31,28 @@ class CameraLostError(DeviceError):
     """
 
 
+def read_slot(wheel) -> tuple[int | None, bool]:
+    """(slot or None, driver said moving). Works for a real wheel or a test double.
+
+    A double that only has ``position`` is trusted when that position is a
+    slot. One that can ``confirmed_position`` (three reads, so a stuck
+    "moving" flag with a valid slot still counts) uses that.
+    """
+    fn = getattr(wheel, "confirmed_position", None)
+    if callable(fn):
+        try:
+            return fn()
+        except Exception:                              # noqa: BLE001
+            return None, True
+    try:
+        pos = int(wheel.position)
+    except Exception:                                  # noqa: BLE001
+        return None, True
+    if pos >= 0:
+        return pos, bool(getattr(wheel, "moving", False))
+    return None, True
+
+
 # Device kinds understood by the application.
 #: `piercam` is an ordinary camera in a different job: it watches the telescope
 #: rather than the sky, so it shares every backend's camera class and differs
@@ -233,6 +255,15 @@ class Mount(Device):
         """
         return None
 
+    def reported_clock(self) -> dict[str, Any]:
+        """UTC and local sidereal time the driver is using. Read-only.
+
+        ``utc`` is a datetime, an ISO-8601 string, or None. ``lst`` is hours,
+        or None. A backend that has no clock leaves both empty. This must
+        not set the time, sync, slew, or change tracking.
+        """
+        return {"utc": None, "lst": None}
+
     def slew_to(self, ra_hours: float, dec_deg: float) -> None:
         raise NotImplementedError
 
@@ -326,6 +357,28 @@ class FilterWheel(Device):
     @property
     def moving(self) -> bool:
         return self.position < 0
+
+    def confirmed_position(self) -> tuple[int | None, bool]:
+        """A slot index we will trust, and whether a read said "moving".
+
+        ASCOM uses position -1 for "moving". The ZWO EFW driver returns -1
+        from a poll that overlaps its own status even when the wheel is
+        sitting on a slot, and the next read is that slot. Three reads: if
+        every read that is a real slot agrees, that slot is the position,
+        including when another of the reads was -1. All -1, or two different
+        slots, is not a filter we will write down. Nothing here guesses.
+        """
+        reads: list[int] = []
+        for _ in range(3):
+            try:
+                reads.append(int(self.position))
+            except Exception:                          # noqa: BLE001 - a failed read is not a slot
+                reads.append(-1)
+        valid = [pos for pos in reads if pos >= 0]
+        said_moving = any(pos < 0 for pos in reads)
+        if valid and len(set(valid)) == 1:
+            return valid[0], said_moving
+        return None, True
 
     def current_name(self) -> str:
         names = self.names

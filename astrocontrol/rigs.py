@@ -141,6 +141,9 @@ class Rig:
                                      channel=self.id, config=self.config)
         self.capture = CaptureService(self.manager, self.config)
         self.capture.telescope = self.name
+        self.capture.role = self.role
+        self.capture.rig_key = self.id
+        self.capture.upload_collab = self._upload_collab_setting()
         # One library serves every telescope — the masters are told apart by
         # what is in their headers, not by which folder they sit in.
         self.capture.library = library
@@ -369,6 +372,23 @@ class Rig:
         return chosen, ("byName" if chosen else "none")
 
     # -- identity ----------------------------------------------------------
+    def _upload_collab_setting(self):
+        """Explicit camera.uploadCollab, or None for the role default.
+
+        The master uploads unless the key is set off. A follower does not,
+        unless that follower's own overlay sets the key on. The shared
+        default is not copied onto the follower: a missing key stays missing.
+        """
+        if self.is_master:
+            section = self.config.section("camera")
+            if "uploadCollab" in section:
+                return bool(section["uploadCollab"])
+            return None
+        overlay = self.store.rig_settings(self.id, "camera") or {}
+        if "uploadCollab" in overlay:
+            return bool(overlay["uploadCollab"])
+        return None
+
     @property
     def is_master(self) -> bool:
         return self.role == "master"

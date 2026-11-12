@@ -35,7 +35,7 @@ from typing import Any
 
 import numpy as np
 
-from . import astro, calibration
+from . import astro, calibration, roofguard
 from .capture import clean_target
 from .config import Config, data_root, effective_site
 from .devices.base import DeviceError
@@ -1059,22 +1059,106 @@ class CalibrationRunner:
         names = filter_names(rig, self.config)
         return names or [spec["filter"] or ""]
 
+    def _lead_dome(self):
+        """The roof the master owns. A follower is not asked."""
+        try:
+            dome = self.rigs.master.manager.get("dome")
+        except Exception:                         # noqa: BLE001 - no master yet
+            return None
+        if dome is None or not getattr(dome, "connected", False) \
+                or not getattr(dome, "can_shutter", False):
+            return None
+        return dome
+
+    @staticmethod
+    def _roof_state(dome) -> str:
+        try:
+            return str(dome.shutter_state or "error").lower()
+        except Exception:                         # noqa: BLE001 - a fault is not closed
+            return "error"
+
+    def _require_roof_closed(self, check, label: str) -> None:
+        """Darks, bias and panel flats shoot only under a closed roof.
+
+        Closing is held until it finishes. Open, opening, error or anything
+        else aborts the frames. OpenShutter is never sent from here.
+        """
+        dome = self._lead_dome()
+        if dome is None:
+            return
+        deadline = time.monotonic() + 30.0
+        told = False
+        while True:
+            check()
+            state = self._roof_state(dome)
+            if state == "closed":
+                return
+            if state == "closing":
+                if not told:
+                    self._say(f"Holding {label}: the roof is closing", "warn")
+                    told = True
+                if time.monotonic() >= deadline:
+                    raise DeviceError(
+                        "the roof did not finish closing; darks, bias and panel "
+                        "flats were not taken")
+                time.sleep(0.5)
+                continue
+            raise DeviceError(
+                f"the roof reads {state}; darks, bias and panel flats are not "
+                "taken unless it is closed, and the roof is not opened for them")
+
+    def _require_cover_closed(self, rig, check) -> None:
+        """Where a cover exists it has to read closed. No cover is fine."""
+        panel = rig.manager.get("flatpanel")
+        if panel is None or not getattr(panel, "connected", False) \
+                or not getattr(panel, "has_cover", False):
+            return
+        if panel.cover_state == "closed":
+            return
+        self._wait_for_cover(panel, "closed", check, timeout=30.0)
+        if panel.cover_state != "closed":
+            raise DeviceError(
+                f"{rig.name}: the cover reads {panel.cover_state}; darks, bias "
+                "and panel flats need it closed")
+
     def _set_on_rig(self, rig, spec: dict[str, Any],
                     flat_exposures: dict[tuple[str, str], float],
                     stopped) -> list[dict[str, Any]]:
         kind = spec["frameType"]
         camera = rig.manager.require("camera")
+        closed = roofguard.needs_closed_roof(spec)
 
-        def check() -> None:
+        def stopped_only() -> None:
             if stopped():
                 raise _Aborted("the calibration run was stopped")
+
+        def check() -> None:
+            stopped_only()
+            if closed:
+                self._require_roof_closed(stopped_only, _describe_set(spec))
 
         def note(text: str) -> None:
             with self._lock:
                 self._rig_state[rig.id] = text
 
+        token = f"{id(self)}:{rig.id}:{kind}"
+        if closed:
+            # For the whole set, including the exposure search: an open that
+            # arrives is refused. Sky flats do not come through here.
+            roofguard.begin(token, f"{rig.name} {kind}")
+        try:
+            return self._shoot_set(rig, spec, flat_exposures, camera, kind,
+                                   closed, stopped, check, note)
+        finally:
+            if closed:
+                roofguard.end(token)
+
+    def _shoot_set(self, rig, spec, flat_exposures, camera, kind, closed,
+                   stopped, check, note) -> list[dict[str, Any]]:
         camera.set_settings(binning=spec["binning"], gain=spec["gain"],
                             offset=spec["offset"])
+        if closed:
+            check()
 
         # Where the subs go: the library, not tonight's target folder.  The
         # target is set to "cal" rather than left blank so the frames are
@@ -1133,6 +1217,8 @@ class CalibrationRunner:
             self._darken(rig, check)
         else:
             self._darken(rig, check)
+        if roofguard.needs_closed_roof(spec):
+            self._require_cover_closed(rig, check)
 
         if kind == "bias":
             exposure = 0.0
@@ -1446,6 +1532,9 @@ class CalibrationRunner:
                 note(f"finding the flat exposure ({attempt}) at {exposure:g}s"
                      + (f", panel {brightness}%" if dimmable else ""))
                 record = rig.capture.capture_blocking(exposure, frame_type="flat")
+                if roofguard.needs_closed_roof(spec):
+                    # A roof that opens between test frames stops the search.
+                    check()
                 stats = record.stats or {}
                 # Signal, not signal plus the camera's offset.
                 level = max(0.0, float(stats.get("median") or 0.0) - pedestal)

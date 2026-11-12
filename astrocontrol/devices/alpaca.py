@@ -549,6 +549,19 @@ class AlpacaMount(_AlpacaDevice, Mount):
         return {"latitude": float(latitude), "longitude": float(longitude),
                 "elevation": float(self._client.get_cached("siteelevation", 30.0, 0.0) or 0.0)}
 
+    def reported_clock(self) -> dict[str, Any]:
+        """``utcdate`` and ``siderealtime``. GET only; the clock is not set."""
+        utc = lst = None
+        try:
+            utc = self._client.get("utcdate", timeout=8.0)
+        except DeviceError:
+            utc = None
+        try:
+            lst = self._client.get("siderealtime", timeout=8.0)
+        except DeviceError:
+            lst = None
+        return {"utc": utc, "lst": lst}
+
     def slew_to(self, ra_hours: float, dec_deg: float) -> None:
         self._require()
         self._client.put("slewtocoordinatesasync",
@@ -887,6 +900,10 @@ class AlpacaDome(_AlpacaDevice, Dome):
 
     def open_shutter(self) -> None:
         self._require()
+        from ..roofguard import blocked
+        why = blocked()
+        if why:
+            raise DeviceError(f"{why}; OpenShutter was not sent")
         self._client.put("openshutter")
 
     def close_shutter(self) -> None:

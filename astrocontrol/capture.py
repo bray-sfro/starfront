@@ -23,7 +23,7 @@ import numpy as np
 
 from . import astro
 from .config import Config, data_root, effective_site
-from .devices.base import CameraLostError, DeviceError
+from .devices.base import CameraLostError, DeviceError, read_slot
 from .devices.manager import DeviceManager
 from .imaging import fits, render, wcs
 from .livestack import Plan, StackError
@@ -238,6 +238,11 @@ class CaptureService:
         # The telescope this camera belongs to: TELESCOP in the header, and the
         # folder frames land in once there is more than one of them.
         self.telescope = ""
+        # Master or follower. The auto-upload gate reads this; a follower
+        # does not upload unless its own camera.uploadCollab is set.
+        self.role = ""
+        self.rig_key = ""
+        self.upload_collab = None
         # Where this telescope is in the PC's list (1-based) and how many there
         # are: RIGID, and the "-N" on a fallback TELESCOP (0.2.53a).
         self.rig_index = 1
@@ -771,6 +776,10 @@ class CaptureService:
             # calibration frame keeps whatever its own run set.
             wanted = self._ensure_settings(camera)
         metadata = self._snapshot_rig()
+        if frame_type == "light":
+            # A wheel that has not settled must not write a blank FILTER, and
+            # a colour camera with no wheel is OSC, not a guessed mono slot.
+            metadata["filter"] = self._light_filter()
 
         self._state = "exposing"
         self._exposure_started = time.time()
@@ -989,13 +998,72 @@ class CaptureService:
             + ", ".join(f"{key} {w['wanted']}" for key, w in wrong.items())
             + " - it will not match the calibration frames", "warn")
 
+    def _colour_camera(self) -> bool:
+        camera = self.manager.get("camera")
+        if camera is None:
+            return bool(self.config.get("camera", "colour", False))
+        if getattr(camera, "bayer_pattern", None):
+            return True
+        return bool(self.config.get("camera", "colour", False))
+
+    def _light_filter(self) -> str | None:
+        """The FILTER a light may wear. Never blank, never guessed.
+
+        A connected wheel must be reporting one named slot. A colour camera
+        with no wheel is OSC-RGB, which is what the collab server calls a
+        one-shot colour frame. A mono camera with no wheel keeps the filter
+        fitted in the drawer, or no card at all when nothing is fitted.
+        """
+        wheel = self.manager.get("filterwheel")
+        if wheel is not None and getattr(wheel, "connected", False):
+            names = [str(name) for name in (wheel.names or [])]
+            slot, said_moving = read_slot(wheel)
+            if slot is None or not (0 <= slot < len(names)) \
+                    or not names[slot].strip() or names[slot] == "-":
+                raise DeviceError(
+                    "the filter wheel has not settled on a known filter; "
+                    "the light was not taken and FILTER was not guessed")
+            if said_moving:
+                self.manager.log(
+                    f"The filter wheel reported moving, but the position read "
+                    f"is {names[slot]}; using that", "warn")
+            return names[slot]
+        if self._colour_camera():
+            fitted = str(self.config.get("camera", "fixedFilter", "") or "").strip()
+            if fitted.upper().startswith("OSC"):
+                return fitted
+            return "OSC-RGB"
+        fitted = str(self.config.get("camera", "fixedFilter", "") or "").strip()
+        return fitted or None
+
+    def upload_identity(self) -> dict[str, Any]:
+        """Who shot this frame, for the upload gate. Not the folder name."""
+        camera = self.manager.get("camera")
+        bayer = ""
+        camera_name = ""
+        if camera is not None:
+            bayer = str(getattr(camera, "bayer_pattern", "") or "")
+            camera_name = str(getattr(camera, "name", "") or "")
+        colour = self._colour_camera()
+        return {
+            "role": self.role or "",
+            "rigId": self.rig_key or "",
+            "name": self.telescope or "",
+            "camera": camera_name,
+            "bayer": bayer,
+            "colour": colour,
+            "mono": bool(camera_name) and not colour,
+            "upload": self.upload_collab,
+        }
+
     def _snapshot_rig(self) -> dict[str, Any]:
         """Read the rest of the rig so the FITS header describes this frame."""
         meta: dict[str, Any] = {}
         wheel = self.manager.get("filterwheel")
         if wheel is not None and wheel.connected:
-            names, position = wheel.names, wheel.position
-            meta["filter"] = names[position] if 0 <= position < len(names) else None
+            names = list(wheel.names or [])
+            slot, _said = read_slot(wheel)
+            meta["filter"] = names[slot] if slot is not None and 0 <= slot < len(names) else None
         else:
             # No wheel to ask, so what the operator said is in the drawer. A
             # RASA's filter cannot be moved by anything, but the frame still has
@@ -1003,6 +1071,11 @@ class CaptureService:
             fitted = str(self.config.get("camera", "fixedFilter", "") or "").strip()
             if fitted:
                 meta["filter"] = fitted
+            elif self._colour_camera():
+                # A one-shot colour camera with nothing in front of it. The
+                # collab server calls that OSC-RGB. "L" would park the frame
+                # waiting for luminance flats.
+                meta["filter"] = "OSC-RGB"
         focuser = self.manager.get("focuser")
         if focuser is not None and focuser.connected:
             meta["focuserPosition"] = focuser.position
@@ -1376,9 +1449,13 @@ class CaptureService:
         if uploader is None or not record.saved or not record.path:
             return
         try:
+            identity = None
+            if hasattr(self, "upload_identity"):
+                identity = self.upload_identity()
             uploader.light_saved(record.path, dict(self.frame_context or {}),
                                  self.telescope or "", self._calibration_want(record, camera),
-                                 night=self.night_name(), filter_name=record.filter or "")
+                                 night=self.night_name(), filter_name=record.filter or "",
+                                 identity=identity)
         except Exception:                               # noqa: BLE001 - never stops a night
             pass
 

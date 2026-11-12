@@ -3,6 +3,7 @@
 A rig fails in two ways. Loudly - an exception, a device that refuses - which
 the sequencer already reports. And quietly: the cooler that never reached
 its setpoint, the mount whose site is a hundred miles from the observatory,
+the mount whose clock is an hour away from this PC,
 the cover that stayed shut, the disk with two frames' worth of room, the
 frames that have had no stars in them since the cloud came over. Nothing
 throws, the night runs to the end, and the morning finds it was wasted.
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import filters as filternames
+from . import mountclock
 from .focushealth import bogus_reading
 
 LEVELS = ("critical", "warning", "notice")
@@ -336,6 +338,22 @@ def mount_site_disagrees(board: WarningBoard, ctx: Context) -> None:
                          "Every slew and every plan is wrong by the difference.",
                          "Set the mount's location in its driver, or untick "
                          "'take the site from the mount' in Site & Optics.")
+
+
+@check
+def mount_clock(board: WarningBoard, ctx: Context) -> None:
+    """The driver's UTC and sidereal time against this PC.
+
+    Raised when the difference is more than a minute. With no mount, the
+    result is a skip and the board stays quiet. The watchdog runs this with
+    the others, so it happens at startup and again after a mount connects.
+    The driver is only read.
+    """
+    report = mountclock.observe(ctx)
+    if report.get("state") != "warn":
+        return
+    board.raise_(mountclock.WARNING_KEY, "warning", report["title"],
+                 report["detail"], report["fix"])
 
 
 @check

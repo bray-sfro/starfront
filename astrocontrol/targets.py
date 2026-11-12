@@ -556,7 +556,11 @@ class TargetStore:
     def add_panel_integration(self, target_id: str, night: str, panel: int,
                               filter_name: str, seconds: float, *,
                               hfr: float | None = None,
-                              guide_rms: float | None = None) -> None:
+                              guide_rms: float | None = None,
+                              telescope: str = "", instrument: str = "",
+                              focal_length: float | None = None,
+                              role: str = "", colour: bool = False,
+                              bayer: str = "") -> None:
         """Credit one sub to the panel it was taken on.
 
         The night log answers "how did last night go?"; this answers "which
@@ -580,17 +584,54 @@ class TargetStore:
                                       "hfrSum": 0.0, "hfrCount": 0,
                                       "rmsSum": 0.0, "rmsCount": 0,
                                       "reported": False}))
-            row["seconds"] = round(row["seconds"] + float(seconds), 1)
-            row["frames"] = int(row["frames"]) + 1
-            # Frames after a report re-open it: a night that grows after it was
-            # sent is sent again, and the server counts the larger figure.
-            row["reported"] = False
-            if hfr is not None:
-                row["hfrSum"] = round(row["hfrSum"] + float(hfr), 4)
-                row["hfrCount"] = int(row["hfrCount"]) + 1
-            if guide_rms is not None:
-                row["rmsSum"] = round(row["rmsSum"] + float(guide_rms), 4)
-                row["rmsCount"] = int(row["rmsCount"]) + 1
+            # A follower's subs are remembered on their own slice and are not
+            # added to the tally the collaboration report sends. The Rokinon's
+            # L frames were being reported as the FSQ85's and counted toward
+            # the project's L hours.
+            from .autoupload import follower_frame
+            follower = follower_frame({
+                "role": role, "telescope": telescope, "name": telescope,
+                "camera": instrument, "colour": colour, "bayer": bayer,
+            })
+            if not follower:
+                row["seconds"] = round(row["seconds"] + float(seconds), 1)
+                row["frames"] = int(row["frames"]) + 1
+                # Frames after a report re-open it: a night that grows after it
+                # was sent is sent again, and the server counts the larger figure.
+                row["reported"] = False
+                if hfr is not None:
+                    row["hfrSum"] = round(row["hfrSum"] + float(hfr), 4)
+                    row["hfrCount"] = int(row["hfrCount"]) + 1
+                if guide_rms is not None:
+                    row["rmsSum"] = round(row["rmsSum"] + float(guide_rms), 4)
+                    row["rmsCount"] = int(row["rmsCount"]) + 1
+            if telescope or instrument or role:
+                part = row.setdefault("byTelescope", {}).setdefault(
+                    telescope or instrument, {
+                        "seconds": 0.0, "frames": 0,
+                        "hfrSum": 0.0, "hfrCount": 0,
+                        "rmsSum": 0.0, "rmsCount": 0,
+                        "reported": False,
+                        "telescope": telescope, "instrument": instrument,
+                        "focalLength": focal_length, "role": role,
+                        "colour": bool(colour), "bayer": bayer,
+                    })
+                part["seconds"] = round(part["seconds"] + float(seconds), 1)
+                part["frames"] = int(part["frames"]) + 1
+                part["reported"] = False
+                part["telescope"] = telescope
+                part["instrument"] = instrument
+                part["role"] = role
+                part["colour"] = bool(colour)
+                part["bayer"] = bayer
+                if focal_length is not None:
+                    part["focalLength"] = float(focal_length)
+                if hfr is not None:
+                    part["hfrSum"] = round(part["hfrSum"] + float(hfr), 4)
+                    part["hfrCount"] = int(part["hfrCount"]) + 1
+                if guide_rms is not None:
+                    part["rmsSum"] = round(part["rmsSum"] + float(guide_rms), 4)
+                    part["rmsCount"] = int(part["rmsCount"]) + 1
         self.save()
 
     def unreported_panels(self, target_id: str) -> list[dict[str, Any]]:
@@ -604,13 +645,34 @@ class TargetStore:
             for night, panels in nights.items():
                 for index, filters in panels.items():
                     for name, row in filters.items():
+                        parts = row.get("byTelescope") or {}
+                        if parts:
+                            for key, part in parts.items():
+                                if part.get("reported") or not part.get("frames"):
+                                    continue
+                                out.append({
+                                    "night": night, "panel": int(index),
+                                    "filter": name, "telescope": part.get("telescope") or key,
+                                    "instrument": part.get("instrument") or "",
+                                    "focalLength": part.get("focalLength"),
+                                    "role": part.get("role") or "",
+                                    "colour": bool(part.get("colour")),
+                                    "bayer": part.get("bayer") or "",
+                                    "seconds": part.get("seconds") or 0.0,
+                                    "frames": part.get("frames") or 0,
+                                    "hfrSum": part.get("hfrSum") or 0.0,
+                                    "hfrCount": part.get("hfrCount") or 0,
+                                    "rmsSum": part.get("rmsSum") or 0.0,
+                                    "rmsCount": part.get("rmsCount") or 0,
+                                })
+                            continue
                         if not row.get("reported") and row.get("frames"):
                             out.append({"night": night, "panel": int(index),
                                         "filter": name, **row})
             return out
 
     def mark_reported(self, target_id: str, night: str, panel: int,
-                      filter_name: str) -> None:
+                      filter_name: str, telescope: str = "") -> None:
         with self._lock:
             target = next((t for t in self._targets if t["id"] == target_id), None)
             if target is None:
@@ -619,7 +681,21 @@ class TargetStore:
                    .get(night, {}).get(str(int(panel)), {}).get(filter_name))
             if row is None:
                 return
-            row["reported"] = True
+            parts = row.get("byTelescope") or {}
+            if telescope and parts:
+                part = parts.get(telescope)
+                if part is None:
+                    part = next((p for p in parts.values()
+                                 if p.get("telescope") == telescope
+                                 or p.get("instrument") == telescope), None)
+                if part is not None:
+                    part["reported"] = True
+                if parts and all(p.get("reported") for p in parts.values()):
+                    row["reported"] = True
+            else:
+                row["reported"] = True
+                for part in parts.values():
+                    part["reported"] = True
         self.save()
 
     @staticmethod

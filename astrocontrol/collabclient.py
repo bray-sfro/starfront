@@ -453,6 +453,21 @@ class CollabClient:
                 self.on_poll(list(tasks))
         return task
 
+def _follower_contribution(row: dict[str, Any]) -> bool:
+    """A session row shot by the follower camera. It is not reported."""
+    from .autoupload import follower_frame
+    return follower_frame({
+        "role": row.get("role") or "",
+        "telescope": row.get("telescope") or "",
+        "name": row.get("telescope") or "",
+        "camera": row.get("instrument") or "",
+        "colour": bool(row.get("colour")),
+        "bayer": row.get("bayer") or "",
+    })
+
+
+# Reopened so the follower check above can sit next to the report it guards.
+class CollabClient(CollabClient):  # noqa: E0102 - continued below
     def report_pending(self) -> int:
         """Send every panel that has been shot on a collaboration and not yet
         reported, and hear the verdicts.
@@ -479,7 +494,23 @@ class CollabClient:
                 continue
             by_index = {int(p.get("index") or 0): p for p in (target.get("panels") or [])}
             batch = []
+            reporting = []
             for row in pending:
+                if _follower_contribution(row):
+                    # Counted on this PC, never sent. Marked reported so the
+                    # next poll does not keep considering it.
+                    self.targets.mark_reported(
+                        target["id"], row["night"], row["panel"], row["filter"],
+                        telescope=str(row.get("telescope") or ""))
+                    self._say(
+                        "Collaboration: not reporting "
+                        f"{row.get('telescope') or row.get('instrument') or 'the follower'} "
+                        f"{row.get('filter') or ''} "
+                        f"({float(row.get('seconds') or 0):.0f}s) — "
+                        "follower frames are not counted toward the project")
+                    continue
+                reporting.append(row)
+            for row in reporting:
                 panel = by_index.get(row["panel"])
                 footprint = None
                 if panel is not None:
@@ -497,6 +528,12 @@ class CollabClient:
                 frames = int(row["frames"])
                 seconds = float(row["seconds"])
                 hfr_px = (row["hfrSum"] / row["hfrCount"]) if row.get("hfrCount") else None
+                own_focal = row.get("focalLength")
+                if own_focal in (None, ""):
+                    own_focal = float(focal) if focal else None
+                else:
+                    own_focal = float(own_focal)
+                instrument = str(row.get("instrument") or "")
                 batch.append({
                     "project": stamp.get("project"), "task": stamp["task"],
                     "night": row["night"], "panel": str(row["panel"]),
@@ -504,8 +541,9 @@ class CollabClient:
                     "seconds": seconds,
                     "exposure": (seconds / frames) if frames else 0.0,
                     "footprint": footprint, "scale": scale,
-                    "focalLength": float(focal) if focal else None,
-                    "colour": colour,
+                    "focalLength": own_focal,
+                    "colour": bool(row["colour"]) if "colour" in row and row.get("telescope") else colour,
+                    "instrument": instrument,
                     # Arcseconds, never pixels: the only unit that means the
                     # same thing on two telescopes.
                     "hfr": (hfr_px * scale) if (hfr_px is not None and scale) else None,
@@ -513,10 +551,11 @@ class CollabClient:
                     "bandpass": bandpasses.get(row["filter"]),
                 })
             answer = self.report(batch)
-            for row, recorded in zip(pending, answer.get("recorded") or []):
+            for row, recorded in zip(reporting, answer.get("recorded") or []):
                 if recorded.get("id"):
                     self.targets.mark_reported(target["id"], row["night"],
-                                               row["panel"], row["filter"])
+                                               row["panel"], row["filter"],
+                                               telescope=str(row.get("telescope") or ""))
                     sent += 1
         return sent
 

@@ -8,7 +8,7 @@
 <!-- The ?v= stamps exist to break a browser cache that has already decided an
      older copy is still fresh. Bump them if a released build ever needs to
      invalidate a client that has not revalidated. -->
-<link rel="stylesheet" href="style.css?v=67">
+<link rel="stylesheet" href="style.css?v=68">
 </head>
 <body>
 
@@ -51,6 +51,7 @@
       <button class="btn small ghost" data-panel-toggle="run" title="Focus curve and sub statistics">Run</button>
       <button class="btn small ghost" data-panel-toggle="log" title="Event log">Log</button>
     </div>
+    <span id="roofBadge" class="roof-badge" hidden></span>
     <span id="clock" class="mono muted"></span>
     <span id="linkState" class="link-state offline">offline</span>
   </div>
@@ -3301,7 +3302,7 @@
 
 <div id="toasts" class="toasts"></div>
 
-<script src="app.js?v=73"></script>
+<script src="app.js?v=74"></script>
 <script src="sky.js?v=62"></script>
 <script src="surveyimg.js?v=1"></script>
 <script src="planner.js?v=62"></script>

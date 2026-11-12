@@ -2668,6 +2668,22 @@ function frameDetail(status, capture) {
   return bits.join('  ·  ');
 }
 
+/* The roof, in the top bar, whenever one is connected. The text is the
+   status payload's, including "Roof opening… 12s" and the technician lock.
+   This does not send an open or a close. */
+function updateRoof(status) {
+  const badge = $('roofBadge');
+  if (!badge) return;
+  const roof = (status && status.roof) || {};
+  if (!roof.connected || !roof.text) {
+    badge.hidden = true;
+    return;
+  }
+  badge.hidden = false;
+  badge.className = `roof-badge ${roof.tone || ''}`;
+  badge.textContent = roof.text;
+}
+
 function updateActivity(status) {
   const bar = $('activityBar');
   if (!bar) return;
@@ -2891,6 +2907,7 @@ function applyStatus(status) {
   updateOutput(capture);
   updateSequenceBanner(status);
   updateActivity(status);
+  updateRoof(status);
   updateRecoveryBar(status);
   updateWarnings(status);
   updateRunPanel(status);
