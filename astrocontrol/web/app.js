@@ -2736,6 +2736,34 @@ function updateRoof(status) {
   badge.textContent = roof.text;
 }
 
+/* The flat-panel cover, beside the roof badge. The text is the status
+   payload's. The buttons send OpenCover / CloseCover / CalibratorOn / Off.
+   They do not send anything to the roof. */
+function updateCover(status) {
+  const badge = $('coverBadge');
+  const buttons = $('coverButtons');
+  if (!badge) return;
+  const cover = (status && status.cover) || {};
+  if (!cover.connected || !cover.text) {
+    badge.hidden = true;
+    if (buttons) buttons.hidden = true;
+    return;
+  }
+  badge.hidden = false;
+  badge.className = `roof-badge ${cover.tone || ''}`;
+  badge.textContent = cover.text;
+  badge.title = cover.stale ? 'Last cover reading is stale' : (cover.text || '');
+  if (!buttons) return;
+  buttons.hidden = false;
+  const open = $('btnCoverOpen');
+  if (open) {
+    const blocked = cover.openBlocked || '';
+    const exposing = ((status.capture || {}).state === 'exposing');
+    open.disabled = !!blocked || exposing;
+    open.title = blocked || (exposing ? 'An exposure is running' : 'Open the flat panel cover');
+  }
+}
+
 function updateActivity(status) {
   const bar = $('activityBar');
   if (!bar) return;
@@ -2960,6 +2988,7 @@ function applyStatus(status) {
   updateSequenceBanner(status);
   updateActivity(status);
   updateRoof(status);
+  updateCover(status);
   updateRecoveryBar(status);
   updateWarnings(status);
   updateRunPanel(status);
@@ -6519,6 +6548,33 @@ function bindControls() {
       { title: 'Ask the driver to close', confirmLabel: 'Send close', danger: true });
     if (ok) send('/api/dome/shutter', 'POST', { open: false });
   });
+  // The flat panel. Opening is confirmed because a light sequence needs the
+  // lid out of the way, and closing because the next dark wants it shut.
+  const coverCommand = async (title, message, path, body, confirmLabel) => {
+    const ok = await confirmAction(message, { title, confirmLabel, danger: true });
+    if (!ok) return;
+    try {
+      await api(rigQuery(path), 'POST', body);
+    } catch (error) {
+      toast(error.message, 'error');
+    }
+  };
+  $('btnCoverOpen').addEventListener('click', () => coverCommand(
+    'Open cover',
+    'Open the flat panel cover? Do this only when the telescope should see the sky.',
+    '/api/flatpanel/cover', { on: true }, 'Open cover'));
+  $('btnCoverClose').addEventListener('click', () => coverCommand(
+    'Close cover',
+    'Close the flat panel cover?',
+    '/api/flatpanel/cover', { on: false }, 'Close cover'));
+  $('btnCoverLightOn').addEventListener('click', () => coverCommand(
+    'Light on',
+    'Turn the flat panel light on at full brightness?',
+    '/api/flatpanel/light', { on: true }, 'Light on'));
+  $('btnCoverLightOff').addEventListener('click', () => coverCommand(
+    'Light off',
+    'Turn the flat panel light off?',
+    '/api/flatpanel/light', { on: false }, 'Light off'));
   $('btnOffsetsRun').addEventListener('click', async () => {
     const names = readFilterNames();
     if (names.length < 2) {

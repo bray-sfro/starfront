@@ -500,14 +500,18 @@ class FlatPanel(Device):
     kind = "flatpanel"
 
     max_brightness: int = 100
+
     @property
     def has_cover(self) -> bool | None:
-        """True when the driver has shown a cover, False when it reports none.
+        """True when this read shows a cover, False when the driver says none.
 
         None when the state is unknown or the read failed. Unknown is not
-        "no cover", and a failed read is not "no cover".
+        "no cover". The value is this read, not a latch taken at connect.
         """
-        state = str(self.cover_state or "unread")
+        try:
+            state = str(self.cover_state or "unread")
+        except Exception:                             # noqa: BLE001 - unknown, not "no cover"
+            return None
         if state == "notpresent":
             return False
         if state in ("closed", "moving", "open", "error"):
@@ -538,8 +542,16 @@ class FlatPanel(Device):
         raise NotImplementedError
 
     @property
+    def calibrator_state(self) -> str:
+        """off, ready, notready, unknown, notpresent, error."""
+        try:
+            return "ready" if self.light_on else "off"
+        except Exception:                             # noqa: BLE001
+            return "unknown"
+
+    @property
     def cover_state(self) -> str:
-        """One of: notpresent, closed, moving, open, unknown."""
+        """notpresent, closed, moving, open, unknown, error, or unread."""
         return "notpresent"
 
     def turn_on(self, brightness: int) -> None:
