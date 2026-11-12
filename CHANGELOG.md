@@ -18,6 +18,11 @@ builds. Not installed anywhere.
   attempts run out.
 - Coordinator code (astrocontrol/collab.py, filters.py) is the live collab
   server's, plus the per-camera `instrument` on session reports.
+- 0.2.53i (PR #14): flat panel/cover badge and Open/Close/Light buttons; the
+  cover is re-read and opened before centring, autofocus, sky flats and lights,
+  and the run holds if it does not report Open. Open Cover is refused during
+  darks, bias, panel flats, exposures, slews and autofocus. This replaces the
+  0.2.53c cover-open path.
 - Multiscope build: the 0.2.53b-r2 per-camera collab agents and filter
   identification, on top of all of the above.
 
