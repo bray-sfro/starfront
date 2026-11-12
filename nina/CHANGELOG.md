@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.0.33
+
+- *Wait for the target to rise*, on by default, on the *Starfront collaboration* container. If a dealt field is still below the project's altitude floor or your horizon when its turn comes, the container now sits until it is up (and far enough from a Moon that is up), then shoots it, instead of ending and leaving a gap in the sequence. Fields that are already up are still shot first. The wait is checked once a minute and stops at astronomical dawn, or at once if the sequence is cancelled. Untick the box on the container to keep the old skip-and-move-on behaviour.
+
+
 ## 1.0.0.31
 
 - *Collect the lights on the server* in the start-a-collaboration form, and on Edit. A collaboration with it on takes everyone's lights, flats, darks and bias through the files page at collab.starfront.space/files, sorted by collaboration and person, for the coordinator to stack. A card on such a collaboration says so and has an *Open the files page* button.
