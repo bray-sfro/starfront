@@ -5,10 +5,13 @@ where the telescope thinks it is pointing, and writes the answer to a small
 `.ini` file beside its output path.  Everything here is that conversation, plus
 the two things a solved position is actually good for at the eyepiece:
 
-  * **sync**   - tell the mount where it really is, once.
-  * **centre** - solve, sync, slew back to the target and solve again, until the
-    target is under the crosshair.  This is what makes "go to M51" land M51 in
-    the middle of the frame rather than somewhere in the general area.
+  * **sync**   - tell the mount where it really is, once. The operator's
+    own Sync button. Centring does not use it.
+  * **centre** - solve, and slew to the target minus the measured offset
+    (aim = target + (target − solved)), until the target is under the
+    crosshair. The mount is not synced: TheSky's SyncToCoordinates throws,
+    and a thrown sync must not be treated as a pointing model. A solve that
+    is flipped or a jump is thrown away before any slew.
 
 Solves run on their own thread; the UI polls `status()` through the status
 socket, exactly like a capture.
@@ -309,14 +312,18 @@ class Solver:
         finally:
             self._set("idle")
 
-    def _report(self, result: SolveResult) -> None:
+    def _report(self, result: SolveResult, remember_angle: bool = True) -> None:
         with self._lock:
             self._result = result
         self.manager.log(
             f"Solved {result.filename or 'frame'}: RA {result.ra:.5f}h  "
             f"Dec {result.dec:+.4f}°  {result.scale:.2f}\"/px  "
             f"rot {result.rotation:+.2f}°  ({result.seconds:.1f}s)", "success")
-        self._remember_angle(result)
+        # A trusted field that is the other way up from the saved camera
+        # angle is still where the telescope is. Writing that angle into the
+        # settings would defeat the flip check on the next frame.
+        if remember_angle:
+            self._remember_angle(result)
 
     def _remember_angle(self, result: SolveResult) -> None:
         """Keep the stored camera angle in step with what the sky says it is.
@@ -504,12 +511,226 @@ class Solver:
             time.sleep(0.3)
         return True
 
+    # A reported angle this close to half a turn from the reference is the
+    # other way up. ASTAP's false match on a mirrored field comes back that
+    # way (M31: +95.6° on the target, −84.5° on the match 24° away). A correct
+    # solve is also free to quote the other half-turn, but then it is still
+    # sitting on the same piece of sky, so the angle alone is not the reject.
+    _FLIP_WINDOW_DEG = 15.0
+    # Farther than this from the target, a flipped angle is not the mount's
+    # model being wrong. After a home the model can be tens of degrees out
+    # and still the right way up; that solve is kept.
+    _FLIP_FAR_DEG = 5.0
+    # After a correction, a new solve may land this far past the move just
+    # commanded before it is thrown away. Three times the slew, and never
+    # tighter than five degrees: a one-arcminute nudge must not reject a
+    # solve a degree off because the mount did not go where it was told.
+    _JUMP_FLOOR_DEG = 5.0
+    _JUMP_FACTOR = 3.0
+
+    @staticmethod
+    def _rotation_apart(a: float, b: float) -> float:
+        """Shortest turn from `a` to `b`, in degrees, 0 to 180."""
+        return abs(((float(a) - float(b) + 180.0) % 360.0) - 180.0)
+
+    def _optics_angle(self) -> float | None:
+        raw = self.config.get("optics", "rotation", None)
+        try:
+            if raw is None:
+                return None
+            return float(raw)
+        except (TypeError, ValueError):
+            return None
+
+    def _centring_outlier(self, result: SolveResult, target_ra: float,
+                          target_dec: float, accepted: dict[str, float] | None,
+                          commanded_deg: float | None) -> str | None:
+        """Why this solve must not move the mount, or None if it may.
+
+        A flipped solve is one whose angle is ~180° from the camera's, and
+        which is not on the field the last accepted solve (or the target, the
+        first time) said we were on. A jump is a solve that moved many times
+        further than the slew just commanded. Either one is discarded before
+        an offset is applied.
+        """
+        reference = accepted["rotation"] if accepted else self._optics_angle()
+        flipped = (reference is not None and self._rotation_apart(
+            result.rotation, reference) >= 180.0 - self._FLIP_WINDOW_DEG)
+        if accepted is None:
+            if not flipped:
+                return None
+            away = astro.separation_degrees(
+                result.ra, result.dec, target_ra, target_dec)
+            if away > self._FLIP_FAR_DEG:
+                return (f"rotation {result.rotation:.1f}° is flipped from the "
+                        f"camera angle {reference:.1f}°, and the solve is "
+                        f"{away:.1f}° from the target")
+            return None
+        jumped = astro.separation_degrees(
+            result.ra, result.dec, accepted["ra"], accepted["dec"])
+        if flipped and jumped > 1.0:
+            return (f"rotation flipped from {accepted['rotation']:.1f}° to "
+                    f"{result.rotation:.1f}° and the solve jumped {jumped:.1f}°")
+        limit = max(self._JUMP_FLOOR_DEG,
+                    (commanded_deg or 0.0) * self._JUMP_FACTOR)
+        if jumped > limit:
+            return (f"the solve jumped {jumped:.1f}°, more than {limit:.1f}° "
+                    f"after a {(commanded_deg or 0.0):.1f}° correction")
+        return None
+
+    # A blind field is trusted when a second independent frame agrees, or
+    # when this one frame's scale and image FOV match the optics. Either is
+    # enough to offset back to the target. Neither is a mount sync.
+    _RECOVERY_AGREEMENT_DEG = 1.0
+    _RECOVERY_ANGLE_DEG = 5.0
+    _RECOVERY_SEARCH_DEG = 1.5
+
+    def _solve_for_centring(self, record: Any, blind_left: list[bool] | None = None
+                            ) -> SolveResult | None:
+        """The tight solve, or one blind solve of this frame if the hint misses.
+
+        `blind_left` is accepted and ignored. 0.2.53e cleared it before the
+        flipped result was rejected, so every later exposure stayed on the
+        stale mount hint. Each fresh exposure may search the whole sky once.
+        A rejection does not spend that for the rest of the centring.
+        """
+        del blind_left
+        try:
+            result = self._solve_image(record.id)
+            result._solve_kind = "tight"
+            return result
+        except DeviceError as exc:
+            if self._abort.is_set():
+                raise
+            self.manager.log(
+                f"No solution within the search radius ({exc}); "
+                "trying one blind solve of this frame", "warn")
+            try:
+                result = self._solve_wide(record)
+                result._solve_kind = "blind"
+                return result
+            except DeviceError as again:
+                if self._abort.is_set():
+                    raise
+                self.manager.log(f"The blind solve failed ({again})", "warn")
+                return None
+
+    def _locally_confirm(self, record: Any, candidate: SolveResult) -> SolveResult:
+        """Re-solve a blind field at its own coordinates.
+
+        `-r` is only how far ASTAP searches its database. The image FOV is
+        the sensor, from the optics, and is not replaced by that radius.
+        """
+        result = self._solve_record(
+            record, radius=self._RECOVERY_SEARCH_DEG, hint_position=False,
+            hint=(candidate.ra, candidate.dec))
+        reason = self._field_mismatch(
+            {"ra": candidate.ra, "dec": candidate.dec,
+             "rotation": candidate.rotation, "scale": candidate.scale},
+            result)
+        if reason:
+            raise DeviceError(reason)
+        result._solve_kind = "blind"
+        result._locally_confirmed_for = id(record)
+        return result
+
+    def _field_mismatch(self, packed: dict[str, Any],
+                        result: SolveResult) -> str | None:
+        away = astro.separation_degrees(
+            packed["ra"], packed["dec"], result.ra, result.dec)
+        if away > self._RECOVERY_AGREEMENT_DEG:
+            return f"sky positions are {away:.3f} degrees apart"
+        if self._rotation_apart(float(packed["rotation"]) % 180.0,
+                                float(result.rotation) % 180.0) > self._RECOVERY_ANGLE_DEG:
+            return "rotations disagree (modulo 180)"
+        if (packed.get("scale") and result.scale
+                and abs(result.scale / float(packed["scale"]) - 1.0) > 0.05):
+            return "optical scales disagree"
+        return None
+
+    def _expected_scale(self, record: Any) -> tuple[float, float] | None:
+        """Arcsec/pixel and image height in degrees, from the optics."""
+        focal_length = self.config.get("optics", "focalLength")
+        camera = self.manager.get("camera")
+        pixel_size = getattr(camera, "pixel_size_um", 0.0) if camera else 0.0
+        height = getattr(record, "height", 0) or 0
+        binning = getattr(record, "binning", 1) or 1
+        if not focal_length or not pixel_size or not height:
+            return None
+        scale = 206.265 * float(pixel_size) * float(binning) / float(focal_length)
+        return scale, scale * float(height) / 3600.0
+
+    def _scale_and_fov_ok(self, result: SolveResult, record: Any) -> bool:
+        """True only when this frame's scale and FOV match the optics.
+
+        Missing optics is not a pass: one uncorroborated frame then needs a
+        second independent field before the mount is moved a long way.
+        """
+        expected = self._expected_scale(record)
+        if expected is None:
+            return False
+        scale, fov = expected
+        if not math.isfinite(result.scale) or result.scale <= 0 or scale <= 0:
+            return False
+        tolerance = min(0.50, max(0.02,
+            float(self.config.get("solver", "scaleTolerance", 0.20) or 0.20)))
+        if abs(result.scale / scale - 1.0) > tolerance:
+            return False
+        if result.fov_height and abs(result.fov_height / fov - 1.0) > tolerance:
+            return False
+        return True
+
+    def _recovery_trusted(self, result: SolveResult, record: Any,
+                          pending: dict[str, Any] | None) -> bool:
+        """A measured field we will offset back to the target from.
+
+        One locally confirmed solve that matches the optics, or two
+        independent locally confirmed solves that agree. A zero scale is
+        never enough. The saved camera angle is not changed here.
+        """
+        if getattr(result, "_locally_confirmed_for", None) != id(record):
+            return False
+        if not math.isfinite(result.scale) or result.scale <= 0:
+            return False
+        if self._scale_and_fov_ok(result, record):
+            return True
+        if pending is None or pending.get("frame") == id(record):
+            return False
+        return self._field_mismatch(pending, result) is None
+
+    def _offset_slew(self, mount: Any, target_ra: float, target_dec: float,
+                     result: SolveResult, east: float, north: float) -> float:
+        """Slew to target − (solved − target). Returns that slew in degrees.
+
+        The same arithmetic as aim = target + (target − solved). Worked from
+        the target every time: adding the error onto the last aim walked the
+        mount off the field. The mount is not synced. TheSky's
+        SyncToCoordinates throws a null reference, and a thrown sync is not
+        a pointing model.
+        """
+        # Signed shortest RA error, in hours, so a solve just west of 0h does
+        # not aim twenty-three hours the other way.
+        delta_ra = ((result.ra - target_ra + 12.0) % 24.0) - 12.0
+        delta_dec = result.dec - target_dec
+        aim_ra = astro.normalise_ra_hours(target_ra - delta_ra)
+        aim_dec = max(-90.0, min(90.0, target_dec - delta_dec))
+        self._pointing_offset = (delta_ra, delta_dec)
+        commanded = astro.separation_degrees(result.ra, result.dec, aim_ra, aim_dec)
+        self.manager.log(
+            f"Pointing offset RA {delta_ra * 15.0 * 60.0 * math.cos(math.radians(target_dec)):+.2f}', "
+            f"Dec {delta_dec * 60.0:+.2f}' "
+            f"(solved - target); slewing to RA {aim_ra:.5f}h  Dec {aim_dec:+.4f}° "
+            f"by RA {-east:+.2f}', Dec {-north:+.2f}'")
+        self._set("correcting",
+                  f"{result.separation:.2f}' out — slewing by the pointing offset")
+        mount.slew_to(aim_ra, aim_dec)
+        self._wait_for_slew(mount)
+        return commanded
+
     # -- centring ----------------------------------------------------------
     def _center(self, ra: float | None, dec: float | None,
                 rotation: float | None = None) -> None:
         mount = self.manager.require("mount")
-        if not mount.can_sync:
-            raise DeviceError("centring needs a mount that can be synced")
 
         target_ra = astro.normalise_ra_hours(ra) if ra is not None else mount.ra
         target_dec = dec if dec is not None else mount.dec
@@ -519,14 +740,23 @@ class Solver:
 
         self.manager.log(
             f"Centring on RA {target_ra:.5f}h  Dec {target_dec:+.4f}° "
-            f"(within {tolerance:g}')")
+            f"(within {tolerance:g}'); corrections are a pointing offset, "
+            "not a mount sync")
 
         if ra is not None or dec is not None:
             self._set("slewing", "slewing to the target")
             mount.slew_to(target_ra, target_dec)
             self._wait_for_slew(mount)
 
-        can_sync = True
+        # A rejected blind field does not spend the recovery for later
+        # exposures. There is no separation ceiling: a trusted field tens of
+        # degrees off is still offset back to the target. Horizon and the
+        # mount's own limits are the slew's problem, not a 30° give-up.
+        accepted: dict[str, float] | None = None
+        commanded_deg: float | None = None
+        last_valid: float | None = None
+        pending: dict[str, Any] | None = None
+
         for attempt in range(1, attempts + 1):
             if self._abort.is_set():
                 raise DeviceError("centring aborted")
@@ -546,10 +776,59 @@ class Solver:
             finally:
                 self.capture.resume_saving()
 
-            result = self._solve_image(record.id)
+            result = self._solve_for_centring(record)
+            if result is None:
+                self.manager.log(
+                    f"Centre attempt {attempt}/{attempts}: no usable solution")
+                continue
+
+            away = astro.separation_degrees(
+                result.ra, result.dec, target_ra, target_dec)
+            if (getattr(result, "_solve_kind", "") == "blind"
+                    and (away > 1.0 or self._centring_outlier(
+                        result, target_ra, target_dec, accepted, commanded_deg))):
+                try:
+                    result = self._locally_confirm(record, result)
+                except DeviceError as exc:
+                    if self._abort.is_set():
+                        raise
+                    self.manager.log(
+                        f"Centre attempt {attempt}/{attempts}: blind result "
+                        f"not validated ({exc}); no movement", "warn")
+                    continue
+
+            reason = self._centring_outlier(
+                result, target_ra, target_dec, accepted, commanded_deg)
+            trusted = False
+            if reason and accepted is None and self._recovery_trusted(
+                    result, record, pending):
+                # The flip gate still rejected this as an ordinary solve.
+                # Two frames, or one frame whose scale and FOV match, mean
+                # the telescope really is there: offset back to the target.
+                trusted = True
+                self.manager.log(
+                    f"Trusted measured field RA {result.ra:.5f}h "
+                    f"Dec {result.dec:+.4f}° ({reason}). "
+                    "Slewing by the pointing offset back to the target, "
+                    "not syncing the mount and not saving this angle.", "warn")
+                reason = None
+            if reason:
+                self.manager.log(
+                    f"Centre attempt {attempt}/{attempts}: rejected — {reason}. "
+                    f"Candidate RA {result.ra:.5f}h Dec {result.dec:+.4f}°. "
+                    "The mount was not moved.", "warn")
+                if getattr(result, "_locally_confirmed_for", None) == id(record):
+                    pending = {"ra": result.ra, "dec": result.dec,
+                               "rotation": result.rotation, "scale": result.scale,
+                               "frame": id(record)}
+                continue
+
             result.separation = astro.separation_degrees(
                 result.ra, result.dec, target_ra, target_dec) * 60.0
-            self._report(result)
+            self._report(result, remember_angle=not trusted)
+            last_valid = result.separation
+            accepted = {"ra": result.ra, "dec": result.dec,
+                        "rotation": float(result.rotation)}
 
             centred = result.separation <= tolerance
             # Where it landed against where it was sent, in arcminutes on the
@@ -570,9 +849,11 @@ class Solver:
             # pointing also says which way up it is, so correcting both from one
             # frame costs nothing beyond the moving. Only when a framing angle
             # was actually asked for — a plain re-centre must not start turning
-            # a rotator nobody mentioned.
+            # a rotator nobody mentioned. Only an accepted solve turns it.
             turned = False
-            if rotation is not None and attempt < attempts:
+            # A trusted field that is flipped relative to the saved angle is
+            # not a rotator error. Turning to that angle would adopt it.
+            if rotation is not None and attempt < attempts and not trusted:
                 turned = self._correct_rotation(rotation, result.rotation)
 
             if centred and not turned:
@@ -590,42 +871,19 @@ class Solver:
             # angle, but the pointing may be fine — re-slewing a centred mount
             # would only spoil it.
             if not centred:
-                self._set("correcting",
-                          f"{result.separation:.2f}' out — syncing and re-slewing")
-                synced = False
-                if can_sync:
-                    try:
-                        mount.sync_to(result.ra, result.dec)
-                        synced = True
-                    except Exception as exc:      # noqa: BLE001 - the driver's refusal
-                        # Some drivers will not take a sync - TheSky's throws
-                        # a null reference at it - and a centring that gave
-                        # up there left every panel wherever the mount first
-                        # put it. Not asked again this centring.
-                        can_sync = False
-                        self.manager.log(f"The mount would not sync ({exc}); nudging "
-                                         "the slew by the measured error instead", "warn")
-                if synced:
-                    self.manager.log("Synced the mount to the solve; slewing to the "
-                                     "target again")
-                    mount.slew_to(target_ra, target_dec)
-                else:
-                    # The error is known, so the slew is nudged by it: ask for
-                    # the target plus however far short of it the mount
-                    # landed. Always from the *target*, never from the last
-                    # nudged aim - compounding the nudge each attempt walked
-                    # the mount steadily away from the field.
-                    aim_ra = astro.normalise_ra_hours(target_ra + (target_ra - result.ra))
-                    aim_dec = max(-90.0, min(90.0, target_dec + (target_dec - result.dec)))
-                    self.manager.log(f"Nudging the slew by RA {-east:+.2f}', Dec {-north:+.2f}' "
-                                     f"to RA {aim_ra:.5f}h  Dec {aim_dec:+.4f}°")
-                    mount.slew_to(aim_ra, aim_dec)
-                self._wait_for_slew(mount)
+                commanded_deg = self._offset_slew(
+                    mount, target_ra, target_dec, result, east, north)
+                if trusted:
+                    # The next exposure is an ordinary centring solve. Keeping
+                    # the far field's angle would reject the real camera angle
+                    # as a flip once the telescope is back on the target.
+                    accepted = None
+                    commanded_deg = None
+                    pending = None
 
-        last = self._result.separation if self._result else None
         raise DeviceError(
-            f"still {last:.2f}' from the target after {attempts} attempts"
-            if last is not None else f"could not centre after {attempts} attempts")
+            f"still {last_valid:.2f}' from the target after {attempts} attempts"
+            if last_valid is not None else f"could not centre after {attempts} attempts")
 
     def _wait_for_slew(self, mount: Any, timeout: float = 300.0) -> None:
         """Block until the mount stops moving.
@@ -826,18 +1084,31 @@ class Solver:
         return result
 
     # -- one solve ---------------------------------------------------------
-    def _solve_image(self, image_id: str | None) -> SolveResult:
-        record = self._pick_record(image_id)
+    def _solve_record(self, record: Any, *, radius: float | None = None,
+                      hint_position: bool = True,
+                      hint: tuple[float, float] | None = None) -> SolveResult:
         started = time.monotonic()
         self._set("solving", f"solving {record.filename}")
-
         with tempfile.TemporaryDirectory(prefix="astrocontrol-solve-") as workspace:
             source = self._fits_for(record, Path(workspace))
-            ini = self._run_astap(source, Path(workspace) / "solution", record)
-
+            ini = self._run_astap(source, Path(workspace) / "solution", record,
+                                  radius=radius, hint_position=hint_position,
+                                  hint=hint)
         result = self._interpret(ini, record)
         result.seconds = round(time.monotonic() - started, 2)
         return result
+
+    def _solve_wide(self, record: Any) -> SolveResult:
+        """One solve with no position hint, over the whole sky.
+
+        Used once when the configured radius finds nothing. The field size is
+        still passed: the frame came off this camera, and a scale hint is not
+        the lie a wrong sky position is.
+        """
+        return self._solve_record(record, radius=180.0, hint_position=False)
+
+    def _solve_image(self, image_id: str | None) -> SolveResult:
+        return self._solve_record(self._pick_record(image_id))
 
     def _pick_record(self, image_id: str | None) -> Any:
         if image_id:
@@ -884,7 +1155,10 @@ class Solver:
         return ra, dec, fov
 
     def _run_astap(self, source: Path, output: Path, record: Any,
-                   track: bool = True, blind: bool = False) -> dict[str, str]:
+                   track: bool = True, blind: bool = False,
+                   radius: float | None = None,
+                   hint_position: bool = True,
+                   hint: tuple[float, float] | None = None) -> dict[str, str]:
         """Run the solver.
 
         `track` publishes the process so `abort` can kill it; a background
@@ -902,8 +1176,23 @@ class Solver:
         if executable is None:
             raise DeviceError("ASTAP was not found")
 
-        ra, dec, fov = (None, None, None) if blind else self._hints(record)
-        radius = float(self.config.get("solver", "searchRadius", 15.0))
+        if blind:
+            ra, dec, fov = None, None, None
+        else:
+            ra, dec, fov = self._hints(record)
+            if hint is not None:
+                # Where to look, only. The field size stays the image FOV.
+                ra, dec = hint
+            elif not hint_position:
+                ra, dec = None, None
+        if radius is None:
+            # No place to look means the whole sky. A hinted solve uses the
+            # configured radius, which is what keeps a mirrored false match
+            # out when the telescope is already near the target.
+            radius = (180.0 if blind or not hint_position
+                      else float(self.config.get("solver", "searchRadius", 15.0)))
+        else:
+            radius = float(radius)
         downsample = int(self.config.get("solver", "downsample", 0))
         max_stars = int(self.config.get("solver", "maxStars", 500))
         timeout = float(self.config.get("solver", "timeout", 120.0))
@@ -915,7 +1204,7 @@ class Solver:
             args += ["-ra", f"{astro.normalise_ra_hours(ra):.6f}",
                      "-spd", f"{dec + 90.0:.6f}", "-r", f"{radius:g}"]
         else:
-            args += ["-r", "180"]                # blind solve: search everywhere
+            args += ["-r", f"{radius:g}"]        # no position hint: this radius, or the whole sky
         if fov:
             args += ["-fov", f"{fov:.4f}"]
         if downsample:

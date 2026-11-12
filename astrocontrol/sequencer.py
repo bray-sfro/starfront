@@ -26,7 +26,7 @@ Two events interrupt imaging and are handled rather than avoided:
   * **the meridian** - a German equatorial mount cannot track through it.
     Imaging stops before the target gets there, the mount is sent back to the
     same coordinates (which makes the driver flip), the new pointing is plate
-    solved and synced, and imaging resumes.
+    solved and corrected by the pointing offset, and imaging resumes.
   * **focus drift** - temperature moves, filters are not parfocal, and hours
     pass.  A focus run is triggered on whichever of those comes first.
 
@@ -1813,6 +1813,10 @@ class Sequencer:
                         self._say(f"{entry['name']}: the deal changed under the run - "
                                   "starting over on what the plan says now", "warn")
                     continue
+                except _CentreFailed as exc:
+                    self._say(f"{entry['name']}: {exc}", "error")
+                    self._tell("failure", f"{entry['name']}: centring failed",
+                               str(exc))
                 except _Skipped:
                     self._say(f"Skipped {entry['name']}", "warn")
                 break
@@ -2739,16 +2743,21 @@ class Sequencer:
                 self._solve_failures = 0
                 self._unwarn("solver.failing")
             except DeviceError as exc:
-                # A failed centre is not a reason to abandon the night; the frame
-                # is still usable, just not perfectly framed.
-                self._say(f"Could not centre on {label}: {exc}", "warn")
+                # Centring ran out. Focusing and exposing anyway is how a night
+                # shoots a field it is not on. This target stops; the next one
+                # is still tried. The night is not closed out for it.
                 self._solve_failures += 1
+                self._say(f"Could not centre on {label}: {exc}. "
+                          "Not focusing or imaging this target.", "error")
                 if self._solve_failures >= 3:
                     self._warn("solver.failing", "warning", "Plate solving keeps failing",
                                f"{self._solve_failures} centring solves in a row have failed; "
                                f"last: {exc}",
                                "Cloud, focus, or a wrong focal length in Site & Optics. "
-                               "Targets are being shot where the mount put them.")
+                               "This target was not imaged.")
+                raise _CentreFailed(
+                    f"{label} was not centred ({exc}); autofocus and imaging "
+                    "were not started") from exc
 
         # Slew, settle and centre together: what one panel costs before a single
         # frame of it is taken, which on a mosaic is paid once per panel.
@@ -3272,7 +3281,11 @@ class Sequencer:
                                   float(rotation) if rotating else None)
                 self._wait_for_solver()
             except DeviceError as exc:
-                self._say(f"Could not re-centre after the flip: {exc}", "warn")
+                self._say(f"Could not re-centre after the flip: {exc}. "
+                          "Not imaging this target from here.", "error")
+                raise _CentreFailed(
+                    f"{label} was not re-centred after the flip ({exc}); "
+                    "imaging was stopped") from exc
 
         if guiding:
             self._say("Restarting guiding")
@@ -4817,6 +4830,8 @@ class Sequencer:
                 self._goto(panel, label)
                 recovered = True
                 break
+            except _CentreFailed:
+                raise
             except DeviceError as exc:
                 self._say(f"Could not get back on target (attempt {attempt} of "
                           f"{attempts}): {exc}", "warn")
@@ -5258,8 +5273,12 @@ class Sequencer:
                                 False)
                 return
         if self.solver is not None and self.solver.executable() is not None:
-            with contextlib.suppress(Exception):
+            try:
                 self._goto(panel, label)
+            except _CentreFailed:
+                raise
+            except Exception:
+                pass
         if not tracking:
             self._recovered("mount", "Tracking again", True)
 
@@ -5698,6 +5717,15 @@ class Sequencer:
                 self._dither(entry)
 
         return True
+
+
+class _CentreFailed(Exception):
+    """Centring ran out of attempts. This target is not focused or imaged.
+
+    The rest of the plan still runs. Raising DeviceError here would end the
+    night, which is what a failed slew does, and swallowing it is what used
+    to start autofocus on a field the telescope was not on.
+    """
 
 
 class _Stopped(Exception):
