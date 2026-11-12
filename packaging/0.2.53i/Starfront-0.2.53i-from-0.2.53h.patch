@@ -1,0 +1,2095 @@
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -1,4 +1,10 @@
+ # Changelog
++
++## 0.2.53i
++
++- Flat panel cover and calibrator light in the top bar, next to the roof badge: Open, Closed, Moving, Unknown, Error, Not present, plus light on/off and brightness. The status request reads a cache. It does not call the cover driver, so a hung CoverState cannot stall `/api/status`.
++- Open cover, Close cover, Light on (full brightness) and Light off in the top bar, with a confirmation. Open is refused (HTTP 409) during darks, bias and panel flats, and while an exposure, slew or autofocus is running.
++- Sequence start re-reads CoverState and opens the cover before the first slew, centring frame, autofocus frame, sky flat or light. Unknown on a connected CoverCalibrator is opened; a `has_cover` flag latched at connect is not trusted. The run is held if the cover does not report Open in time, or if the first sky frame still looks like a bias (the Twin FSQ's ~503 ADU lid). A camera or cover reconnect re-checks before the next sky frame. Darks, bias, panel flats and autocal keep the cover closed and never open the roof.
+ 
+ ## 0.2.53h
+ 
+--- a/astrocontrol/__init__.py
++++ b/astrocontrol/__init__.py
+@@ -1,4 +1,4 @@
+ ﻿"""Starfront - astrophotography equipment control."""
+ 
+-__version__ = "0.2.53h"
++__version__ = "0.2.53i"
+ 
+--- a/astrocontrol/calibrating.py
++++ b/astrocontrol/calibrating.py
+@@ -35,7 +35,7 @@
+ 
+ import numpy as np
+ 
+-from . import astro, calibration, roofguard
++from . import astro, calibration, coverprep, roofguard
+ from .capture import clean_target
+ from .config import Config, data_root, effective_site
+ from .devices.base import DeviceError
+@@ -938,6 +938,22 @@
+             })
+         return results
+ 
++    def _open_cover_for_sky(self, rig, label: str) -> None:
++        """Open and verify the cover for sky flats. Never for a panel flat."""
++        if coverprep.guard_blocks_open():
++            raise DeviceError(coverprep.guard_blocks_open()
++                              or "the cover stays closed")
++        panel = rig.manager.get("flatpanel")
++        if panel is None or not getattr(panel, "connected", False):
++            return
++
++        def log(message: str, level: str = "info") -> None:
++            self._say(f"{rig.name}: {message}", level)
++
++        coverprep.ensure_open(
++            panel, timeout=coverprep.timeout_seconds(self.config),
++            log=log, command=coverprep.auto_cover(self.config))
++
+     def _begin_sky(self, rig, spec: dict[str, Any]) -> None:
+         """Get one telescope ready to look at the twilight sky."""
+         camera = rig.manager.require("camera")
+@@ -947,8 +963,9 @@
+             self._select_filter(rig, spec["filter"], lambda: None)
+ 
+         # The sky is the light source, so the panel must be out and the cover
+-        # open — the same thing a light frame needs, and the same code does it.
+-        rig.capture.open_light_path()
++        # open before the first sky-flat frame. Re-read CoverState; do not
++        # trust a has_cover latch from connect. A failure holds the run.
++        self._open_cover_for_sky(rig, "sky flats")
+ 
+         night = rig.capture.night_name()
+         # calib-layout: <root>/RASA1/Flats/<night>/sky.  exact=True stops the
+@@ -968,6 +985,10 @@
+                 st["waiting"] or f"sky flat {len(st['paths']) + 1}/{wanted} "
+                                  f"at {exposure:.2f}s")
+         record = rig.capture.capture_blocking(exposure, frame_type="flat")
++        camera = rig.manager.get("camera")
++        coverprep.judge_sky_frame(
++            getattr(record, "stats", None),
++            getattr(camera, "offset", None) if camera is not None else None)
+         # Signal, not signal plus the camera's offset: at the exposures a fast
+         # telescope wants in a bright sky the two are comparable.
+         level = max(0.0, float(record.stats.get("median") or 0.0)
+@@ -1108,18 +1129,27 @@
+                 "taken unless it is closed, and the roof is not opened for them")
+ 
+     def _require_cover_closed(self, rig, check) -> None:
+-        """Where a cover exists it has to read closed. No cover is fine."""
++        """Where a cover exists it has to read closed. No cover is fine.
++
++        Unknown is not "no cover". A failed read is not "no cover". Both hold
++        the darks rather than shooting through a lid that might be open.
++        """
+         panel = rig.manager.get("flatpanel")
+-        if panel is None or not getattr(panel, "connected", False) \
+-                or not getattr(panel, "has_cover", False):
++        if panel is None or not getattr(panel, "connected", False):
+             return
+-        if panel.cover_state == "closed":
++        state = coverprep.read_state(panel)
++        if state == "notpresent":
+             return
+-        self._wait_for_cover(panel, "closed", check, timeout=30.0)
+-        if panel.cover_state != "closed":
++        if state == "closed":
++            return
++        if state in ("open", "moving", "unknown", "error"):
++            with contextlib.suppress(Exception):
++                panel.close_cover()
++            self._wait_for_cover(panel, "closed", check, timeout=30.0)
++        if coverprep.read_state(panel) != "closed":
+             raise DeviceError(
+-                f"{rig.name}: the cover reads {panel.cover_state}; darks, bias "
+-                "and panel flats need it closed")
++                f"{rig.name}: the cover reads {coverprep.read_state(panel)}; "
++                "darks, bias and panel flats need it closed")
+ 
+     def _set_on_rig(self, rig, spec: dict[str, Any],
+                     flat_exposures: dict[tuple[str, str], float],
+@@ -1373,7 +1403,12 @@
+                       "of whatever the telescope is pointed at", "warn")
+             return
+ 
+-        if panel.has_cover and panel.cover_state != "closed":
++        state = coverprep.read_state(panel)
++        if state == "unread":
++            raise DeviceError(
++                f"{rig.name}: the cover could not be read; panel flats need it "
++                "closed, and it was not opened")
++        if state not in ("closed", "notpresent"):
+             self._say(f"{rig.name}: closing the cover for the flats")
+             panel.close_cover()
+             self._wait_for_cover(panel, "closed", check)
+@@ -1418,9 +1453,14 @@
+             return
+         with contextlib.suppress(Exception):
+             panel.turn_off()
+-        if panel.has_cover and panel.cover_state != "closed":
++        state = coverprep.read_state(panel)
++        if state not in ("closed", "notpresent", "unread"):
+             panel.close_cover()
+             self._wait_for_cover(panel, "closed", check)
++        elif state == "unread":
++            raise DeviceError(
++                f"{rig.name}: the cover could not be read; darks and bias need "
++                "it closed")
+         time.sleep(1.0)
+ 
+     def _park_light(self, rig) -> None:
+--- a/astrocontrol/capture.py
++++ b/astrocontrol/capture.py
+@@ -21,7 +21,7 @@
+ 
+ import numpy as np
+ 
+-from . import astro
++from . import astro, coverprep
+ from .config import Config, data_root, effective_site
+ from .devices.base import CameraLostError, DeviceError, read_slot
+ from .devices.manager import DeviceManager
+@@ -325,6 +325,11 @@
+         # for the activity line at the top of the screen.
+         self._frame_type = ""
+         self._current_filter = ""
++        # Set when a cover was confirmed open for the frame about to be taken,
++        # so the downloaded light can be rejected if it is still a bias.
++        self._cover_must_show_sky = False
++        # Set after a camera reconnect, so the next sky frame says it re-checked.
++        self._cover_recheck = False
+ 
+     # -- where frames go ---------------------------------------------------
+     @staticmethod
+@@ -697,6 +702,9 @@
+             self.manager.log("The camera did not come back", "error")
+             return False
+         self.manager.log("The camera is back", "success")
++        # The cover may have been power-cycled with the camera. The retried
++        # frame re-reads CoverState before the shutter opens.
++        self._cover_recheck = True
+         return True
+ 
+     def _run(self, exposure: float, frame_type: str, count: int) -> None:
+@@ -725,51 +733,47 @@
+         """Put the panel out and open the cover, for a frame that needs sky.
+ 
+         Called before every light frame — a manual capture, a sequence sub, a
+-        focus exposure, a plate solve — because all of them are ruined in the
+-        same way by a shut cover, and because the alternative is remembering.
+-        Calibration deliberately closes the cover for the darks and lights the
+-        panel for the flats; this is what undoes both, at the moment it matters
+-        rather than at the end of a run that may have been stopped half way.
+-
+-        Anything the driver refuses is logged and carried past: a frame taken
+-        through a stuck cover is a wasted frame, but a night that stops dead
+-        because a cover reported the wrong state is a wasted night.
++        focus exposure, a plate solve — and before a sky flat. Darks, bias and
++        panel flats do not come through here.
++
++        The cover is re-read now. A `has_cover` flag latched at connect is
++        ignored: an Alnitak that said Unknown at connect used to skip this
++        for the whole night, and the centring frames were of the inside of
++        the lid. Unknown is asked to open. NotPresent is left alone.
++
++        If the cover does not report Open within the timeout, this raises.
++        The frame is not taken. A night that images through a closed cover
++        is the failure this used to allow ("taking the frame anyway").
+         """
+         done: dict[str, Any] = {"panel": False, "cover": False}
+-        if not self.config.get("calibration", "autoCover", True):
++        self._cover_must_show_sky = False
++        blocked = coverprep.guard_blocks_open()
++        if blocked:
++            raise coverprep.CoverHeld(blocked)
++        panel = self.manager.get("flatpanel")
++        if panel is None or not getattr(panel, "connected", False):
+             return done
+-        panel = self.manager.get("flatpanel")
+-        if panel is None or not panel.connected:
+-            return done
+-
+-        try:
+-            if panel.light_on:
+-                panel.turn_off()
+-                done["panel"] = True
+-                self.manager.log("Flat panel switched off for a light frame")
+-
+-            # "notpresent" and "unknown" are left alone: there is either no
+-            # cover or no way to tell, and driving one blind is worse.
+-            if panel.has_cover and panel.cover_state in ("closed", "moving"):
+-                if panel.cover_state == "closed":
+-                    self.manager.log("Opening the cover for a light frame")
+-                    panel.open_cover()
+-                timeout = float(self.config.get("calibration",
+-                                                "coverTimeoutSeconds", 180.0))
+-                deadline = time.monotonic() + timeout
+-                while panel.cover_state != "open":
+-                    if self._abort.is_set():
+-                        return done
+-                    if time.monotonic() > deadline:
+-                        self.manager.log(
+-                            f"The cover is still {panel.cover_state} after "
+-                            f"{timeout:g}s; taking the frame anyway", "warn")
+-                        return done
+-                    time.sleep(0.5)
+-                done["cover"] = True
+-                self.manager.log("Cover open", "success")
+-        except Exception as exc:                  # noqa: BLE001 - never lose a night
+-            self.manager.log(f"Could not open the light path: {exc}", "warn")
++        recheck = self._cover_recheck
++        self._cover_recheck = False
++        if recheck:
++            self.manager.log("Re-checking the cover after reconnect", "warn")
++
++        def log(message: str, level: str = "info") -> None:
++            self.manager.log(message, level)
++
++        def check() -> None:
++            if self._abort.is_set():
++                raise DeviceError("aborted")
++
++        result = coverprep.ensure_open(
++            panel, timeout=coverprep.timeout_seconds(self.config),
++            log=log, check=check,
++            command=coverprep.auto_cover(self.config),
++            announce_open=recheck)
++        done["panel"] = True
++        if result == "open":
++            done["cover"] = True
++            self._cover_must_show_sky = True
+         return done
+ 
+     def _capture_one(self, exposure: float, frame_type: str,
+@@ -891,6 +895,11 @@
+             f"{'Saved' if record.saved else 'Captured (not saved)'} {record.filename}  "
+             f"median {record.stats.get('median')} ADU, max {record.stats.get('max')}",
+             "success")
++        if frame_type == "light" and self._cover_must_show_sky:
++            # The driver said Open. On the Twin FSQ it then saved a 503 ADU
++            # frame, which is a bias through a lid that had not moved.
++            coverprep.judge_sky_frame(
++                record.stats, getattr(camera, "offset", None))
+ 
+     # -- gain and offset (0.2.53) ------------------------------------------
+     def _wanted(self) -> dict[str, Any] | None:
+diff --git a/astrocontrol/coverprep.py b/astrocontrol/coverprep.py
+new file mode 100644
+--- /dev/null
++++ b/astrocontrol/coverprep.py
+@@ -0,0 +1,253 @@
++"""Open the flat-panel cover before any frame that needs sky, and prove it.
++
++The Twin FSQ on EAGLE (2026-11-11, Starfront 0.2.53, ASCOM.OptecAlnitak) left
++the cover shut after an afternoon flat. The night unparked, homed, slewed,
++centred and autofocused with no "Opening the cover" line. Two things caused
++that:
++
++* `has_cover` was latched once at connect. An Alnitak that reports
++  CoverState Unknown (or a read that failed and came back as NotPresent)
++  was treated as a lamp with no cover for the rest of the night.
++* The only open lived in `Capture.open_light_path`, and it ran for a light
++  frame only, after centring and autofocus had already exposed through the lid.
++
++This module re-reads CoverState when a sky frame is about to happen. Unknown
++on a connected CoverCalibrator is an open attempt, not "no cover". NotPresent
++is the only "there is no cover" answer. A failed read is not NotPresent and
++is not treated as open.
++
++Nothing here talks to a roof.
++"""
++
++from __future__ import annotations
++
++import time
++from typing import Any, Callable
++
++from .devices.base import DeviceError
++from . import roofguard
++
++# ASCOM CoverStatus. 0 is NotPresent, a real answer, not a missing read.
++COVER_STATES = {
++    0: "notpresent",
++    1: "closed",
++    2: "moving",
++    3: "open",
++    4: "unknown",
++    5: "error",
++}
++
++# ASCOM CalibratorStatus.
++CALIBRATOR_STATES = {
++    0: "notpresent",
++    1: "off",
++    2: "notready",
++    3: "ready",
++    4: "unknown",
++    5: "error",
++}
++
++# A closed lid on the Twin FSQ read about 503 ADU with almost no spread,
++# on both the 5 s L centring frames and the 6 s R autofocus frames.
++# A sky frame through an open cover is not that flat.
++_CAPPED_SPREAD = 45.0
++_CAPPED_MEDIAN = 1500.0
++
++
++class CoverHeld(DeviceError):
++    """The run must not image, centre or focus until the cover is open."""
++
++
++def map_cover(value: Any) -> str:
++    """Map a driver CoverState. A missing value is unread, never NotPresent."""
++    if value is None:
++        return "unread"
++    try:
++        number = int(value)
++    except (TypeError, ValueError):
++        text = str(value or "").strip().lower()
++        if text in COVER_STATES.values() or text in ("unread",):
++            return text
++        return "unread"
++    return COVER_STATES.get(number, "unread")
++
++
++def map_calibrator(value: Any) -> str:
++    if value is None:
++        return "unknown"
++    try:
++        number = int(value)
++    except (TypeError, ValueError):
++        text = str(value or "").strip().lower()
++        if text in CALIBRATOR_STATES.values():
++            return text
++        return "unknown"
++    return CALIBRATOR_STATES.get(number, "unknown")
++
++
++def read_state(panel: Any) -> str:
++    """The driver's CoverState right now. Never the value latched at connect."""
++    if panel is None:
++        return "notpresent"
++    try:
++        return map_cover(panel.cover_state)
++    except Exception:
++        return "unread"
++
++
++def wants_open(frame_type: str, source: str | None = None) -> bool:
++    """Lights and sky flats need the cover open. Darks, bias and panel flats do not."""
++    kind = str(frame_type or "").lower()
++    if kind in ("bias", "dark", "darkflat"):
++        return False
++    if kind == "flat":
++        return str(source or "panel").lower() == "sky"
++    return kind == "light"
++
++
++def timeout_seconds(config: Any) -> float:
++    """How long to wait for CoverState == Open.
++
++    Observatories set `calibration.coverTimeoutSeconds` (EAGLE uses 180).
++    The night checks turn `sequencer.coverTimeoutSeconds` down; when that
++    value is not the 120 s default, it wins so a test does not wait the
++    full calibration timeout.
++    """
++    seq_t = 120.0
++    cal_t = 180.0
++    try:
++        seq_t = float(config.get("sequencer", "coverTimeoutSeconds", 120.0) or 120.0)
++    except Exception:
++        seq_t = 120.0
++    try:
++        cal_t = float(config.get("calibration", "coverTimeoutSeconds", 180.0) or 180.0)
++    except Exception:
++        cal_t = 180.0
++    if abs(seq_t - 120.0) > 0.01:
++        return max(0.05, seq_t)
++    return max(0.05, seq_t, cal_t)
++
++
++def auto_cover(config: Any) -> bool:
++    try:
++        return bool(config.get("calibration", "autoCover", True))
++    except Exception:
++        return True
++
++
++def looks_capped(stats: dict[str, Any] | None, offset: Any = None) -> str | None:
++    """A sky frame that is really a bias through a closed lid, or None.
++
++    Both halves are required: the median sits near the bias/offset and the
++    spread is tiny. A dim sky frame with stars in it is not flat enough to
++    match, and a frame with no statistics is not judged.
++    """
++    if not stats:
++        return None
++    try:
++        median = float(stats.get("median"))
++    except (TypeError, ValueError):
++        return None
++    spread = stats.get("stdDev", stats.get("mad"))
++    try:
++        spread_value = float(spread)
++    except (TypeError, ValueError):
++        return None
++    if spread_value > _CAPPED_SPREAD:
++        return None
++    ceiling = _CAPPED_MEDIAN
++    try:
++        if offset is not None:
++            ceiling = max(ceiling, float(offset) + 1000.0)
++    except (TypeError, ValueError):
++        pass
++    if median > ceiling:
++        return None
++    return (f"median {median:.0f} ADU with spread {spread_value:.1f} "
++            f"(a closed cover reads like a bias, not a sky frame)")
++
++
++def ensure_open(panel: Any, *, timeout: float, log: Callable[..., None],
++                check: Callable[[], None] | None = None,
++                pause: Callable[[float], None] | None = None,
++                command: bool = True, announce_open: bool = True) -> str:
++    """Open the cover and wait until the driver reports Open.
++
++    Returns "open" or "absent" (no cover / no panel). Raises CoverHeld when
++    the cover cannot be shown to be open. Does not command a roof.
++
++    `command` false means the operator turned autoCover off: a cover that
++    already reads open is accepted, and anything else holds without an
++    OpenCover.
++    """
++    if panel is None or not getattr(panel, "connected", True):
++        return "absent"
++    if check is None:
++        check = lambda: None
++    if pause is None:
++        pause = time.sleep
++    try:
++        panel.turn_off()
++    except Exception as exc:                          # noqa: BLE001 - said, then the cover
++        log(f"Could not turn the calibrator light off: {exc}", "warn")
++
++    state = read_state(panel)
++    if state == "notpresent":
++        return "absent"
++    if state == "open":
++        if announce_open:
++            log("Cover open", "success")
++        return "open"
++    if not command:
++        raise CoverHeld(
++            f"Holding the run: autoCover is off and the cover reads {state}, "
++            "not open. No sky frame will be taken through it")
++    if state == "unread":
++        raise CoverHeld(
++            "Holding the run: CoverState could not be read, so the panel is "
++            "not being treated as coverless and OpenCover was not sent")
++
++    # closed, moving, unknown, error. Unknown is the Alnitak case: the cover
++    # is there, the driver has not said it is open, and the last latch said
++    # "no cover". Ask once and then require Open.
++    log(f"Opening the cover (driver reports {state})", "warn")
++    try:
++        panel.open_cover()
++    except Exception as exc:                          # noqa: BLE001 - the driver error is the reason
++        raise CoverHeld(
++            f"Holding the run: OpenCover failed while the driver reported "
++            f"{state}: {exc}") from exc
++
++    deadline = time.monotonic() + max(0.05, float(timeout))
++    last = state
++    while True:
++        check()
++        last = read_state(panel)
++        if last == "open":
++            log("Cover open", "success")
++            return "open"
++        if time.monotonic() >= deadline:
++            raise CoverHeld(
++                f"Holding the run: the cover is {last}, not open, after "
++                f"{float(timeout):g}s. No sky frame, centring frame or "
++                "autofocus frame will be taken through it")
++        remaining = deadline - time.monotonic()
++        pause(min(0.25, max(0.0, remaining)))
++
++
++def judge_sky_frame(stats: dict[str, Any] | None, offset: Any = None) -> None:
++    """Raise CoverHeld when a sky frame looks like the lid was still shut."""
++    reason = looks_capped(stats, offset)
++    if reason:
++        raise CoverHeld(
++            "Holding the run: the cover was asked to open but the frame "
++            f"looks like a bias through a closed cover ({reason}). "
++            "Centring, autofocus and the next light are held")
++
++
++def guard_blocks_open() -> str | None:
++    """Why a cover open must not be sent, from the closed-roof calibration guard."""
++    why = roofguard.blocked()
++    if not why:
++        return None
++    return f"{why}; the cover stays closed"
+diff --git a/astrocontrol/coverstatus.py b/astrocontrol/coverstatus.py
+new file mode 100644
+--- /dev/null
++++ b/astrocontrol/coverstatus.py
+@@ -0,0 +1,220 @@
++"""Cover and calibrator-light status for the main window. Display only.
++
++The badge is built from the last reading a background probe stored. A status
++request never calls the driver: a CoverState read that hangs (the 0.2.52b
++`/api/status` that returned no body) stays on the probe thread, and the
++request returns the cached line, or "unknown" when there is no reading yet.
++
++Nothing here commands the cover or the roof.
++"""
++
++from __future__ import annotations
++
++import threading
++import time
++from typing import Any
++
++from . import coverprep
++
++_lock = threading.Lock()
++_store: dict[int, dict[str, Any]] = {}
++_inflight: dict[int, threading.Thread] = {}
++
++_BADGE = {
++    "open": ("Cover open", "open"),
++    "closed": ("Cover closed", "closed"),
++    "moving": ("Cover moving", "moving"),
++    "unknown": ("Cover unknown", "unknown"),
++    "unread": ("Cover unknown", "unknown"),
++    "error": ("Cover error", "error"),
++    "notpresent": ("Cover not present", "notpresent"),
++}
++
++
++def reset() -> None:
++    with _lock:
++        _store.clear()
++
++
++def drop(panel: Any) -> None:
++    """Forget a reading. Used when the panel or the camera reconnects."""
++    if panel is None:
++        return
++    with _lock:
++        _store.pop(id(panel), None)
++
++
++def note(panel: Any, reading: dict[str, Any]) -> None:
++    if panel is None:
++        return
++    stored = dict(reading)
++    stored.setdefault("readAt", time.time())
++    with _lock:
++        _store[id(panel)] = stored
++
++
++def cached(panel: Any) -> dict[str, Any]:
++    """The last reading. Instant. Never touches the driver."""
++    if panel is None:
++        return {"connected": False, "coverState": "", "text": "", "tone": ""}
++    with _lock:
++        found = _store.get(id(panel))
++    connected = bool(getattr(panel, "connected", False))
++    if not found:
++        return {
++            "connected": connected,
++            "coverState": "unknown" if connected else "",
++            "hasCover": None,
++            "lightOn": None,
++            "calibratorState": "unknown" if connected else "",
++            "brightness": None,
++            "maxBrightness": getattr(panel, "max_brightness", None),
++            "readAt": None,
++            "ageSeconds": None,
++            "stale": True,
++            "pending": True,
++            "error": "",
++        }
++    read_at = found.get("readAt")
++    age = None if read_at is None else round(max(0.0, time.time() - float(read_at)), 1)
++    return {
++        **found,
++        "connected": connected and found.get("connected", True),
++        "ageSeconds": age,
++        "stale": bool(found.get("stale")) or (age is not None and age > 15.0),
++        "pending": False,
++    }
++
++
++def _probe_generic(panel: Any) -> dict[str, Any]:
++    """One reading from whatever attributes the panel offers.
++
++    Runs on the probe thread. A hang here does not reach the status request.
++    """
++    state = coverprep.read_state(panel)
++    brightness = None
++    maximum = getattr(panel, "max_brightness", None)
++    light = None
++    calibrator = "unknown"
++    error = ""
++    try:
++        brightness = int(panel.brightness)
++    except Exception as exc:                          # noqa: BLE001 - a status miss
++        error = str(exc)
++    try:
++        maximum = int(getattr(panel, "max_brightness", maximum) or 0) or maximum
++    except Exception:
++        pass
++    try:
++        raw = getattr(panel, "calibrator_state", None)
++        if raw is None and hasattr(panel, "light_on"):
++            light = bool(panel.light_on)
++            calibrator = "ready" if light else "off"
++        else:
++            calibrator = coverprep.map_calibrator(raw)
++            light = calibrator == "ready"
++    except Exception as exc:                          # noqa: BLE001
++        error = error or str(exc)
++        light = None
++    has = None
++    if state == "notpresent":
++        has = False
++    elif state in ("closed", "moving", "open", "error"):
++        has = True
++    return {
++        "connected": True,
++        "coverState": state,
++        "hasCover": has,
++        "lightOn": light,
++        "calibratorState": calibrator,
++        "brightness": brightness,
++        "maxBrightness": maximum,
++        "error": error,
++        "stale": False,
++    }
++
++
++def _probe(panel: Any) -> None:
++    started = time.time()
++    try:
++        fast = getattr(panel, "probe_cover", None)
++        if callable(fast):
++            reading = dict(fast(timeout=1.5) or {})
++            reading.setdefault("connected", True)
++        else:
++            reading = _probe_generic(panel)
++    except Exception as exc:                          # noqa: BLE001 - cached as unknown
++        reading = {
++            "connected": bool(getattr(panel, "connected", False)),
++            "coverState": "unread",
++            "hasCover": None,
++            "lightOn": None,
++            "calibratorState": "unknown",
++            "brightness": None,
++            "maxBrightness": getattr(panel, "max_brightness", None),
++            "error": str(exc),
++            "stale": True,
++        }
++    reading["readAt"] = time.time()
++    reading["readSeconds"] = round(time.time() - started, 3)
++    note(panel, reading)
++
++
++def kick(panel: Any) -> None:
++    """Start a probe if one is not already running. Does not wait for it."""
++    if panel is None or not getattr(panel, "connected", False):
++        return
++    key = id(panel)
++    with _lock:
++        thread = _inflight.get(key)
++        if thread is not None and thread.is_alive():
++            return
++        thread = threading.Thread(
++            target=_probe, args=(panel,), daemon=True, name="cover-status")
++        _inflight[key] = thread
++        thread.start()
++
++
++def observe(panel_status: dict[str, Any] | None) -> dict[str, Any]:
++    """One badge line from a status dict that was already read. No driver call."""
++    panel = panel_status or {}
++    if not panel.get("connected"):
++        return {"connected": False, "text": "", "state": "", "tone": "",
++                "light": "", "lightOn": None, "brightness": None,
++                "maxBrightness": None, "calibratorState": "",
++                "readAt": panel.get("readAt"), "stale": False}
++    state = str(panel.get("coverState") or "unknown").lower()
++    label, tone = _BADGE.get(state, (f"Cover {state}", "unknown"))
++    light_on = panel.get("lightOn")
++    brightness = panel.get("brightness")
++    maximum = panel.get("maxBrightness")
++    calibrator = str(panel.get("calibratorState") or "")
++    if light_on is True:
++        if brightness is not None and maximum:
++            light = f"light on {brightness}/{maximum}"
++        elif brightness is not None:
++            light = f"light on {brightness}"
++        else:
++            light = "light on"
++    elif calibrator == "notready":
++        light = "light not ready"
++    elif light_on is False or calibrator == "off":
++        light = "light off"
++    else:
++        light = "light unknown"
++    text = f"{label} · {light}"
++    return {
++        "connected": True,
++        "text": text,
++        "state": state if state != "unread" else "unknown",
++        "tone": tone,
++        "light": light,
++        "lightOn": light_on,
++        "brightness": brightness,
++        "maxBrightness": maximum,
++        "calibratorState": calibrator,
++        "readAt": panel.get("readAt"),
++        "ageSeconds": panel.get("ageSeconds"),
++        "stale": bool(panel.get("stale")),
++        "error": panel.get("error") or "",
++    }
+--- a/astrocontrol/devices/alpaca.py
++++ b/astrocontrol/devices/alpaca.py
+@@ -800,7 +800,7 @@
+     def connect(self) -> None:
+         super().connect()
+         self.max_brightness = int(self._client.get("maxbrightness") or 100)
+-        self.has_cover = self.cover_state not in ("notpresent", "unknown")
++        # Cover state is re-read when a sky frame needs it. Not latched here.
+ 
+     @property
+     def brightness(self) -> int:
+@@ -808,12 +808,60 @@
+ 
+     @property
+     def light_on(self) -> bool:
+-        return int(self._client.get_cached("calibratorstate", 1.0, 1) or 1) == 3
++        return self.calibrator_state == "ready"
++
++    @property
++    def calibrator_state(self) -> str:
++        from .. import coverprep
++        missing = object()
++        value = self._client.get_cached("calibratorstate", 1.0, missing)
++        if value is missing or value is None:
++            return "unknown"
++        return coverprep.map_calibrator(value)
+ 
+     @property
+     def cover_state(self) -> str:
+-        value = self._client.get_cached("coverstate", 1.0, 0)
+-        return self._COVER_STATES.get(int(value or 0), "unknown")
++        # A missing read is unread. 0 is NotPresent only when the driver said 0.
++        from .. import coverprep
++        missing = object()
++        value = self._client.get_cached("coverstate", 1.0, missing)
++        if value is missing or value is None:
++            return "unread"
++        return coverprep.map_cover(value)
++
++    def probe_cover(self, timeout: float = 1.5) -> dict:
++        """Bounded cover/light read for the status cache."""
++        from .. import coverprep
++        error = ""
++        try:
++            state = coverprep.map_cover(self._client.get("coverstate", timeout=timeout))
++        except Exception as exc:                     # noqa: BLE001
++            state = "unread"
++            error = str(exc)
++        try:
++            calibrator = coverprep.map_calibrator(
++                self._client.get("calibratorstate", timeout=timeout))
++        except Exception as exc:                     # noqa: BLE001
++            calibrator = "unknown"
++            error = error or str(exc)
++        try:
++            brightness = int(self._client.get("brightness", timeout=timeout) or 0)
++        except Exception as exc:                     # noqa: BLE001
++            brightness = None
++            error = error or str(exc)
++        has = False if state == "notpresent" else (
++            True if state in ("closed", "moving", "open", "error") else None)
++        return {
++            "connected": True,
++            "coverState": state,
++            "hasCover": has,
++            "lightOn": calibrator == "ready",
++            "calibratorState": calibrator,
++            "brightness": brightness,
++            "maxBrightness": self.max_brightness,
++            "error": error,
++            "stale": state == "unread",
++        }
+ 
+     def turn_on(self, brightness: int) -> None:
+         self._require()
+@@ -834,13 +882,18 @@
+     def status(self) -> dict[str, Any]:
+         if not self._connected:
+             return {"connected": False}
++        from .. import coverstatus
++        snap = coverstatus.cached(self)
+         return {
+             "connected": True,
+-            "brightness": self.brightness,
+-            "maxBrightness": self.max_brightness,
+-            "lightOn": self.light_on,
+-            "hasCover": self.has_cover,
+-            "coverState": self.cover_state,
++            "brightness": snap.get("brightness"),
++            "maxBrightness": snap.get("maxBrightness", self.max_brightness),
++            "lightOn": snap.get("lightOn"),
++            "calibratorState": snap.get("calibratorState") or "",
++            "hasCover": snap.get("hasCover"),
++            "coverState": snap.get("coverState") or "unknown",
++            "readAt": snap.get("readAt"),
++            "stale": snap.get("stale", True),
+         }
+ 
+ 
+--- a/astrocontrol/devices/ascom.py
++++ b/astrocontrol/devices/ascom.py
+@@ -1142,7 +1142,9 @@
+         self._set("Connected", True)
+         self._connected = True
+         self.max_brightness = int(self._get("MaxBrightness", 100) or 100)
+-        self.has_cover = self.cover_state not in ("notpresent", "unknown")
++        # CoverState is not latched here. An Alnitak often reports Unknown
++        # until it is asked, and a failed read used to be stored as "no cover"
++        # for the rest of the night.
+ 
+     def disconnect(self) -> None:
+         try:
+@@ -1156,12 +1158,64 @@
+ 
+     @property
+     def light_on(self) -> bool:
+-        # CalibratorStatus: 1 = Off, 3 = Ready.
+-        return int(self._get("CalibratorState", 1) or 1) == 3
++        # CalibratorStatus: 1 = Off, 3 = Ready. A failed read is off, not on.
++        return self.calibrator_state == "ready"
++
++    @property
++    def calibrator_state(self) -> str:
++        from .. import coverprep
++        missing = object()
++        value = self._get("CalibratorState", missing)
++        if value is missing or value is None:
++            return "unknown"
++        return coverprep.map_calibrator(value)
+ 
+     @property
+     def cover_state(self) -> str:
+-        return self._COVER_STATES.get(int(self._get("CoverState", 0) or 0), "unknown")
++        # 0 is CoverStatus.NotPresent, a real answer. A failed read must not
++        # use that number, or a panel whose cover cannot be read is treated
++        # as a lamp with no cover and OpenCover is never sent.
++        from .. import coverprep
++        missing = object()
++        value = self._get("CoverState", missing)
++        if value is missing or value is None:
++            return "unread"
++        return coverprep.map_cover(value)
++
++    def probe_cover(self, timeout: float = 1.5) -> dict:
++        """One bounded cover/light read for the status cache. Not for commands."""
++        from .. import coverprep
++        error = ""
++        try:
++            raw_cover = self._read("CoverState", timeout)
++            state = coverprep.map_cover(raw_cover)
++        except Exception as exc:                     # noqa: BLE001 - cached, not raised
++            state = "unread"
++            error = str(exc)
++        try:
++            raw_cal = self._read("CalibratorState", timeout)
++            calibrator = coverprep.map_calibrator(raw_cal)
++        except Exception as exc:                     # noqa: BLE001
++            calibrator = "unknown"
++            error = error or str(exc)
++        try:
++            brightness = int(self._read("Brightness", timeout) or 0)
++        except Exception as exc:                     # noqa: BLE001
++            brightness = None
++            error = error or str(exc)
++        has = False if state == "notpresent" else (
++            True if state in ("closed", "moving", "open", "error") else None)
++        return {
++            "connected": True,
++            "coverState": state,
++            "hasCover": has,
++            "lightOn": calibrator == "ready",
++            "calibratorState": calibrator,
++            "brightness": brightness,
++            "maxBrightness": self.max_brightness,
++            "error": error,
++            "stale": state == "unread",
++        }
+ 
+     def turn_on(self, brightness: int) -> None:
+         self._require()
+@@ -1180,15 +1234,22 @@
+         self._invoke("CloseCover")
+ 
+     def status(self) -> dict[str, Any]:
++        # The cache only. CoverState on a stuck Alnitak must not run inside
++        # the status request; the probe thread fills the cache.
+         if not self._connected:
+             return {"connected": False}
++        from .. import coverstatus
++        snap = coverstatus.cached(self)
+         return {
+             "connected": True,
+-            "brightness": self.brightness,
+-            "maxBrightness": self.max_brightness,
+-            "lightOn": self.light_on,
+-            "hasCover": self.has_cover,
+-            "coverState": self.cover_state,
++            "brightness": snap.get("brightness"),
++            "maxBrightness": snap.get("maxBrightness", self.max_brightness),
++            "lightOn": snap.get("lightOn"),
++            "calibratorState": snap.get("calibratorState") or "",
++            "hasCover": snap.get("hasCover"),
++            "coverState": snap.get("coverState") or "unknown",
++            "readAt": snap.get("readAt"),
++            "stale": snap.get("stale", True),
+         }
+ 
+ 
+--- a/astrocontrol/devices/base.py
++++ b/astrocontrol/devices/base.py
+@@ -500,7 +500,23 @@
+     kind = "flatpanel"
+ 
+     max_brightness: int = 100
+-    has_cover: bool = False
++
++    @property
++    def has_cover(self) -> bool | None:
++        """True when this read shows a cover, False when the driver says none.
++
++        None when the state is unknown or the read failed. Unknown is not
++        "no cover". The value is this read, not a latch taken at connect.
++        """
++        try:
++            state = str(self.cover_state or "unread")
++        except Exception:                             # noqa: BLE001 - unknown, not "no cover"
++            return None
++        if state == "notpresent":
++            return False
++        if state in ("closed", "moving", "open", "error"):
++            return True
++        return None
+ 
+     @property
+     def brightness(self) -> int:
+@@ -511,8 +527,16 @@
+         raise NotImplementedError
+ 
+     @property
++    def calibrator_state(self) -> str:
++        """off, ready, notready, unknown, notpresent, error."""
++        try:
++            return "ready" if self.light_on else "off"
++        except Exception:                             # noqa: BLE001
++            return "unknown"
++
++    @property
+     def cover_state(self) -> str:
+-        """One of: notpresent, closed, moving, open, unknown."""
++        """notpresent, closed, moving, open, unknown, error, or unread."""
+         return "notpresent"
+ 
+     def turn_on(self, brightness: int) -> None:
+--- a/astrocontrol/devices/manager.py
++++ b/astrocontrol/devices/manager.py
+@@ -202,6 +202,10 @@
+             self._backends[kind] = backend
+             if kind == "filterwheel":
+                 self.apply_filter_names()
++            if kind in ("flatpanel", "camera"):
++                # A reconnect invalidates the cover reading. The next sky
++                # frame re-reads the driver instead of trusting the old Open.
++                self._drop_cover_cache()
+             self.log(f"{KIND_LABELS[kind]} connected: {device.name}", "success")
+             return device
+ 
+@@ -256,9 +260,18 @@
+             except Exception as exc:
+                 self.log(f"{KIND_LABELS[kind]} disconnect error: {exc}", "warn")
+             finally:
++                if kind in ("flatpanel", "camera"):
++                    self._drop_cover_cache()
+                 self._devices[kind] = None
+                 self._backends.pop(kind, None)
+                 self.log(f"{KIND_LABELS[kind]} disconnected")
++
++    def _drop_cover_cache(self) -> None:
++        try:
++            from .. import coverstatus
++        except Exception:                             # noqa: BLE001 - status is optional
++            return
++        coverstatus.drop(self._devices.get("flatpanel"))
+ 
+     def disconnect_all(self) -> None:
+         for kind in KINDS:
+--- a/astrocontrol/main.py
++++ b/astrocontrol/main.py
+@@ -31,6 +31,8 @@
+ from . import identify
+ from . import ninaimport
+ from . import mountclock
++from . import coverprep
++from . import coverstatus
+ from . import roofguard
+ from . import roofstatus
+ from . import warnings
+@@ -1406,6 +1408,11 @@
+             errors[name] = f"{type(exc).__name__}: {exc}"
+             return {} if fallback is None else fallback
+ 
++    # Cover and light are probed on their own thread. This does not wait,
++    # and it does not call the driver on the request thread.
++    with contextlib.suppress(Exception):
++        for rig in rigs.all:
++            coverstatus.kick(rig.manager.get("flatpanel"))
+     payload = part("core", _snapshot_core)
+     for name, read in (("sequence", lambda: {**sequencer.status(),
+                                              "shutdown": dict(shutdown_task)}),
+@@ -1431,6 +1438,15 @@
+     payload["roof"] = roofstatus.observe(
+         (payload.get("devices") or {}).get("dome") or {},
+         str(seq.get("roofLocked") or ""), payload["serverTime"])
++    # Cover badge, from the cache the probe filled. Not a driver call.
++    payload["cover"] = coverstatus.observe((payload.get("devices") or {}).get("flatpanel"))
++    blocked = coverprep.guard_blocks_open()
++    payload["cover"]["openBlocked"] = blocked or ""
++    for entry in payload.get("rigs") or []:
++        if isinstance(entry, dict):
++            entry["cover"] = coverstatus.observe(
++                (entry.get("devices") or {}).get("flatpanel"))
++            entry["cover"]["openBlocked"] = blocked or ""
+     payload["seq"] = next(_snapshot_seq)
+     if errors:
+         payload["sectionErrors"] = errors
+@@ -1944,11 +1960,49 @@
+     return {"ok": True}
+ 
+ 
++def _cover_open_blocked(target) -> str | None:
++    """Why Open Cover must be refused.
++
++    Opening during a dark, bias or panel-flat run is refused because the
++    cover has to stay shut for those frames. Opening during an exposure, a
++    slew or autofocus is also refused: nothing in the sequence shows that
++    moving the lid then is safe, and the sequence itself opens the cover
++    before those stages start. Close and the light are still allowed.
++    """
++    why = coverprep.guard_blocks_open()
++    if why:
++        return why
++    capture = getattr(target, "capture", None)
++    if capture is not None and (
++            str(getattr(capture, "_state", "") or "") == "exposing"
++            or getattr(capture, "busy", False)):
++        return "an exposure is running; the cover was not opened"
++    mount = None
++    with contextlib.suppress(Exception):
++        mount = target.manager.get("mount")
++    if mount is not None and getattr(mount, "connected", True) \
++            and getattr(mount, "slewing", False):
++        return "the mount is slewing; the cover was not opened"
++    focuser = getattr(target, "focuser", None)
++    if focuser is not None and getattr(focuser, "running", False):
++        return "autofocus is running; the cover was not opened"
++    if sequencer.running and str(getattr(sequencer, "_state", "") or "") in (
++            "slewing", "centring", "focusing", "exposing", "imaging"):
++        return (f"the sequence is {sequencer._state}; the cover was not opened")
++    return None
++
++
+ @app.post("/api/flatpanel/cover")
+ def set_cover(body: TrackingRequest, rig: str | None = None) -> dict[str, Any]:
+     target = _rig(rig)
+     panel = _guard(target.manager.require, "flatpanel")
+-    _guard(panel.open_cover if body.on else panel.close_cover)
++    if body.on:
++        why = _cover_open_blocked(target)
++        if why:
++            raise HTTPException(status_code=409, detail=why)
++        _guard(panel.open_cover)
++    else:
++        _guard(panel.close_cover)
+     target.manager.log(f"Cover {'opening' if body.on else 'closing'}")
+     return {"ok": True}
+ 
+--- a/astrocontrol/sequencer.py
++++ b/astrocontrol/sequencer.py
+@@ -45,7 +45,7 @@
+ from pathlib import Path
+ from typing import Any
+ 
+-from . import allsky, astro, capture, filters, plans, roofguard, schedule
++from . import allsky, astro, capture, coverprep, filters, plans, roofguard, schedule
+ from .devices.base import DeviceError, read_slot
+ from .recovery import (FAILED as RIG_FAILED, OK as RIG_OK, RECOVERING as RIG_RECOVERING,
+                        ProgressJournal, RigRecovery, backoff, call_with_timeout)
+@@ -1046,6 +1046,7 @@
+         if panel is None:
+             return "nothing to centre on (the run carries on with what it has)"
+         label = f"{(entry or {}).get('name') or 'the target'}"
++        self._ensure_sky_cover(label)
+         ra, dec = astro.normalise_ra_hours(panel["ra"]), float(panel["dec"])
+         self._set("slewing", f"auto-restart: slewing to {label}")
+         mount = self._slew(self._mount_ready(), ra, dec, label)
+@@ -1500,8 +1501,13 @@
+                        + ", ".join(e.get("name", "?") for e in stored["entries"][:8])
+                        + ("…" if len(stored["entries"]) > 8 else ""))
+             self._prepare_cameras()
+-            if any(not plans.is_calibration(e) for e in stored["entries"]):
+-                self._open_cover()
++            # The cover is not opened here. A plan that starts with darks,
++            # bias or panel flats must keep it shut; a light target opens it
++            # in _goto, before the slew and before any centring or autofocus
++            # frame. Opening here used to run whenever any later entry was a
++            # light, including in front of the darks, and it trusted a
++            # has_cover flag latched at connect so an Unknown Alnitak never
++            # moved.
+             self._walk_plan(stored, known)
+ 
+             self._set(IDLE, "sequence finished")
+@@ -1696,35 +1702,54 @@
+                   else "Mount stopped moving but does not report being at home",
+                   "success" if mount.at_home else "warn")
+ 
+-    def _open_cover(self) -> None:
+-        """Open the flat panel's cover before the first slew, light off.
++    def _ensure_sky_cover(self, label: str) -> None:
++        """Open and verify every connected cover before `label` looks at the sky.
++
++        Re-reads the driver. Does nothing during a dark, bias or panel-flat
++        run (the roof guard is held for those). Does not command the roof.
++        """
++        if coverprep.guard_blocks_open():
++            return
++        rigs = self.rigs.imaging() if hasattr(self.rigs, "imaging") else [self.master]
++        for rig in rigs:
++            panel = None
++            with contextlib.suppress(Exception):
++                panel = rig.manager.get("flatpanel")
++            if panel is None or not getattr(panel, "connected", False):
++                continue
++            self._open_cover(panel, label)
++
++    def _open_cover(self, panel: Any = None, label: str = "the first slew") -> None:
++        """Open one flat panel's cover and wait until it reports Open.
+ 
+         A cover closed at the end of one night stays closed until something
+-        opens it, and nothing did: the next night's frames were of the inside
+-        of the lid. A cover that will not open ends the night here rather than
+-        after an hour of those.
+-        """
+-        panel = self.manager.get("flatpanel")
+-        if panel is None or not panel.connected:
+-            return
+-        with contextlib.suppress(Exception):
+-            panel.turn_off()
+-        if not getattr(panel, "has_cover", False):
+-            return
+-        if panel.cover_state in ("open", "notpresent"):
++        opens it. `has_cover` latched at connect is not consulted: CoverState
++        is read now, and Unknown on a connected CoverCalibrator is opened.
++        A cover that does not report Open holds the run instead of letting
++        a centring frame or an autofocus frame shoot through the lid.
++        """
++        if coverprep.guard_blocks_open():
++            return
++        if panel is None:
++            panel = self.manager.get("flatpanel")
++        if panel is None or not getattr(panel, "connected", False):
+             return
+         self._set("homing", "opening the cover")
+-        self._say("Opening the flat panel's cover")
+-        panel.open_cover()
+-        deadline = time.monotonic() + float(
+-            self._settings().get("coverTimeoutSeconds") or 120.0)
+-        while panel.cover_state == "moving" and time.monotonic() < deadline:
+-            self._check()
+-            time.sleep(0.5)
+-        if panel.cover_state != "open":
+-            raise DeviceError(f"the flat panel's cover is {panel.cover_state}, "
+-                              "not open")
+-        self._say("Cover open", "success")
++
++        def log(message: str, level: str = "info") -> None:
++            text = message
++            if message.startswith("Opening the cover"):
++                text = f"Opening the cover before {label} — {message}"
++            self._say(text, level)
++
++        try:
++            coverprep.ensure_open(
++                panel, timeout=coverprep.timeout_seconds(self.config),
++                log=log, check=self._check,
++                command=coverprep.auto_cover(self.config))
++        except coverprep.CoverHeld:
++            self._set("waiting", f"holding: the cover is not open before {label}")
++            raise
+ 
+     def _walk_plan(self, stored: dict[str, Any], known: dict[str, Any]) -> None:
+         """Work through the plan in order, finishing each target before the next.
+@@ -2101,6 +2126,7 @@
+             return
+ 
+         self._wait_for_start(entry)
++        self._ensure_sky_cover(entry.get("name") or "the all-sky survey")
+         if not self._ensure_roof_open(entry.get("name") or "the all-sky survey", entry):
+             return
+         settings = {**self.config.section("allsky"), **(parameters.get("plan") or {})}
+@@ -2362,6 +2388,10 @@
+         latitude, longitude = site
+ 
+         self._wait_for_start(entry)
++        # The cover first, and whether or not the roof is already open. The
++        # Twin FSQ left the lid shut through centring and autofocus because
++        # nothing re-read CoverState until a later light frame.
++        self._ensure_sky_cover(entry.get("name") or "the target")
+         # 0.2.53b: the roof opened before anything moves or exposes - at the
+         # start of the sequence (its first target) and before every target
+         # after it, if it is not open by then.
+@@ -2674,7 +2704,11 @@
+         and a centring has lost its star, and its corrections fight the sync
+         and the nudges. `_run_entry` starts it again once the panel is
+         centred and focused.
+-        """
++
++        The cover is verified before the home and the slew, so a centring
++        frame cannot be the first thing that asks the lid to move.
++        """
++        self._ensure_sky_cover(label)
+         self._home_mount()
+         guider = self.manager.get("guider")
+         if guider is not None and guider.connected and guider.guiding:
+@@ -2924,6 +2958,9 @@
+                      entry: dict[str, Any] | None = None) -> None:
+         """Focus every telescope at once, if any of them is due.
+ 
++        The cover is verified before the first autofocus frame. A sweep
++        through a closed lid measures nothing and used to run anyway.
++
+         They go together because a focus sweep defocuses the stars on purpose:
+         while one telescope is sweeping, nothing else on the mount can be taking
+         a usable frame anyway.  Doing them in series would double the time the
+@@ -2964,6 +3001,8 @@
+         if not reasons:
+             return
+ 
++        # Before the first autofocus exposure, not merely before a light.
++        self._ensure_sky_cover(label or "autofocus")
+         first = next(iter(reasons.values()))
+         for rig in rigs:
+             self._refocus_reason.pop(rig.id, None)
+@@ -3249,6 +3288,11 @@
+                 time.sleep(0.3)
+ 
+         if settings.get("flipSolve", True) and self.solver.executable() is not None:
++            # A full sequencer re-checks the cover before the post-flip solve.
++            # A rotator-only stand-in used by the flip check has no cover.
++            ensure = getattr(self, "_ensure_sky_cover", None)
++            if ensure is not None:
++                ensure("the re-centre after the flip")
+             self._set("flipping", "re-centring after the flip")
+             try:
+                 # With the panel's angle, so the solve measures the frame's
+@@ -5226,6 +5270,9 @@
+                     self._say(f"{rig.name}: " + "; ".join(outcome["failed"]), "warn")
+                 elif outcome["connected"]:
+                     self._say(f"{rig.name}: the camera is back", "success")
++                    # The lid may have dropped with the USB. Re-read it before
++                    # the next centring, autofocus or light frame.
++                    self._ensure_sky_cover(f"{rig.name} after the camera reconnect")
+             except Exception as exc:              # noqa: BLE001 - reported, not fatal
+                 self._say(f"{rig.name}: could not reconnect the camera — {exc}",
+                           "warn")
+--- a/astrocontrol/web/app.js
++++ b/astrocontrol/web/app.js
+@@ -2684,6 +2684,34 @@
+   badge.textContent = roof.text;
+ }
+ 
++/* The flat-panel cover, beside the roof badge. The text is the status
++   payload's. The buttons send OpenCover / CloseCover / CalibratorOn / Off.
++   They do not send anything to the roof. */
++function updateCover(status) {
++  const badge = $('coverBadge');
++  const buttons = $('coverButtons');
++  if (!badge) return;
++  const cover = (status && status.cover) || {};
++  if (!cover.connected || !cover.text) {
++    badge.hidden = true;
++    if (buttons) buttons.hidden = true;
++    return;
++  }
++  badge.hidden = false;
++  badge.className = `roof-badge ${cover.tone || ''}`;
++  badge.textContent = cover.text;
++  badge.title = cover.stale ? 'Last cover reading is stale' : (cover.text || '');
++  if (!buttons) return;
++  buttons.hidden = false;
++  const open = $('btnCoverOpen');
++  if (open) {
++    const blocked = cover.openBlocked || '';
++    const exposing = ((status.capture || {}).state === 'exposing');
++    open.disabled = !!blocked || exposing;
++    open.title = blocked || (exposing ? 'An exposure is running' : 'Open the flat panel cover');
++  }
++}
++
+ function updateActivity(status) {
+   const bar = $('activityBar');
+   if (!bar) return;
+@@ -2908,6 +2936,7 @@
+   updateSequenceBanner(status);
+   updateActivity(status);
+   updateRoof(status);
++  updateCover(status);
+   updateRecoveryBar(status);
+   updateWarnings(status);
+   updateRunPanel(status);
+@@ -6363,6 +6392,33 @@
+       { title: 'Close roof', confirmLabel: 'Close', danger: true });
+     if (ok) send('/api/dome/shutter', 'POST', { open: false });
+   });
++  // The flat panel. Opening is confirmed because a light sequence needs the
++  // lid out of the way, and closing because the next dark wants it shut.
++  const coverCommand = async (title, message, path, body, confirmLabel) => {
++    const ok = await confirmAction(message, { title, confirmLabel, danger: true });
++    if (!ok) return;
++    try {
++      await api(rigQuery(path), 'POST', body);
++    } catch (error) {
++      toast(error.message, 'error');
++    }
++  };
++  $('btnCoverOpen').addEventListener('click', () => coverCommand(
++    'Open cover',
++    'Open the flat panel cover? Do this only when the telescope should see the sky.',
++    '/api/flatpanel/cover', { on: true }, 'Open cover'));
++  $('btnCoverClose').addEventListener('click', () => coverCommand(
++    'Close cover',
++    'Close the flat panel cover?',
++    '/api/flatpanel/cover', { on: false }, 'Close cover'));
++  $('btnCoverLightOn').addEventListener('click', () => coverCommand(
++    'Light on',
++    'Turn the flat panel light on at full brightness?',
++    '/api/flatpanel/light', { on: true }, 'Light on'));
++  $('btnCoverLightOff').addEventListener('click', () => coverCommand(
++    'Light off',
++    'Turn the flat panel light off?',
++    '/api/flatpanel/light', { on: false }, 'Light off'));
+   $('btnOffsetsRun').addEventListener('click', async () => {
+     const names = readFilterNames();
+     if (names.length < 2) {
+--- a/astrocontrol/web/index.html
++++ b/astrocontrol/web/index.html
+@@ -52,6 +52,13 @@
+       <button class="btn small ghost" data-panel-toggle="log" title="Event log">Log</button>
+     </div>
+     <span id="roofBadge" class="roof-badge" hidden></span>
++    <span id="coverBadge" class="roof-badge" hidden></span>
++    <span id="coverButtons" class="cover-buttons" hidden>
++      <button class="btn small" id="btnCoverOpen" type="button">Open cover</button>
++      <button class="btn small" id="btnCoverClose" type="button">Close cover</button>
++      <button class="btn small" id="btnCoverLightOn" type="button">Light on</button>
++      <button class="btn small ghost" id="btnCoverLightOff" type="button">Light off</button>
++    </span>
+     <span id="clock" class="mono muted"></span>
+     <span id="linkState" class="link-state offline">offline</span>
+   </div>
+--- a/astrocontrol/web/style.css
++++ b/astrocontrol/web/style.css
+@@ -383,7 +383,9 @@
+ .roof-badge.moving { color: var(--blue); border-color: var(--blue); }
+ .roof-badge.open { color: var(--good); border-color: var(--good); }
+ .roof-badge.closed { color: var(--muted); }
+-.roof-badge.locked, .roof-badge.error { color: var(--warn); border-color: var(--warn); }
++.roof-badge.locked, .roof-badge.error, .roof-badge.unknown { color: var(--warn); border-color: var(--warn); }
++.roof-badge.notpresent { color: var(--muted); }
++.cover-buttons { display: inline-flex; gap: 4px; align-items: center; }
+ /* Working on something that takes a moment. */
+ .activity.busy { background: linear-gradient(90deg, rgba(91, 141, 217, 0.16), transparent 55%); }
+ .activity.busy .activity-icon { color: var(--blue); animation: activity-pulse 1.6s infinite; }
+diff --git a/tools/check_cover_open_on_start.py b/tools/check_cover_open_on_start.py
+new file mode 100644
+--- /dev/null
++++ b/tools/check_cover_open_on_start.py
+@@ -0,0 +1,381 @@
++"""The cover opens and is verified before any sky frame (0.2.53i).
++
++    python tools/check_cover_open_on_start.py
++
++Twin FSQ, 2026-11-11: the lid was left shut after an L-flat. The sequence
++unparked, homed, slewed, centred and autofocused with no "Opening the cover"
++line, because has_cover was latched false at connect and the only open ran
++later, for a light frame. The frame after "Cover open" was still ~503 ADU.
++
++Darks, bias, panel flats and autocal must not open the cover, and must not
++open the roof.
++"""
++
++from __future__ import annotations
++
++import inspect
++import os
++import sys
++import tempfile
++import time
++from pathlib import Path
++
++ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(ROOT))
++os.environ.setdefault("ASTRO_DATA_DIR", tempfile.mkdtemp(prefix="cover-open-"))
++
++from astrocontrol import coverprep, roofguard                         # noqa: E402
++from astrocontrol.capture import CaptureService                       # noqa: E402
++from astrocontrol.config import Config                                # noqa: E402
++from astrocontrol.devices.base import DeviceError                     # noqa: E402
++from astrocontrol.sequencer import Sequencer                          # noqa: E402
++
++results: list[bool] = []
++
++
++def case(name, ok, detail=""):
++    print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  - {detail}" if detail else ""))
++    results.append(bool(ok))
++
++
++class Panel:
++    """An Alnitak that can report Unknown and ignore a latched has_cover."""
++
++    def __init__(self, state="closed", has_cover=False, sticks=False):
++        self.connected = True
++        self.has_cover = has_cover
++        self._state = state
++        self.sticks = sticks
++        self.opens = 0
++        self.closes = 0
++        self.off = 0
++        self.light_on = False
++        self.brightness = 0
++        self.max_brightness = 100
++        self.name = "ASCOM.OptecAlnitak.CoverCalibrator"
++
++    @property
++    def cover_state(self):
++        return self._state
++
++    def open_cover(self):
++        self.opens += 1
++        if not self.sticks:
++            self._state = "open"
++
++    def close_cover(self):
++        self.closes += 1
++        if not self.sticks:
++            self._state = "closed"
++
++    def turn_off(self):
++        self.off += 1
++        self.light_on = False
++
++    def turn_on(self, brightness):
++        self.brightness = brightness
++        self.light_on = self._state == "closed"
++
++
++class Dome:
++    def __init__(self):
++        self.connected = True
++        self.can_shutter = True
++        self.commands = []
++        self.shutter_state = "open"
++
++    def open_shutter(self):
++        self.commands.append("open")
++
++    def close_shutter(self):
++        self.commands.append("close")
++
++
++class Mount:
++    connected = True
++    can_find_home = True
++    can_park = True
++    slewing = False
++    tracking = True
++    at_park = False
++    at_home = True
++
++    def __init__(self):
++        self.homes = 0
++        self.slews = []
++
++    def find_home(self):
++        self.homes += 1
++
++    def slew_to(self, ra, dec):
++        self.slews.append((ra, dec))
++
++    def unpark(self):
++        self.at_park = False
++
++    def set_tracking(self, on):
++        self.tracking = bool(on)
++
++
++class Manager:
++    def __init__(self, devices):
++        self.devices = devices
++        self.messages = []
++
++    def get(self, kind):
++        return self.devices.get(kind)
++
++    def require(self, kind):
++        device = self.devices.get(kind)
++        if device is None:
++            raise DeviceError(f"{kind} not connected")
++        return device
++
++    def log(self, message, level="info"):
++        self.messages.append((level, str(message)))
++
++
++class Rig:
++    def __init__(self, config, devices):
++        self.id = "fsq106"
++        self.name = "FSQ106 twin"
++        self.role = "master"
++        self.config = config
++        self.manager = Manager(devices)
++        self.capture = devices.get("capture")
++        self.solver = None
++        self.focuser = None
++
++
++class Rigs:
++    def __init__(self, rig):
++        self.master = rig
++        self.all = [rig]
++        self.messages = rig.manager.messages
++
++    def imaging(self):
++        return self.all
++
++    def get(self, _rid):
++        return self.master
++
++    def log(self, message, level="info"):
++        self.messages.append((level, str(message)))
++
++
++def build(panel, extra=None):
++    config = Config(Path(tempfile.mkdtemp()) / "settings.json")
++    config.update("sequencer", {"coverTimeoutSeconds": 0.4,
++                                "roofTimeoutSeconds": 1.0,
++                                "parkTimeoutSeconds": 1.0})
++    devices = {"flatpanel": panel, "dome": Dome()}
++    if extra:
++        devices.update(extra)
++    rig = Rig(config, devices)
++    if rig.capture is None:
++        rig.capture = CaptureService(rig.manager, config)
++        devices["capture"] = rig.capture
++    seq = Sequencer(Rigs(rig), config, None, None)
++    return seq, rig, config
++
++
++# ---------------------------------------------------- (b) unknown is opened
++panel = Panel(state="unknown", has_cover=False)
++seq, rig, config = build(panel)
++seq._ensure_sky_cover("M42")
++case("Unknown at sequence start opens the cover even when has_cover was latched false",
++     panel.opens == 1 and panel.cover_state == "open",
++     f"opens={panel.opens} state={panel.cover_state}")
++case("the calibrator light is turned off before the open", panel.off == 1)
++case("the roof was not commanded", rig.manager.get("dome").commands == [],
++     str(rig.manager.get("dome").commands))
++
++# Already open: re-read, do not command again.
++panel = Panel(state="open", has_cover=True)
++seq, rig, _config = build(panel)
++seq._open_cover()
++case("a cover that already reads Open is left alone", panel.opens == 0)
++
++# NotPresent is the only "no cover" answer.
++panel = Panel(state="notpresent", has_cover=False)
++seq, rig, _config = build(panel)
++seq._open_cover()
++case("NotPresent is not commanded", panel.opens == 0)
++
++# ---------------------------------------------------- (a) before any sky frame
++panel = Panel(state="closed", has_cover=False)
++mount = Mount()
++seq, rig, _config = build(panel, {"mount": mount})
++order = []
++seq._home_mount = lambda: order.append("home")
++try:
++    seq._goto({"ra": 5.5, "dec": -5.0}, "M42")
++except Exception as exc:                                  # noqa: BLE001 - we only need the start
++    order.append(f"later:{exc}")
++case("the cover is opened before the mount is homed or slewed",
++     panel.opens == 1 and panel.cover_state == "open" and order[:1] == ["home"],
++     str(order))
++case("and that open is before any slew", mount.slews == [] or order[0] == "home",
++     str(mount.slews))
++
++goto_src = inspect.getsource(Sequencer._goto)
++home_at = goto_src.find("_home_mount")
++cover_at = goto_src.find("_ensure_sky_cover")
++case("centring's slew path checks the cover before homing",
++     0 <= cover_at < home_at, f"cover {cover_at} home {home_at}")
++focus_src = inspect.getsource(Sequencer._maybe_focus)
++case("autofocus checks the cover before the sweep",
++     "_ensure_sky_cover" in focus_src)
++entry_src = inspect.getsource(Sequencer._run_entry)
++case("a light target checks the cover even when the roof is already open",
++     entry_src.find("_ensure_sky_cover") < entry_src.find("_ensure_roof_open"))
++
++# A cover that never reports Open holds the run. Nothing is slewed or centred.
++panel = Panel(state="closed", has_cover=True, sticks=True)
++mount = Mount()
++seq, rig, _config = build(panel, {"mount": mount})
++held = ""
++try:
++    seq._goto({"ra": 5.5, "dec": -5.0}, "M42")
++except DeviceError as exc:
++    held = str(exc)
++case("a cover that does not open holds the run",
++     "not open" in held and "Holding" in held, held)
++case("and does not home or slew or centre",
++     mount.homes == 0 and mount.slews == [], f"homes={mount.homes} slews={mount.slews}")
++case("the hold does not open the roof", rig.manager.get("dome").commands == [])
++
++# ---------------------------------------------------- (c) the frame itself
++reason = coverprep.looks_capped({"median": 503, "stdDev": 6.0}, offset=50)
++case("a 503 ADU flat frame is a closed cover", reason is not None, str(reason))
++case("a real sky frame is not",
++     coverprep.looks_capped({"median": 8400, "stdDev": 900}, offset=50) is None)
++try:
++    coverprep.judge_sky_frame({"median": 513, "stdDev": 4}, offset=50)
++    case("a bias-like sky frame holds the run", False)
++except DeviceError as exc:
++    case("a bias-like sky frame holds the run",
++         "Holding" in str(exc) and "503" not in str(exc) or "513" in str(exc),
++         str(exc))
++
++# The capture path used by centring and autofocus raises instead of shooting.
++panel = Panel(state="closed", has_cover=False, sticks=True)
++manager = Manager({"flatpanel": panel})
++cap = CaptureService(manager, Config(Path(tempfile.mkdtemp()) / "c.json"))
++cap.config.update("sequencer", {"coverTimeoutSeconds": 0.3})
++raised = ""
++try:
++    cap.open_light_path()
++except DeviceError as exc:
++    raised = str(exc)
++case("a light-path open that times out does not take the frame",
++     "Holding" in raised and panel.opens == 1, raised)
++
++panel = Panel(state="unknown", has_cover=False)
++manager = Manager({"flatpanel": panel})
++cap = CaptureService(manager, Config(Path(tempfile.mkdtemp()) / "c.json"))
++done = cap.open_light_path()
++case("centring and autofocus open an Unknown cover before the exposure",
++     done.get("cover") is True and panel.cover_state == "open" and panel.opens == 1,
++     str(done))
++
++# ---------------------------------------------------- (d) reconnect
++panel = Panel(state="open", has_cover=True)
++seq, rig, _config = build(panel)
++seq._open_cover()
++panel._state = "closed"
++panel.has_cover = False
++seq._ensure_sky_cover("FSQ106 twin after the camera reconnect")
++case("after a reconnect the cover is re-read and opened again",
++     panel.opens == 1 and panel.cover_state == "open",
++     f"opens={panel.opens} state={panel.cover_state} latched={panel.has_cover}")
++case("reconnect re-check does not command the roof",
++     rig.manager.get("dome").commands == [])
++
++# ---------------------------------------------------- (e) darks stay shut
++panel = Panel(state="closed", has_cover=True)
++dome = Dome()
++seq, rig, _config = build(panel)
++rig.manager.devices["dome"] = dome
++with roofguard.closed_for("bias"):
++    seq._ensure_sky_cover("bias")
++    seq._open_cover()
++case("open-and-verify does not fire for a bias run", panel.opens == 0)
++case("and the roof is not opened either", dome.commands == [])
++
++with roofguard.closed_for("dark"):
++    seq._ensure_sky_cover("dark")
++case("open-and-verify does not fire for a dark run", panel.opens == 0)
++
++with roofguard.closed_for("panel flats"):
++    seq._ensure_sky_cover("panel flats")
++case("open-and-verify does not fire for panel flats", panel.opens == 0)
++
++for kind, source in (("bias", None), ("dark", None), ("darkflat", None),
++                     ("flat", "panel")):
++    case(f"{kind}/{source or 'panel'} is not a sky open",
++         not coverprep.wants_open(kind, source))
++case("a sky flat is a sky open", coverprep.wants_open("flat", "sky"))
++case("autocal of darks and panel flats does not want the cover open",
++     not any(coverprep.wants_open(kind, source)
++             for kind, source in (("bias", None), ("dark", None), ("flat", "panel"))))
++
++# Panel flats still close the cover and turn the light on. No OpenCover.
++from astrocontrol.calibrating import CalibrationRunner               # noqa: E402
++
++
++class Library:
++    root = Path(tempfile.mkdtemp(prefix="cover-lib-"))
++
++    def settings(self):
++        return {"flatAutoBrightness": False}
++
++    def sub_folder(self, *_a, **_k):
++        folder = self.root / "subs"
++        folder.mkdir(parents=True, exist_ok=True)
++        return folder
++
++
++class Cam:
++    connected = True
++    gain = 100
++    offset = 50
++    name = "ASI"
++    temperature = -10
++    sensor_width = 0
++    sensor_height = 0
++
++    def set_settings(self, **_kw):
++        pass
++
++
++panel = Panel(state="open", has_cover=True)
++config = Config(Path(tempfile.mkdtemp()) / "settings.json")
++config.update("sequencer", {"coverTimeoutSeconds": 0.4})
++devices = {"flatpanel": panel, "camera": Cam(), "dome": Dome()}
++rig = Rig(config, devices)
++runner = CalibrationRunner(Rigs(rig), config, Library())
++runner._prepare_light(rig, {"frameType": "flat", "source": "panel", "filter": "",
++                            "brightness": 40, "binning": 1, "gain": 100,
++                            "offset": 50}, lambda: None)
++case("panel flats close the cover", panel.cover_state == "closed" and panel.closes >= 1,
++     f"state={panel.cover_state} closes={panel.closes} opens={panel.opens}")
++case("panel flats do not open the cover", panel.opens == 0)
++case("panel flats turn the light on with the cover shut",
++     panel.light_on and panel.brightness == 40, f"on={panel.light_on} b={panel.brightness}")
++case("panel flats do not open the roof", devices["dome"].commands == [])
++
++runner._darken(rig, lambda: None)
++case("darks leave the cover closed", panel.cover_state == "closed" and panel.opens == 0)
++
++sky = Panel(state="closed", has_cover=False)
++devices["flatpanel"] = sky
++rig.manager.devices = devices
++runner._open_cover_for_sky(rig, "sky flats")
++case("sky flats open a cover that was latched as absent",
++     sky.opens == 1 and sky.cover_state == "open")
++case("sky flats do not open the roof", devices["dome"].commands == [])
++
++failed = len(results) - sum(results)
++print(f"\n{sum(results)}/{len(results)} passed")
++raise SystemExit(1 if failed else 0)
+diff --git a/tools/check_cover_status.py b/tools/check_cover_status.py
+new file mode 100644
+--- /dev/null
++++ b/tools/check_cover_status.py
+@@ -0,0 +1,260 @@
++"""Cover badge, status payload, and the open/close/light buttons (0.2.53i).
++
++    python tools/check_cover_status.py
++
++The status request must return while a cover read is hung. Open Cover is
++refused during a dark/bias/panel-flat run and while an exposure, slew or
++autofocus is in progress. Nothing here commands a roof.
++"""
++
++from __future__ import annotations
++
++import os
++import sys
++import tempfile
++import time
++from pathlib import Path
++from types import SimpleNamespace
++
++ROOT = Path(__file__).resolve().parent.parent
++sys.path.insert(0, str(ROOT))
++os.environ.setdefault("ASTRO_DATA_DIR", tempfile.mkdtemp(prefix="cover-status-"))
++
++from astrocontrol import coverprep, coverstatus, roofguard          # noqa: E402
++from astrocontrol.devices.base import DeviceError                    # noqa: E402
++from fastapi import HTTPException                                    # noqa: E402
++from astrocontrol.main import (get_status, rigs, set_cover,          # noqa: E402
++                               set_flat_light)
++
++results: list[bool] = []
++
++
++def case(name, ok, detail=""):
++    print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  - {detail}" if detail else ""))
++    results.append(bool(ok))
++
++
++# ---------------------------------------------------------------- mapping
++for number, word in ((0, "notpresent"), (1, "closed"), (2, "moving"),
++                     (3, "open"), (4, "unknown"), (5, "error")):
++    case(f"CoverState {number} is {word}", coverprep.map_cover(number) == word)
++
++case("a failed CoverState read is not NotPresent",
++     coverprep.map_cover(None) == "unread")
++case("CalibratorStatus ready is the light",
++     coverprep.map_calibrator(3) == "ready")
++case("CalibratorStatus off is off", coverprep.map_calibrator(1) == "off")
++
++# A value latched at connect is not what the badge or the open decision uses.
++panel = SimpleNamespace(connected=True, has_cover=False, cover_state="unknown",
++                        light_on=False, brightness=0, max_brightness=100)
++case("Unknown is not treated as no cover",
++     coverprep.read_state(panel) == "unknown")
++case("lights want the cover open", coverprep.wants_open("light"))
++case("sky flats want the cover open", coverprep.wants_open("flat", "sky"))
++case("panel flats do not", not coverprep.wants_open("flat", "panel"))
++case("darks do not", not coverprep.wants_open("dark"))
++case("bias does not", not coverprep.wants_open("bias"))
++case("dark flats do not", not coverprep.wants_open("darkflat"))
++
++
++def badge(state, light_on=False, brightness=0, maximum=100, calibrator="off"):
++    coverstatus.reset()
++    device = SimpleNamespace(connected=True)
++    coverstatus.note(device, {
++        "connected": True, "coverState": state, "lightOn": light_on,
++        "brightness": brightness, "maxBrightness": maximum,
++        "calibratorState": calibrator, "readAt": time.time(), "stale": False,
++    })
++    return coverstatus.observe(coverstatus.cached(device))
++
++
++for state, text in (
++    ("open", "Cover open"),
++    ("closed", "Cover closed"),
++    ("moving", "Cover moving"),
++    ("unknown", "Cover unknown"),
++    ("error", "Cover error"),
++    ("notpresent", "Cover not present"),
++):
++    shown = badge(state)
++    case(f"badge says {text}", shown["text"].startswith(text), shown["text"])
++    case(f"badge state {state}", shown["state"] == state, shown["state"])
++
++lit = badge("closed", light_on=True, brightness=80, maximum=100, calibrator="ready")
++case("light on shows brightness over the maximum",
++     "light on 80/100" in lit["text"], lit["text"])
++dark = badge("open", light_on=False, calibrator="off")
++case("light off is on the badge", "light off" in dark["text"], dark["text"])
++case("no panel, no badge",
++     coverstatus.observe({"connected": False})["connected"] is False)
++
++# ----------------------------------------------------------- the status API
++class HangPanel:
++    """CoverState never returns. The status request must not wait for it."""
++
++    connected = True
++    name = "ASCOM.OptecAlnitak.CoverCalibrator"
++    driver_id = "ASCOM.OptecAlnitak.CoverCalibrator"
++    max_brightness = 100
++    calls = 0
++
++    @property
++    def cover_state(self):
++        HangPanel.calls += 1
++        time.sleep(30)
++        return "closed"
++
++    @property
++    def light_on(self):
++        time.sleep(30)
++        return False
++
++    @property
++    def brightness(self):
++        time.sleep(30)
++        return 0
++
++    def status(self):
++        snap = coverstatus.cached(self)
++        return {"connected": True, "name": self.name, **snap}
++
++
++hang = HangPanel()
++master = rigs.master
++previous = master.manager._devices.get("flatpanel")
++master.manager._devices["flatpanel"] = hang
++try:
++    started = time.monotonic()
++    payload = get_status()
++    elapsed = time.monotonic() - started
++    case("/api/status returns while the cover driver is hung",
++         elapsed < 1.5 and isinstance(payload, dict) and "cover" in payload,
++         f"{elapsed:.2f}s keys={sorted(payload)[:8]}")
++    case("the hung read is not reported as Open",
++         payload["cover"].get("state") != "open", str(payload["cover"]))
++    case("the payload names the cover state",
++         "state" in payload["cover"] and "text" in payload["cover"],
++         str(payload["cover"]))
++    rig_covers = [entry.get("cover") for entry in payload.get("rigs") or []]
++    case("each rig in the status payload has a cover",
++         bool(rig_covers) and all(isinstance(item, dict) for item in rig_covers),
++         str(rig_covers)[:200])
++    again = time.monotonic()
++    second = get_status()
++    case("a second status read does not wait on the hung probe either",
++         time.monotonic() - again < 1.5 and "cover" in second,
++         f"{time.monotonic() - again:.2f}s")
++    time.sleep(0.05)
++    case("the hung CoverState read is on the probe, not the request",
++         HangPanel.calls >= 1 and elapsed < 1.5, f"calls={HangPanel.calls}")
++finally:
++    if previous is None:
++        master.manager._devices.pop("flatpanel", None)
++    else:
++        master.manager._devices["flatpanel"] = previous
++
++
++# ------------------------------------------------------------- the buttons
++class ButtonPanel:
++    connected = True
++    name = "ASCOM.OptecAlnitak.CoverCalibrator"
++    max_brightness = 255
++
++    def __init__(self):
++        self.commands = []
++
++    def open_cover(self):
++        self.commands.append("open")
++
++    def close_cover(self):
++        self.commands.append("close")
++
++    def turn_on(self, brightness):
++        self.commands.append(f"on:{brightness}")
++
++    def turn_off(self):
++        self.commands.append("off")
++
++
++button = ButtonPanel()
++master.manager._devices["flatpanel"] = button
++capture = master.capture
++saved_state = capture._state
++saved_focus = getattr(master.focuser, "_running", None)
++try:
++    set_flat_light(SimpleNamespace(on=True, brightness=None))
++    case("Light on uses full brightness when none is given",
++         button.commands[-1] == "on:255", str(button.commands))
++    set_flat_light(SimpleNamespace(on=False, brightness=None))
++    case("Light off is sent", button.commands[-1] == "off", str(button.commands))
++
++    with roofguard.closed_for("panel flats"):
++        refused = False
++        try:
++            set_cover(SimpleNamespace(on=True))
++        except HTTPException as exc:
++            refused = exc.status_code == 409 and "cover" in str(exc.detail).lower()
++            case("Open Cover during calibration is HTTP 409",
++                 refused, str(getattr(exc, "detail", exc)))
++        case("and the cover was not opened", "open" not in button.commands,
++             str(button.commands))
++        set_cover(SimpleNamespace(on=False))
++        case("Close Cover is still allowed during calibration",
++             button.commands[-1] == "close", str(button.commands))
++
++    capture._state = "exposing"
++    try:
++        set_cover(SimpleNamespace(on=True))
++        case("Open Cover during an exposure is refused", False)
++    except HTTPException as exc:
++        case("Open Cover during an exposure is refused",
++             exc.status_code == 409 and "exposure" in str(exc.detail),
++             str(exc.detail))
++    capture._state = saved_state
++
++    class Slewing:
++        connected = True
++        slewing = True
++
++    master.manager._devices["mount"] = Slewing()
++    try:
++        set_cover(SimpleNamespace(on=True))
++        case("Open Cover during a slew is refused", False)
++    except HTTPException as exc:
++        case("Open Cover during a slew is refused",
++             exc.status_code == 409 and "slew" in str(exc.detail),
++             str(exc.detail))
++    finally:
++        master.manager._devices.pop("mount", None)
++
++    if master.focuser is not None:
++        master.focuser._running = True
++        try:
++            set_cover(SimpleNamespace(on=True))
++            case("Open Cover during autofocus is refused", False)
++        except HTTPException as exc:
++            case("Open Cover during autofocus is refused",
++                 exc.status_code == 409 and "autofocus" in str(exc.detail),
++                 str(exc.detail))
++        finally:
++            master.focuser._running = saved_focus
++    else:
++        case("Open Cover during autofocus is refused", False, "no focuser on the rig")
++
++    case("the refused opens never reached the driver",
++         button.commands.count("open") == 0, str(button.commands))
++finally:
++    capture._state = saved_state
++    if master.focuser is not None:
++        master.focuser._running = saved_focus
++    master.manager._devices.pop("flatpanel", None)
++
++import inspect                                                       # noqa: E402
++case("the new cover module does not command a roof",
++     "open_shutter" not in inspect.getsource(coverprep)
++     and "request_open" not in inspect.getsource(coverprep))
++
++failed = len(results) - sum(results)
++print(f"\n{sum(results)}/{len(results)} passed")
++raise SystemExit(1 if failed else 0)
+--- a/tools/check_mount_clock.py
++++ b/tools/check_mount_clock.py
+@@ -136,7 +136,7 @@
+ 
+ 
+ # ---------------------------------------------------------------- the wiring
+-case("version is 0.2.53h", __version__ == "0.2.53h", __version__)
++case("version is 0.2.53i", __version__ == "0.2.53i", __version__)
+ case("the clock check is on the watchdog",
+      any(fn.__name__ == "mount_clock" for fn in warnings.CHECKS))
+ main_text = (ROOT / "astrocontrol/main.py").read_text()
