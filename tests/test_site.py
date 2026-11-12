@@ -113,9 +113,79 @@ def test_my_telescopes_are_mine_alone_and_say_if_they_are_online(tmp_path):
     assert on["state"] == "imaging" and on["target"] == "M31"
     assert on["equipment"]["scale"] == 1.46 and on["equipment"]["field"] == [2.54, 1.7]
     assert on["equipment"]["filters"] == ["L", "Ha"]
-    assert on["work"] == [{"project": "aaaaaa000001", "name": "M42 horse", "state": "accepted", "personal": False}]
+    assert on["work"] == [{"project": "aaaaaa000001", "name": "M42 horse", "state": "accepted", "active": False,
+                           "lastSent": None, "lastNight": None, "personal": False}]
+    assert on["replaces"] == [] and d["notSeenLately"] == []
     assert not off["online"] and off["seen"] is None and off["ageSeconds"] is None
     # Long after its last check-in it is offline, with when it was last seen.
     store._run("UPDATE agents SET seen = seen - 7200 WHERE id = 'aaaaaaaa1111'")
     late = client.get("/api/v1/site/telescopes", headers=BRAY).json()["telescopes"][0]
     assert not late["online"] and 7190 < late["ageSeconds"] < 7300
+
+
+FSQ = {"name": "Default", "focalLength": 389.0, "pixelSize": 3.76, "sensorWidth": 9576, "sensorHeight": 6388,
+       "filters": {"L": None}, "colour": False, "client": "nina"}
+
+
+def _agent(store, agent_id, name, created, seen, profile, presence=None, owner_id="u-bray"):
+    store.add_agent(agent_id, "rig-secret-" + agent_id, name, "astrofalls", owner_id)
+    store.seen(agent_id, profile, presence or {"telescope": name, "state": "idle"})
+    store._run("UPDATE agents SET created = ?, seen = ? WHERE id = ?", created, seen, agent_id)
+
+
+def test_a_telescope_connected_again_is_one_card_not_one_per_enrolment(tmp_path):
+    import time as _t
+    client, store = build(tmp_path)
+    now = _t.time()
+    day = 86400.0
+    # The N.I.N.A. plugin on one rig, connected four times: each enrolment
+    # stopped checking in just before the next one was made.
+    _agent(store, "nina00000001", "Default", now - 40 * day, now - 30 * day, dict(FSQ, sensorWidth=None))
+    _agent(store, "nina00000002", "Default", now - 30 * day + 300, now - 20 * day, FSQ)
+    _agent(store, "nina00000003", "Default", now - 20 * day + 60, now - 5 * day, FSQ)
+    _agent(store, "nina00000004", "Default", now - 5 * day + 120, now - 60, FSQ)
+    # Same optics, same name, but both checking in at once: two telescopes.
+    _agent(store, "twin00000001", "Telescope 1", now - 50 * day, now - 30, dict(FSQ, client=""))
+    _agent(store, "twin00000002", "Telescope 1", now - 45 * day, now - 90, dict(FSQ, client=""))
+    # A different telescope under the same enrolment name is never folded.
+    _agent(store, "vsd000000001", "Default", now - 25 * day, now - 4 * day, dict(FSQ, focalLength=300.0))
+    # Never reported optics: nothing to tell it apart by, so it stays itself.
+    _agent(store, "empty0000001", "Telescope 1", now - 60 * day, now - 59 * day, {"name": "Telescope 1"})
+    d = client.get("/api/v1/site/telescopes", headers=BRAY).json()
+    ids = sorted(c["id"] for c in d["telescopes"])
+    assert ids == ["nina00000004", "twin00000001", "twin00000002", "vsd000000001"]
+    nina = next(c for c in d["telescopes"] if c["id"] == "nina00000004")
+    assert sorted(nina["replaces"]) == ["nina00000001", "nina00000002", "nina00000003"]
+    assert abs(nina["firstAdded"] - (now - 40 * day)) < 5
+    # Not seen in a month: listed apart, not among the telescopes in use.
+    assert [c["id"] for c in d["notSeenLately"]] == ["empty0000001"]
+    assert "rig-secret" not in client.get("/api/v1/site/telescopes", headers=BRAY).text
+    assert "connected again" in client.get("/telescopes").text
+
+
+def test_working_on_needs_the_rig_to_be_on_it_not_just_a_task(tmp_path):
+    import time as _t
+    client, store = build(tmp_path)
+    now = _t.time()
+    store.add_project("cccccc000004", "California Dreaming", "Bray", {"collectFiles": True}, owner_id="u-bray")
+    store.add_project("dddddd000005", "Brand new", "Bray", {"collectFiles": True}, owner_id="u-bray")
+    _agent(store, "fsq106000001", "Telescope 1", now - 90 * 86400, now - 30, dict(FSQ, client=""),
+           {"telescope": "fsq106", "state": "imaging", "project": "aaaaaa000001"})
+    for tid, project in (("t-m42", "aaaaaa000001"), ("t-cal", "cccccc000004"), ("t-new", "dddddd000005")):
+        store.add_task({"id": tid, "project": project, "agent": "fsq106000001", "state": "accepted",
+                        "version": 1, "issued": 1.0})
+    # Its last night on California Dreaming was weeks ago; the target has since
+    # left the rig's plan, but the server still holds the task as accepted.
+    store._run("INSERT INTO contributions (id, project, agent, task, night, filter, seconds, accepted, received,"
+               " payload) VALUES ('c1', 'cccccc000004', 'fsq106000001', 't-cal', '2026-10-19', 'L', 3600, 1, ?, '{}')",
+               now - 23 * 86400)
+    work = {w["name"]: w for w in client.get("/api/v1/site/telescopes", headers=BRAY).json()["telescopes"][0]["work"]}
+    assert work["M42 horse"]["active"]                                   # pointed at it right now
+    assert not work["California Dreaming"]["active"] and work["California Dreaming"]["lastNight"] == "2026-10-19"
+    assert not work["Brand new"]["active"] and work["Brand new"]["lastNight"] is None
+    # A night reported lately makes it "working on" again.
+    store._run("UPDATE contributions SET received = ? WHERE id = 'c1'", now - 2 * 86400)
+    work = {w["name"]: w for w in client.get("/api/v1/site/telescopes", headers=BRAY).json()["telescopes"][0]["work"]}
+    assert work["California Dreaming"]["active"]
+    page = client.get("/telescopes").text
+    assert "'Joined'" in page and "nothing sent since" in page
