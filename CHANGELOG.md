@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.53h
+
+- Auto-upload backfill uses the same capture root as capture. A blank `capture.rootDirectory` is `data_root()/captures`, not "scan nothing".
+- The backfill log names that folder and the counts: scanned, matched, queued, and skipped by reason.
+- A capture folder that matches more than one collaboration target is not given the first name. It is kept only when the header or the current task names exactly one stamp; otherwise it is skipped and logged. On EAGLE, `m42_horse_test_mosaic` is project `97fcae827a9f`, task `481536614589`, not the declined task `b9412d46f576`.
+
 ## 0.2.53g
 
 Single-scope Namibia (EAGLE4PRO) build, on 0.2.53b.

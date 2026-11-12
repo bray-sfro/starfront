@@ -53,6 +53,27 @@ def clean_target(name: str) -> str:
     return _UNSAFE.sub("_", (name or "").strip()).strip("_")
 
 
+def capture_root(config: Any) -> Path:
+    """The folder frames are written under.
+
+    A blank or missing ``capture.rootDirectory`` is ``data_root()/captures``,
+    which on EAGLE is ``C:\\Users\\primalucelab\\Starfront\\captures``. Capture
+    and the auto-upload backfill both call this. A second copy of the rule
+    is how a blank setting made the backfill scan nothing.
+    """
+    raw = ""
+    if config is not None:
+        try:
+            raw = config.get("capture", "rootDirectory", "") or ""
+        except Exception:                              # noqa: BLE001 - same fallback
+            section = config.section("capture") if hasattr(config, "section") else {}
+            raw = (section or {}).get("rootDirectory") or ""
+    text = str(raw or "").strip()
+    if text:
+        return Path(text).expanduser()
+    return data_root() / "captures"
+
+
 def _utc(timestamp: float) -> str:
     """A moment as DATE-OBS wants it: ISO, UTC, milliseconds."""
     return datetime.fromtimestamp(timestamp, tz=timezone.utc).strftime(
@@ -320,9 +341,7 @@ class CaptureService:
 
     @property
     def root_dir(self) -> Path:
-        configured = (self.config.get("capture", "rootDirectory", "") or "").strip()
-        return (Path(configured).expanduser() if configured
-                else data_root() / "captures")
+        return capture_root(self.config)
 
     @property
     def session_dir(self) -> Path:

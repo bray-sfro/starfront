@@ -622,11 +622,104 @@ def follower_and_backfill(tmp: Path) -> None:
           f"the master frame is sent ({master_item['state']})")
 
 
+def blank_root_and_duplicate_name(tmp: Path) -> None:
+    """A blank capture.rootDirectory still scans data_root()/captures.
+
+    Two targets named 'm42 horse test mosaic' are not resolved by whichever
+    is first. The folder belongs to the task this PC is on
+    (481536614589), not the declined one (b9412d46f576). With no exact
+    task, the folder is skipped. The follower is still not queued.
+    """
+    import os
+    from astrocontrol.capture import CaptureService, capture_root
+    from astrocontrol.config import Config
+    from astrocontrol.imaging.fits import write as write_fits
+    import numpy as np
+
+    previous = os.environ.get("ASTRO_DATA_DIR")
+    data = tmp / "eagle-data"
+    os.environ["ASTRO_DATA_DIR"] = str(data)
+    try:
+        config = Config(data / "settings.json")
+        # The installed settings leave this blank. Capture and backfill must
+        # agree on the fallback.
+        check(config.get("capture", "rootDirectory", "") == "",
+              "the default capture root is blank")
+        root = capture_root(config)
+        check(root == data / "captures", f"blank rootDirectory is {root}")
+        capture = CaptureService(SimpleNamespace(), config)
+        check(capture.root_dir == root, "backfill and capture share capture_root")
+
+        folder = root / "m42_horse_test_mosaic" / "2026-11-05" / "FSQ85"
+        folder.mkdir(parents=True)
+        blank = np.zeros((4, 4), dtype=np.uint16)
+        master = folder / "m42_P20_5s_26C_0001.fits"
+        follower_dir = root / "m42_horse_test_mosaic" / "2026-11-05" / "Rokinon_135mm"
+        follower_dir.mkdir(parents=True)
+        follower = follower_dir / "m42_P20_L_5s_0001.fits"
+        write_fits(master, blank, {"IMAGETYP": "Light", "INSTRUME": "ZWO ASI6200MM Pro",
+                                   "TELESCOP": "FSQ85", "EXPTIME": 5})
+        write_fits(follower, blank, {"IMAGETYP": "Light", "INSTRUME": "ZWO ASI6200MC Pro",
+                                     "BAYERPAT": "RGGB", "TELESCOP": "Rokinon 135mm",
+                                     "FILTER": "L", "EXPTIME": 5})
+        project = "97fcae827a9f"
+        accepted = "481536614589"
+        declined = "b9412d46f576"
+        targets = [
+            {"name": "m42 horse test mosaic",
+             "collab": {"project": project, "projectName": "m42 horse test mosaic",
+                        "task": declined}},
+            {"name": "m42 horse test mosaic",
+             "collab": {"project": project, "projectName": "m42 horse test mosaic",
+                        "task": accepted}},
+        ]
+        rigs = [
+            {"name": "FSQ85", "role": "master", "camera": "ZWO ASI6200MM Pro", "upload": None},
+            {"name": "Rokinon 135mm", "role": "follower", "camera": "ZWO ASI6200MC Pro",
+             "colour": True, "upload": None},
+        ]
+        logs: list[str] = []
+        up = AutoUploader(config, SimpleNamespace(
+            _ready=lambda: None,
+            status=lambda: {"task": {"id": accepted}}),
+            folder=tmp / "blank-queue", log=lambda message, level="info": logs.append(message))
+        report = up.backfill(targets=targets, rigs=rigs)
+        check(Path(report["root"]) == root, f"backfill scanned {report['root']}")
+        check(report["scanned"] == 2 and report["matched"] == 2 and report["queued"] == 1,
+              f"blank root found the frames ({report})")
+        queued = [item for item in up.items if item["path"].endswith("m42_P20_5s_26C_0001.fits")]
+        check(len(queued) == 1 and queued[0]["task"] == accepted and queued[0]["project"] == project,
+              "the duplicate name resolves to the current task, not the first stamp")
+        check(all(item["task"] != declined for item in up.items),
+              "the declined task was not guessed")
+        check(report["skippedBy"].get("follower") == 1
+              and not any(item["path"].endswith("L_5s_0001.fits") for item in up.items),
+              "the follower is still excluded")
+        check(any("scanned 2" in line and "queued 1" in line and str(root) in line for line in logs),
+              "the log names the root and the counts")
+
+        # No current task, and the header does not name one: do not pick a stamp.
+        up2 = AutoUploader(config, SimpleNamespace(_ready=lambda: None, status=lambda: {}),
+                           folder=tmp / "blank-queue-2",
+                           log=lambda message, level="info": logs.append(message))
+        report2 = up2.backfill(targets=targets, rigs=rigs)
+        check(report2["queued"] == 0 and report2["skippedBy"].get("ambiguous", 0) >= 1,
+              f"without an exact task the duplicate name is skipped ({report2['skippedBy']})")
+        check(any("ambiguous" in line for line in logs),
+              "the ambiguous folder is logged")
+    finally:
+        if previous is None:
+            os.environ.pop("ASTRO_DATA_DIR", None)
+        else:
+            os.environ["ASTRO_DATA_DIR"] = previous
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         units(Path(tmp))
         per_frame(Path(tmp))
         follower_and_backfill(Path(tmp))
+        blank_root_and_duplicate_name(Path(tmp))
         tree = os.environ.get("STARFRONT_SERVER_TREE")
         if tree:
             end_to_end(Path(tmp), Path(tree))

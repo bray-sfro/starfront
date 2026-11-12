@@ -848,17 +848,25 @@ class AutoUploader:
                 {k.lower(): v for k, v in (exc.headers or {}).items()}
 
     # -- lights that never got a PROJID -----------------------------------------
-    def _capture_root(self) -> Path | None:
-        if self.config is None:
-            return None
-        raw = ""
+    def _capture_root(self) -> Path:
+        """The same folder CaptureService writes into, blank setting included."""
+        from .capture import capture_root
+        return capture_root(self.config)
+
+    def _current_task_id(self) -> str:
+        """The task this PC is on, when the collab client knows it."""
+        client = self.client
+        if client is None:
+            return ""
+        status = getattr(client, "status", None)
         try:
-            raw = self.config.get("capture", "rootDirectory", "") or ""
-        except Exception:                              # noqa: BLE001
-            section = self.config.section("capture") if hasattr(self.config, "section") else {}
-            raw = str((section or {}).get("rootDirectory") or "")
-        text = str(raw or "").strip()
-        return Path(text).expanduser() if text else None
+            if callable(status):
+                task = (status() or {}).get("task") or {}
+                return str(task.get("id") or "")
+            task = getattr(client, "_task", None) or {}
+            return str(task.get("id") or "")
+        except Exception:                              # noqa: BLE001 - no task is not a guess
+            return ""
 
     def _target_rows(self) -> list[dict[str, Any]]:
         src = self.targets
@@ -893,31 +901,93 @@ class AutoUploader:
             })
         return rows
 
-    def _project_for(self, path: Path, header: dict[str, Any],
-                     targets: list[dict[str, Any]]) -> tuple[str, str] | None:
-        """The collaboration this file was shot for, from the target record.
+    @staticmethod
+    def _target_folder(path: Path, root: Path) -> str:
+        """The directory directly under the capture root: the target's folder."""
+        try:
+            relative = path.resolve().relative_to(root.resolve())
+        except ValueError:
+            return ""
+        return relative.parts[0] if relative.parts else ""
 
-        The folder name is how a target is recognised. Which camera shot the
-        file is a separate question and is not answered here.
+    @staticmethod
+    def _stamp_of(target: dict[str, Any]) -> tuple[str, str]:
+        stamp = target.get("collab") or {}
+        return str(stamp.get("project") or ""), str(stamp.get("task") or "")
+
+    def _folder_hits(self, folder: str,
+                     targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Targets whose collab stamp is exactly this capture folder.
+
+        Exact means the folder equals the target name, the stamp's project
+        name, the project id, or the task id — compared as written and as
+        `clean_target` writes a folder. A parent directory that merely
+        contains the name is not a match, and the first of two names is
+        not either.
         """
         from .capture import clean_target
-        keys = {part.name.lower() for part in path.parents}
-        keys |= {clean_target(part.name).lower() for part in path.parents}
-        for raw in (header.get("TARGET"), str(header.get("OBJECT") or "").split(" - ")[0]):
-            text = str(raw or "").strip()
-            if text:
-                keys.add(text.lower())
-                keys.add(clean_target(text).lower())
+        wanted = folder.strip().lower()
+        if not wanted:
+            return []
+        hits = []
         for target in targets:
-            name = str(target.get("name") or "")
-            stamp = target.get("collab") or {}
-            project = str(stamp.get("project") or "")
-            task = str(stamp.get("task") or "")
-            if not name or not project or not task:
+            project, task = self._stamp_of(target)
+            if not project or not task:
                 continue
-            if {name.lower(), clean_target(name).lower()} & keys:
-                return project, task
-        return None
+            stamp = target.get("collab") or {}
+            tokens: set[str] = set()
+            for text in (target.get("name"), stamp.get("projectName"), project, task):
+                raw = str(text or "").strip()
+                if not raw:
+                    continue
+                tokens.add(raw.lower())
+                tokens.add(clean_target(raw).lower())
+            if wanted in tokens:
+                hits.append(target)
+        return hits
+
+    def _project_for(self, path: Path, header: dict[str, Any],
+                     targets: list[dict[str, Any]], root: Path
+                     ) -> tuple[tuple[str, str] | None, str]:
+        """The one stamp for this file, or a reason it was not matched.
+
+        A header `COLTASK` or `PROJID` that names exactly one stamp wins.
+        Otherwise the capture folder must name exactly one stamp. Two
+        targets with the same name stay unresolved unless the task this PC
+        is on is exactly one of them. Anything still shared is skipped.
+        """
+        header_task = str(header.get("COLTASK") or "").strip()
+        header_project = str(header.get("PROJID") or "").strip()
+        if header_task or header_project:
+            exact = []
+            for target in targets:
+                project, task = self._stamp_of(target)
+                if not project or not task:
+                    continue
+                if header_task and task == header_task:
+                    exact.append(target)
+                elif not header_task and project == header_project:
+                    exact.append(target)
+            if len(exact) == 1:
+                return self._stamp_of(exact[0]), ""
+            if len(exact) > 1:
+                return None, "ambiguous"
+
+        hits = self._folder_hits(self._target_folder(path, root), targets)
+        if len(hits) == 1:
+            return self._stamp_of(hits[0]), ""
+        if len(hits) > 1:
+            current = self._current_task_id()
+            narrowed = [target for target in hits
+                        if self._stamp_of(target)[1] == current] if current else []
+            if len(narrowed) == 1:
+                return self._stamp_of(narrowed[0]), ""
+            ids = ", ".join(sorted({self._stamp_of(target)[1] for target in hits}))
+            folder = self._target_folder(path, root)
+            self._ambiguous = getattr(self, "_ambiguous", {})
+            self._ambiguous.setdefault(folder, ids)
+            return None, "ambiguous"
+        return None, "no target"
 
     def backfill(self, root: Path | str | None = None,
                  targets: list[dict[str, Any]] | None = None,
@@ -934,25 +1004,39 @@ class AutoUploader:
         rows = list(targets) if targets is not None else self._target_rows()
         known = list(rigs) if rigs is not None else self._rig_rows()
         queued: list[str] = []
-        skipped: list[str] = []
-        if base is None or not Path(base).is_dir():
-            return {"queued": 0, "skipped": 0, "queuedNames": [], "skippedNames": []}
-        paths = sorted(Path(base).rglob("*.fit*"))
+        skipped_names: dict[str, list[str]] = {}
+        self._ambiguous = {}
+        scanned = matched = 0
+
+        def skip(reason: str, name: str) -> None:
+            skipped_names.setdefault(reason, []).append(name)
+
+        if not base.is_dir():
+            self._say(f"Auto-upload: backfill root {base}: not a folder, "
+                      "scanned 0, matched 0, queued 0, skipped 0")
+            return {"root": str(base), "scanned": 0, "matched": 0, "queued": 0,
+                    "skipped": 0, "skippedBy": {}, "queuedNames": [],
+                    "skippedNames": []}
+        paths = sorted(path for path in base.rglob("*.fit*") if path.is_file())
+        scanned = len(paths)
         for path in paths:
-            if not path.is_file():
-                continue
             try:
                 header = read_header(path)
             except Exception:                          # noqa: BLE001 - skip a bad file
+                skip("bad header", path.name)
                 continue
             kind = str(header.get("IMAGETYP") or "").strip().lower()
             if not kind.startswith("light"):
+                skip("not a light", path.name)
                 continue
             if str(header.get("PROJID") or "").strip():
+                skip("has PROJID", path.name)
                 continue
-            found = self._project_for(path, header, rows)
+            found, why = self._project_for(path, header, rows, base)
             if found is None:
+                skip(why or "no target", path.name)
                 continue
+            matched += 1
             project, task = found
             ident = identity_from_header(header)
             for rig in known:
@@ -967,19 +1051,33 @@ class AutoUploader:
                             ident["role"] = ident.get("role") or "follower"
                     break
             if not allows_upload(ident, strict=True):
-                skipped.append(path.name)
+                skip("follower", path.name)
                 continue
             if self.add(path, project, "light", task,
                         rig=str(ident.get("name") or ""),
                         filter_name=str(header.get("FILTER") or ""),
                         identity=ident):
                 queued.append(path.name)
-        if queued or skipped:
-            self._say(f"Auto-upload: backfill queued {len(queued)} light(s)"
-                      + (f", skipped {len(skipped)} follower frame(s)" if skipped else ""))
+            else:
+                skip("already queued", path.name)
+        skipped = sum(len(names) for names in skipped_names.values())
+        reason_bits = [f"{reason} {len(names)}"
+                       for reason, names in sorted(skipped_names.items())]
+        ambiguous = getattr(self, "_ambiguous", {})
+        if ambiguous:
+            detail = "; ".join(f"{folder} ({ids})" for folder, ids in sorted(ambiguous.items()))
+            reason_bits.append(f"ambiguous folders: {detail}")
+        self._say(
+            f"Auto-upload: backfill root {base}: scanned {scanned}, "
+            f"matched {matched}, queued {len(queued)}, skipped {skipped}"
+            + (f" ({', '.join(reason_bits)})" if reason_bits else ""))
+        if queued:
             self._log_queue()
-        return {"queued": len(queued), "skipped": len(skipped),
-                "queuedNames": queued, "skippedNames": skipped}
+        return {"root": str(base), "scanned": scanned, "matched": matched,
+                "queued": len(queued), "skipped": skipped,
+                "skippedBy": {reason: len(names) for reason, names in skipped_names.items()},
+                "queuedNames": queued,
+                "skippedNames": [name for names in skipped_names.values() for name in names]}
 
     # -- what the Collab tab shows ------------------------------------------------
     def status(self) -> dict[str, Any]:
