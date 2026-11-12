@@ -725,13 +725,6 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # has not returned in this long is treated as hung - 2026-10-14 02:24
         # was a download that never came back, and nothing timed it out.
         "downloadTimeoutSeconds": 120.0,
-        # How long one ImageReady poll may sit in the driver. A poll that
-        # overruns is quarantined; it is not cancelled, and nothing else is
-        # sent to that camera until the call returns.
-        "imageReadyTimeoutSeconds": 15.0,
-        # After a timed-out camera call, how long a reconnect may wait for
-        # that call to actually return before it refuses to touch the camera.
-        "cameraQuarantineSeconds": 5.0,
         # Slack on top of exposure + hungSeconds + downloadTimeoutSeconds
         # before a telescope's frame is given up on and its thread abandoned.
         "slotGraceSeconds": 60.0,
