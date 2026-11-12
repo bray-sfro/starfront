@@ -61,6 +61,9 @@ namespace Starfront.Collab.Services {
         /// <summary>The collaboration the last light belonged to, when it was one of ours.</summary>
         public string LastProject { get; private set; } = "";
 
+        /// <summary>Where each saved collaboration light is handed, the moment it is saved. Null sends nothing.</summary>
+        public Upload.LightUploader Uploader { get; set; }
+
         public void Register(PanelContext context) => byTarget[context.TargetName] = context;
 
         public void Forget(string targetName) => byTarget.TryRemove(targetName, out _);
@@ -76,6 +79,8 @@ namespace Starfront.Collab.Services {
                 if (context != null && args.Image.MetaData.Image.ImageType == "LIGHT") {
                     args.Image.MetaData.GenericHeaders.Add(new StringMetaDataHeader("STARFRNT", context.ProjectId, "Starfront collaboration"));
                     args.Image.MetaData.GenericHeaders.Add(new IntMetaDataHeader("SFPANEL", context.PanelNumber, "Starfront panel number"));
+                    // The key the server's upload check reads (Starfront writes the same).
+                    args.Image.MetaData.GenericHeaders.Add(new StringMetaDataHeader("PROJID", context.ProjectId, "Starfront collaboration id"));
                 }
             } catch (Exception ex) {
                 Logger.Debug($"Starfront: could not stamp the frame - {ex.Message}");
@@ -119,6 +124,13 @@ namespace Starfront.Collab.Services {
                     Logger.Warning($"Starfront: {context.TargetName} {filter} +{seconds:0}s not credited - HFR {measured:0.00}\" is over the "
                                    + $"project's {limit:0.0}\" limit");
                     return;
+                }
+
+                // Straight onto the upload queue: this only appends to a list and
+                // wakes the uploader's own thread, so the save never waits on it.
+                var saved = args.PathToImage;
+                if (Uploader != null && saved != null && saved.IsFile) {
+                    Uploader.Enqueue(saved.LocalPath, context.ProjectId, context.TaskId);
                 }
 
                 ledger.Credit(night, context.ProjectId, context.TaskId, context.PanelNumber.ToString(), filter, seconds,

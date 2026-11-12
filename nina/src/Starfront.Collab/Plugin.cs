@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using System.ComponentModel.Composition;
 using System.Diagnostics;
 using System.Windows.Input;
@@ -9,6 +10,7 @@ using NINA.Plugin;
 using NINA.Plugin.Interfaces;
 using NINA.Profile.Interfaces;
 using NINA.WPF.Base.Interfaces.Mediator;
+using Starfront.Collab.Server;
 using Starfront.Collab.Services;
 using Starfront.Collab.Settings;
 using Starfront.Collab.Ui;
@@ -61,6 +63,9 @@ namespace Starfront.Collab {
             SignOutCommand = new AsyncRelayCommand(SignOutAsync, () => !Runtime.Session.Busy);
             RefreshCommand = new AsyncRelayCommand(RefreshAsync, () => !Runtime.Session.Busy);
             JoinDiscordCommand = new CommunityToolkit.Mvvm.Input.RelayCommand(OpenDiscord);
+            RegisterScopeCommand = new CommunityToolkit.Mvvm.Input.RelayCommand(OpenRegister);
+            ScopeDirectory.Changed += () => Dispatch.OnUi(LoadScopeChoices);
+            LoadScopeChoices();
             Runtime.Session.PropertyChanged += (_, e) => {
                 if (e.PropertyName == nameof(Services.StarfrontSession.Busy)) {
                     Ui.Dispatch.OnUi(() => {
@@ -95,6 +100,25 @@ namespace Starfront.Collab {
         public AsyncRelayCommand SignOutCommand { get; }
         public AsyncRelayCommand RefreshCommand { get; }
         public ICommand JoinDiscordCommand { get; }
+        public ICommand RegisterScopeCommand { get; }
+
+        /// <summary>The scope dropdown: a blank row, then the server's scopes, bound ones first.</summary>
+        public ObservableCollection<ScopeChoice> ScopeChoices { get; } = new();
+
+        private void LoadScopeChoices() {
+            var chosen = ScopeDirectory.Choices();
+            ScopeChoices.Clear();
+            ScopeChoices.Add(new ScopeChoice { Id = "", DisplayName = "Let the server use this profile's bind", Bound = false });
+            foreach (var row in chosen) ScopeChoices.Add(row);
+        }
+
+        private static void OpenRegister() {
+            try {
+                Process.Start(new ProcessStartInfo(ScopeDirectory.RegisterUrl) { UseShellExecute = true });
+            } catch (Exception ex) {
+                Logger.Error(ex);
+            }
+        }
 
         private async Task SignInAsync() {
             try {

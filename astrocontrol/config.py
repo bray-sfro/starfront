@@ -914,6 +914,11 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "autoUploadMbit": 0.0,
         # Only between dawn and dusk at this site, never while imaging.
         "autoUploadDaytimeOnly": False,
+        # File by the scope this agent is bound to (0.2.55). On, the collab
+        # tab picks a scope id per telescope and uploads send it. Off is the
+        # previous path: no scope id, and the server keeps the telescope-name
+        # fallback until this is switched on. Missing means on.
+        "registeredScopes": True,
     },
     # Telling somebody who is not in the room. A night that dies at one in the
     # morning is a night lost entirely unless something says so.

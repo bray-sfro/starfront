@@ -221,6 +221,10 @@ namespace Starfront.Collab.Server {
         [JsonProperty("name")] public string Name { get; set; } = "";
         [JsonProperty("protocol")] public int Protocol { get; set; }
         [JsonProperty("serverTime")] public double ServerTime { get; set; }
+        /// <summary>Scopes this agent may file under, when the server sends them with hello.</summary>
+        [JsonProperty("scopes")] public List<ScopeInfo> Scopes { get; set; } = new();
+        /// <summary>The name the server shows for this agent. A rename changes this, not the stored scope id.</summary>
+        [JsonProperty("displayName")] public string DisplayName { get; set; } = "";
     }
 
     public class EnrolledAgent {
