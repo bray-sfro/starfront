@@ -1869,6 +1869,17 @@ table.survey-fields tr:hover td { background: var(--panel-2); }
 .scope-filter-row input { margin-top: 0; font-family: var(--mono, monospace); font-size: 12.5px; }
 .scope-filter-row .wheel { font-size: 11.5px; color: var(--muted); }
 
+/* Check filters from the stars. */
+.filter-check { margin: 4px 0 16px; }
+.filter-check-head { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.filter-check table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 6px; }
+.filter-check th, .filter-check td { text-align: left; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+.filter-check th { font-weight: 600; color: var(--muted); font-size: 11px; }
+.filter-check td.num { font-family: var(--mono, monospace); }
+.filter-check tr.mismatch td { color: var(--bad); }
+.filter-check tr.probable-mismatch td, .filter-check tr.uncertain td.verdict { color: var(--warn, #c90); }
+.filter-check tr.match td.verdict { color: var(--good, #4a4); }
+
 #settingsDialog { width: min(620px, 94vw); }
 #settingsDialog .modal-body { max-height: 78vh; overflow-y: auto; scrollbar-width: thin; }
 #settingsDialog h3 {

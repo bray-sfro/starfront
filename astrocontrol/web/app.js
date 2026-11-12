@@ -4741,6 +4741,107 @@ function fillFocusFilter(selected) {
   select.value = names.includes(wanted) ? wanted : '';
 }
 
+/* Check filters from the stars (filterid.py): which filter each telescope's
+   star colours and brightness look like, against what it is set to. Only a
+   suggestion; a "Use" button sets it through the same path as typing it. */
+let filterCheckTimer = null;
+const FILTER_CHECK_VERDICTS = {
+  match: 'matches', mismatch: 'MISMATCH — check the drawer',
+  'probable-mismatch': 'probably not what is set', uncertain: 'not sure',
+  unset: 'nothing set', 'unknown-setting': 'set to something it cannot test',
+};
+
+function bindFilterCheck() {
+  const button = $('filterCheckBtn');
+  if (!button) return;
+  button.addEventListener('click', async () => {
+    try {
+      const started = await send('/api/telescopes/filters/check', 'POST', { mode: 'auto' });
+      toast(started.exposing ? 'Taking a short frame on each camera to check the filters'
+        : 'Checking the filters on the latest frames', 'info');
+    } catch { /* send() already said */ }
+    pollFilterCheck();
+  });
+  $('filterCheckAbort').addEventListener('click', async () => {
+    try { await send('/api/telescopes/filters/check/abort', 'POST', {}); } catch { /* said */ }
+  });
+  pollFilterCheck();
+}
+
+async function pollFilterCheck() {
+  clearTimeout(filterCheckTimer);
+  let status;
+  try { status = await api('/api/telescopes/filters/check'); } catch { return; }
+  renderFilterCheck(status);
+  if (status.running) filterCheckTimer = setTimeout(pollFilterCheck, 2000);
+}
+
+function renderFilterCheck(status) {
+  const line = $('filterCheckStatus');
+  const host = $('filterCheckResult');
+  if (!line || !host) return;
+  $('filterCheckBtn').disabled = !!status.running;
+  $('filterCheckAbort').hidden = !status.running;
+  line.textContent = status.running ? (status.message || 'Checking…')
+    : (status.error ? `Failed: ${status.error}` : '');
+  host.innerHTML = '';
+  const result = status.result;
+  const rows = result ? Object.values(result.telescopes || {}) : [];
+  if (!rows.length) return;
+  const when = document.createElement('p');
+  when.className = 'small muted';
+  when.textContent = `${result.trigger === 'night' ? 'Start-of-night check' : 'Checked'} at `
+    + new Date(result.when * 1000).toLocaleTimeString();
+  host.appendChild(when);
+  const table = document.createElement('table');
+  const head = table.createTHead().insertRow();
+  for (const title of ['Telescope', 'Looks like', 'Sure', 'Next best', 'Colour term', 'Zero point', 'Stars', 'Set to', '', ''])
+    head.appendChild(Object.assign(document.createElement('th'), { textContent: title }));
+  const body = table.createTBody();
+  for (const row of rows) {
+    const tr = body.insertRow();
+    tr.className = row.verdict || '';
+    const cell = (text, cls) => {
+      const td = tr.insertCell();
+      td.textContent = text == null ? '—' : String(text);
+      if (cls) td.className = cls;
+      return td;
+    };
+    cell(row.name);
+    if (row.error) {
+      const td = cell(row.error); td.colSpan = 9;
+      continue;
+    }
+    cell(`${row.filterName} (${row.filter})`);
+    cell(`${Math.round(row.confidence * 100)}%`, 'num');
+    cell(row.runnerUp ? `${row.runnerUp} ${Math.round(row.runnerUpConfidence * 100)}%` : null, 'num');
+    cell(row.fit ? (row.fit.slope >= 0 ? '+' : '') + row.fit.slope.toFixed(2) : null, 'num');
+    cell(row.fit ? (-row.fit.zp).toFixed(2) : null, 'num');
+    cell(row.stars, 'num');
+    cell(row.configured || 'nothing');
+    cell(FILTER_CHECK_VERDICTS[row.verdict] || row.verdict, 'verdict');
+    const act = tr.insertCell();
+    if (row.verdict !== 'match' && row.filter) {
+      const use = document.createElement('button');
+      use.type = 'button';
+      use.className = 'btn ghost';
+      use.textContent = `Use ${row.filter}`;
+      use.title = `Set ${row.name} to ${row.filterName}`;
+      use.addEventListener('click', async () => {
+        try {
+          const done = await send('/api/telescopes/filters/check/apply', 'POST',
+            { filters: { [row.rig]: row.filter } });
+          toast(`${row.name}: ${row.filter} in the light path`, 'success');
+          renderFilterCheck(done.check || status);
+          renderScopeFilters();
+        } catch { /* send() already said */ }
+      });
+      act.appendChild(use);
+    }
+  }
+  host.appendChild(table);
+}
+
 /** The "in the light path now" list follows whatever is selected above. */
 /* What is in each telescope: one row per telescope on the Filters page, a
    box to type the filter into, saved the moment the box is left.  This is
@@ -6629,6 +6730,7 @@ function init() {
   buildConnectRows();
   bindAsk();
   bindFilters();
+  bindFilterCheck();
   bindControls();
   initViewer();
   applyOptionalTabs();

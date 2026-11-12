@@ -171,6 +171,11 @@ class CaptureService:
     #: The PC's auto-upload queue, set once by the program for every rig.
     shared_uploader: Any = None
 
+    #: Called as hook(capture, record) after every light is stored - the
+    #: filter check's start-of-night look. A hook must be quick and must not
+    #: raise; a failure is swallowed so it can never stop a capture.
+    light_hooks: list[Any] = []
+
     # A frame taken without saving outlives the cache as a reduced copy, so
     # the focus and centring frames of a night can still be looked at. The
     # viewer draws a whole frame at about this size anyway; only the sharp
@@ -299,6 +304,9 @@ class CaptureService:
         # for the activity line at the top of the screen.
         self._frame_type = ""
         self._current_filter = ""
+        # The last photometric filter check on this camera (filterid), so the
+        # night's later lights can carry FILTDET/FILTCONF beside FILTER.
+        self.detected_filter: dict[str, Any] | None = None
 
     # -- where frames go ---------------------------------------------------
     @staticmethod
@@ -1211,6 +1219,18 @@ class CaptureService:
             header["PROJECT"] = (context.get("collabProjectName"), "collaboration")
             header["PROJID"] = (context.get("collabProject"), "collaboration id")
             header["COLTASK"] = (context.get("collabTask"), "collaboration task id")
+        # What tonight's photometric check saw behind this camera. Its own
+        # keywords: FILTER stays whatever the operator set, and a check made
+        # before the filter setting changed says nothing about the new one.
+        detected = self.detected_filter
+        if frame_type == "light" and detected:
+            with contextlib.suppress(Exception):
+                from .filterid import header_cards
+                from .filters import same as same_filter
+                if not same_filter(detected.get("configured") or "", metadata.get("filter") or ""):
+                    raise ValueError("the filter setting changed since the check")
+                header.update(header_cards(
+                    detected, self.night_name(datetime.fromtimestamp(started))))
         return header
 
     # -- the camera's usual gain/offset (0.2.53a) ---------------------------
@@ -1365,6 +1385,9 @@ class CaptureService:
         if frame_type == "light":
             self._queue_calibration(record, camera, metadata)
             self._queue_stack(record, frame, header, camera)
+            for hook in list(self.light_hooks):
+                with contextlib.suppress(Exception):
+                    hook(self, record)
             self._queue_upload(record, camera)
         return record
 

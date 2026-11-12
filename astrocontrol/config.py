@@ -814,6 +814,11 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "overlap": 0.08,           # an object in a seam is a missed discovery
         "filter": "",
     },
+    # Which filter is in each drawer, from the stars (filterid.py). Only ever
+    # suggests: the filter setting changes when the operator accepts.
+    "filterCheck": {
+        "autoAtStart": True,       # look at the first lights of each night's sequence
+    },
     "solver": {
         "astapPath": "",           # blank means "look in the usual places"
         "searchRadius": 15.0,      # degrees to search around the hint

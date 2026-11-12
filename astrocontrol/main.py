@@ -29,6 +29,7 @@ from . import autorestart
 from .tasks import DeviceTasks, TaskBusy, TaskFailed
 from . import filters
 from . import identify
+from . import filterid
 from . import ninaimport
 from . import warnings
 from .capture import clean_target
@@ -115,6 +116,15 @@ pairing = identify.PairingCheck(rigs)
 # that is driving them, or the check carries on exposing into the shutdown
 # and racing the SDK calls that are putting the observatory to bed.
 sequencer.extra_aborts.append(pairing.abort)
+
+# Which filter is in which drawer, from the stars: a RASA's filter is changed
+# by hand and nothing reports it. Suggests only - the setting changes when a
+# person presses the button. At the start of a night it looks at the first
+# lights the sequence takes anyway; it never exposes or moves anything then.
+filter_check = filterid.FilterCheck(rigs, config,
+                                    sequence_running=lambda: sequencer.running)
+filterid.install_light_hook(filter_check)
+sequencer.extra_aborts.append(filter_check.abort)
 
 # Picking imaging tasks up from a collaboration server. Started either way: it
 # does nothing at all until a server and a token are configured, and it can
@@ -1220,6 +1230,18 @@ class IdentifyRequest(BaseModel):
     exposure: float | None = Field(default=None, gt=0, le=120)
 
 
+class FilterCheckRequest(BaseModel):
+    rigs: list[str] = Field(default_factory=list, max_length=8)
+    #: auto: reuse recent lights, else take frames; reuse; expose
+    mode: str = Field(default="auto", pattern="^(auto|reuse|expose)$")
+    exposure: float | None = Field(default=None, gt=0, le=60)
+
+
+class FilterCheckApply(BaseModel):
+    #: telescope id -> the filter to set (what the check found, normally)
+    filters: dict[str, str] = Field(default_factory=dict)
+
+
 class GuideRequest(BaseModel):
     settlePixels: float = Field(default=1.5, gt=0, le=50)
     settleTime: float = Field(default=8.0, ge=0, le=600)
@@ -1632,6 +1654,59 @@ def set_telescope_filters(body: TelescopeFiltersRequest) -> dict[str, Any]:
                 collab_client.hello()
         threading.Thread(target=tell, name="collab-filters", daemon=True).start()
     return {"filters": saved}
+
+
+# ---------------------------------------------------------------------------
+# Which filter is in which telescope, from the stars
+# ---------------------------------------------------------------------------
+
+@app.get("/api/telescopes/filters/check")
+def filter_check_status() -> dict[str, Any]:
+    return filter_check.status()
+
+
+@app.post("/api/telescopes/filters/check")
+def filter_check_start(body: FilterCheckRequest) -> dict[str, Any]:
+    """Measure each telescope's stars against Gaia and say which filter they
+    look like. Reuses lights from the last 45 minutes when every telescope has
+    one; otherwise takes one short frame on every camera at once, which is
+    refused while a sequence owns the cameras. Changes no setting."""
+    if pairing.running:
+        raise HTTPException(status_code=400, detail="a focuser check is running")
+    free = not sequencer.owns_the_cameras
+    if free and body.mode != "reuse":
+        for rig in rigs.all:
+            if rig.focuser.running:
+                raise HTTPException(status_code=400,
+                                    detail=f"{rig.name} is focusing; wait for it to finish")
+    started = _guard(filter_check.start, body.rigs or None, body.mode, body.exposure, free)
+    if started.get("exposing"):
+        sequencer.cancel_warming("a filter check was started")
+    return {"started": True, **started}
+
+
+@app.post("/api/telescopes/filters/check/abort")
+def filter_check_abort() -> dict[str, Any]:
+    filter_check.abort()
+    return {"aborted": True}
+
+
+@app.post("/api/telescopes/filters/check/apply")
+def filter_check_apply(body: FilterCheckApply) -> dict[str, Any]:
+    """Set the filters the operator accepted, through the same path as typing
+    them in. Only the telescopes named are touched."""
+    if not body.filters:
+        raise HTTPException(status_code=400, detail="no filters given")
+    for rig_id in body.filters:
+        _rig(rig_id)
+    outcome = _guard(filter_check.apply, body.filters,
+                     lambda chosen: set_telescope_filters(TelescopeFiltersRequest(filters=chosen)))
+    for rig_id, letter in (outcome.get("filters") or {}).items():
+        with contextlib.suppress(Exception):
+            capture = rigs.get(rig_id).capture
+            if capture.detected_filter:
+                capture.detected_filter = {**capture.detected_filter, "configured": letter}
+    return {**outcome, "check": filter_check.status()}
 
 
 @app.post("/api/camera/cooler")
@@ -2655,9 +2730,98 @@ def _apply_task_allocation(entry_id: str, task: dict[str, Any],
         allocation.append({"name": name,
                            "exposure": float(item.get("exposure") or 0.0),
                            "count": count})
-    result = _guard(plan.set_filters, entry_id, allocation, _share_count(target),
-                    1e12, _overheads())
-    return bool(result.get("clamped"))
+    # A mount carrying several telescopes, each with its own filter fitted in
+    # a drawer (a triple RASA: R, G and B), is one rig to the server and is
+    # dealt one filter a night for the lot. Each telescope with a drawer is
+    # given its own filter here - at the project's sub length for it, sized to
+    # the same visit - rather than following the master's rows, which shot G
+    # and B at R's sub length and left the collaboration block showing R only.
+    own = _drawer_allocations(task)
+    master_id = rigs.master.id
+    if master_id in own:
+        allocation = own.pop(master_id)
+    overheads = _overheads()
+    panels = _share_count(target)
+    result = _guard(plan.set_filters, entry_id, allocation, panels, 1e12, overheads)
+    clamped = bool(result.get("clamped"))
+    for rig in rigs.all:
+        if rig.id == master_id:
+            continue
+        if rig.id in own:
+            answer = _guard(plan.set_filters, entry_id, own[rig.id], panels, 1e12,
+                            overheads, rig.id)
+            clamped = clamped or bool(answer.get("clamped"))
+        else:
+            # A telescope with a wheel follows the master, as it always has.
+            with contextlib.suppress(Exception):
+                plan.clear_rig_filters(entry_id, rig.id)
+    return clamped
+
+
+def _visit_min_frames(task: dict[str, Any]) -> int:
+    """The fewest frames the project counts as a visit to one panel."""
+    status = collab_client.status()
+    wants = (status.get("requirementsByProject") or {}).get(str(task.get("project") or ""))
+    if wants is None:
+        wants = task.get("requirements") or {}
+    try:
+        return max(1, int((wants or {}).get("minFramesPerVisit") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _drawer_allocations(task: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Each drawer telescope's own share of a task, keyed by telescope id.
+
+    Only on a mount with more than one telescope, and only for telescopes
+    whose filter is fitted by hand (no wheel): those cannot shoot whatever the
+    server names for the mount, only what is in the drawer. Each gets its own
+    filter at the task's sub length for that filter. With a visit, the frames
+    fill the same time on each panel as the server's visit (never fewer than
+    the project's minimum per visit, which is what makes a panel stackable);
+    without one, the project's full depth for that filter. A telescope whose
+    filter the project does not want sits the chunk out (an empty list),
+    rather than shooting frames the server would refuse.
+    """
+    everyone = rigs.all
+    if len(everyone) < 2:
+        return {}
+    fitted = plans.fitted_filters(everyone)
+    if not fitted:
+        return {}
+    visit = task.get("visit") or {}
+    tonight = {collab._key(name): int(count or 0)
+               for name, count in (visit.get("frames") or {}).items()}
+    rows = {}
+    for item in task.get("filters") or []:
+        with contextlib.suppress(Exception):
+            entry = collab.FilterTask.read(item)
+            if entry.exposure > 0:
+                rows.setdefault(collab._key(entry.filter), (item, entry))
+    seconds = float(visit.get("seconds") or 0.0)
+    if tonight and seconds <= 0:
+        # An older visit with no seconds: the time the named filter takes.
+        for key, count in tonight.items():
+            if key in rows:
+                seconds = max(seconds, count * rows[key][1].exposure)
+    least = _visit_min_frames(task)
+    out: dict[str, list[dict[str, Any]]] = {}
+    for rig_id, name in fitted.items():
+        found = rows.get(collab._key(name))
+        if found is None:
+            out[rig_id] = []
+            continue
+        item, entry = found
+        if tonight:
+            if collab._key(name) in tonight:
+                count = tonight[collab._key(name)]
+            else:
+                count = max(least, int(seconds // entry.exposure)) if seconds > 0 else 0
+        else:
+            count = entry.frames()
+        out[rig_id] = [{"name": item.get("filter") or entry.filter,
+                        "exposure": entry.exposure, "count": count}]
+    return out
 
 
 def _share_count(target: dict[str, Any]) -> int:
@@ -5053,9 +5217,29 @@ def _repair_collab_allocation(entry: dict[str, Any],
         _resync_task(task)
         return next((e for e in plan.raw()["entries"] if e["id"] == entry["id"]),
                     entry)
-    if any(int(f.get("count") or 0) > 0 for f in (entry.get("filters") or [])):
+    # A drawer telescope on a multi-telescope mount carries its own share of
+    # the chunk (see `_drawer_allocations`). A plan written before that -
+    # every follower mirroring the master's one filter - is brought into
+    # step here, once, without waiting for the server's next deal.
+    drawers = _drawer_allocations(task)
+    own = entry.get("rigFilters") or {}
+    stale = any(rig_id != rigs.master.id and rig_id not in own for rig_id in drawers)
+    planned = any(int(f.get("count") or 0) > 0
+                  for rows in [entry.get("filters") or [], *own.values()]
+                  for f in (rows or []))
+    if planned and not stale:
+        return entry
+    if (drawers and len(drawers) == len(rigs.all)
+            and not any(drawers.values()) and not stale):
+        # Every telescope's drawer holds a filter the project does not take:
+        # nothing to plan, and nothing to put back on every read.
         return entry
     _apply_task_allocation(entry["id"], task, target)
+    if stale and planned:
+        rigs.log(f"Collaboration: {entry['name']}: each telescope now shoots "
+                 "the filter in its own drawer", "info")
+        return next((e for e in plan.raw()["entries"] if e["id"] == entry["id"]),
+                    entry)
     rigs.log(f"Collaboration: {entry['name']} had no frames planned; the "
              "project's depth has been put back on every panel", "warn")
     return next((e for e in plan.raw()["entries"] if e["id"] == entry["id"]),
@@ -5345,8 +5529,9 @@ def get_plan(date: str | None = Query(default=None)) -> dict[str, Any]:
         # its slowest telescope's allocation costs — not the sum of them.
         used = plans.entry_seconds(entry, rig_ids, master_id, info["panels"],
                                    overheads)
-        # A follower with a filter in its drawer is shown shooting the
-        # master's frames through that filter, which is what it will do.
+        # A follower with a filter in its drawer is shown shooting what it
+        # will shoot: its own share on a collaboration chunk, otherwise the
+        # master's frames through that filter.
         fitted = plans.fitted_filters(rigs.all)
         allocations = {rig_id: plans.allocation_for(entry, rig_id, master_id, fitted)
                        for rig_id in rig_ids}

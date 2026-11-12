@@ -293,11 +293,26 @@ class CollabClient:
         return names, bandpasses
 
     def _default_exposures(self) -> dict[str, float]:
+        """The sub length of every filter on the mount, master first.
+
+        Every telescope's, not only the master's: a triple RASA with R, G
+        and B in three drawers used to tell the server its R length alone,
+        and G and B were then dealt at a fallback that no dark matched.
+        Where two telescopes carry the same filter the master's length wins,
+        then the first follower's.
+        """
         from . import calibrating
-        try:
-            return calibrating.default_exposures(self.rigs.master, self.config)
-        except Exception:                          # noqa: BLE001 - never fatal
-            return {}
+        table: dict[str, float] = {}
+        everyone = [self.rigs.master] + [rig for rig in self.rigs.all
+                                         if rig is not self.rigs.master]
+        for rig in everyone:
+            try:
+                own = calibrating.default_exposures(rig, self.config)
+            except Exception:                      # noqa: BLE001 - never fatal
+                continue
+            for name, seconds in own.items():
+                table.setdefault(name, seconds)
+        return table
 
     def _hours_from_plan(self) -> float | None:
         if self.hours_hint is None:

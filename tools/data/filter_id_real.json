@@ -1,0 +1,332 @@
+{
+ "2026-03-28markarian_RASA1_2026-03-29_00-55-46__-5.00_300.00s_0": {
+  "colourRange": [
+   0.29,
+   1.95
+  ],
+  "curvature": 0.24,
+  "hfr": 2.523,
+  "scatter": 0.054,
+  "slope": -0.272,
+  "slopeError": 0.012,
+  "slopeQuadratic": -0.308,
+  "stars": 248,
+  "zp": -15.86,
+  "zpError": 0.003
+ },
+ "2026-03-28markarian_RASA2_2026-03-29_00-57-59__-5.00_300.00s_0": {
+  "colourRange": [
+   0.29,
+   2.14
+  ],
+  "curvature": 0.2,
+  "hfr": 1.728,
+  "scatter": 0.045,
+  "slope": -0.284,
+  "slopeError": 0.009,
+  "slopeQuadratic": -0.293,
+  "stars": 414,
+  "zp": -16.463,
+  "zpError": 0.002
+ },
+ "2026-03-28markarian_RASA3_2026-03-29_00-54-53__-5.00_300.00s_0": {
+  "colourRange": [
+   0.29,
+   1.95
+  ],
+  "curvature": 0.22,
+  "hfr": 4.392,
+  "scatter": 0.047,
+  "slope": -0.252,
+  "slopeError": 0.012,
+  "slopeQuadratic": -0.278,
+  "stars": 180,
+  "zp": -16.552,
+  "zpError": 0.003
+ },
+ "2026-08-27brg_RASA1_2026-08-27_23-36-27__29.10_2.00s_0388.fits": {
+  "colourRange": [
+   0.24,
+   2.52
+  ],
+  "curvature": 0.05,
+  "hfr": 2.896,
+  "scatter": 0.12,
+  "slope": 0.948,
+  "slopeError": 0.018,
+  "slopeQuadratic": 0.931,
+  "stars": 106,
+  "zp": -18.911,
+  "zpError": 0.008
+ },
+ "2026-08-27brg_RASA1_2026-08-27_23-36-58__29.10_2.00s_0399.fits": {
+  "colourRange": [
+   0.24,
+   2.52
+  ],
+  "curvature": 0.08,
+  "hfr": 3.019,
+  "scatter": 0.092,
+  "slope": 0.935,
+  "slopeError": 0.018,
+  "slopeQuadratic": 0.908,
+  "stars": 102,
+  "zp": -18.924,
+  "zpError": 0.008
+ },
+ "2026-08-27brg_RASA2_2026-08-27_23-36-27__29.10_2.00s_0382.fits": {
+  "colourRange": [
+   0.24,
+   1.74
+  ],
+  "curvature": 0.19,
+  "hfr": 2.29,
+  "scatter": 0.073,
+  "slope": -0.218,
+  "slopeError": 0.017,
+  "slopeQuadratic": -0.208,
+  "stars": 144,
+  "zp": -18.909,
+  "zpError": 0.006
+ },
+ "2026-08-27brg_RASA2_2026-08-27_23-36-59__29.10_2.00s_0393.fits": {
+  "colourRange": [
+   0.24,
+   1.74
+  ],
+  "curvature": 0.16,
+  "hfr": 2.295,
+  "scatter": 0.062,
+  "slope": -0.217,
+  "slopeError": 0.015,
+  "slopeQuadratic": -0.206,
+  "stars": 135,
+  "zp": -18.915,
+  "zpError": 0.005
+ },
+ "2026-08-27brg_RASA3_2026-08-27_23-36-28__28.20_2.00s_0339.fits": {
+  "colourRange": [
+   0.24,
+   2.52
+  ],
+  "curvature": 0.16,
+  "hfr": 2.78,
+  "scatter": 0.084,
+  "slope": 0.528,
+  "slopeError": 0.017,
+  "slopeQuadratic": 0.487,
+  "stars": 121,
+  "zp": -19.13,
+  "zpError": 0.007
+ },
+ "2026-08-27brg_RASA3_2026-08-27_23-36-56__28.20_2.00s_0348.fits": {
+  "colourRange": [
+   0.24,
+   2.52
+  ],
+  "curvature": 0.12,
+  "hfr": 2.686,
+  "scatter": 0.08,
+  "slope": 0.562,
+  "slopeError": 0.015,
+  "slopeQuadratic": 0.51,
+  "stars": 125,
+  "zp": -19.127,
+  "zpError": 0.007
+ },
+ "2026-10-07_RASA1_LIGHT_5s_g0_bin1_20261007-203138.fits": {
+  "colourRange": [
+   0.24,
+   2.76
+  ],
+  "curvature": 0.23,
+  "hfr": 3.532,
+  "scatter": 0.087,
+  "slope": 1.034,
+  "slopeError": 0.009,
+  "slopeQuadratic": 0.971,
+  "stars": 473,
+  "zp": -19.211,
+  "zpError": 0.004
+ },
+ "2026-10-07_RASA1_LIGHT_5s_g0_bin1_20261007-205456.fits": {
+  "colourRange": [
+   0.24,
+   2.69
+  ],
+  "curvature": 0.19,
+  "hfr": 2.513,
+  "scatter": 0.084,
+  "slope": 1.045,
+  "slopeError": 0.008,
+  "slopeQuadratic": 0.981,
+  "stars": 655,
+  "zp": -19.207,
+  "zpError": 0.003
+ },
+ "2026-10-07_RASA2_LIGHT_5s_g100_bin1_20261007-203138.fits": {
+  "colourRange": [
+   0.24,
+   2.15
+  ],
+  "curvature": 0.19,
+  "hfr": 3.215,
+  "scatter": 0.063,
+  "slope": -0.083,
+  "slopeError": 0.006,
+  "slopeQuadratic": -0.148,
+  "stars": 688,
+  "zp": -19.069,
+  "zpError": 0.002
+ },
+ "2026-10-07_RASA2_LIGHT_5s_g100_bin1_20261007-205456.fits": {
+  "colourRange": [
+   0.32,
+   2.27
+  ],
+  "curvature": 0.19,
+  "hfr": 1.715,
+  "scatter": 0.063,
+  "slope": -0.061,
+  "slopeError": 0.006,
+  "slopeQuadratic": -0.141,
+  "stars": 849,
+  "zp": -19.049,
+  "zpError": 0.002
+ },
+ "2026-10-07_RASA3_LIGHT_5s_g100_bin1_20261007-203138.fits": {
+  "colourRange": [
+   0.31,
+   2.4
+  ],
+  "curvature": 0.19,
+  "hfr": 2.748,
+  "scatter": 0.059,
+  "slope": 0.619,
+  "slopeError": 0.006,
+  "slopeQuadratic": 0.555,
+  "stars": 762,
+  "zp": -19.344,
+  "zpError": 0.002
+ },
+ "2026-10-07_RASA3_LIGHT_5s_g100_bin1_20261007-205456.fits": {
+  "colourRange": [
+   0.35,
+   2.4
+  ],
+  "curvature": 0.19,
+  "hfr": 1.523,
+  "scatter": 0.058,
+  "slope": 0.641,
+  "slopeError": 0.006,
+  "slopeQuadratic": 0.562,
+  "stars": 848,
+  "zp": -19.328,
+  "zpError": 0.002
+ },
+ "2026-10-14_RASA2_LIGHT_G_0.4s_g100_bin1_20261014-200639.fits": {
+  "colourRange": [
+   0.14,
+   2.65
+  ],
+  "curvature": 0.17,
+  "hfr": 1.517,
+  "scatter": 0.197,
+  "slope": 0.007,
+  "slopeError": 0.034,
+  "slopeQuadratic": -0.08,
+  "stars": 76,
+  "zp": -18.541,
+  "zpError": 0.023
+ },
+ "2026-10-14_RASA3_LIGHT_B_0.4s_g100_bin1_20261014-200639.fits": {
+  "colourRange": [
+   0.14,
+   2.65
+  ],
+  "curvature": 0.33,
+  "hfr": 1.947,
+  "scatter": 0.285,
+  "slope": 0.566,
+  "slopeError": 0.068,
+  "slopeQuadratic": 0.487,
+  "stars": 42,
+  "zp": -18.565,
+  "zpError": 0.039
+ },
+ "SNR_G206.9_2.3_2026-03-13_RASA1_2026-03-14_00-34-24__-5.00_300": {
+  "colourRange": [
+   -0.07,
+   2.41
+  ],
+  "curvature": 0.2,
+  "hfr": 3.473,
+  "scatter": 0.1,
+  "slope": -0.228,
+  "slopeError": 0.01,
+  "slopeQuadratic": -0.258,
+  "stars": 277,
+  "zp": -15.784,
+  "zpError": 0.006
+ },
+ "SNR_G206.9_2.3_2026-03-13_RASA3_2026-03-14_00-30-04__-5.00_300": {
+  "colourRange": [
+   -0.01,
+   2.41
+  ],
+  "curvature": 0.19,
+  "hfr": 3.172,
+  "scatter": 0.098,
+  "slope": -0.209,
+  "slopeError": 0.008,
+  "slopeQuadratic": -0.244,
+  "stars": 386,
+  "zp": -16.461,
+  "zpError": 0.005
+ },
+ "Sh2-132_Lion_Nebula_2026-08-18_RASA1_2026-08-19_01-01-32__-5.0": {
+  "colourRange": [
+   0.51,
+   2.13
+  ],
+  "curvature": 0.18,
+  "hfr": 15.728,
+  "scatter": 0.059,
+  "slope": 1.005,
+  "slopeError": 0.021,
+  "slopeQuadratic": 0.95,
+  "stars": 58,
+  "zp": -19.377,
+  "zpError": 0.008
+ },
+ "Sh2-132_Lion_Nebula_2026-08-18_RASA2_2026-08-19_01-01-00__-5.0": {
+  "colourRange": [
+   0.51,
+   2.69
+  ],
+  "curvature": 0.15,
+  "hfr": 18.511,
+  "scatter": 0.098,
+  "slope": 0.602,
+  "slopeError": 0.03,
+  "slopeQuadratic": 0.497,
+  "stars": 43,
+  "zp": -19.545,
+  "zpError": 0.016
+ },
+ "Sh2-132_Lion_Nebula_2026-08-18_RASA3_2026-08-19_01-01-59__29.1": {
+  "colourRange": [
+   0.51,
+   2.15
+  ],
+  "curvature": -0.01,
+  "hfr": 15.42,
+  "scatter": 0.108,
+  "slope": -0.03,
+  "slopeError": 0.031,
+  "slopeQuadratic": -0.024,
+  "stars": 40,
+  "zp": -19.254,
+  "zpError": 0.015
+ }
+}

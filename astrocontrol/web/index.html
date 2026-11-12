@@ -8,7 +8,7 @@
 <!-- The ?v= stamps exist to break a browser cache that has already decided an
      older copy is still fresh. Bump them if a released build ever needs to
      invalidate a client that has not revalidated. -->
-<link rel="stylesheet" href="style.css?v=67">
+<link rel="stylesheet" href="style.css?v=68">
 </head>
 <body>
 
@@ -1904,6 +1904,26 @@
     </div>
     <datalist id="filterNameOptions"></datalist>
 
+    <!-- Which filter the stars say is in each telescope (filterid.py). A
+         suggestion only: nothing changes until "Use" is pressed. -->
+    <div class="filter-check" id="filterCheck">
+      <div class="filter-check-head">
+        <button type="button" class="btn" id="filterCheckBtn">Check filters from the stars</button>
+        <button type="button" class="btn ghost" id="filterCheckAbort" hidden>Stop</button>
+        <span class="small muted" id="filterCheckStatus"></span>
+      </div>
+      <p class="small muted">
+        Measures the stars in each telescope's latest frame (or one short frame
+        on every camera, if none is recent) against Gaia, and says which filter
+        their colours and brightness look like. It never changes the setting
+        on its own. It also runs on the first frames of each night's sequence,
+        and records what it found as <span class="mono">FILTDET</span> /
+        <span class="mono">FILTCONF</span> on later frames &mdash;
+        <span class="mono">FILTER</span> stays what is typed above.
+      </p>
+      <div id="filterCheckResult"></div>
+    </div>
+
     <h3>Filter wheel <span class="tag" data-role="rig-scope">—</span></h3>
     <p class="small muted">
       Only for a telescope that has a wheel. Name the slots, in the order they
@@ -3301,7 +3321,7 @@
 
 <div id="toasts" class="toasts"></div>
 
-<script src="app.js?v=73"></script>
+<script src="app.js?v=74"></script>
 <script src="sky.js?v=62"></script>
 <script src="surveyimg.js?v=1"></script>
 <script src="planner.js?v=62"></script>

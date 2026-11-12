@@ -2918,9 +2918,15 @@
 
     const byName = new Map(allocation.map((row) => [row.name, row]));
     const shareCount = (share.length && share.length < total) ? share.length : entry.panels;
+    // On a mount with several telescopes each one has its own allocation
+    // (entry.allocations, by telescope): a triple RASA shoots R, G and B at
+    // once, one through each drawer. Reading the master's list alone showed
+    // R and a dash for the other two, as if they were not on it at all.
+    const scopes = collabScopes(entry, data);
     for (const row of (info.filters || [])) {
       const planned = byName.get(row.filter) || { count: 0 };
-      const count = planned.count || 0;
+      const mine = scopes ? scopes.byFilter.get(filterKey(row.filter)) : null;
+      const count = mine ? mine.count : (planned.count || 0);
       const full = row.exposure > 0 ? Math.ceil((row.hours || 0) * 3600 / row.exposure) : 0;
       const cell = (text, className = '') => {
         const node = document.createElement('span');
@@ -2928,9 +2934,16 @@
         node.textContent = text;
         return node;
       };
+      const label = cell(row.filter, 'plan-filter-name');
+      if (scopes) {
+        const who = document.createElement('span');
+        who.className = 'muted small collab-scope';
+        who.textContent = mine ? ` · ${mine.names.join(', ')}` : ' · no telescope';
+        label.appendChild(who);
+      }
       if (nightly) {
         table.append(
-          cell(row.filter, 'plan-filter-name'),
+          label,
           cell(`${Number(row.exposure).toFixed(0)}s`, 'mono'),
           cell(count ? String(count) : '—', 'mono'),
           cell(full ? String(full) : '—', 'mono muted'),
@@ -2939,7 +2952,7 @@
             : '—', 'mono muted'));
       } else {
         table.append(
-          cell(row.filter, 'plan-filter-name'),
+          label,
           cell(`${Number(row.exposure).toFixed(0)}s`, 'mono'),
           cell(count ? String(count) : '—', 'mono'),
           cell(count ? String(count * entry.panels) : '—', 'mono muted'),
@@ -2949,13 +2962,23 @@
       }
     }
     spec.appendChild(table);
+    if (scopes) {
+      const line = document.createElement('div');
+      line.className = 'small collab-scopes';
+      line.textContent = 'Tonight per telescope: ' + scopes.lines.join(' · ');
+      spec.appendChild(line);
+    }
     if (nightly) {
       const note = document.createElement('div');
       note.className = 'small muted';
       note.textContent = (info.visit && info.visit.filter
-        ? `Tonight is a ${info.visit.filter} night for this telescope: the server gives each `
-          + 'telescope one filter a night on a mosaic, the one the field still wants most '
-          + 'once the others are counted. '
+        ? (scopes && scopes.drawers
+          ? `The server named ${info.visit.filter} for this mount tonight; each telescope `
+            + 'with a filter in its drawer shoots its own filter alongside it, at the '
+            + 'project\u2019s sub length and for the same time on each panel. '
+          : `Tonight is a ${info.visit.filter} night for this telescope: the server gives each `
+            + 'telescope one filter a night on a mosaic, the one the field still wants most '
+            + 'once the others are counted. ')
         : '')
         + 'Tonight’s frames per panel are chosen by the server each night '
         + 'from what everybody has collected so far: enough on each panel for your own '
@@ -3032,6 +3055,51 @@
     // -- what everybody together has collected ----------------------------
     wrap.appendChild(buildDepth(info));
     return wrap;
+  }
+
+  /** A filter name compared the way the server compares them. */
+  function filterKey(name) {
+    const text = String(name || '').trim().toLowerCase();
+    return { ha: 'h', 'h-alpha': 'h', halpha: 'h', oiii: 'o', sii: 's', lum: 'l', luminance: 'l',
+      red: 'r', green: 'g', blue: 'b' }[text] || text;
+  }
+
+  /** What each telescope on the mount shoots of a collaboration chunk.
+   *
+   *  Null on a one-telescope rig, where the master's list is the whole story.
+   *  Otherwise, per filter, the frames per panel and the telescopes shooting
+   *  it; a line per telescope for the heading; and whether any of them has a
+   *  filter fixed in a drawer.
+   */
+  function collabScopes(entry, data) {
+    const telescopes = (data && data.telescopes) || [];
+    if (telescopes.length < 2) return null;
+    const allocations = entry.allocations || {};
+    const forecast = entry.tonight || {};
+    const byFilter = new Map();
+    const lines = [];
+    let drawers = false;
+    for (const rig of telescopes) {
+      const rows = (allocations[rig.id] || []).filter((r) => Number(r.count) > 0);
+      const fitted = (rig.filters || []).length === 1;
+      if (fitted) drawers = true;
+      for (const r of rows) {
+        const key = filterKey(r.name);
+        const held = byFilter.get(key) || { count: 0, names: [] };
+        held.count = Math.max(held.count, Number(r.count) || 0);
+        held.names.push(rig.name);
+        byFilter.set(key, held);
+      }
+      const reach = (forecast[rig.id] || {}).frames || {};
+      const frames = Object.values(reach).reduce((a, b) => a + (Number(b) || 0), 0);
+      if (rows.length) {
+        lines.push(`${rig.name} ${rows.map((r) => `${r.name} ${r.count}×${Number(r.exposure).toFixed(0)}s`).join(', ')}`
+          + (frames ? ` (${frames} frames)` : ''));
+      } else {
+        lines.push(`${rig.name} sits out${fitted ? ` (${rig.filters[0]} is not a filter this project takes)` : ''}`);
+      }
+    }
+    return { byFilter, lines, drawers };
   }
 
   /** Depth per filter, across every contributor.
