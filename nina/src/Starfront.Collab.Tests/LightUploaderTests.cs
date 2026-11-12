@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Net.Http;
 using System.Security.Cryptography;
 using Newtonsoft.Json.Linq;
+using Starfront.Collab.Server;
 using Starfront.Collab.Settings;
 using Starfront.Collab.Upload;
 using Xunit;
@@ -17,6 +18,7 @@ namespace Starfront.Collab.Tests {
         public readonly ConcurrentQueue<string> Calls = new();
         public WireAnswer? ForceStart;
         public int FailPutNumber = -1;
+        public JObject LastStart;
         private int puts;
         private int next;
 
@@ -25,6 +27,7 @@ namespace Starfront.Collab.Tests {
             if (method == HttpMethod.Post && path == "/api/v1/agent/uploads") {
                 if (ForceStart is WireAnswer forced) return forced;
                 var body = JObject.Parse(await content.ReadAsStringAsync(token));
+                LastStart = body;
                 var sha = body.Value<string>("sha256");
                 if (Files.Values.Any(f => Hex(f.Data) == sha)) return Ok(new JObject { ["already"] = true, ["status"] = "ready" });
                 foreach (var (sid, s) in Sessions) if (s.Sha == sha) return Ok(new JObject { ["already"] = false, ["id"] = sid, ["offset"] = s.Data.Length, ["chunk"] = 100_000 });
@@ -200,6 +203,89 @@ namespace Starfront.Collab.Tests {
             Assert.Equal("queued", item.State);
             Assert.Equal(0, item.Attempts);
             Assert.True(item.NextTryUtc - DateTime.UtcNow < TimeSpan.FromSeconds(1));
+        }
+
+        [Fact]
+        public void Scope_id_is_sent_only_when_the_agent_has_more_than_one_bind() {
+            var multiServer = new FakeServer();
+            var multiPath = Light("rasa-l.fits");
+            var onePath = Light("one.fits");
+            var offPath = Light("off.fits");
+            Thread.Sleep(400);
+            using (var up = new LightUploader(Path.Combine(root, "qscope"), () => true, multiServer, scopeId: () => "scope-l", boundScopes: () => 3)) {
+                up.Enqueue(multiPath, "p1", "t1");
+                up.StepAsync(CancellationToken.None).GetAwaiter().GetResult();
+                Assert.Equal("scope-l", multiServer.LastStart.Value<string>("scopeId"));
+                Assert.Null(multiServer.LastStart["telescope"]);
+            }
+            var one = new FakeServer();
+            using (var up = new LightUploader(Path.Combine(root, "qone"), () => true, one, scopeId: () => "scope-l", boundScopes: () => 1)) {
+                up.Enqueue(onePath, "p1", "t1");
+                up.StepAsync(CancellationToken.None).GetAwaiter().GetResult();
+                Assert.Null(one.LastStart["scopeId"]);
+                Assert.Null(one.LastStart["telescope"]);
+            }
+            var off = new FakeServer();
+            using (var up = new LightUploader(Path.Combine(root, "qoff"), () => true, off, scopeId: () => "", boundScopes: () => 3)) {
+                up.Enqueue(offPath, "p1", "t1");
+                up.StepAsync(CancellationToken.None).GetAwaiter().GetResult();
+                Assert.Null(off.LastStart["scopeId"]);
+            }
+        }
+
+        [Fact]
+        public void A_scope_409_holds_that_file_and_leaves_the_others() {
+            var server = new FakeServer();
+            var held = 0;
+            var path = Light("held.fits");
+            Thread.Sleep(400);
+            server.ForceStart = new WireAnswer(409, new JObject { ["detail"] = "this agent is not bound to that scope" }, null);
+            using var up = new LightUploader(Path.Combine(root, "qhold"), () => true, server, scopeId: () => "scope-l", boundScopes: () => 3);
+            up.Enqueue(path, "p1", "t1");
+            up.StepAsync(CancellationToken.None).GetAwaiter().GetResult();
+            var item = up.Snapshot().Single();
+            Assert.Equal("held", item.State);
+            Assert.Contains("not bound", item.Error);
+            Assert.Contains("held", up.StatusLine);
+            // The next file is a different answer. ForceStart still 409s everything,
+            // so a camera miss and the 400/403 forms are each their own uploader.
+            Assert.Equal("held", item.State);
+            held = up.Snapshot().Count(i => i.State == "held");
+            Assert.Equal(1, held);
+        }
+
+        [Theory]
+        [InlineData(409, "no scope matches this camera (RASA)")]
+        [InlineData(403, "that scope belongs to another agent")]
+        [InlineData(400, "unknown scope")]
+        [InlineData(400, "missing scopeId")]
+        public void Scope_errors_hold_the_file(int code, string detail) {
+            var path = Light($"e{code}-{detail.Length}.fits");
+            Thread.Sleep(400);
+            var server = new FakeServer { ForceStart = new WireAnswer(code, new JObject { ["detail"] = detail }, null) };
+            using var up = new LightUploader(Path.Combine(root, "q" + code + detail.Length), () => true, server,
+                scopeId: () => "scope-a", boundScopes: () => 3);
+            up.Enqueue(path, "p1", "t1");
+            up.StepAsync(CancellationToken.None).GetAwaiter().GetResult();
+            var item = up.Snapshot().Single();
+            Assert.Equal("held", item.State);
+            Assert.Contains(detail, item.Error);
+            Assert.NotEqual("refused", item.State);
+        }
+
+        [Fact]
+        public void Dropdown_lists_bound_scopes_first_by_display_name() {
+            var choices = ScopeDirectory.ChoicesOf(new[] {
+                new ScopeInfo { Id = "scope-fsq", DisplayName = "FSQ-106", BoundToThisAgent = false },
+                new ScopeInfo { Id = "scope-l", Name = "old", DisplayName = "RASA-L", BoundToThisAgent = true },
+                new ScopeInfo { Id = "scope-r", DisplayName = "RASA-R", BoundToThisAgent = true },
+                new ScopeInfo { Id = "scope-a", DisplayName = "RASA-A", BoundToThisAgent = true },
+            });
+            Assert.Equal(new[] { "scope-a", "scope-l", "scope-r", "scope-fsq" }, choices.Select(c => c.Id).ToArray());
+            Assert.Equal("RASA-L", choices.Single(c => c.Id == "scope-l").DisplayName);
+            Assert.Null(ScopeDirectory.HoldMessage(409, new JObject { ["detail"] = "auto-upload is off on that collaboration" }));
+            Assert.Null(ScopeDirectory.HoldMessage(403, new JObject { ["detail"] = "not a light of this collaboration: wrong field" }));
+            Assert.Equal("unknown scope", ScopeDirectory.HoldMessage(400, new JObject { ["detail"] = "unknown scope" }));
         }
     }
 }

@@ -61,6 +61,9 @@ namespace Starfront.Collab.Settings {
             public bool SharePosition { get; set; } = true;
             // Missing from an older file means on: uploads are the default (1.0.0.32).
             public bool AutoUpload { get; set; } = AutoUploadDefault;
+            // Missing means on: file by the registered scope (1.0.0.34). Off is the
+            // previous path, which sends no scope id.
+            public bool RegisteredScopes { get; set; } = true;
             public int PollMinutes { get; set; } = 10;   // no longer read; kept so older files load
         }
 
@@ -158,6 +161,15 @@ namespace Starfront.Collab.Settings {
             set { global.AutoUpload = value; Save(); RaisePropertyChanged(); }
         }
 
+        /// <summary>
+        /// Whether uploads name a registered scope. On unless switched off.
+        /// Off is the previous path: no scope id is sent.
+        /// </summary>
+        public bool RegisteredScopes {
+            get => global.RegisteredScopes;
+            set { global.RegisteredScopes = value; Save(); RaisePropertyChanged(); }
+        }
+
         /// <summary>How often the plugin talks to the server, in minutes. Fixed; it was a setting once and nobody needed to change it.</summary>
         public const int PollMinutes = 10;
 
@@ -175,7 +187,17 @@ namespace Starfront.Collab.Settings {
 
         // -- the equipment: per N.I.N.A. profile -------------------------------
 
-        /// <summary>What this telescope is called on the chart: the profile's name unless typed over.</summary>
+        /// <summary>
+        /// The registered scope this N.I.N.A. profile files under. The id, not
+        /// the name, so a rename on the server only changes the dropdown label.
+        /// Blank lets the server resolve the single bind. Stored per profile.
+        /// </summary>
+        public string ScopeId {
+            get => options.GetValueString(nameof(ScopeId), "") ?? "";
+            set { options.SetValueString(nameof(ScopeId), (value ?? "").Trim()); RaisePropertyChanged(); }
+        }
+
+        /// <summary>What this telescope is called on the chart: the profile's name unless typed over. Not used to file a light.</summary>
         public string TelescopeName {
             get {
                 var typed = options.GetValueString(nameof(TelescopeName), "");

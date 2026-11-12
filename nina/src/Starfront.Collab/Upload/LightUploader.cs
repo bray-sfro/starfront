@@ -8,6 +8,7 @@ using System.Security.Cryptography;
 using System.Text;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using Starfront.Collab.Server;
 
 namespace Starfront.Collab.Upload {
 
@@ -17,7 +18,7 @@ namespace Starfront.Collab.Upload {
         public string Project { get; set; } = "";
         public string Task { get; set; } = "";
         public string Kind { get; set; } = "light";
-        public string State { get; set; } = "queued";     // queued | retry | sent | already | refused
+        public string State { get; set; } = "queued";     // queued | retry | sent | already | refused | held
         public int Attempts { get; set; }
         public DateTime NextTryUtc { get; set; } = DateTime.MinValue;
         public DateTime AddedUtc { get; set; } = DateTime.UtcNow;
@@ -69,6 +70,8 @@ namespace Starfront.Collab.Upload {
         private readonly Func<bool> enabled;
         private readonly IUploadWire wire;
         private readonly Action<string, string> log;
+        private readonly Func<string> scopeId;
+        private readonly Func<int> boundScopes;
         private readonly string queuePath;
         private readonly object gate = new();
         private readonly List<UploadItem> items;
@@ -78,12 +81,18 @@ namespace Starfront.Collab.Upload {
         private Thread thread;
         private DateTime pausedUntilUtc = DateTime.MinValue;
 
-        public LightUploader(string folder, Func<bool> enabled, IUploadWire wire, Action<string, string> log = null) {
+        public LightUploader(string folder, Func<bool> enabled, IUploadWire wire, Action<string, string> log = null,
+                             Func<string> scopeId = null, Func<int> boundScopes = null) {
             Directory.CreateDirectory(folder);
             queuePath = System.IO.Path.Combine(folder, "queue.json");
             this.enabled = enabled;
             this.wire = wire;
             this.log = log ?? ((_, _) => { });
+            // scopeId is sent only when this agent holds more than one bind.
+            // A single bind is resolved by the server. A null func sends nothing,
+            // which is the previous path.
+            this.scopeId = scopeId ?? (() => "");
+            this.boundScopes = boundScopes ?? (() => 0);
             items = Load();
         }
 
@@ -100,7 +109,8 @@ namespace Starfront.Collab.Upload {
                     var waiting = items.Count(i => i.Open);
                     var sent = items.Count(i => i.State == "sent" || i.State == "already");
                     var refused = items.Count(i => i.State == "refused");
-                    var text = $"{sent} sent, {waiting} waiting" + (refused > 0 ? $", {refused} refused" : "");
+                    var held = items.Count(i => i.State == "held");
+                    var text = $"{sent} sent, {waiting} waiting" + (held > 0 ? $", {held} held" : "") + (refused > 0 ? $", {refused} refused" : "");
                     if (pausedUntilUtc > DateTime.UtcNow) text += $" - paused until {pausedUntilUtc.ToLocalTime():HH:mm}";
                     return text;
                 }
@@ -221,6 +231,11 @@ namespace Starfront.Collab.Upload {
             } catch (Refused ex) {
                 Mark(item, i => { i.State = "refused"; i.Error = ex.Message; i.DoneUtc = DateTime.UtcNow; });
                 log("warn", $"Starfront upload: {name} not sent - {ex.Message}");
+            } catch (Held ex) {
+                // The scope will not take this file. It stays in the queue with
+                // the reason. The other files are not paused and this one is not dropped.
+                Mark(item, i => { i.State = "held"; i.Error = ex.Message; });
+                log("warn", $"Starfront upload: {name} held - {ex.Message}");
             } catch (Pause ex) {
                 var until = DateTime.UtcNow + ex.For;
                 if (ex.ProjectOnly) projectPaused[item.Project] = until; else pausedUntilUtc = until;
@@ -242,6 +257,12 @@ namespace Starfront.Collab.Upload {
                 ["project"] = item.Project, ["name"] = name, ["kind"] = item.Kind,
                 ["bytes"] = item.Bytes, ["sha256"] = item.Sha256, ["task"] = item.Task ?? "",
             };
+            // The profile name is not a filing key. With more than one bind the
+            // scope id says which camera this light belongs to.
+            var chosen = (scopeId() ?? "").Trim();
+            var binds = 0;
+            try { binds = boundScopes(); } catch (Exception) { binds = 0; }
+            if (chosen.Length > 0 && binds > 1) start["scopeId"] = chosen;
             var answer = await wire.SendAsync(HttpMethod.Post, "/api/v1/agent/uploads", Json(start), token).ConfigureAwait(false);
             Obey(answer);
             if (answer.Body.Value<bool?>("already") == true) {
@@ -286,6 +307,8 @@ namespace Starfront.Collab.Upload {
 
         private static void Obey(WireAnswer answer) {
             if (answer.Code >= 200 && answer.Code < 300) return;
+            var hold = ScopeDirectory.HoldMessage(answer.Code, answer.Body);
+            if (hold != null) throw new Held(hold);
             var detail = answer.Body?.Value<string>("detail") ?? $"HTTP {answer.Code}";
             switch (answer.Code) {
                 case 0: throw new IOException(detail);
@@ -337,6 +360,8 @@ namespace Starfront.Collab.Upload {
         }
 
         private sealed class Refused : Exception { public Refused(string m) : base(m) { } }
+
+        private sealed class Held : Exception { public Held(string m) : base(m) { } }
 
         private sealed class Pause : Exception {
             public TimeSpan For { get; }

@@ -51,7 +51,11 @@ namespace Starfront.Collab.Services {
                 Uploader = new Upload.LightUploader(Path.Combine(Settings.DataFolder, "uploads"),
                     () => settings.AutoUpload && settings.Enrolled,
                     new Upload.HttpUploadWire(() => settings.ServerUrl, () => settings.AgentToken),
-                    (level, text) => { if (level == "warn") Logger.Warning(text); else Logger.Info(text); });
+                    (level, text) => { if (level == "warn") Logger.Warning(text); else Logger.Info(text); },
+                    // More than one bind (rasa1 on RASA-L/A/R) has to name the scope.
+                    // One bind is resolved by the server. The flag off sends nothing.
+                    () => settings.RegisteredScopes ? settings.ScopeId : "",
+                    () => ScopeDirectory.BoundCount);
                 Reporter.Uploader = Uploader;
                 Session = new StarfrontSession(host, Settings, Client, Ledger, Reporter);
                 Ready = true;
