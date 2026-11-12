@@ -1703,27 +1703,41 @@ class Sequencer:
         opens it, and nothing did: the next night's frames were of the inside
         of the lid. A cover that will not open ends the night here rather than
         after an hour of those.
+
+        ASCOM CoverStatus.NotPresent is the only "no cover" answer. Unknown is
+        not that answer, and a failed read is not that answer either. A
+        lamp-only panel that reports NotPresent is not commanded.
         """
         panel = self.manager.get("flatpanel")
         if panel is None or not panel.connected:
             return
         with contextlib.suppress(Exception):
             panel.turn_off()
-        if not getattr(panel, "has_cover", False):
+        action = panel.cover_prepare() if hasattr(panel, "cover_prepare") else (
+            "skip" if str(getattr(panel, "cover_state", "")) in ("open", "notpresent")
+            or not getattr(panel, "has_cover", False) else "open")
+        if action == "skip":
             return
-        if panel.cover_state in ("open", "notpresent"):
-            return
+        state = str(getattr(panel, "cover_state", "unread"))
+        if action == "unreadable":
+            raise DeviceError(
+                "CoverState could not be read — the panel is not being treated "
+                "as coverless, and OpenCover was not sent")
         self._set("homing", "opening the cover")
-        self._say("Opening the flat panel's cover")
-        panel.open_cover()
+        self._say(f"Opening the flat panel's cover (driver reports {state})", "warn")
+        try:
+            panel.open_cover()
+        except Exception as exc:                  # noqa: BLE001 - show the driver error
+            raise DeviceError(f"OpenCover failed while the driver reported {state}: {exc}") from exc
         deadline = time.monotonic() + float(
             self._settings().get("coverTimeoutSeconds") or 120.0)
-        while panel.cover_state == "moving" and time.monotonic() < deadline:
+        while str(panel.cover_state) != "open" and time.monotonic() < deadline:
             self._check()
             time.sleep(0.5)
         if panel.cover_state != "open":
             raise DeviceError(f"the flat panel's cover is {panel.cover_state}, "
-                              "not open")
+                              "not open — OpenCover was sent and the driver "
+                              "did not report open")
         self._say("Cover open", "success")
 
     def _walk_plan(self, stored: dict[str, Any], known: dict[str, Any]) -> None:
@@ -3924,11 +3938,20 @@ class Sequencer:
 
     @staticmethod
     def _roof_state(dome) -> str:
-        """open, closed, opening, closing, error - a read that fails is error."""
+        """Driver word. A failed read is error. Unknown is not open."""
         try:
-            return str(dome.shutter_state or "error").lower()
+            refresh = getattr(dome, "refresh_shutter", None)
+            if refresh is not None:
+                return str(refresh() or "unknown").lower()
+            return str(dome.shutter_state or "unknown").lower()
         except Exception:                         # noqa: BLE001 - a fault is not open
             return "error"
+
+    @staticmethod
+    def _note_roof_conflict(dome, text: str | None) -> None:
+        note = getattr(dome, "note_shutter_conflict", None)
+        if note is not None:
+            note(text)
 
     def _safety_watching(self) -> bool:
         watcher = getattr(self, "safety", None)
@@ -3982,6 +4005,11 @@ class Sequencer:
         if dome is None:
             return True
         if self._roof_state(dome) == "open":
+            # Already-reported open is the driver's word. Do not send another
+            # OpenShutter, and do not call it verified.
+            self._say(
+                f"Driver already reports the roof open before {label} — "
+                "not verified. No OpenShutter sent.", "warn")
             return True
         if self._roof_locked:
             raise DeviceError(f"the roof is treated as locked ({self._roof_locked}); "
@@ -4015,11 +4043,13 @@ class Sequencer:
             raise DeviceError("the roof was not opened: 'Require safety monitor to "
                               "open' is on and there is no safety monitor")
         else:
-            title = "Roof opened with no safety monitor - nothing will close it for weather"
-            detail = (f"{getattr(dome, 'name', 'The roof')} is being opened for {label} "
-                      "with no safety monitor connected or configured. Starfront "
-                      "closes it at the end of the run, but nothing will close it "
-                      "if the weather turns.")
+            title = ("Roof commanded open with no safety monitor"
+                     " — nothing will close it for weather")
+            detail = (f"{getattr(dome, 'name', 'The roof')} is being commanded open "
+                      f"for {label} with no safety monitor connected or configured. "
+                      "The command has not been carried out yet. Starfront asks the "
+                      "driver to close at the end of the run, but nothing will close "
+                      "it if the weather turns.")
             self._warn("roof.nosafety", "warning", title, detail,
                        "Connect a safety monitor (Equipment → Safety), or watch the sky.")
             self._roof_alert(title, detail)
@@ -4048,7 +4078,9 @@ class Sequencer:
                 self._roof_lock(dome, f"not open after {timeout:.0f} s (it reads {state})")
             self._sleep(self.ROOF_POLL_SECONDS)
             state = self._roof_state(dome)
-        self._say("Roof open", "success")
+        self._say(
+            "Driver reports the roof open — not verified. "
+            "Starfront has no roof sensor and did not see the roof move.", "warn")
         self._unwarn("roof.closed")
         return True
 
@@ -4072,27 +4104,29 @@ class Sequencer:
             return
         started = time.monotonic()
         alerted = False
-        self._say(f"Holding the lights: the roof reads {state}", "warn")
+        self._say(f"Holding the lights: the driver reports the roof {state}", "warn")
         while state != "open":
-            self._set("waiting", f"lights held: the roof reads {state}")
+            self._set("waiting", f"lights held: the driver reports {state}")
             if not alerted and time.monotonic() - started >= 60.0:
                 alerted = True
-                title = "Lights held: the roof is not open"
+                title = "Lights held: the driver does not report the roof open"
                 detail = (f"{getattr(dome, 'name', 'The roof')} has read {state} for a "
-                          "minute. No light is taken until it reads open"
+                          "minute. No light is taken while the driver reports that. "
+                          "This is the driver's word, not a physical position."
                           + (f" (treated as locked: {self._roof_locked})"
-                             if self._roof_locked else "") + ".")
+                             if self._roof_locked else ""))
                 self._warn("roof.closed", "critical", title, detail,
                            "Open the roof, or stop the sequence.")
                 self._roof_alert(title, detail)
-            reason = self._past_deadline(None, None)
-            if reason:
-                self._say(f"{reason} while the lights were held for the roof", "warn")
+            end = self._past_deadline(None, None)
+            if end:
+                self._say(f"{end} while the lights were held for the roof", "warn")
                 raise _Skipped()
             self._sleep(5.0)
             state = self._roof_state(dome)
         self._unwarn("roof.closed")
-        self._say("The roof reads open again: carrying on", "success")
+        self._say("Driver reports the roof open again — not verified. Carrying on.",
+                  "warn")
 
     def _close_roof_after_run(self) -> None:
         """Shut the roof this run opened, once the mount is parked (0.2.53b)."""
@@ -4142,18 +4176,45 @@ class Sequencer:
             return
 
         self._set("parking", "closing the roof")
-        dome.close_shutter()
+        try:
+            dome.close_shutter()
+        except Exception as exc:                  # noqa: BLE001 - the driver's word
+            raise DeviceError(f"CloseShutter failed: {exc}") from exc
+        # 0.2.53b returned on the first read. HakosRoof was still reporting
+        # open for about a second, then opening, then closed. Wait the timeout.
+        no_change = float(self._settings().get("roofCloseNoChangeSeconds") or 30.0)
         deadline = time.monotonic() + timeout
-        while dome.shutter_state in ("closing", "opening") \
-                and time.monotonic() < deadline:
+        started = time.monotonic()
+        last = self._roof_state(dome)
+        changed_at = started
+        alerted = False
+        while time.monotonic() < deadline:
+            state = self._roof_state(dome)
+            if state == "closed":
+                self._say("Driver reports the roof closed — not independently verified",
+                          "warn")
+                self._unwarn("roof.nosafety")
+                if getattr(dome, "can_park", False) and not dome.at_park:
+                    with contextlib.suppress(Exception):
+                        dome.park()
+                return
+            if state != last:
+                last = state
+                changed_at = time.monotonic()
+            elif not alerted and time.monotonic() - changed_at >= no_change:
+                alerted = True
+                detail = (f"Close still pending: the driver still reports {state} "
+                          f"{no_change:.0f}s after CloseShutter. Not verified.")
+                self._say(detail, "error")
+                self._note_roof_conflict(dome, detail)
+                self._warn("roof.close", "critical",
+                           "The driver has not reported the roof closed",
+                           detail, "Look at the roof. Do not treat the driver word as proof.")
             time.sleep(1.0)
-        if dome.shutter_state != "closed":
-            raise DeviceError(f"the roof is {dome.shutter_state}")
-        self._say("Roof closed", "success")
-        self._unwarn("roof.nosafety")
-        if getattr(dome, "can_park", False) and not dome.at_park:
-            with contextlib.suppress(Exception):
-                dome.park()
+        state = self._roof_state(dome)
+        raise DeviceError(
+            f"the driver still reports {state} {timeout:.0f}s after CloseShutter"
+            " — not verified closed")
 
     def _abort_cameras(self) -> None:
         for stop in list(self.extra_aborts):
@@ -4174,7 +4235,9 @@ class Sequencer:
             return
         with contextlib.suppress(Exception):
             panel.turn_off()
-        if not getattr(panel, "has_cover", False):
+        # Close only a cover the driver has shown us. Unknown is not a
+        # command to move, and NotPresent is a lamp with no cover.
+        if panel.has_cover is not True:
             return
         if panel.cover_state == "closed":
             return

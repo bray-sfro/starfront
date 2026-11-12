@@ -260,6 +260,13 @@ input[type="checkbox"] { accent-color: var(--accent); }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .readout b.alert { color: var(--warn); }
+.readout b.roof-driver-open,
+.readout b.roof-pending { color: var(--warn); }
+.readout b.roof-driver-closed,
+.readout b.roof-unknown { color: var(--muted); }
+.readout b.roof-conflict,
+.readout b.roof-error { color: #ffb4a8; }
+#domeShutterNote { margin: -6px 0 8px; }
 
 .progress {
   height: 4px; background: var(--panel-2); border-radius: 3px;

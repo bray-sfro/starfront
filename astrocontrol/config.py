@@ -595,6 +595,10 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # abort that never finishes is an abort that never parked.
         "coverTimeoutSeconds": 120.0,
         "roofTimeoutSeconds": 300.0,
+        # After CloseShutter, how long the driver may keep reporting the same
+        # word before that is called a conflict. The close keeps waiting until
+        # roofTimeoutSeconds. 0.2.53b gave up on the first still-open read.
+        "roofCloseNoChangeSeconds": 30.0,
         # 0.2.53b - the roof at the start of a target. Open it (lead telescope
         # only) before the first home/slew/focus/light of every target if it
         # is not open; acts only when a dome/roof with a shutter is connected.

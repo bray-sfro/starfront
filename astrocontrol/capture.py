@@ -748,12 +748,21 @@ class CaptureService:
                 done["panel"] = True
                 self.manager.log("Flat panel switched off for a light frame")
 
-            # "notpresent" and "unknown" are left alone: there is either no
-            # cover or no way to tell, and driving one blind is worse.
-            if panel.has_cover and panel.cover_state in ("closed", "moving"):
-                if panel.cover_state == "closed":
-                    self.manager.log("Opening the cover for a light frame")
-                    panel.open_cover()
+            # NotPresent: lamp only, do not command. Unknown is not that.
+            # A failed read is reported and not commanded.
+            action = panel.cover_prepare() if hasattr(panel, "cover_prepare") else (
+                "open" if panel.has_cover and panel.cover_state in ("closed", "moving")
+                else "skip")
+            if action == "unreadable":
+                self.manager.log(
+                    "CoverState could not be read — not treating the panel as "
+                    "coverless, and not sending OpenCover", "error")
+                return done
+            if action == "open":
+                state = str(panel.cover_state)
+                self.manager.log(
+                    f"Opening the cover for a light frame (driver reports {state})")
+                panel.open_cover()
                 timeout = float(self.config.get("calibration",
                                                 "coverTimeoutSeconds", 180.0))
                 deadline = time.monotonic() + timeout

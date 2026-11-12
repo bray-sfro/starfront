@@ -775,6 +775,7 @@ class SequencerSettingsRequest(BaseModel):
     pauseLightsUnlessRoofOpen: bool | None = None
     closeRoofAtEnd: bool | None = None
     reopenRoofOnAutoRestart: bool | None = None
+    roofCloseNoChangeSeconds: float | None = Field(default=None, ge=5, le=600)
 
 
 class GuidingSettingsRequest(BaseModel):
@@ -3671,8 +3672,16 @@ def dome_shutter(body: DomeShutterRequest) -> dict[str, Any]:
         _guard(dome.open_shutter)
     else:
         _guard(dome.close_shutter)
-    rigs.log(f"Roof: {'opening' if body.open else 'closing'}", "warn")
-    return {"ok": True}
+    # Acceptance is not a position. The driver has been asked; it has not
+    # been checked, and this program cannot check it physically.
+    report = dome.shutter_report() if hasattr(dome, "shutter_report") else {
+        "shutterVerified": False, "shutterQuality": "pending"}
+    rigs.log(
+        f"Roof command accepted: asking the driver to "
+        f"{'open' if body.open else 'close'}. Not a verified roof position.",
+        "warn")
+    return {"ok": True, "accepted": True, "verified": False, "pending": True,
+            "shutter": report}
 
 
 @app.post("/api/dome/park")

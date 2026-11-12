@@ -800,7 +800,6 @@ class AlpacaFlatPanel(_AlpacaDevice, FlatPanel):
     def connect(self) -> None:
         super().connect()
         self.max_brightness = int(self._client.get("maxbrightness") or 100)
-        self.has_cover = self.cover_state not in ("notpresent", "unknown")
 
     @property
     def brightness(self) -> int:
@@ -812,8 +811,15 @@ class AlpacaFlatPanel(_AlpacaDevice, FlatPanel):
 
     @property
     def cover_state(self) -> str:
-        value = self._client.get_cached("coverstate", 1.0, 0)
-        return self._COVER_STATES.get(int(value or 0), "unknown")
+        missing = object()
+        value = self._client.get_cached("coverstate", 1.0, missing)
+        if value is missing or value is None:
+            return "unread"
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return "unread"
+        return self._COVER_STATES.get(number, "unread")
 
     def turn_on(self, brightness: int) -> None:
         self._require()
@@ -841,6 +847,7 @@ class AlpacaFlatPanel(_AlpacaDevice, FlatPanel):
             "lightOn": self.light_on,
             "hasCover": self.has_cover,
             "coverState": self.cover_state,
+            "coverPrepare": self.cover_prepare(),
         }
 
 
@@ -904,11 +911,21 @@ class AlpacaDome(_AlpacaDevice, Dome):
         why = blocked()
         if why:
             raise DeviceError(f"{why}; OpenShutter was not sent")
-        self._client.put("openshutter")
+        self.begin_shutter_command("open")
+        try:
+            self._client.put("openshutter")
+        except Exception as exc:
+            self.fail_shutter_command(str(exc))
+            raise
 
     def close_shutter(self) -> None:
         self._require()
-        self._client.put("closeshutter")
+        self.begin_shutter_command("close")
+        try:
+            self._client.put("closeshutter")
+        except Exception as exc:
+            self.fail_shutter_command(str(exc))
+            raise
 
     def park(self) -> None:
         self._require()
@@ -920,10 +937,17 @@ class AlpacaDome(_AlpacaDevice, Dome):
 
     def status(self) -> dict[str, Any]:
         if not self._connected:
-            return {"connected": False}
+            return {
+                "connected": False,
+                "shutterState": "unknown",
+                "shutterVerified": False,
+                "shutterQuality": "unknown",
+                "shutterNote": self.SHUTTER_NOTE,
+            }
+        # A missing shutterstatus stays error (the cache default), never open.
+        report = self.shutter_report(self.shutter_state)
         return {
             "connected": True,
-            "shutterState": self.shutter_state,
             "canShutter": self.can_shutter,
             "canPark": self.can_park,
             "canSlave": self.can_slave,
@@ -931,6 +955,7 @@ class AlpacaDome(_AlpacaDevice, Dome):
             "atPark": self.at_park,
             "slewing": self.slewing,
             "azimuth": self.azimuth,
+            **report,
         }
 
 

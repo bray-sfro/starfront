@@ -1142,7 +1142,6 @@ class AscomFlatPanel(_AscomDevice, FlatPanel):
         self._set("Connected", True)
         self._connected = True
         self.max_brightness = int(self._get("MaxBrightness", 100) or 100)
-        self.has_cover = self.cover_state not in ("notpresent", "unknown")
 
     def disconnect(self) -> None:
         try:
@@ -1161,7 +1160,18 @@ class AscomFlatPanel(_AscomDevice, FlatPanel):
 
     @property
     def cover_state(self) -> str:
-        return self._COVER_STATES.get(int(self._get("CoverState", 0) or 0), "unknown")
+        # 0 is CoverStatus.NotPresent, a real answer. A failed read must not
+        # use that number, or a panel whose cover cannot be read is treated
+        # as a lamp with no cover and OpenCover is never sent.
+        missing = object()
+        value = self._get("CoverState", missing)
+        if value is missing or value is None:
+            return "unread"
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return "unread"
+        return self._COVER_STATES.get(number, "unread")
 
     def turn_on(self, brightness: int) -> None:
         self._require()
@@ -1189,6 +1199,7 @@ class AscomFlatPanel(_AscomDevice, FlatPanel):
             "lightOn": self.light_on,
             "hasCover": self.has_cover,
             "coverState": self.cover_state,
+            "coverPrepare": self.cover_prepare(),
         }
 
 
@@ -1224,13 +1235,46 @@ class AscomSafetyMonitor(_AscomDevice, SafetyMonitor):
 class AscomDome(_AscomDevice, Dome):
     _SHUTTER_STATES = {0: "open", 1: "closed", 2: "opening", 3: "closing", 4: "error"}
 
+    # Status-panel polling must not turn into a roof-server read on every
+    # refresh. Control loops call refresh_shutter(), which is allowed once a
+    # second. A reading older than STALE_SECONDS is unknown, never the last open.
+    POLL_SECONDS = 5.0
+    STALE_SECONDS = 30.0
+    MIN_REFRESH_SECONDS = 1.0
+    BACKOFF_MAX_SECONDS = 60.0
+    _shutter_driver = "unknown"
+    _shutter_last_good: str | None = None
+    _shutter_read_at: float | None = None
+    _shutter_tried_at: float | None = None
+    _shutter_failures = 0
+
     def __init__(self, prog_id: str, name: str) -> None:
         Dome.__init__(self, prog_id, name)
         self._prog_id = prog_id
+        self._reset_shutter_account()
+
+    def _reset_shutter_account(self) -> None:
+        self._shutter_driver = "unknown"
+        self._shutter_last_good = None
+        self._shutter_read_at = None
+        self._shutter_tried_at = None
+        self._shutter_failures = 0
+        self._shutter_command = None
+        self._shutter_command_pending = False
+        self._shutter_command_error = None
+        self._shutter_conflict = None
 
     def connect(self) -> None:
         self._open(self._prog_id)
         self._set("Connected", True)
+        # A new connection has not been read yet. Do not keep a previous open,
+        # and do not treat a driver's default as a roof that is open.
+        self._reset_shutter_account()
+        if self._get("Connected", True) is False:
+            self._connected = False
+            raise DeviceError(
+                f"{self.name}: the driver did not connect (it reports "
+                "Connected = False after being asked to connect)")
         self._connected = True
         self.can_park = bool(self._get("CanPark", False))
         self.can_shutter = bool(self._get("CanSetShutter", False))
@@ -1241,18 +1285,116 @@ class AscomDome(_AscomDevice, Dome):
             self._set("Connected", False)
         finally:
             self._connected = False
+            self._reset_shutter_account()
+
+    @staticmethod
+    def _map_shutter_status(value: Any) -> str:
+        """Map an ASCOM ShutterStatus integer. 0 is open. None is unknown, not open."""
+        if value is None:
+            return "unknown"
+        try:
+            return AscomDome._SHUTTER_STATES.get(int(value), "error")
+        except (TypeError, ValueError):
+            return "error"
+
+    def _pull_shutter(self, now: float) -> None:
+        self._shutter_tried_at = now
+        missing = object()
+        value = self._get("ShutterStatus", missing)
+        if value is missing:
+            self._shutter_failures += 1
+            return
+        state = self._map_shutter_status(value)
+        if state in ("error", "unknown"):
+            self._shutter_failures += 1
+            if state == "error":
+                self._shutter_driver = "error"
+                self._shutter_read_at = now
+            return
+        previous = self._shutter_last_good
+        self._shutter_failures = 0
+        self._shutter_driver = state
+        self._shutter_last_good = state
+        self._shutter_read_at = now
+        self._settle_shutter_command(state, previous)
+
+    def _settle_shutter_command(self, state: str, previous: str | None) -> None:
+        command = self._shutter_command
+        pending = self._shutter_command_pending
+        if pending and command == "close" and state == "opening":
+            # HakosRoof has been seen to report opening after CloseShutter.
+            # That is a driver word, not proof the roof is moving shut.
+            self._shutter_conflict = (
+                "driver reports opening while a close command is still pending")
+        elif pending and command == "open" and state == "open":
+            self._shutter_command_pending = False
+        elif pending and command == "close" and state == "closed":
+            self._shutter_command_pending = False
+            if self._shutter_conflict and "close command" in self._shutter_conflict:
+                self._shutter_conflict = None
+        elif (previous in ("open", "closed") and state in ("open", "closed")
+              and previous != state and not pending):
+            self._shutter_conflict = (
+                f"driver flipped from {previous} to {state} with no command in progress")
+
+    def _shutter_due(self, now: float) -> bool:
+        tried = self._shutter_tried_at
+        if tried is None:
+            return True
+        wait = self.POLL_SECONDS
+        if self._shutter_failures:
+            wait = min(self.BACKOFF_MAX_SECONDS,
+                       self.POLL_SECONDS * (2 ** min(self._shutter_failures, 8)))
+        return now >= tried + wait
+
+    def _published_shutter(self) -> str:
+        if not self.can_shutter:
+            return "notpresent"
+        now = time.monotonic()
+        read_at = self._shutter_read_at
+        if read_at is not None and now - read_at > self.STALE_SECONDS:
+            return "unknown"
+        if self._shutter_failures:
+            return "error"
+        if read_at is None:
+            return "unknown"
+        return self._shutter_driver or "unknown"
 
     @property
     def shutter_state(self) -> str:
         if not self.can_shutter:
             return "notpresent"
-        # 0.2.53b: ShutterStatus 0 *is* shutterOpen. `... or 4` turned every
-        # open roof into "error", so nothing could ever see one open.
-        value = self._get("ShutterStatus", None)
-        try:
-            return self._SHUTTER_STATES.get(int(value), "error")
-        except (TypeError, ValueError):
-            return "error"
+        now = time.monotonic()
+        if self._shutter_due(now):
+            self._pull_shutter(now)
+        return self._published_shutter()
+
+    def shutter_age(self) -> float | None:
+        if self._shutter_read_at is None:
+            return None
+        return max(0.0, time.monotonic() - self._shutter_read_at)
+
+    def refresh_shutter(self) -> str:
+        """A driver read for a control loop, at most once a second."""
+        if not self.can_shutter:
+            return "notpresent"
+        now = time.monotonic()
+        tried = self._shutter_tried_at
+        if tried is None or now - tried >= self.MIN_REFRESH_SECONDS:
+            self._pull_shutter(now)
+        return self._published_shutter()
+
+    def shutter_report(self, state: str | None = None) -> dict[str, Any]:
+        if state is None:
+            state = self._published_shutter() if self.can_shutter else "notpresent"
+        report = super().shutter_report(state)
+        age = self.shutter_age()
+        report["shutterAgeSeconds"] = None if age is None else round(age, 1)
+        report["shutterLastDriver"] = self._shutter_last_good
+        if age is not None and age > self.STALE_SECONDS:
+            report["shutterQuality"] = "stale"
+            report["shutterState"] = "unknown"
+        return report
 
     @property
     def at_park(self) -> bool:
@@ -1277,11 +1419,21 @@ class AscomDome(_AscomDevice, Dome):
         why = blocked()
         if why:
             raise DeviceError(f"{why}; OpenShutter was not sent")
-        self._invoke("OpenShutter")
+        self.begin_shutter_command("open")
+        try:
+            self._invoke("OpenShutter")
+        except Exception as exc:
+            self.fail_shutter_command(str(exc))
+            raise
 
     def close_shutter(self) -> None:
         self._require()
-        self._invoke("CloseShutter")
+        self.begin_shutter_command("close")
+        try:
+            self._invoke("CloseShutter")
+        except Exception as exc:
+            self.fail_shutter_command(str(exc))
+            raise
 
     def park(self) -> None:
         self._require()
@@ -1293,10 +1445,16 @@ class AscomDome(_AscomDevice, Dome):
 
     def status(self) -> dict[str, Any]:
         if not self._connected:
-            return {"connected": False}
+            return {
+                "connected": False,
+                "shutterState": "unknown",
+                "shutterVerified": False,
+                "shutterQuality": "unknown",
+                "shutterNote": self.SHUTTER_NOTE,
+            }
+        report = self.shutter_report(self.shutter_state)
         return {
             "connected": True,
-            "shutterState": self.shutter_state,
             "canShutter": self.can_shutter,
             "canPark": self.can_park,
             "canSlave": self.can_slave,
@@ -1304,6 +1462,7 @@ class AscomDome(_AscomDevice, Dome):
             "atPark": self.at_park,
             "slewing": self.slewing,
             "azimuth": self.azimuth,
+            **report,
         }
 
 

@@ -1606,6 +1606,7 @@
 
       <div class="readout-row" id="domeRow" hidden>
         <div class="readout"><span>Roof</span><b id="domeShutter">—</b></div>
+        <div class="small" id="domeShutterNote"></div>
         <div class="readout"><span>Dome</span><b id="domeAz">—</b></div>
       </div>
       <div class="row gap" id="domeControls" hidden>
@@ -2137,11 +2138,12 @@
     <label class="inline"><input type="checkbox" id="seqOpenRoof" checked>
       Open roof at sequence start</label>
     <p class="small muted">
-      With a dome or roll-off connected, the lead telescope opens it before the
-      first slew of every target, and nothing moves or exposes until it reads
-      open. An open that fails or does not finish in time is treated as the
-      site's technician lock: nothing more is sent to the roof, no lights are
-      taken, you are alerted and the run stops (park, warm).
+      With a dome or roll-off connected, the lead telescope sends OpenShutter
+      before the first slew of every target. Nothing moves or exposes until the
+      driver reports open. That report is not a physical check. An open that
+      fails or does not finish in time is treated as the site's technician lock:
+      nothing more is sent to the roof, no lights are taken, you are alerted
+      and the run stops (park, warm).
     </p>
     <label class="inline"><input type="checkbox" id="seqRoofNeedsSafety">
       Require safety monitor to open</label>
@@ -2151,6 +2153,8 @@
     </p>
     <label>Roof open timeout (s)
       <input type="number" id="seqRoofOpenTimeout" min="10" max="1800" step="10" value="180"></label>
+    <label>Close: warn if the driver reading has not changed (s)
+      <input type="number" id="seqRoofCloseNoChange" min="5" max="600" step="5" value="30"></label>
     <label class="inline"><input type="checkbox" id="seqRoofGate" checked>
       Hold lights while the roof is not open</label>
     <label class="inline"><input type="checkbox" id="seqRoofCloseAtEnd" checked>
