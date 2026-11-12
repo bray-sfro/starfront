@@ -59,6 +59,8 @@ namespace Starfront.Collab.Settings {
             public string AgentId { get; set; } = "";
             public string AgentName { get; set; } = "";
             public bool SharePosition { get; set; } = true;
+            // Missing from an older file means on: uploads are the default (1.0.0.32).
+            public bool AutoUpload { get; set; } = AutoUploadDefault;
             public int PollMinutes { get; set; } = 10;   // no longer read; kept so older files load
         }
 
@@ -146,6 +148,14 @@ namespace Starfront.Collab.Settings {
         public bool SharePosition {
             get => global.SharePosition;
             set { global.SharePosition = value; Save(); RaisePropertyChanged(); }
+        }
+
+        /// <summary>Whether each collaboration light is sent to the server as it is saved. On unless switched off.</summary>
+        public const bool AutoUploadDefault = true;
+
+        public bool AutoUpload {
+            get => global.AutoUpload;
+            set { global.AutoUpload = value; Save(); RaisePropertyChanged(); }
         }
 
         /// <summary>How often the plugin talks to the server, in minutes. Fixed; it was a setting once and nobody needed to change it.</summary>

@@ -165,7 +165,7 @@ namespace Starfront.Collab.Ui {
             MinFocal = ""; MaxFocal = ""; MaxHfr = ""; MaxGuideRms = ""; MinExposure = ""; MaxExposure = "";
             MaxMoon = ""; MinMoonSeparation = ""; MinAltitude = ""; MinFrames = "10"; MaxBortle = "";
             RequireCalibrated = false;
-            CollectFiles = false;
+            CollectFiles = true;
             Filters.Clear();
             acceptOscRgb = true; acceptOscNarrowband = true;
             RaisePropertyChanged(nameof(AcceptOscRgb));

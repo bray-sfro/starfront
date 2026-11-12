@@ -164,6 +164,7 @@
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
                         <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
 
                     <TextBlock Grid.Row="0" Grid.Column="0" Margin="0,4" VerticalAlignment="Center" Text="Name on the chart" />
@@ -173,6 +174,10 @@
                     <TextBlock Grid.Row="1" Grid.Column="0" Margin="0,4" VerticalAlignment="Center" Text="Show where I point" />
                     <CheckBox Grid.Row="1" Grid.Column="1" Margin="0,4" VerticalAlignment="Center" IsChecked="{Binding Settings.SharePosition}" />
                     <TextBlock Grid.Row="1" Grid.Column="2" Margin="10,4,0,4" VerticalAlignment="Center" Opacity="0.7" Text="the mount's RA and Dec and what it is doing, for the others' charts; never your site" TextWrapping="Wrap" />
+
+                    <TextBlock Grid.Row="3" Grid.Column="0" Margin="0,4" VerticalAlignment="Center" Text="Upload my collaboration lights" />
+                    <CheckBox Grid.Row="3" Grid.Column="1" Margin="0,4" VerticalAlignment="Center" IsChecked="{Binding Settings.AutoUpload}" />
+                    <TextBlock Grid.Row="3" Grid.Column="2" Margin="10,4,0,4" VerticalAlignment="Center" Opacity="0.7" Text="each light shot for a collaboration goes to the server the moment N.I.N.A. saves it, in the background; your files are never changed or deleted" TextWrapping="Wrap" />
 
                     <TextBlock Grid.Row="2" Grid.Column="0" Margin="0,4" VerticalAlignment="Center" Text="Bortle class of the sky" />
                     <TextBox Grid.Row="2" Grid.Column="1" Margin="0,4" Text="{Binding Settings.Bortle, ValidatesOnExceptions=True}" />

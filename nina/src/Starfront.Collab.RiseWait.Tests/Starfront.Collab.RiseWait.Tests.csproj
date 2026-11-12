@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- RiseWait has no N.I.N.A. types, so these cases run on any OS. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <UseWPF>false</UseWPF>
+    <EnableWindowsTargeting>false</EnableWindowsTargeting>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <NoWarn>$(NoWarn);NU1701;CS1591</NoWarn>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\Starfront.Collab\Sequencer\RiseWait.cs" Link="RiseWait.cs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+</Project>

@@ -49,7 +49,10 @@ and builds a target for it: the field of a single-field collaboration, or one
 per dealt panel of a mosaic. Each goes *is it up?*, slew and centre (and
 rotate, with a rotator), switch filter, take the frames. A field below the
 project's altitude floor, below your horizon or too near a Moon that is up is
-skipped for now and tried again once the others are done. Every light is
+skipped for now and tried again once the others are done; if it will still
+rise tonight, the container then waits until it is up, once a minute, until
+dawn, unless *Wait for the target to rise* is unticked on the container.
+Every light is
 credited to the sky it covered with its star size and guiding error, kept on
 disk, and sent to the server on the next check-in. Frames shot while the
 server was down go the next time it answers.

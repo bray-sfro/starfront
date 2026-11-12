@@ -2,7 +2,12 @@
   <PropertyGroup>
     <PluginRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..'))</PluginRoot>
     <PluginArtifactDirectory>$(PluginRoot)/artifacts</PluginArtifactDirectory>
-    <PluginStageDirectory>$(PluginArtifactDirectory)/stage/$(Configuration)</PluginStageDirectory>
+    <!-- Staged per assembly: two plugins live in this folder now, and a shared
+         staging folder would let one ship the other's files. -->
+    <PluginStageDirectory>$(PluginArtifactDirectory)/stage/$(Configuration)/$(AssemblyName)</PluginStageDirectory>
+    <!-- Which props file the manifest is written from. The collaboration plugin
+         uses Plugin.props; a project with props of its own says so. -->
+    <PluginPropsFile Condition="'$(PluginPropsFile)' == ''">$(PluginRoot)/Plugin.props</PluginPropsFile>
     <PluginChannel Condition="'$(PluginChannel)' == ''">Release</PluginChannel>
     <!-- The scripts run on PowerShell 7 and on Windows PowerShell 5.1 alike;
          override with -p:PluginPowerShell=pwsh where 7 is installed. -->
@@ -33,6 +38,6 @@
     <Exec Command="$(PluginPowerShell) -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)Deploy-Plugin.ps1&quot; -Stage &quot;$(PluginStageDirectory)&quot; -Title &quot;$(Title)&quot; -Destination &quot;$(PluginDeployDirectory)&quot;" />
   </Target>
   <Target Name="PackagePlugin" DependsOnTargets="StagePlugin">
-    <Exec Command="$(PluginPowerShell) -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)Package-Plugin.ps1&quot; -Stage &quot;$(PluginStageDirectory)&quot; -AssemblyName &quot;$(TargetFileName)&quot; -Props &quot;$(PluginRoot)/Plugin.props&quot; -Version &quot;$(FileVersion)&quot; -Repository &quot;$(RepositoryUrl)&quot; -OutputDirectory &quot;$(PluginArtifactDirectory)/release&quot; -InstallerUrl &quot;$(PluginInstallerUrl)&quot; -Channel &quot;$(PluginChannel)&quot;" />
+    <Exec Command="$(PluginPowerShell) -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)Package-Plugin.ps1&quot; -Stage &quot;$(PluginStageDirectory)&quot; -AssemblyName &quot;$(TargetFileName)&quot; -Props &quot;$(PluginPropsFile)&quot; -Version &quot;$(FileVersion)&quot; -Repository &quot;$(RepositoryUrl)&quot; -OutputDirectory &quot;$(PluginArtifactDirectory)/release&quot; -InstallerUrl &quot;$(PluginInstallerUrl)&quot; -Channel &quot;$(PluginChannel)&quot;" />
   </Target>
 </Project>

@@ -28,6 +28,12 @@
                             SelectedValue="{Binding ProjectId}"
                             SelectedValuePath="Id" />
                     </StackPanel>
+                    <CheckBox
+                        Margin="0,8,0,0"
+                        VerticalAlignment="Center"
+                        Content="Wait for the target to rise"
+                        IsChecked="{Binding WaitForTargetToRise}"
+                        ToolTip="If a dealt field is still below the project's floor or your horizon, wait until it rises instead of skipping it and moving on. Fields that are already up are shot first." />
                     <TextBlock
                         Margin="0,6,0,0"
                         Opacity="0.8"

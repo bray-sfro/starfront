@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.ComponentModel.Composition;
 using System.IO;
 using System.Runtime.Serialization;
@@ -72,6 +73,7 @@ namespace Starfront.Collab.Sequencer {
         private readonly ISafetyMonitorMediator safetyMonitorMediator;
 
         private string projectId = "";
+        private bool waitForTargetToRise = true;
         private string summary = "";
         private IList<string> issues = new List<string>();
 
@@ -135,6 +137,16 @@ namespace Starfront.Collab.Sequencer {
         public string ProjectId {
             get => projectId;
             set { projectId = value ?? ""; RaisePropertyChanged(); RaisePropertyChanged(nameof(TonightText)); }
+        }
+
+        /// <summary>When a dealt field is still below the floor, sit until it rises
+        /// rather than ending the container and leaving a gap in the sequence.
+        /// On by default; a mosaic still shoots the fields that are already up first.</summary>
+        [JsonProperty(DefaultValueHandling = DefaultValueHandling.Populate)]
+        [DefaultValue(true)]
+        public bool WaitForTargetToRise {
+            get => waitForTargetToRise;
+            set { waitForTargetToRise = value; RaisePropertyChanged(); }
         }
 
         [OnDeserialized]
@@ -278,6 +290,10 @@ namespace Starfront.Collab.Sequencer {
                     foreach (var panel in again) panel.ResetAll();
                     await base.Execute(progress, token);
                 }
+                // After the fields that are already up have been tried, sit for
+                // any that will still rise tonight, rather than ending and
+                // leaving a hole in the sequence.
+                await WaitForRiseAsync(progress, token);
             } finally {
                 session.Run.Running = false;
                 session.Run.TargetName = null;
@@ -381,6 +397,80 @@ namespace Starfront.Collab.Sequencer {
         private bool IsUpNow(PanelPlan plan) {
             var (altitude, azimuth) = SkyMath.AltAz(plan.Coordinates, profileService);
             return altitude >= Math.Max(plan.MinAltitude, SkyMath.HorizonAltitude(profileService, azimuth));
+        }
+
+        private bool IsMoonSafe(PanelPlan plan) {
+            if (plan.MinMoonSeparation is double wanted && wanted > 0) {
+                var (separation, moonUp) = SkyMath.MoonSeparation(plan.Coordinates, profileService);
+                if (moonUp && separation < wanted) return false;
+            }
+            return true;
+        }
+
+        private DateTime DawnTonight() {
+            try {
+                var (_, dawn) = SkyMath.DarkHours(nighttimeCalculator.Calculate());
+                return dawn;
+            } catch (Exception ex) {
+                Logger.Debug($"Starfront: dawn could not be worked out - {ex.Message}");
+                var now = DateTime.Now;
+                return now.Hour >= 12 ? now.Date.AddDays(1).AddHours(6) : now.Date.AddHours(6);
+            }
+        }
+
+        /// <summary>Where a panel stands, and when (if at all) it will next
+        /// clear the floor, sampled from now until dawn.</summary>
+        private RiseWaitField RiseField(StarfrontPanel panel, DateTime now, DateTime dawn) {
+            var plan = panel.Plan;
+            var (altitude, azimuth) = SkyMath.AltAz(plan.Coordinates, profileService, now);
+            var horizon = SkyMath.HorizonAltitude(profileService, azimuth);
+            var floor = Math.Max(plan.MinAltitude, horizon);
+            var up = altitude >= floor;
+            DateTime? riseAt = up ? now : null;
+            var willClear = up;
+            var end = dawn > now ? dawn : now.AddHours(12);
+            if (!up) {
+                for (var t = now; t <= end; t = t.AddMinutes(10)) {
+                    var (a, z) = SkyMath.AltAz(plan.Coordinates, profileService, t);
+                    var f = Math.Max(plan.MinAltitude, SkyMath.HorizonAltitude(profileService, z));
+                    if (a >= f) {
+                        willClear = true;
+                        riseAt = t;
+                        break;
+                    }
+                }
+            }
+            return new RiseWaitField(plan.TargetName, plan.MinAltitude, horizon, panel.SkippedForAltitude, willClear, up, IsMoonSafe(plan), riseAt);
+        }
+
+        /// <summary>Wait until a still-skipped field is up and Moon-safe, then
+        /// shoot it, repeating until dawn or nothing left will rise.</summary>
+        private async Task WaitForRiseAsync(IProgress<ApplicationStatus> progress, CancellationToken token) {
+            if (!WaitForTargetToRise) return;
+            while (true) {
+                token.ThrowIfCancellationRequested();
+                var now = DateTime.Now;
+                var dawn = DawnTonight();
+                var fields = Items.OfType<StarfrontPanel>().Select(p => RiseField(p, now, dawn)).ToList();
+                var status = RiseWait.Decide(fields, now, dawn, WaitForTargetToRise);
+                if (status.Action == RiseWaitAction.Stop) {
+                    if (status.Message.Length > 0) Logger.Info($"Starfront: stopped waiting - {status.Message}");
+                    return;
+                }
+                if (status.Action == RiseWaitAction.ShootReady) {
+                    var ready = Items.OfType<StarfrontPanel>().Where(p => p.SkippedForAltitude && IsUpNow(p.Plan) && IsMoonSafe(p.Plan)).ToList();
+                    if (ready.Count == 0) return;
+                    Logger.Info($"Starfront: {ready.Count} field(s) have risen; shooting them");
+                    foreach (var panel in ready) panel.ResetAll();
+                    await base.Execute(progress, token);
+                    continue;
+                }
+                Summary = status.Message;
+                if (Runtime.Ready) Runtime.Session.Run.Summary = status.Message;
+                Logger.Info($"Starfront: {status.Message}");
+                progress?.Report(new ApplicationStatus { Status = $"Starfront: {status.Message}" });
+                await Task.Delay(RiseWait.PollInterval, token);
+            }
         }
 
         private void ClearRuntimeChildren() {
@@ -684,6 +774,7 @@ namespace Starfront.Collab.Sequencer {
                                                            domeFollower, plateSolverFactory, windowServiceFactory, nighttimeCalculator,
                                                            applicationStatusMediator, safetyMonitorMediator) {
                 ProjectId = ProjectId,
+                WaitForTargetToRise = WaitForTargetToRise,
             };
             copy.CopyMetaData(this);
             foreach (var condition in Conditions) { var child = (ISequenceCondition)condition.Clone(); copy.Conditions.Add(child); child.AttachNewParent(copy); }
