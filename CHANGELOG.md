@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.2.54 (consolidated, 2026-11-11)
+
+One tree for every change made since 0.2.53b, in single-scope and multiscope
+builds. Not installed anywhere.
+
+- 0.2.53g and 0.2.53h (PR #10): everything above.
+- 0.2.53c (PR #5): the roof driver's ShutterStatus is never shown as a verified
+  open or closed; a close that does not change the reading warns; Alnitak cover
+  prep before panel flats. Merged under 0.2.53g's roof guard: the guard still
+  refuses an open first.
+- 0.2.53d (PR #6): a timed-out camera call quarantines that camera until the
+  call returns; no automatic outlet power-cycling on reconnect; three failed
+  reconnects stop.
+- 0.2.53e/f (PR #7): centring never syncs the mount; it slews by the measured
+  offset, rejects flipped or jumping solves, and fails the target when
+  attempts run out.
+- Coordinator code (astrocontrol/collab.py, filters.py) is the live collab
+  server's, plus the per-camera `instrument` on session reports.
+- Multiscope build: the 0.2.53b-r2 per-camera collab agents and filter
+  identification, on top of all of the above.
+
 ## 0.2.53h
 
 - Auto-upload backfill uses the same capture root as capture. A blank `capture.rootDirectory` is `data_root()/captures`, not "scan nothing".
