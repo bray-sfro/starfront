@@ -169,7 +169,9 @@ class OffsetRun:
             # Put the focuser back where it started rather than leaving it
             # wherever the last filter happened to want it.
             with _ignore():
-                focuser.move_to(int(start_position))
+                # The one connected now: a focuser reconnected mid-run is a
+                # new object, and the old one answers nothing.
+                (rig.manager.get("focuser") or focuser).move_to(int(start_position))
         except Exception as exc:                  # noqa: BLE001 - never fatal
             with self._lock:
                 self._error = f"{type(exc).__name__}: {exc}"

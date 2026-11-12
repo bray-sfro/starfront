@@ -229,7 +229,6 @@ class Phd2Guider(Guider):
         self._version: str | None = None
         self._pixel_scale: float | None = None
         self._settling: dict[str, Any] | None = None
-        self._settle_error: str | None = None
         self._last_error: str | None = None
         self._star_lost: str | None = None
         self._snr: float | None = None
@@ -418,7 +417,6 @@ class Phd2Guider(Guider):
         self._ra_errors.clear()
         self._dec_errors.clear()
         self._settling = None
-        self._settle_error = None
         self._snr = None
         self._app_state = "Unknown"
 
@@ -548,11 +546,6 @@ class Phd2Guider(Guider):
             self._app_state = "Looping"
         elif name == "StartGuiding":
             self._app_state = "Guiding"
-            # A fresh session gets a fresh window: the RMS of the one that
-            # was just restarted for being rough must not condemn this one
-            # before it has taken a frame.
-            self._ra_errors.clear()
-            self._dec_errors.clear()
         elif name == "Paused":
             self._app_state = "Paused"
         elif name == "Resumed":
@@ -585,10 +578,8 @@ class Phd2Guider(Guider):
             self._settling = None
             if status:
                 self._last_error = str(event.get("Error") or "settling failed")
-                self._settle_error = self._last_error
             else:
                 self._last_error = None
-                self._settle_error = None
         elif name == "GuidingDithered":
             self._ra_errors.clear()
             self._dec_errors.clear()
@@ -612,7 +603,8 @@ class Phd2Guider(Guider):
 
     # -- control -----------------------------------------------------------
     def start_guiding(self, settle_pixels: float = 1.5, settle_time: float = 8.0,
-                      settle_timeout: float = 60.0, recalibrate: bool = False) -> None:
+                      settle_timeout: float = 60.0, recalibrate: bool = False,
+                      fresh_star: bool = False) -> None:
         """Start guiding, finding a star first if there is not one yet.
 
         `guide` on its own will try to select a star, but from a standing stop
@@ -620,36 +612,57 @@ class Phd2Guider(Guider):
         at.  Looping first and picking a star explicitly is what NINA and SGP
         do, and it turns "no star found" into a message that says which step
         actually failed.
+
+        `fresh_star` drops the star PHD2 has and picks again: for guiding that
+        is rough rather than lost, the same faint star again is the same
+        rough guiding again.
         """
         self._require()
         if self._equipment_connected is False:
             raise DeviceError("PHD2's own camera and mount are not connected")
 
-        if self.auto_select_star and self._app_state in ("Stopped", "Unknown"):
+        if fresh_star:
+            with _suppress_device_error():
+                self._call("deselect_star")
+            self._reset_metrics()
+        if self.auto_select_star and (fresh_star
+                                      or self._app_state in ("Stopped", "Unknown")):
             self._find_a_star()
 
-        # `guide` answers at once; the settle itself is reported later by a
-        # SettleDone event.  PHD2 sends its first Settling event only after
-        # the first guide frame, which can be seconds after it has already
-        # said StartGuiding — and in that gap a caller asking "guiding and
-        # not settling?" was told yes, and took a five-minute sub on a
-        # guider that then failed to settle at all.  So the settle is marked
-        # as under way here, before the request goes, and stays so until
-        # SettleDone says how it went.
-        self._ra_errors.clear()
-        self._dec_errors.clear()
-        self._settle_error = None
-        self._settling = {"distance": None, "time": 0.0,
-                          "settleTime": float(settle_time), "starLocked": None}
-        try:
-            self._call("guide", [
-                {"pixels": float(settle_pixels), "time": float(settle_time),
-                 "timeout": float(settle_timeout)},
-                bool(recalibrate),
-            ], timeout=float(settle_timeout) + 90.0)
-        except DeviceError:
-            self._settling = None
-            raise
+        # `guide` does not come back until PHD2 has settled, so it must not be
+        # held to the ordinary short RPC timeout.
+        self._call("guide", [
+            {"pixels": float(settle_pixels), "time": float(settle_time),
+             "timeout": float(settle_timeout)},
+            bool(recalibrate),
+        ], timeout=float(settle_timeout) + 90.0)
+
+    def calibration_data(self) -> dict[str, Any] | None:
+        """PHD2's mount calibration as it stands, or None if it has none.
+
+        Carries `orthoError`: how far the RA and Dec axes are from the right
+        angle they should make, in degrees, worked out the way PHD2 does for
+        its own guide log. A calibration made on a star PHD2 could barely see
+        comes out tens of degrees off, and guiding on it pushes the star away
+        with every correction.
+        """
+        self._require()
+        data = self._call("get_calibration_data", ["Mount"])
+        if not isinstance(data, dict) or not data.get("calibrated"):
+            return None
+        x_angle = self._as_float(data.get("xAngle"))
+        y_angle = self._as_float(data.get("yAngle"))
+        ortho = None
+        if x_angle is not None and y_angle is not None:
+            ortho = abs(((x_angle - y_angle) % 180.0) - 90.0)
+        return {
+            "calibrated": True,
+            "xAngle": x_angle, "yAngle": y_angle,
+            "xRate": self._as_float(data.get("xRate")),
+            "yRate": self._as_float(data.get("yRate")),
+            "declination": self._as_float(data.get("declination")),
+            "orthoError": ortho,
+        }
 
     def _find_a_star(self) -> None:
         """Loop exposures until PHD2 has a frame, then auto-select a star."""
@@ -718,10 +731,6 @@ class Phd2Guider(Guider):
     def settling(self) -> bool:
         return self._settling is not None
 
-    @property
-    def settle_error(self) -> str | None:
-        return None if self._settling is not None else self._settle_error
-
     def status(self) -> dict[str, Any]:
         if not self._connected:
             return {"connected": False}
@@ -747,7 +756,6 @@ class Phd2Guider(Guider):
             "snr": self._snr,
             "starLost": self._star_lost,
             "error": self._last_error,
-            "settleError": self.settle_error,
             "samples": len(self._ra_errors),
             "rmsRaPx": rms_ra,
             "rmsDecPx": rms_dec,

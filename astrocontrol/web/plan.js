@@ -20,6 +20,8 @@
     // Which telescope's allocation each entry is showing. Per entry, so
     // switching to the second scope on one target does not switch it on all.
     rigTab: new Map(),
+    // A redraw a save asked for while a box was still being typed into.
+    renderWanted: false,
     // The last Auto-arrange result, kept so its reasoning stays on screen
     // while the allocations it wrote are looked over.
     arranged: null,
@@ -825,6 +827,7 @@
   /* ------------------------------------------------------------- rendering */
 
   function render() {
+    sched.renderWanted = false;
     const host = $('schedList');
     const data = sched.data;
     if (!data) { host.innerHTML = '<p class="muted small">Loading…</p>'; return; }
@@ -1519,11 +1522,6 @@
     stage.appendChild(status);
     wrap.appendChild(stage);
 
-    const legend = document.createElement('div');
-    legend.className = 'depth-legend small';
-    legend.hidden = true;
-    wrap.appendChild(legend);
-
     const caption = document.createElement('p');
     caption.className = 'small muted';
     wrap.appendChild(caption);
@@ -1545,20 +1543,15 @@
 
     /** How wide a sky the picture shows: the region with a margin, in a
      *  3:2 frame, the same shape the survey cutout is asked for. */
-    /** The sky the map covers: on a single target the server reaches out to
-     *  take in every frame shot around the field, so the union of
-     *  everybody's fields of view is in the picture. */
-    function shown() { return grid.extent || grid.region; }
-
     function fieldOfView() {
-      const region = shown();
+      const region = grid.region;
       const across = Math.max(0.5, Math.abs(region.width));
       const down = Math.max(0.5, Math.abs(region.height));
       return Math.min(60, Math.max(across, down * FRAME_W / FRAME_H) * 1.12);
     }
 
     function geometry() {
-      const region = shown();
+      const region = grid.region;
       const ra0 = region.ra, dec0 = region.dec;
       const w = canvas.clientWidth || 600;
       const h = Math.round(w * FRAME_H / FRAME_W);
@@ -1617,10 +1610,7 @@
         const cw = cell.width * g.scale, ch = cell.height * g.scale;
         const seconds = Number(column[index] || 0);
         const fraction = goal > 0 ? seconds / goal : (seconds > 0 ? 1 : 0);
-        // Sky outside the region is drawn a little fainter: it is depth the
-        // frames made around the field, not depth the project asked for.
-        const outside = cell.inside === false;
-        ctx.globalAlpha = (fraction > 0 ? 0.45 + 0.25 * Math.min(1, fraction) : 0.12) * (outside ? 0.6 : 1);
+        ctx.globalAlpha = fraction > 0 ? 0.45 + 0.25 * Math.min(1, fraction) : 0.12;
         ctx.fillStyle = colour(fraction);
         ctx.fillRect(centre[0] - cw / 2, centre[1] - ch / 2, cw + 0.6, ch + 0.6);
         ctx.globalAlpha = 1;
@@ -1630,45 +1620,17 @@
           ctx.strokeRect(centre[0] - cw / 2, centre[1] - ch / 2, cw, ch);
         }
       });
-      // Every camera's field of view, at the angle it was really shot,
-      // over the depth it made - the union of the frames is what the map
-      // around a single target is made of, and a frame turned ninety
-      // degrees puts its depth above and below the field, not beside it.
-      // Each telescope keeps one colour; the filter being looked at is
-      // drawn solid, the others faint.
-      const prints = grid.footprints || [];
-      prints.forEach((print) => {
-        const at = g.toCanvas(print.ra, print.dec);
-        if (!at) return;
-        const w = print.width * g.scale, h = print.height * g.scale;
-        const own = (print.filter || '') === filter;
-        ctx.save();
-        ctx.translate(at[0], at[1]);
-        ctx.rotate(-(print.rotation || 0) * DEG);
-        ctx.strokeStyle = telescopeColour(print.telescope || print.agent, own ? 0.95 : 0.3);
-        ctx.lineWidth = own ? 1.6 : 1;
-        ctx.setLineDash(own ? [] : [3, 3]);
-        ctx.strokeRect(-w / 2, -h / 2, w, h);
-        ctx.setLineDash([]);
-        // A short bar along the frame's top edge says which way is up.
-        if (own) {
-          ctx.fillStyle = telescopeColour(print.telescope || print.agent, 0.9);
-          ctx.fillRect(-w / 2, -h / 2, w, Math.min(4, h * 0.05));
-        }
-        ctx.restore();
-      });
       // The region's edge, dashed. Its width and height are degrees of sky,
-      // so on the tangent plane it is a rectangle about its centre - the
+      // so on the tangent plane it is a rectangle about the centre - the
       // same shape the cells tile. Working its corners out in right
       // ascension with one cosine drew the top edge narrower than the
       // bottom, a trapezoid that no cell agreed with.
       const r = grid.region;
-      const rc = g.toCanvas(r.ra, r.dec) || [g.w / 2, g.h / 2];
       const rw = r.width * g.scale, rh = r.height * g.scale;
       ctx.setLineDash([5, 4]);
       ctx.strokeStyle = 'rgba(200, 210, 230, 0.7)';
       ctx.lineWidth = 1;
-      ctx.strokeRect(rc[0] - rw / 2, rc[1] - rh / 2, rw, rh);
+      ctx.strokeRect(g.w / 2 - rw / 2, g.h / 2 - rh / 2, rw, rh);
       ctx.setLineDash([]);
       // No panels over it. The depth map is about what the collaboration
       // has collected, not where this telescope goes next; the framing on
@@ -1687,44 +1649,19 @@
       ctx.fillText(goal > 0 ? `${(goal / 3600).toFixed(0)}h` : 'shot', 10 + 11 * 12 + 4, g.h - 11);
     }
 
-    /** One colour per telescope, the same every time it is drawn. */
-    function telescopeColour(name, alpha) {
-      let hash = 0;
-      for (const ch of String(name || '')) hash = (hash * 31 + ch.charCodeAt(0)) >>> 0;
-      const hue = hash % 360;
-      return `hsla(${hue}, 85%, 68%, ${alpha})`;
-    }
-
     function describe() {
       if (!grid) return;
       const prog = ((grid.progress || {})[filter]) || {};
       const column = (grid.seconds || {})[filter] || [];
-      const inside = grid.cells.map((cell, i) => (cell.inside === false ? null : i)).filter((i) => i !== null);
-      const picked = inside.length ? inside : column.map((_, i) => i);
-      const total = picked.reduce((a, i) => a + Number(column[i] || 0), 0);
+      const total = column.reduce((a, b) => a + Number(b || 0), 0);
+      const cells = Math.max(1, column.length);
       const goalHours = Number((grid.goals || {})[filter] || 0);
       caption.textContent = `${filter}: ${Math.round(Number(prog.average || 0) * 100)}% done`
         + (goalHours ? ` against ${goalHours.toFixed(0)}h at every point` : '')
         + ` · ${Math.round(Number(prog.atGoal || 0) * 100)}% of the field at full depth`
         + ` · thinnest part ${Math.round(Number(prog.thinnest || 0) * 100)}%`
-        + ` · ${(total / Math.max(1, picked.length) / 3600).toFixed(2)}h average on a cell`
+        + ` · ${(total / cells / 3600).toFixed(2)}h average on a cell`
         + ' — everybody’s accepted frames, where they really landed. Hover a cell for its hours.';
-      // Whose fields of view are drawn, at what angle, with how much in
-      // this filter: the key to the outlines on the picture.
-      legend.innerHTML = '';
-      const prints = (grid.footprints || []).filter((p) => (p.filter || '') === filter);
-      for (const print of prints) {
-        const item = document.createElement('span');
-        item.className = 'depth-key';
-        const swatch = document.createElement('i');
-        swatch.style.background = telescopeColour(print.telescope || print.agent, 0.95);
-        item.appendChild(swatch);
-        item.appendChild(document.createTextNode(
-          `${print.telescope || 'telescope'} · ${Number(print.rotation || 0).toFixed(0)}°`
-          + ` · ${print.width.toFixed(1)}×${print.height.toFixed(1)}° · ${(print.seconds / 3600).toFixed(1)}h`));
-        legend.appendChild(item);
-      }
-      legend.hidden = !prints.length;
     }
 
     function pick(name) {
@@ -1789,15 +1726,11 @@
         const url = `/api/survey/image?ra=${(region.ra / 15).toFixed(6)}`
           + `&dec=${region.dec.toFixed(6)}&fov=${fieldOfView().toFixed(4)}`
           + `&width=${FRAME_W}&height=${FRAME_H}`;
-        const response = await fetch(url);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const blob = await response.blob();
-        image = await new Promise((resolve, reject) => {
-          const element = new Image();
-          element.onload = () => resolve(element);
-          element.onerror = () => reject(new Error('the image could not be decoded'));
-          element.src = URL.createObjectURL(blob);
-        });
+        // Shared, deduplicated and backed off (surveyimg.js): show() calls
+        // this on every redraw while there is no picture, and each call used
+        // to be another request to a survey service that was not answering.
+        if (window.surveyImages.isDown()) return;
+        image = await window.surveyImages.image(url);
         depthCache.set(info.project, { ...(depthCache.get(info.project) || {}), image });
         draw();
       } catch (error) {
@@ -1807,7 +1740,12 @@
 
     wrap.show = async () => {
       if (!info.project) { status.textContent = 'No collaboration behind this target.'; return; }
-      const stale = !cached.at || Date.now() - cached.at > DEPTH_REFRESH_MS;
+      // Read the cache now, not the copy taken when this panel was built:
+      // showFramings() calls this on every redraw, and the old snapshot
+      // never saw its own fetch land, so every redraw fetched again.
+      const held = depthCache.get(info.project) || {};
+      if (!grid && held.grid) grid = held.grid;
+      const stale = !depthFresh(held, Date.now());
       if (grid) {
         // Drawn at once from what was fetched before; refreshed quietly
         // underneath when that is getting old.
@@ -1819,15 +1757,16 @@
         status.hidden = false;
         status.textContent = 'Fetching the depth map…';
       }
+      if (!depthMayTry(held, Date.now())) return;   // failed a moment ago
       let fresh;
       try {
-        fresh = await app.api(`/api/collab/projects/${encodeURIComponent(info.project)}/depth`);
+        fresh = await depthFetch(depthCache, depthInflight, info.project,
+          (project) => app.api(`/api/collab/projects/${encodeURIComponent(project)}/depth`));
       } catch (error) {
         if (!grid) status.textContent = `The depth map could not be fetched: ${error.message}`;
         return;
       }
       grid = fresh;
-      depthCache.set(info.project, { ...(depthCache.get(info.project) || {}), grid, at: Date.now() });
       status.hidden = true;
       buttons();
       if (!image) fetchSky();
@@ -1837,10 +1776,42 @@
 
   /** Depth maps and their sky pictures by project, across re-renders. */
   const depthCache = new Map();
+  /** The fetch in flight per project, so panels redrawn while one is on its
+   *  way wait for it instead of starting their own. */
+  const depthInflight = new Map();
+  // depth-cache:begin (tools/check_plan_depth.py runs this part on its own)
   const DEPTH_REFRESH_MS = 60 * 1000;
-  // The Collab tab draws the same map on an opened card, so the one picture
-  // of a field is the same picture wherever it is looked at.
-  app.buildDepthMap = buildDepthMap;
+  /** After a failed fetch, how long before another is tried. */
+  const DEPTH_RETRY_MS = 30 * 1000;
+
+  function depthFresh(held, now) {
+    return !!(held && held.at && now - held.at <= DEPTH_REFRESH_MS);
+  }
+
+  function depthMayTry(held, now) {
+    return !(held && held.failedAt && now - held.failedAt < DEPTH_RETRY_MS);
+  }
+
+  /** One fetch of a project's depth map, shared by everybody who asks while
+   *  it is on its way, and its answer (or its failure) kept in the cache. */
+  function depthFetch(cache, inflight, project, get) {
+    if (inflight.has(project)) return inflight.get(project);
+    const promise = (async () => {
+      try {
+        const grid = await get(project);
+        cache.set(project, { ...(cache.get(project) || {}), grid, at: Date.now(), failedAt: 0 });
+        return grid;
+      } catch (error) {
+        cache.set(project, { ...(cache.get(project) || {}), failedAt: Date.now() });
+        throw error;
+      } finally {
+        inflight.delete(project);
+      }
+    })();
+    inflight.set(project, promise);
+    return promise;
+  }
+  // depth-cache:end
 
   /* ------------------------------------------------------- the framing */
 
@@ -2337,15 +2308,7 @@
         const url = `/api/survey/image?ra=${target.ra.toFixed(6)}`
           + `&dec=${target.dec.toFixed(6)}&fov=${fov.toFixed(4)}`
           + `&width=${FRAME_W}&height=${FRAME_H}`;
-        const response = await fetch(url);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        const blob = await response.blob();
-        image = await new Promise((resolve, reject) => {
-          const element = new Image();
-          element.onload = () => resolve(element);
-          element.onerror = () => reject(new Error('the image could not be decoded'));
-          element.src = URL.createObjectURL(blob);
-        });
+        image = await window.surveyImages.image(url);   // shared + backed off
         status.hidden = true;
       } catch (error) {
         // The overlay is the useful half and does not need the picture, so it
@@ -2727,6 +2690,28 @@
         });
         tabs.appendChild(button);
       }
+      // A follower given its own allocation can be handed back to the
+      // master's. Without this the only way back was zeroing every row.
+      if (chosen !== data.masterRig && (entry.rigFilters || {})[chosen]) {
+        const follow = document.createElement('button');
+        follow.className = 'btn small ghost rig-follow';
+        follow.textContent = 'Follow the master again';
+        follow.title = 'Drop this telescope\'s own filters and exposures and shoot '
+          + 'the master\'s allocation through what it carries.';
+        follow.disabled = unusable;
+        follow.addEventListener('click', async () => {
+          // A save still queued for this tab would put it straight back.
+          const key = `${entry.id}:${chosen}`;
+          clearTimeout(sched.dirty.get(key));
+          sched.dirty.delete(key);
+          try {
+            await app.api(`/api/plan/entries/${entry.id}/filters`
+              + `?rig=${encodeURIComponent(chosen)}`, 'DELETE');
+          } catch (error) { app.toast(error.message, 'error'); return; }
+          load();
+        });
+        tabs.appendChild(follow);
+      }
       wrap.appendChild(tabs);
     }
 
@@ -2773,8 +2758,13 @@
       time.className = 'mono muted';
 
       const refresh = () => {
-        row.exposure = Math.max(1, Number(exposure.value) || 1);
-        row.count = Math.max(0, Number(count.value) || 0);
+        // A box being retyped passes through empty and through "3" on the
+        // way to 300. Only a whole value counts; the last good one stands
+        // until there is a new one.
+        const typed = exposure.value === '' ? NaN : Number(exposure.value);
+        if (Number.isFinite(typed) && typed >= 1) row.exposure = Math.min(3600, typed);
+        const frames = count.value === '' ? NaN : Number(count.value);
+        if (Number.isFinite(frames) && frames >= 0) row.count = Math.floor(frames);
         const others = rows.filter((r) => r !== row && r.count > 0);
         const ceiling = maxCount(row.exposure, entry.panels,
           entry.availableSeconds, others, overheads);
@@ -2796,12 +2786,32 @@
         updateBar();
       };
 
-      exposure.addEventListener('input', () => { refresh(); queueSave(entry.id, rows, chosen); });
-      count.addEventListener('input', () => { refresh(); queueSave(entry.id, rows, chosen); });
+      // Live feedback on every keystroke; the save waits for the value to be
+      // committed - Enter, Tab, a click elsewhere or a spinner press - so the
+      // server never sees "3" on its way to "300", trims the frames to fit
+      // it, and sends a toast and a smaller count back for the trouble.
+      exposure.addEventListener('input', refresh);
+      count.addEventListener('input', refresh);
+      const commit = () => {
+        if (!(Number(exposure.value) >= 1)) exposure.value = String(row.exposure);
+        if (count.value === '') count.value = '0';
+        refresh();
+        queueSave(entry.id, rows, chosen);
+      };
+      exposure.addEventListener('change', commit);
+      count.addEventListener('change', commit);
+      for (const box of [exposure, count]) {
+        box.addEventListener('keydown', (event) => {
+          if (event.key === 'Enter') { event.preventDefault(); box.blur(); }
+        });
+      }
       // Leaving the field is when a value the server trimmed is safe to show.
       count.addEventListener('blur', () => {
         if (Number(count.value) !== row.count) count.value = String(row.count);
         refresh();
+      });
+      exposure.addEventListener('blur', () => {
+        if (Number(exposure.value) !== row.exposure) exposure.value = String(row.exposure);
       });
 
       table.append(label, exposure, count, total, time);
@@ -3139,12 +3149,13 @@
             }
             if (row.refresh) row.refresh();
           }
-          $('schedSaved').textContent = 'saved';
-          await refreshTotals();
-        } else {
-          $('schedSaved').textContent = 'saved';
-          await refreshTotals();
         }
+        $('schedSaved').textContent = 'saved';
+        await refreshTotals();
+        // The save changed more than the box it came from: the time on the
+        // telescope's tab, whether a follower still mirrors, the night's
+        // totals. Redrawn once nothing on the plan is mid-edit.
+        renderWhenIdle();
       } catch (error) {
         app.toast(error.message, 'error');
         $('schedSaved').textContent = 'not saved';
@@ -3162,6 +3173,25 @@
       for (const entry of data.entries) { seconds += entry.usedSeconds; frames += entry.frames; }
       showSummary(data, seconds, frames);
     } catch { /* the next full load will catch up */ }
+  }
+
+  /** Whether a plan box is being typed into, or a save is still queued. */
+  function planEditing() {
+    const active = document.activeElement;
+    return sched.dirty.size > 0
+      || !!(active && active.matches('input, textarea, select')
+            && $('schedList').contains(active));
+  }
+
+  /** Redraw the plan from what the server now holds, once nothing is mid-edit.
+   *
+   * Rebuilding straight away replaced the next box while it was being typed
+   * into, and the value typed a moment ago went back to what the server had
+   * last seen. So the redraw waits for the cursor to leave the plan's boxes
+   * and for every queued save to land; `focusout` on the list picks it up. */
+  function renderWhenIdle() {
+    if (!planEditing()) { render(); return; }
+    sched.renderWanted = true;
   }
 
   /* ------------------------------------------------------------- loading */
@@ -3452,6 +3482,14 @@
     bindDragging();
     bindSequence();
     loadSequences();
+    // A redraw held back while a box was being edited happens when the
+    // cursor leaves the plan's boxes - after the focus has moved, so a Tab
+    // into the next box is not mistaken for leaving.
+    $('schedList').addEventListener('focusout', () => {
+      setTimeout(() => {
+        if (sched.renderWanted && !planEditing()) render();
+      }, 0);
+    });
     let wasOn = false;
     app.onStatus((status, tab) => {
       updateSequenceBar(status && status.sequence);
@@ -3474,7 +3512,7 @@
       const sequence = (status && status.sequence) || {};
       if (sequence.running && sched.data
           && $('schedList').offsetParent !== null
-          && !document.activeElement.matches('input')) {
+          && !planEditing()) {
         const active = document.querySelector('.plan-box.active');
         const badge = active && active.querySelector('.run-badge');
         const stage = sequence.paused ? 'paused'

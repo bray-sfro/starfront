@@ -207,13 +207,12 @@ class CollabAdmin:
                     requirements: dict[str, Any] | None = None,
                     goals: dict[str, float] | None = None,
                     coordinator: str = "", notes: str = "",
-                    kind: str = "mosaic", collect_files: bool = False) -> dict[str, Any]:
+                    kind: str = "mosaic") -> dict[str, Any]:
         return self._call("POST", "/api/v1/projects", {
             "name": name, "region": region, "kind": kind,
             "requirements": requirements or {},
             "goals": goals or {},
             "coordinator": coordinator, "notes": notes,
-            "collectFiles": bool(collect_files),
         })
 
     def update_project(self, project_id: str,
@@ -221,12 +220,6 @@ class CollabAdmin:
         """Change a project after it was started. Only the keys given move."""
         return self._call("PUT", f"/api/v1/projects/{urllib.parse.quote(project_id)}",
                           changes)
-
-    def redeal_project(self, project_id: str) -> dict[str, Any]:
-        """Have every rig on a project dealt afresh the next time it asks:
-        tonight's lists are forgotten, nothing moves under a run."""
-        return self._call("POST", f"/api/v1/projects/{urllib.parse.quote(project_id)}/redeal",
-                          {})
 
     # -- delegation --------------------------------------------------------
     def add_task(self, project_id: str, agent: str, region: dict[str, Any],

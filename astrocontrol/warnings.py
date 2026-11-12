@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import filters as filternames
+from .focushealth import bogus_reading
 
 LEVELS = ("critical", "warning", "notice")
 RANK = {level: index for index, level in enumerate(LEVELS)}
@@ -515,12 +516,20 @@ def frames_not_saved(board: WarningBoard, ctx: Context) -> None:
     if not run.get("running") or ctx.rigs is None:
         return
     with contextlib.suppress(Exception):
-        capture = ctx.rigs.master.capture
-        if run.get("state") in ("imaging", "exposing") and not capture.save_enabled:
+        if run.get("state") not in ("imaging", "exposing"):
+            return
+        # Every telescope, by name: the Saving box on the camera panel shows
+        # only the telescope selected in the top bar, so "saving is off" with
+        # no name sent a person to check the one that was fine.
+        rigs = list(ctx.rigs.imaging()) if hasattr(ctx.rigs, "imaging") else [ctx.rigs.master]
+        off = [rig.name for rig in rigs if not rig.capture.save_enabled]
+        if off:
             board.raise_("capture.unsaved", "critical", "Frames are not being saved",
-                         "The sequence is exposing and saving is switched off; "
-                         "every frame is lost as it lands.",
-                         "Turn saving back on in the camera panel.")
+                         f"The sequence is exposing and saving is switched off on "
+                         f"{', '.join(off)}; every frame from "
+                         f"{'it' if len(off) == 1 else 'them'} is lost as it lands.",
+                         f"Select {off[0]} in the top bar and turn saving back on in "
+                         "the camera panel.")
 
 
 @check
@@ -596,32 +605,158 @@ def focuser_wanted(board: WarningBoard, ctx: Context) -> None:
                          "The focuser reports no temperature",
                          "Refocusing on temperature change cannot happen; the clock "
                          "and star-size triggers still can.")
+    # 0 steps at -273 C is the driver's placeholder for "no focuser here",
+    # not a focuser at the end of its travel (FSQ106 and vsd100, 2026-11-03).
+    # That is said by `focuser_responding`, and the travel warning is not.
+    if bogus_reading(focuser) is not None:
+        return
     with contextlib.suppress(Exception):
         limit = int(getattr(focuser, "max_step", 0) or 0)
         position = int(focuser.position)
-        # A focuser that found focus at 32922 an hour ago and now says 0 has
-        # not been wound in: its driver has lost the device. ZWO's answers 0
-        # and no temperature once the USB link drops, and "at the end of its
-        # travel" sent somebody looking at the wrong thing on the night it
-        # happened. Say what it is, and what to do about it.
-        found = None
-        with contextlib.suppress(Exception):
-            last = (ctx.rigs.master.focuser.status() or {}).get("last") or {}
-            found = last.get("bestPosition")
-        if (position <= 0 and found and int(found) > 1000
-                and getattr(focuser, "temperature", None) is None):
-            board.raise_("focuser.lost", "critical", "The focuser has stopped answering",
-                         f"It reports position 0 and no temperature, but focus was found "
-                         f"at {int(found)} tonight. Its USB link has most likely dropped; "
-                         "a focus run now would drive it to nonsense.",
-                         "Check the focuser's USB cable and hub, then disconnect and "
-                         "reconnect it under Equipment. Refocus after.")
-            return
         if limit and (position <= 0 or position >= limit):
             board.raise_("focuser.limit", "warning", "The focuser is at the end of its travel",
                          f"Position {position} of 0–{limit}: a focus sweep cannot move "
                          "past it one way.",
                          "Move the focuser toward the middle of its range and refocus.")
+
+
+@check
+def focuser_responding(board: WarningBoard, ctx: Context) -> None:
+    """A focuser that says it is connected but is not answering (0.2.52d).
+
+    Every telescope's, not only the master's: on a RASA mount each drawer
+    has its own focuser, and any one of them can lose its USB.
+    """
+    rigs = []
+    with contextlib.suppress(Exception):
+        rigs = list(ctx.rigs.all) if ctx.rigs is not None else []
+    for index, rig in enumerate(rigs):
+        focuser = ctx.device("focuser", rig)
+        health = getattr(rig, "focus_health", None)
+        state = dict(getattr(health, "state", None) or {})
+        key = "focuser.dead" if index == 0 else f"focuser.dead.{getattr(rig, 'id', index)}"
+        name = getattr(rig, "name", "") if len(rigs) > 1 else ""
+        who = f"{name}: " if name else ""
+        bad = bogus_reading(focuser) if focuser is not None else None
+        if state.get("state") == "dead" and (focuser is None or bad is not None):
+            board.raise_(key, "warning", f"{who}The focuser is not responding",
+                         "Starfront reconnected it 3 times and it still does not "
+                         f"answer ({state.get('reason') or 'no reply'}). Autofocus "
+                         "cannot run; frames are at whatever focus it was left at.",
+                         "Power-cycle or replug the focuser (or its USB hub) at the "
+                         "scope, then reconnect it under Equipment.")
+        elif (state.get("state") == "reconnected" and bad is None
+                and time.time() - float(state.get("at") or 0) < 3600):
+            board.raise_(key, "notice", f"{who}The focuser was reconnected",
+                         "It had stopped answering ("
+                         + str(state.get("reason") or "no reply")[:160]
+                         + ") and was reconnected at "
+                         + time.strftime("%H:%M", time.localtime(float(state["at"])))
+                         + "; it is answering again.",
+                         "Nothing to do. If it keeps happening, check its USB "
+                         "cable and hub at the scope.")
+        elif bad is not None:
+            board.raise_(key, "warning", f"{who}The focuser is not responding",
+                         f"It says it is connected but {bad}. Starfront reconnects "
+                         "it by itself before the next focus move.",
+                         "If that does not bring it back, power-cycle or replug it "
+                         "at the scope.")
+
+
+@check
+def camera_responding(board: WarningBoard, ctx: Context) -> None:
+    """A camera that says it is connected but is not answering (0.2.52e).
+
+    Every telescope's: on a RASA mount each drawer has its own camera, and
+    one of them losing its USB says nothing about the other two. Read from
+    what the camera check found - this never asks the driver anything.
+    """
+    rigs = []
+    with contextlib.suppress(Exception):
+        rigs = list(ctx.rigs.all) if ctx.rigs is not None else []
+    for index, rig in enumerate(rigs):
+        health = getattr(rig, "camera_health", None)
+        state = dict(getattr(health, "state", None) or {})
+        camera = ctx.device("camera", rig)
+        lost = getattr(camera, "lost_reason", None) if camera is not None else None
+        key = "camera.dead" if index == 0 else f"camera.dead.{getattr(rig, 'id', index)}"
+        name = getattr(rig, "name", "") or "this telescope"
+        if state.get("state") == "dead":
+            board.raise_(key, "warning", f"Camera {name} is not responding, power-cycle "
+                         "or replug it at the scope",
+                         "Starfront reconnected it 3 times and it still does not answer ("
+                         + str(state.get("reason") or "no reply")[:200]
+                         + "). Its sequence is paused; the other telescopes carry on.",
+                         "Power-cycle or replug the camera (or its USB hub) at the "
+                         "scope; Starfront reconnects it by itself after that.")
+        elif isinstance(lost, str) and lost:
+            board.raise_(key, "warning", f"Camera {name} is not responding",
+                         lost[:240] + ". Starfront reconnects it before its next "
+                         "exposure.",
+                         "If that does not bring it back, power-cycle or replug it "
+                         "at the scope.")
+        elif (state.get("state") == "reconnected"
+                and time.time() - float(state.get("at") or 0) < 3600):
+            board.raise_(key, "notice", f"Camera {name} was reconnected",
+                         "It had stopped answering ("
+                         + str(state.get("reason") or "no reply")[:160]
+                         + ") and was reconnected at "
+                         + time.strftime("%H:%M", time.localtime(float(state["at"])))
+                         + "; it is answering again.",
+                         "Nothing to do. If it keeps happening, check its USB "
+                         "cable, hub and power at the scope.")
+
+
+@check
+def camera_settings_match(board: WarningBoard, ctx: Context) -> None:
+    """A saved light whose GAIN/OFFSET is not the telescope's (0.2.53).
+
+    2026-11-04, the twin FSQ: 36 m42 subs at gain 0 / offset 0 against a
+    calibration library at 100 / 50, and nothing said so until processing.
+    Read from what the capture found when it saved the frame - this never
+    asks the driver anything. Every telescope's, each under its own key.
+    """
+    rigs = []
+    with contextlib.suppress(Exception):
+        rigs = list(ctx.rigs.all) if ctx.rigs is not None else []
+    for index, rig in enumerate(rigs):
+        capture = getattr(rig, "capture", None)
+        found = getattr(capture, "settings_mismatch", None)
+        if not isinstance(found, dict):
+            continue
+        suffix = "" if index == 0 else f".{getattr(rig, 'id', index)}"
+        name = getattr(rig, "name", "") or "this telescope"
+        if found.get("kind") == "mismatch":
+            fields = found.get("fields") or {}
+            board.raise_(
+                "camera.settings" + suffix, "warning",
+                f"{name}: frames are not at the profile's gain/offset",
+                f"{found.get('file')} was saved with "
+                + ", ".join(f"{k.upper()} {v.get('header')}" for k, v in fields.items())
+                + "; this telescope's settings say "
+                + ", ".join(f"{k} {v.get('wanted')}" for k, v in fields.items())
+                + ". Those frames will not match the calibration library.",
+                "Check the camera's gain/offset on the Camera panel; Starfront sets "
+                "them again before every light, so if this stays the driver is "
+                "refusing them - reconnect the camera.")
+        elif found.get("kind") == "history" and ctx.imaging():
+            # 0.2.53a: blank in the profile, so the camera's own usual values.
+            board.raise_(
+                "camera.settings" + suffix, "notice",
+                f"{name}: using historical gain {found.get('gain')} / offset "
+                f"{found.get('offset')} (from {found.get('count')} lights)",
+                "This telescope has no gain/offset of its own, so Starfront uses the "
+                "values most of this camera's past lights were taken at.",
+                "Set the gain and offset under Equipment > Camera to make it explicit.")
+        elif found.get("kind") == "unset" and ctx.imaging():
+            # No setting and no history: loud (0.2.53a), not a notice.
+            board.raise_(
+                "camera.settings" + suffix, "warning",
+                f"{name} has no gain/offset of its own",
+                f"Lights are being taken at whatever the camera is at (gain "
+                f"{found.get('gain')} / offset {found.get('offset')}), and a camera "
+                "reconnect can change that mid-night.",
+                "Set the gain and offset under Equipment > Camera for this telescope.")
 
 
 # -- the guider --------------------------------------------------------------
@@ -702,10 +837,36 @@ def weather(board: WarningBoard, ctx: Context) -> None:
     with contextlib.suppress(Exception):
         status = ctx.safety.status()
         if status.get("safe") is False:
-            board.raise_("safety.unsafe", "critical", "The safety monitor says unsafe",
+            held, hold = status.get("unsafeFor"), status.get("holdSeconds")
+            waiting = (not status.get("confirmed") and status.get("acted") is not False
+                       and held is not None and hold and held < hold)
+            board.raise_("safety.unsafe", "warning" if waiting else "critical",
+                         "The safety monitor says unsafe"
+                         + (f" (shutting down if it lasts {hold - held:.0f} s more)"
+                            if waiting else ""),
                          str(status.get("error") or "The sky is not safe to open under."),
                          "Nothing to do but wait; the program acts on it by itself.")
-        elif status.get("enabled", True) and not status.get("connected") \
+        restart = status.get("autoRestart") or {}
+        state = restart.get("state")
+        if state == "armed":
+            wait = restart.get("restartIn")
+            board.raise_("safety.restart", "notice",
+                         "Auto-restart armed after the weather shutdown",
+                         (f"restarts in {wait:.0f} s if it stays safe" if wait is not None
+                          else "waiting for the sky to read safe")
+                         + f" ({restart.get('reason') or ''})",
+                         "Any Stop, Start, slew or park by hand cancels it.")
+        elif state == "restarting":
+            board.raise_("safety.restart", "notice", "Auto-restart under way",
+                         f"step: {restart.get('step') or '?'} - {restart.get('reason') or ''}",
+                         "Stop the sequence to cancel it.")
+        elif state in ("skipped", "failed"):
+            board.raise_("safety.restart", "warning",
+                         "No auto-restart" if state == "skipped" else "Auto-restart failed",
+                         str(restart.get("reason") or ""),
+                         "The observatory stays shut down; start it by hand if you want.")
+        if status.get("safe") is not False \
+                and status.get("enabled", True) and not status.get("connected") \
                 and ctx.run().get("loop"):
             board.raise_("safety.missing", "warning",
                          "Running on loop with no safety monitor",
@@ -810,11 +971,22 @@ def sequence_health(board: WarningBoard, ctx: Context) -> None:
             offset = float(recent[0].offset or 0)
             medians = [float((r.stats or {}).get("median") or 0.0) for r in recent]
             if all(m <= offset * 10 + 30 for m in medians) and all(m < 300 for m in medians):
+                # 0.2.53b: say so when the roof is the reason. The sequencer
+                # holds every light while a connected roof is not open.
+                roof = ""
+                with contextlib.suppress(Exception):
+                    dome = ctx.rigs.master.manager.get("dome")
+                    if dome is not None and dome.connected and getattr(dome, "can_shutter", False):
+                        state = str(dome.shutter_state)
+                        if state != "open":
+                            roof = f" The roof reads {state}."
                 board.raise_("frames.black", "critical", "The frames are black",
                              f"The last {len(recent)} lights have a median of "
-                             f"{medians[-1]:.0f} ADU: nothing is reaching the sensor.",
-                             "A cover still on, the panel's cover shut, or a dark filter "
-                             "slot. Check the light path.")
+                             f"{medians[-1]:.0f} ADU: nothing is reaching the sensor.{roof}",
+                             ("The roof is not open: the run holds its lights until it "
+                              "reads open." if roof else
+                              "A cover still on, the panel's cover shut, or a dark filter "
+                              "slot. Check the light path."))
             elif all(m > 60000 for m in medians):
                 board.raise_("frames.white", "critical", "The frames are saturated",
                              f"The last {len(recent)} lights are at {medians[-1]:.0f} ADU.",

@@ -8,7 +8,7 @@
 <!-- The ?v= stamps exist to break a browser cache that has already decided an
      older copy is still fresh. Bump them if a released build ever needs to
      invalidate a client that has not revalidated. -->
-<link rel="stylesheet" href="style.css?v=71">
+<link rel="stylesheet" href="style.css?v=67">
 </head>
 <body>
 
@@ -383,15 +383,6 @@
         <button class="btn small" id="btnNextFrame" title="Next frame (→)">▶</button>
         <button class="btn small ghost" id="btnNewestFrame" title="Back to the latest frame, and follow new ones" hidden>Newest</button>
         <span class="toolbar-gap"></span>
-        <!-- Tonight's subs calibrated and added up as they land, in this same
-             viewer. One button; the picker only appears once the night has
-             more than one stack going (a second filter, a second target). -->
-        <button class="btn small" id="btnLiveStack"
-                title="Show tonight's calibrated live stack of this target instead of the single frame (s)">Live stack</button>
-        <select id="stackPick" class="small" title="Which stack to show" hidden></select>
-        <button class="btn small ghost" id="btnStackReset"
-                title="Throw this stack away and start it again from the next frame" hidden>Restart</button>
-        <span class="toolbar-gap"></span>
         <button class="btn small" id="btnFit">Fit</button>
         <button class="btn small" id="btnActual">1:1</button>
         <button class="btn small" id="btnZoomOut">−</button>
@@ -434,7 +425,6 @@
       <div class="viewer-status mono small">
         <span id="cursorReadout">—</span>
         <span class="spacer"></span>
-        <span id="stackInfo" class="stack-info"></span>
         <span id="frameInfo"></span>
       </div>
     </div>
@@ -1400,8 +1390,12 @@
         <span class="spacer"></span>
         <label class="inline small" title="Let the others see where this telescope points and what it is shooting. Never your location.">
           <input type="checkbox" id="colShare" checked> Share my position</label>
+        <label class="inline small" title="Send the lights this PC shoots for a collaboration task, and the masters that calibrate them, to the collaboration server as each one is captured. Your files are never changed or deleted. The collaboration's owner must turn uploads on for it too.">
+          <input type="checkbox" id="colAutoUpload" checked> Upload my collab lights</label>
         <button class="btn small" id="btnColRefresh">Refresh</button>
       </div>
+
+      <div class="small mono" id="colUploadLine" style="padding:2px 10px" hidden></div>
 
       <div class="collab-page">
 
@@ -1423,8 +1417,8 @@
         </div>
 
         <!-- ------------------------------------------------- 1. start one -->
-        <details class="fold col-start-fold" id="colStartFold">
-          <summary>+ Start a collaboration</summary>
+        <details class="fold" id="colStartFold">
+          <summary>Start a collaboration</summary>
           <div class="plan-box">
             <div class="row gap">
               <label class="inline"><input type="radio" name="colShape"
@@ -1507,21 +1501,12 @@
               </div>
               <label class="inline"><input type="checkbox" id="colRCalibrated">
                 Only calibrated frames count</label>
-              <label class="inline" title="Everyone on it uploads their lights to the server's files page, sorted by collaboration and person, for you to stack. Off, the ledger records what was shot and the files stay with whoever shot them."><input type="checkbox" id="colPCollect">
-                Collect the lights on the server</label>
               <div class="row gap" style="margin-top: 6px">
-                <label class="inline" title="A colour camera's broadband is its own band, OSC-RGB, kept apart from mono red, green and blue. Ticking this adds OSC-RGB to the filters; give it hours wanted."><input type="checkbox" id="colROscRgb" checked>
-                  Take OSC broadband (OSC-RGB)</label>
-                <label class="inline" title="A colour camera through a dual-band filter records Ha and OIII on one matrix: its own band, OSC-Ha+OIII. Ticking this adds it to the filters."><input type="checkbox" id="colROscNb" checked>
-                  Take OSC narrowband (OSC-Ha+OIII)</label>
-              </div>
-              <div class="row gap" style="margin-top: 6px">
-                <label class="inline">Colour cameras only with the Moon under
+                <label class="inline"><input type="checkbox" id="colRColour" checked>
+                  One-shot colour cameras may take part</label>
+                <label class="inline">— only with the Moon under
                   <input type="number" id="colRColourMoon" step="5" min="0" max="100"
                          style="width: 64px" placeholder="any"> % lit</label>
-                <label class="inline" title="1 is the darkest sky, 9 an inner city. A rig that has not rated its sky is told, not refused.">Sky no worse than Bortle
-                  <input type="number" id="colRMaxBortle" step="1" min="1" max="9"
-                         style="width: 64px" placeholder="any"></label>
               </div>
               <p class="small muted">
                 A colour camera shoots broadband RGB whatever is in front of it,
@@ -1540,11 +1525,7 @@
         </details>
 
         <!-- ------------------------------------------------ 2. take part -->
-        <!-- The night as it is happening: who is on the sky right now, and
-             the frames landing. The list of collaborations below is the
-             ledger; this is the reason to open it. -->
-        <div class="col-live" id="colLive" hidden></div>
-        <h3 class="collab-heading">Collaborations tonight
+        <h3 class="collab-heading">Active collaborations
           <span class="tag" id="colOpenCount">0</span></h3>
         <div id="colBrowse">
           <p class="small muted">Set a server above, then refresh.</p>
@@ -1620,6 +1601,7 @@
       <h2>Observatory</h2>
 
       <div class="safety-banner" id="safetyBanner">Not watching the weather</div>
+      <div class="small muted" id="safetySourceLine" hidden></div>
 
       <div class="readout-row" id="domeRow" hidden>
         <div class="readout"><span>Roof</span><b id="domeShutter">—</b></div>
@@ -1632,6 +1614,7 @@
       </div>
 
       <h3 id="switchHeading" hidden>Power</h3>
+      <div class="small mono muted switch-readings" id="switchReadings" hidden></div>
       <div class="switch-list" id="switchList" hidden></div>
 
       <p class="small muted" id="observatoryNote">
@@ -1794,6 +1777,34 @@
     </p>
     </section>
 
+    <section class="pref" data-pref="power" data-pref-label="Power" hidden>
+    <!-- The power box, port by port: what each outlet feeds. One table for
+         the whole mount, because there is one box; the gear below it is what
+         a power cycle would switch for each device, and the hand button. -->
+    <h3>Outlets <span class="small muted" id="powerBoxName"></span></h3>
+    <p class="small muted" id="powerPageNote"></p>
+    <div class="outlet-table" id="powerOutlets"></div>
+    <p class="small muted">
+      Every port on the box, labelled as the box labels it, and the piece of
+      gear it feeds. Pick the device on each row and save. An outlet left
+      unassigned that carries a telescope's own name ("rasa1" on a port
+      labelled rasa1 or RASA1) is taken as that telescope's camera, so a box
+      labelled that way needs nothing picked at all. The Observatory panel
+      shows each outlet with what it feeds.
+    </p>
+
+    <h3>Gear</h3>
+    <div class="power-gear" id="powerGear"></div>
+    <p class="small muted">
+      What a power cycle of each device switches: its outlets off for a few
+      seconds and back on, the device closed first and reconnected after
+      (Equipment › Recovery › The power box sets the times). Recovery does
+      this by itself for a camera that will not reconnect; anything else is
+      cycled by hand from here. A mount cycled by hand will need homing
+      afterwards.
+    </p>
+    </section>
+
     <section class="pref" data-pref="camera" data-pref-label="Camera" hidden>
     <h3>Camera <span class="tag" data-role="rig-scope">—</span></h3>
     <div class="grid-2">
@@ -1816,8 +1827,12 @@
         <input type="number" id="camWarmRate" step="0.5" min="0.5" max="30" value="3">
       </label>
     </div>
-    <label class="inline"><input type="checkbox" id="camCoolStart" checked> Cool down when a sequence starts</label>
-    <label class="inline"><input type="checkbox" id="camWarmEnd" checked> Warm up when it finishes</label>
+    <label class="inline"><input type="checkbox" id="camCoolAll" checked>
+      Cool <strong>every</strong> telescope's camera when a sequence starts (one setting for the whole mount)</label>
+    <label class="inline"><input type="checkbox" id="camCoolStart" checked> Cool down when a sequence starts (this telescope only, when the switch above is off)</label>
+    <label class="inline"><input type="checkbox" id="camWarmEnd" checked> Warm up at the end of the night (off: never warm automatically)</label>
+    <label class="inline"><input type="checkbox" id="camWarmOnStop"> Also warm up when I press Stop or the plan ends early</label>
+    <label class="inline"><input type="checkbox" id="camWarmAtDawn" checked> A camera left cold by a Stop warms at dawn if nothing has started by then</label>
     <label class="inline"><input type="checkbox" id="camWaitCooling"> Wait for temperature before the first slew</label>
     <p class="small muted">
       Gain and offset are applied when a sequence starts, so a night always
@@ -1831,6 +1846,23 @@
       before the first light frame — by which time there is usually nothing left
       to wait for. Turn it on to hold everything still until the setpoint is
       reached.
+    </p>
+
+    <h3>Power <span class="tag" data-role="rig-scope">—</span></h3>
+    <p class="small muted" id="camPowerNote">
+      Connect a power box on the Connection page to assign outlets.
+    </p>
+    <div class="row gap">
+      <button class="btn small" id="btnPowerCycle" type="button">Power-cycle this camera now</button>
+      <button class="btn small ghost" id="btnPowerPage" type="button">Assign outlets…</button>
+      <span class="small muted" id="camPowerLast"></span>
+    </div>
+    <p class="small muted">
+      Which outlets feed this camera — its 12 V port and the USB port it
+      hangs off — is set on the Power page, where every port on the box is
+      tied to the piece of gear it feeds. A camera that has fallen off the
+      USB bus will not open for a reconnect; these are what recovery switches
+      off and on to bring it back (Equipment › Recovery › The power box).
     </p>
 
     <h3>Camera angle <span class="tag" data-role="rig-scope">—</span></h3>
@@ -1974,30 +2006,6 @@
       darks is hours of closed-shutter time that cannot be taken again on the
       night they turn out to be missing.
     </p>
-
-    <h3>Live stack</h3>
-    <p class="small muted">
-      Every light is calibrated with the masters that match it and folded
-      into tonight's picture of the target as it lands. The <b>Live stack</b>
-      button on the Image tab shows it. The raw frames are never touched.
-    </p>
-    <label class="inline"><input type="checkbox" id="stackEnabled"> Stack tonight's lights as they are taken</label>
-    <label class="inline"><input type="checkbox" id="stackOwn"> Stack my own targets, not only collaborations</label>
-    <label class="inline"><input type="checkbox" id="stackGradient"> Remove each frame's sky gradient on the way in</label>
-    <label class="inline"><input type="checkbox" id="stackRaw"> Stack frames that have no matching masters, raw</label>
-    <label class="inline"><input type="checkbox" id="stackShare"> Send tiles to the collaboration as well</label>
-    <label class="small">Canvas size, pixels on the long side (0 = the camera's own resolution)
-      <input type="number" id="stackMaxPixels" min="0" max="16384" step="256">
-    </label>
-    <p class="small muted">
-      At the camera's own resolution the stack lives on disk beside your
-      settings, about 2.6 GB a filter for a 60-megapixel camera, and each sub
-      takes a little longer to fold in. Put a number here to keep it smaller:
-      3000 is about 180 MB a filter and fits in memory.
-    </p>
-    <div class="row gap">
-      <button class="btn small" id="btnStackSave">Save live stack settings</button>
-    </div>
     </section>
 
     <section class="pref" data-pref="focus" data-pref-label="Autofocus" hidden>
@@ -2082,23 +2090,31 @@
     <h3>Meridian flip</h3>
     <label class="inline"><input type="checkbox" id="flipEnabled" checked>
       Flip the mount at the meridian</label>
+    <label>The mount can track this long past the meridian (min)
+      <input type="number" id="flipLimit" step="1" min="0" max="180" value="0">
+    </label>
     <div class="grid-2">
-      <label>Stop imaging this long before (min)
+      <label>Stop imaging this long before that (min)
         <input type="number" id="flipPause" step="1" min="0" max="120" value="5">
       </label>
-      <label>Flip this long after (min)
+      <label>Flip this long after transit (min)
         <input type="number" id="flipAfter" step="1" min="0" max="120" value="2">
       </label>
     </div>
     <label class="inline"><input type="checkbox" id="flipSolve" checked>
       Plate solve and re-centre after the flip</label>
     <p class="small muted">
-      A German equatorial cannot track through the meridian. Imaging stops
-      before the target gets there, the mount is sent back to the same
-      coordinates — which is what makes the driver flip — and the new pointing
-      is solved and synced before imaging starts again. A fork mount reports no
-      side of pier and is left alone whatever this says. Focus is checked after
-      every flip, because on most rigs it shifts across one.
+      A German equatorial has to change sides at the meridian, but most can
+      track some minutes past it before their own limit stops them. Put that
+      figure here, a little under the limit set in the mount or its driver,
+      and the last frame runs through transit with the flip following the
+      moment it ends. At 0 imaging has to stop a whole frame short of transit,
+      and with ten-minute subs that is a quarter of an hour of sky spent
+      waiting at every flip. The flip itself is a slew back to the same
+      coordinates — which is what makes the driver change sides — and the new
+      pointing is solved and synced before imaging starts again. A fork mount
+      reports no side of pier and is left alone whatever this says. Focus is
+      checked after every flip, because on most rigs it shifts across one.
     </p>
 
     <h3>Slewing</h3>
@@ -2117,6 +2133,27 @@
     </p>
 
     <h3>When the sequence starts</h3>
+    <label class="inline"><input type="checkbox" id="seqOpenRoof" checked>
+      Open roof at sequence start</label>
+    <p class="small muted">
+      With a dome or roll-off connected, the lead telescope opens it before the
+      first slew of every target, and nothing moves or exposes until it reads
+      open. An open that fails or does not finish in time is treated as the
+      site's technician lock: nothing more is sent to the roof, no lights are
+      taken, you are alerted and the run stops (park, warm).
+    </p>
+    <label class="inline"><input type="checkbox" id="seqRoofNeedsSafety">
+      Require safety monitor to open</label>
+    <p class="small muted">
+      Off: with no safety monitor the roof is opened anyway, with a warning that
+      nothing will close it for weather. On: no monitor, no open.
+    </p>
+    <label>Roof open timeout (s)
+      <input type="number" id="seqRoofOpenTimeout" min="10" max="1800" step="10" value="180"></label>
+    <label class="inline"><input type="checkbox" id="seqRoofGate" checked>
+      Hold lights while the roof is not open</label>
+    <label class="inline"><input type="checkbox" id="seqRoofCloseAtEnd" checked>
+      Close the roof this run opened when the run ends (after the park)</label>
     <label class="inline"><input type="checkbox" id="seqHomeAtStart" checked>
       Home the mount before the first slew</label>
     <p class="small muted">
@@ -2201,6 +2238,62 @@
       back is deliberately much slower: starting up into a gap in the cloud is
       how a rig ends up opening and closing its roof all night.
     </p>
+
+    <h3>Network safety monitor (Alpaca)</h3>
+    <p class="small muted">
+      A SafetyMonitor read straight off an Alpaca server, such as the
+      Starfront roof API (https, alpaca-api.tx.starfront.space, port 443, the
+      building's device number). Unlike a monitor on the Equipment rows it
+      cannot be "not connected": any error, timeout, certificate failure,
+      stale answer or PC clock more than the skew limit off the server's reads
+      <b>unsafe</b>. Off leaves the Equipment-row monitor working as before.
+    </p>
+    <label>Source
+      <select id="safSource">
+        <option value="">Off (Equipment-row monitor only)</option>
+        <option value="alpaca">Alpaca server</option>
+      </select>
+    </label>
+    <div class="grid-2">
+      <label>Scheme
+        <select id="safAlpacaScheme">
+          <option value="http">http</option>
+          <option value="https">https</option>
+        </select>
+      </label>
+      <label>Host
+        <input type="text" id="safAlpacaHost" placeholder="alpaca-api.tx.starfront.space">
+      </label>
+      <label>Port (0 = 11111 for http, 443 for https)
+        <input type="number" id="safAlpacaPort" step="1" min="0" max="65535" value="0">
+      </label>
+      <label>Base path (usually blank)
+        <input type="text" id="safAlpacaPath" placeholder="">
+      </label>
+      <label>SafetyMonitor device number
+        <input type="number" id="safAlpacaDevice" step="1" min="0" max="9999" value="0">
+      </label>
+      <label class="inline"><input type="checkbox" id="safAlpacaRoofState" checked>
+        Also check the building's report time (Starfront roof/state)</label>
+      <label>No good answer for this long = unsafe (s)
+        <input type="number" id="safStale" step="10" min="30" max="3600" value="180">
+      </label>
+      <label>PC clock may be off the server's by (s)
+        <input type="number" id="safSkew" step="5" min="5" max="3600" value="120">
+      </label>
+      <label>Unconfirmed unsafe must last (s) before the shutdown
+        <input type="number" id="safDebounce" step="5" min="0" max="900" value="75">
+      </label>
+      <label class="inline"><input type="checkbox" id="safAutoRestart" checked>
+        After a weather shutdown, restart once safe for the resume time (doubled per restart)</label>
+      <label>Most auto-restarts a night
+        <input type="number" id="safRestartMax" step="1" min="0" max="20" value="3">
+      </label>
+      <label>Recool timeout on restart (min)
+        <input type="number" id="safRestartCool" step="1" min="1" max="120" value="20">
+      </label>
+    </div>
+    <p class="small" id="safSourceStatus">No network safety source configured.</p>
     </section>
 
     <section class="pref" data-pref="notify" data-pref-label="Notifications" hidden>
@@ -2429,13 +2522,29 @@
       <label>Restart attempts
         <input type="number" id="recGuideAttempts" step="1" min="0" max="20" value="3">
       </label>
-      <label>Recalibrate after N attempts
+      <label>Recalibrate on rough-guiding restart N (0 = never; a lost star never recalibrates)
         <input type="number" id="recRecalAfter" step="1" min="0" max="20" value="2">
       </label>
-      <label>Rough guiding counts as lost above (″ RMS)
-        <input type="number" id="recGuideRough" step="0.5" min="0" max="600" value="5">
+    </div>
+    <h4>Rough guiding</h4>
+    <div class="grid-2">
+      <label>Pick a fresh star above (" RMS; 0 = never)
+        <input type="number" id="recRoughArcsec" step="0.5" min="0" max="60" value="3">
+      </label>
+      <label>...for this many frames in a row
+        <input type="number" id="recRoughFrames" step="1" min="1" max="20" value="2">
+      </label>
+      <label>Not more often than every (min)
+        <input type="number" id="recRoughRetry" step="5" min="0" max="240" value="10">
       </label>
     </div>
+    <p class="small muted">
+      A guider that is still "guiding" at 5" RMS trails every sub as surely as
+      a lost star does. Past the limit for that many frames running, guiding is
+      stopped, the star dropped and a new one auto-selected, then guiding
+      restarted — one more go in the same budget as a lost star. Seeing or wind
+      are not fixed by a better star, which is what the spacing is for.
+    </p>
     <p class="small muted">
       PHD2 usually finds the star again itself within an exposure or two, so the
       wait is not politeness — a cloud is over before a re-acquisition would
@@ -2443,12 +2552,7 @@
       restarted; the later attempts recalibrate as well, which is slow and is
       the only thing that fixes a mount that has been nudged by hand. If none of
       it works the night carries on unguided and says so loudly, because an
-      unguided sub of a bright target is still a sub. The same rescue runs when
-      the guider fails to settle at the start, and when it is holding a star but
-      guiding rougher than the limit above — a reversed calibration pushes the
-      star out of frame while PHD2 still says “Guiding”, so that case goes
-      straight to a fresh star and then a fresh calibration. 0 turns the
-      roughness check off.
+      unguided sub of a bright target is still a sub.
     </p>
     <label class="inline"><input type="checkbox" id="recDiscardLost">
       Move frames taken without a guide lock into a <code>suspect</code> folder</label>
@@ -2492,6 +2596,42 @@
       bus is not, and asking again is the only thing that tells them apart. Only
       the telescope that failed is retried, so a working camera never shoots the
       same slot twice.
+    </p>
+    <label class="inline"><input type="checkbox" id="recReconnectManual" checked>
+      Also for frames taken by hand, and for focus and centring frames</label>
+    <label>Call the camera hung after (s past the exposure)
+      <input type="number" id="recHungSeconds" step="10" min="30" max="1800" value="120">
+    </label>
+    <p class="small muted">
+      Capture and Loop on the Image tab, and the frames a focus sweep or a
+      centring takes, get one disconnect-reconnect on the remembered driver and
+      one more try before the failure is reported. A camera that has not said
+      its exposure is done this long after it should have counts as failed, so a
+      wedged driver is reconnected rather than waited on until morning.
+    </p>
+
+    <h4>The power box</h4>
+    <label class="inline"><input type="checkbox" id="recPowerCycle" checked>
+      Power-cycle a camera's outlets when reconnecting is not enough</label>
+    <div class="grid-2">
+      <label>Plain reconnects first
+        <input type="number" id="recPowerAfter" step="1" min="0" max="10" value="1">
+      </label>
+      <label>Off for (s)
+        <input type="number" id="recPowerOff" step="1" min="1" max="300" value="10">
+      </label>
+      <label>Then wait for it to boot (s)
+        <input type="number" id="recPowerBoot" step="5" min="0" max="600" value="25">
+      </label>
+    </div>
+    <p class="small muted">
+      A camera that has left the USB bus does not come back for a reconnect:
+      the driver cannot open what the PC no longer sees. Cutting its outlets on
+      the power box and restoring them is the one thing that does. Only the
+      outlets assigned to that camera (Equipment › Power) are touched,
+      and only after the plain reconnect has had its go — this many reconnects
+      of the same camera inside a quarter of an hour, or one that fails
+      outright. The sequence's retry budget still bounds it.
     </p>
 
     <h3>Giving up</h3>
@@ -2741,9 +2881,6 @@
       </label>
       <label>Elevation (m)
         <input type="number" id="siteElevation" step="1" min="-500" max="9000" value="0">
-      </label>
-      <label title="1 is the darkest sky there is, 9 an inner city. Sent with your collaboration profile, so a project that asks for a dark sky can tell.">Bortle class of the sky (1–9)
-        <input type="number" id="siteBortle" step="1" min="1" max="9" placeholder="not rated">
       </label>
     </div>
     <p class="small muted" id="siteNote">
@@ -3164,15 +3301,15 @@
 
 <div id="toasts" class="toasts"></div>
 
-<script src="app.js?v=71"></script>
-<script src="livestack.js?v=65"></script>
-<script src="sky.js?v=66"></script>
+<script src="app.js?v=73"></script>
+<script src="sky.js?v=62"></script>
+<script src="surveyimg.js?v=1"></script>
 <script src="planner.js?v=62"></script>
-<script src="plan.js?v=64"></script>
+<script src="plan.js?v=63"></script>
 <script src="surveytab.js?v=62"></script>
 <script src="calibrate.js?v=62"></script>
-<script src="collab.js?v=73"></script>
+<script src="collab.js?v=62"></script>
 <script src="allsky.js?v=62"></script>
-<script src="wizard.js?v=66"></script>
+<script src="wizard.js?v=63"></script>
 </body>
 </html>

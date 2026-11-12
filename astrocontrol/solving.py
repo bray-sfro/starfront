@@ -540,12 +540,11 @@ class Solver:
             # folder *is* the record, that is a frame nobody can tell from the
             # real thing six months later.  It still reaches the viewer; it just
             # never reaches the disk.
-            saved = self.capture.save_enabled
-            self.capture.save_enabled = False
+            self.capture.suspend_saving()
             try:
                 record = self.capture.capture_blocking(exposure)
             finally:
-                self.capture.save_enabled = saved
+                self.capture.resume_saving()
 
             result = self._solve_image(record.id)
             result.separation = astro.separation_degrees(

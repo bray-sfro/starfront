@@ -72,13 +72,84 @@ def _tag(text: Any) -> str:
     return _UNSAFE.sub("_", str(text or "").strip()).strip("_")
 
 
+# ---------------------------------------------------------------------------
+# Library layout (calib-layout patch, 2026-11-01)
+#
+# The library is laid out the way the rig's Dropbox already is, one folder per
+# telescope and one per night:
+#
+#     <root>/RASA1/Bias/2026-10-30/      bias subs
+#     <root>/RASA1/Darks/2026-10-30/     dark subs
+#     <root>/RASA1/Flats/2026-10-30/     panel flat subs (sky flats in .../sky)
+#     <root>/RASA1/DarkFlats/2026-10-30/ darks for the flats
+#     <root>/RASA1/Masters/2026-10-30/   every master built that night
+#
+# The root is `calibration.libraryDirectory` when set; otherwise
+# `<Dropbox>/RASA Rig/Calibration` if that folder exists on this PC; otherwise
+# the old `<data>/calibration`.  The old flat `<…>/calibration/masters` folder
+# is still scanned, read-only, so masters built before this change still match.
+# ---------------------------------------------------------------------------
+
+#: The rig's Dropbox calibration folder, relative to the Dropbox root.
+DROPBOX_CALIBRATION = ("RASA Rig", "Calibration")
+
+#: Sub-folder per frame type.  `skyflat` is the calibration runner's own name
+#: for twilight flats, kept apart from panel flats under the same night.
+KIND_FOLDERS = {"bias": "Bias", "dark": "Darks", "flat": "Flats",
+                "darkflat": "DarkFlats", "skyflat": "Flats"}
+MASTERS_FOLDER = "Masters"
+
+
+def dropbox_root() -> Path | None:
+    """This PC's personal Dropbox folder, from Dropbox's own info.json."""
+    import json
+    import os
+    for env in ("LOCALAPPDATA", "APPDATA"):
+        base = os.environ.get(env)
+        if not base:
+            continue
+        info = Path(base) / "Dropbox" / "info.json"
+        with contextlib.suppress(OSError, ValueError):
+            data = json.loads(info.read_text("utf-8"))
+            for account in ("personal", "business"):
+                path = (data.get(account) or {}).get("path")
+                if path and Path(path).is_dir():
+                    return Path(path)
+    fallback = Path.home() / "Dropbox"
+    return fallback if fallback.is_dir() else None
+
+
+def legacy_library_root() -> Path:
+    """Where every version before this patch kept the library."""
+    return data_root() / "calibration"
+
+
 def library_root(config: Config | None = None) -> Path:
-    """Where the masters live: the configured folder, or one beside the data."""
+    """Where the library lives: configured, else the rig's Dropbox, else legacy."""
     configured = ""
     if config is not None:
         configured = (config.get("calibration", "libraryDirectory", "") or "").strip()
-    return (Path(configured).expanduser() if configured
-            else data_root() / "calibration")
+    if configured:
+        return Path(configured).expanduser()
+    box = dropbox_root()
+    if box is not None:
+        candidate = box.joinpath(*DROPBOX_CALIBRATION)
+        if candidate.is_dir():
+            return candidate
+    return legacy_library_root()
+
+
+def rig_folder(name: Any) -> str:
+    """The telescope's folder name: `rasa1` -> `RASA1`, as the Dropbox has it."""
+    return _tag(name).upper() or "UNKNOWN"
+
+
+def night_of(when: float | None = None) -> str:
+    """The night a moment belongs to, with the same noon cut capture uses."""
+    stamp = time.localtime(when if when is not None else time.time())
+    if stamp.tm_hour < 12:
+        stamp = time.localtime(time.mktime(stamp) - 86400)
+    return time.strftime("%Y-%m-%d", stamp)
 
 
 # ---------------------------------------------------------------------------
@@ -350,11 +421,52 @@ class Library:
 
     @property
     def masters_dir(self) -> Path:
+        """The pre-patch flat masters folder under the root (read-only now)."""
         return self.root / "masters"
 
     @property
     def subs_dir(self) -> Path:
-        return self.root / "subs"
+        """Reported only; subs now go to `sub_folder`."""
+        return self.root
+
+    def sub_folder(self, telescope: Any, kind: str, night: str) -> Path:
+        """Where one night's subs of one kind go: `<root>/RASA1/Darks/<night>`."""
+        folder = self.root / rig_folder(telescope) / KIND_FOLDERS.get(kind, kind.title())
+        folder = folder / night
+        return folder / "sky" if kind == "skyflat" else folder
+
+    def master_folder(self, telescope: Any, night: str | None = None) -> Path:
+        """Where a new master goes: `<root>/RASA1/Masters/<night>`."""
+        return (self.root / rig_folder(telescope) / MASTERS_FOLDER
+                / (night or night_of()))
+
+    def _master_files(self) -> list[tuple[Path, bool]]:
+        """Every candidate master file, as (path, legacy).
+
+        New layout first, so a master that was copied from the old folder into
+        the new one is seen once, as the new copy.  Only `Masters` folders are
+        scanned: the sub folders hold raw bias/dark frames whose headers would
+        otherwise read as masters.
+        """
+        seen: set[str] = set()
+        out: list[tuple[Path, bool]] = []
+
+        def add(paths, legacy: bool) -> None:
+            for path in sorted(paths):
+                if path.name in seen or not path.is_file():
+                    continue
+                seen.add(path.name)
+                out.append((path, legacy))
+
+        root = self.root
+        if root.is_dir():
+            add(root.glob(f"*/{MASTERS_FOLDER}/*/*.fit*"), False)
+            add(root.glob(f"*/{MASTERS_FOLDER}/*.fit*"), False)
+        for old in dict.fromkeys([self.masters_dir,
+                                  legacy_library_root() / "masters"]):
+            if old.is_dir():
+                add(old.glob("*.fit*"), True)
+        return out
 
     def settings(self) -> dict[str, Any]:
         return self.config.section("calibration")
@@ -362,13 +474,10 @@ class Library:
     # -- reading it --------------------------------------------------------
     def masters(self) -> list[dict[str, Any]]:
         """Every master in the library, newest first."""
-        folder = self.masters_dir
         found: list[dict[str, Any]] = []
-        if not folder.is_dir():
-            return found
         with self._lock:
             live: dict[str, tuple[float, dict[str, Any]]] = {}
-            for path in sorted(folder.glob("*.fit*")):
+            for path, legacy in self._master_files():
                 key = str(path)
                 try:
                     stamp = path.stat().st_mtime
@@ -385,6 +494,7 @@ class Library:
                     continue
                 if described is None:
                     continue
+                described["legacy"] = legacy
                 live[key] = (stamp, described)
                 found.append(described)
             self._seen = live
@@ -416,6 +526,9 @@ class Library:
     def remove(self, master_id: str) -> dict[str, Any]:
         for master in self.masters():
             if master["id"] == master_id:
+                if master.get("legacy"):
+                    raise DeviceError(f"{master_id} is in the old masters folder, "
+                                      "which is read-only; delete it by hand")
                 Path(master["path"]).unlink()
                 self.forget()
                 return master
@@ -479,9 +592,14 @@ class Library:
         # — so a named one only ever matches itself.  Darks are the camera's, so
         # a telescope name on them is a preference rather than a rule.
         scope = (want.get("telescope") or "").strip().lower()
-        if kind in ("flat", "darkflat") and scope:
+        # 0.2.53a: TELESCOP can differ from the Starfront name, so the want
+        # may list every name the telescope's frames carry.
+        # A want with no telescope name stays unrestricted, as before.
+        scopes = ({str(n).strip().lower() for n in (want.get("telescopes") or []) if n}
+                  | {scope}) if scope else set()
+        if kind in ("flat", "darkflat") and scopes:
             same_scope = [m for m in matched
-                          if (m["telescope"] or "").strip().lower() == scope]
+                          if (m["telescope"] or "").strip().lower() in scopes]
             if not same_scope:
                 return None, f"no master {kind} for {want.get('telescope')}"
             matched = same_scope
@@ -537,7 +655,7 @@ class Library:
 
         def rank(master: dict[str, Any]) -> tuple:
             owner = (master["telescope"] or "").strip().lower()
-            mine = 0 if (not owner or not scope or owner == scope) else 1
+            mine = 0 if (not owner or not scopes or owner in scopes) else 1
             same_camera = 0 if (not camera or not master["camera"]
                                 or master["camera"].strip().lower() == camera) else 1
             temp_gap = (abs((master["temperature"] or 0) - wanted_temp)
@@ -787,7 +905,9 @@ class Library:
             "SWCREATE": ("Starfront", ""),
         }
         header.update(extra or {})
-        path = self.masters_dir / master_filename(kind, meta)
+        folder = self.master_folder(meta.get("telescope"))
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / master_filename(kind, meta)
         fits.write(path, to_uint16(frame), header)
         self.forget()
         described = describe(path, fits.read_header(path))
@@ -801,9 +921,11 @@ class Library:
             by_type[master["type"]] = by_type.get(master["type"], 0) + 1
         total = sum(m["sizeBytes"] for m in found)
         writable = True
+        # Check the root, not the old masters folder: creating that would put
+        # an empty `masters` folder back into the Dropbox layout.
         with contextlib.suppress(OSError):
-            self.masters_dir.mkdir(parents=True, exist_ok=True)
-        if not self.masters_dir.is_dir():
+            self.root.mkdir(parents=True, exist_ok=True)
+        if not self.root.is_dir():
             writable = False
         return {
             "root": str(self.root),

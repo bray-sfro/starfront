@@ -77,6 +77,20 @@ class Manager:
 
 class Capture:
     save_enabled = True
+    _suspended = 0
+
+    def suspend_saving(self):
+        if self._suspended == 0:
+            self._save_before = self.save_enabled
+            self.save_enabled = False
+        self._suspended += 1
+
+    def resume_saving(self):
+        if self._suspended == 0:
+            return
+        self._suspended -= 1
+        if self._suspended == 0:
+            self.save_enabled = self._save_before
 
     def capture_blocking(self, exposure, **kw):
         return types.SimpleNamespace(id="frame", filename="frame.fits")

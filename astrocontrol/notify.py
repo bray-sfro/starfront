@@ -42,6 +42,11 @@ EVENTS = {
     "recovery": "onRecovery",
     "giveUp": "onGiveUp",
     "safety": "onSafety",
+    # Auto-restart after a weather shutdown (0.2.53a): armed, restarting,
+    # resumed, skipped, cancelled, failed. Same switch as "safety", but not
+    # rate-limited - it is a few messages a night at most (3 restarts), and
+    # the one saying it will restart lands seconds after the shutdown alert.
+    "safetyRestart": "onSafety",
     # What the telescope is doing: a night opening, a target starting, a
     # meridian flip, the observatory going to bed, the next night's time.
     "activity": "onActivity",
@@ -65,7 +70,7 @@ THROTTLED = {"failure", "recovery", "giveUp", "safety", "warning"}
 #: night that ended well, blue for a telescope going about its business.
 COLOURS = {
     "failure": 0xD9503D, "giveUp": 0xD9503D, "warning": 0xD9503D,
-    "safety": 0xD9A03D, "recovery": 0xD9A03D,
+    "safety": 0xD9A03D, "recovery": 0xD9A03D, "safetyRestart": 0xD9A03D,
     "sequenceEnd": 0x4BB87A, "calibration": 0x4BB87A,
     "activity": 0x5B8DD9, "test": 0x9AA8BD,
 }

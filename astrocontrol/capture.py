@@ -23,13 +23,16 @@ import numpy as np
 
 from . import astro
 from .config import Config, data_root, effective_site
-from .devices.base import DeviceError
+from .devices.base import CameraLostError, DeviceError
 from .devices.manager import DeviceManager
 from .imaging import fits, render, wcs
 from .livestack import Plan, StackError
 from .pipeline import Job
 
 FRAME_TYPES = ("light", "dark", "bias", "flat", "darkflat")
+
+#: A night folder is named for its date: `<root>/<target>/<night>`.
+_NIGHT_NAME = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 LIGHT_PATH_TYPES = ("light", "flat")      # frame types where the shutter/sky matters
 
 # How many frames may be waiting to be calibrated before the queue starts
@@ -38,11 +41,9 @@ LIGHT_PATH_TYPES = ("light", "flat")      # frame types where the shutter/sky ma
 CALIBRATION_BACKLOG = 24
 
 # How much larger than the camera's field a target's live-stack canvas is made:
-# a tenth again each way, so dithering, drift and a meridian flip all still
-# land inside it rather than being cropped away one sub at a time. Dither is
-# arcseconds and a re-centred flip is arcminutes; at the camera's own
-# resolution every extra tenth is a fifth more pixels to hold.
-STACK_MARGIN = 1.1
+# a fifth again each way, so dithering, drift and a meridian flip all still
+# land inside it rather than being cropped away one sub at a time.
+STACK_MARGIN = 1.2
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._+-]+")
 
@@ -139,16 +140,90 @@ class ImageRecord:
         return payload
 
 
+_GENERIC_TELESCOPE = re.compile(r"^\s*telescope\s*\d*\s*$", re.IGNORECASE)
+
+
+def is_generic_telescope(name: str) -> bool:
+    """'Telescope 1', 'telescope', 'Telescope12' - the names nobody chose."""
+    return bool(_GENERIC_TELESCOPE.match(name or ""))
+
+
+def pc_name(config: Any) -> str:
+    """This PC's rig name: the fleet nodeName, else the hostname."""
+    import socket                                        # noqa: PLC0415
+    name = ""
+    try:
+        name = str((config.section("server") or {}).get("nodeName") or "").strip()
+    except Exception:                                    # noqa: BLE001
+        name = ""
+    if not name:
+        try:
+            name = socket.gethostname()
+        except Exception:                                # noqa: BLE001
+            name = ""
+    return name.strip()
+
+
 class CaptureService:
     # Frames captured with saving switched off exist only in this cache, so it
     # is deeper than it needs to be for saved frames alone.
     MAX_CACHED_FRAMES = 8
+    #: The PC's auto-upload queue, set once by the program for every rig.
+    shared_uploader: Any = None
+
+    # A frame taken without saving outlives the cache as a reduced copy, so
+    # the focus and centring frames of a night can still be looked at. The
+    # viewer draws a whole frame at about this size anyway; only the sharp
+    # crop at full zoom is lost, and these are frames nobody zooms into.
+    PREVIEW_LONG_SIDE = 1600
+    MAX_PREVIEWS = 80
 
     def __init__(self, manager: DeviceManager, config: Config | None = None) -> None:
         self.manager = manager
         self.config = config or Config()
         self._directory_override: Path | None = None
+        self._previews: OrderedDict[str, tuple[np.ndarray, int]] = OrderedDict()
+        self._start_lock = threading.Lock()
+        # calib-layout: True when the override already names the telescope, so
+        # `session_dir` must not add the per-telescope subfolder to it.
+        self._directory_exact = False
         self.save_enabled = True
+        # Borrowers that want frames kept off the disk - a focus sweep, a
+        # centring frame, the focuser check - are counted rather than each
+        # remembering and restoring `save_enabled` themselves.  Two of them
+        # overlapping (a sweep still finishing as the next run's sweep began)
+        # used to restore each other's answer and leave saving off for a
+        # whole target's lights.
+        self._save_suspended = 0
+        self._save_before = True
+        self._save_lock = threading.Lock()
+        #: Brings this telescope's camera back on its remembered driver.  Set
+        #: by whoever owns the telescopes; None means a failed frame is
+        #: simply a failed frame.
+        self.reconnect_camera: Any = None
+        #: The telescope's CameraHealth (0.2.52e): the camera is checked
+        #: before every exposure, and one that has stopped answering is
+        #: reconnected rather than sent StartExposure. None: not checked.
+        self.health: Any = None
+        #: The gain/offset every light must be taken at (0.2.53): a callable
+        #: returning {"gain", "offset", "source"} or None, set by the Rig
+        #: (the telescope's profile, else what this session was running at).
+        self.wanted_settings: Any = None
+        #: Told the gain/offset this session runs at when the profile leaves
+        #: them blank; set by the Rig.
+        self.note_settings: Any = None
+        #: Gain/offset a manual Capture asked for, which outrank the profile
+        #: for that run only. None for the sequencer's frames.
+        self._explicit_settings: dict[str, Any] | None = None
+        #: The last saved light whose header GAIN/OFFSET did not match what
+        #: was wanted, or that had nothing to match against; read by the
+        #: warnings board. None when the last light matched.
+        self.settings_mismatch: dict[str, Any] | None = None
+        self._said_unset = False
+        # This camera's usual gain/offset from its own past lights (0.2.53a),
+        # cached per (camera, folder); see `historical_settings`.
+        self._history_key: tuple | None = None
+        self._history: dict[str, Any] | None = None
         self.target_name = ""
         # What goes in the OBJECT header.  Kept apart from `target_name` because
         # that one has to survive being put in a filename and this one does not:
@@ -163,6 +238,10 @@ class CaptureService:
         # The telescope this camera belongs to: TELESCOP in the header, and the
         # folder frames land in once there is more than one of them.
         self.telescope = ""
+        # Where this telescope is in the PC's list (1-based) and how many there
+        # are: RIGID, and the "-N" on a fallback TELESCOP (0.2.53a).
+        self.rig_index = 1
+        self.rig_count = 1
         self.subfolder: str | None = None
         # What the sequencer knows about the frame that the camera cannot:
         # which target and panel, the panel's own coordinates and angle, and
@@ -190,6 +269,9 @@ class CaptureService:
         # the rig; None means frames are taken and nothing is stacked.
         self.stacker: Any = None
         self._stack_said_already: str = ""
+        # The collaboration auto-upload queue (astrocontrol/autoupload.py),
+        # shared by every rig on this PC. Set by the program; None sends nothing.
+        self.uploader: Any = None
         self._sequences: dict[str, int] = {}
         self.images: list[ImageRecord] = []
         self._by_id: dict[str, ImageRecord] = {}
@@ -197,6 +279,10 @@ class CaptureService:
         self._lock = threading.RLock()
 
         self._thread: threading.Thread | None = None
+        # Bumped by `release_stuck`; a blocking capture remembers the value it
+        # started under, and one that finds it changed was given up on.
+        self._generation = 0
+        self._owner_generation: dict[int, int] = {}
         self._abort = threading.Event()
         self._loop = False
         self._state = "idle"
@@ -249,6 +335,8 @@ class CaptureService:
                 parts.append(self.target_name)
             parts.append(self.night_name())
             base = Path(*parts)
+        if self._directory_override is not None and self._directory_exact:
+            return base
         return base / self.subfolder if self.subfolder else base
 
     # -- state -------------------------------------------------------------
@@ -291,9 +379,15 @@ class CaptureService:
     def set_output(self, save: bool | None = None, directory: str | None = None,
                    target: str | None = None,
                    object_name: str | None = None,
-                   panel: str | None = None) -> dict[str, Any]:
-        """Change where frames go, or whether they are written at all."""
+                   panel: str | None = None,
+                   exact: bool = False) -> dict[str, Any]:
+        """Change where frames go, or whether they are written at all.
+
+        `exact` (calib-layout): use `directory` as is, without the
+        per-telescope subfolder a multi-telescope rig normally adds.
+        """
         if directory is not None:
+            self._directory_exact = bool(exact) and bool(directory.strip())
             text = directory.strip()
             if not text:
                 # An empty folder puts us back on the target/night layout.
@@ -325,11 +419,38 @@ class CaptureService:
         if panel is not None:
             self.panel_label = clean_target(panel)
         if save is not None:
-            self.save_enabled = bool(save)
+            with self._save_lock:
+                if self._save_suspended:
+                    # A borrower has saving off for the moment; the choice is
+                    # what comes back when it is done.
+                    self._save_before = bool(save)
+                else:
+                    self.save_enabled = bool(save)
             self.manager.log(
-                "Frames will be saved to disk" if self.save_enabled
-                else "Frames are NOT being saved", "info" if self.save_enabled else "warn")
+                "Frames will be saved to disk" if bool(save)
+                else "Frames are NOT being saved", "info" if bool(save) else "warn")
         return self.status()
+
+    def suspend_saving(self) -> None:
+        """Keep frames off the disk until the matching `resume_saving`.
+
+        Nested calls are fine: saving comes back when the last borrower is
+        done, to whatever it was before the first one started - or to what
+        `set_output` was asked for in the meantime.
+        """
+        with self._save_lock:
+            if self._save_suspended == 0:
+                self._save_before = self.save_enabled
+                self.save_enabled = False
+            self._save_suspended += 1
+
+    def resume_saving(self) -> None:
+        with self._save_lock:
+            if self._save_suspended == 0:
+                return
+            self._save_suspended -= 1
+            if self._save_suspended == 0:
+                self.save_enabled = self._save_before
 
     def set_context(self, **fields: Any) -> None:
         """What the sequencer knows about the frames to come. See `frame_context`."""
@@ -354,6 +475,7 @@ class CaptureService:
         return {
             "save": self.save_enabled,
             "directory": self._directory_override,
+            "exact": self._directory_exact,
             "target": self.target_name,
             "object": self.object_name,
             "panel": self.panel_label,
@@ -363,6 +485,7 @@ class CaptureService:
     def restore_output(self, state: dict[str, Any]) -> None:
         self.save_enabled = bool(state.get("save", True))
         self._directory_override = state.get("directory")
+        self._directory_exact = bool(state.get("exact", False))
         self.target_name = state.get("target") or ""
         self.object_name = state.get("object") or ""
         self.panel_label = state.get("panel") or ""
@@ -372,6 +495,19 @@ class CaptureService:
     def start(self, exposure: float, frame_type: str = "light", binning: int | None = None,
               gain: int | None = None, offset: int | None = None, loop: bool = False,
               count: int = 1) -> None:
+        # One start at a time (0.2.50): `busy` is only true once the thread
+        # is running, and between the check and the thread there is a driver
+        # call (the settings), so two quick presses of Capture both got
+        # through and two exposures fought over one camera.
+        if not self._start_lock.acquire(blocking=False):
+            raise DeviceError("a capture is already starting")
+        try:
+            self._start(exposure, frame_type, binning, gain, offset, loop, count)
+        finally:
+            self._start_lock.release()
+
+    def _start(self, exposure: float, frame_type: str, binning: int | None,
+               gain: int | None, offset: int | None, loop: bool, count: int) -> None:
         if self.busy:
             raise DeviceError("a capture is already running")
         frame_type = frame_type.lower()
@@ -382,6 +518,17 @@ class CaptureService:
 
         camera = self.manager.require("camera")
         camera.set_settings(binning=binning, gain=gain, offset=offset)
+        # What this run was asked for is what every one of its frames is
+        # checked against; and with no gain/offset in the profile, it is what
+        # a reconnect puts back.
+        self._explicit_settings = ({"gain": None if gain is None else int(gain),
+                                    "offset": None if offset is None else int(offset),
+                                    "source": {"gain": "this capture",
+                                               "offset": "this capture"}}
+                                   if gain is not None or offset is not None else None)
+        if self._explicit_settings is not None and callable(self.note_settings):
+            with contextlib.suppress(Exception):
+                self.note_settings(gain, offset, "the Camera panel")
 
         self._abort.clear()
         self._loop = bool(loop)
@@ -403,11 +550,14 @@ class CaptureService:
         `busy` still reports True throughout: the caller's own thread is the one
         holding the camera, which is what stops the UI queueing a second run.
         """
-        if self.busy:
-            raise DeviceError("a capture is already running")
-        camera = self.manager.require("camera")
-
-        self._thread = threading.current_thread()
+        with self._start_lock:
+            if self.busy:
+                raise DeviceError("a capture is already running")
+            camera = self.manager.require("camera")
+            self._thread = threading.current_thread()
+            self._owner_generation[threading.get_ident()] = self._generation
+            # The sequencer's frames: the telescope's own gain/offset.
+            self._explicit_settings = None
         self._abort.clear()
         self._loop = False
         self._error = None
@@ -416,18 +566,54 @@ class CaptureService:
                          "binning": camera.binning, "gain": camera.gain,
                          "offset": camera.offset, "count": 1}
         try:
-            self._capture_one(exposure, frame_type)
+            try:
+                self._capture_one(exposure, frame_type)
+            except Exception as exc:              # noqa: BLE001 - decided below
+                # A focus or centring frame that the camera dropped gets the
+                # same reconnect-and-one-more-try as a frame taken by hand.
+                if self._abort.is_set() or not self._reconnect_and_retry(exc):
+                    raise
+                self._capture_one(exposure, frame_type)
             self._frames_taken = 1
         except Exception as exc:
-            self._error = str(exc)
+            if not self._abandoned():
+                self._error = str(exc)
             raise
         finally:
-            self._state = "idle"
-            self._thread = None
+            # A thread that was given up on and comes back later must not
+            # mark a newer capture as finished.
+            if self._thread is threading.current_thread():
+                self._state = "idle"
+                self._thread = None
+            self._owner_generation.pop(threading.get_ident(), None)
 
         if self._latest_id is None:
             raise DeviceError("the exposure produced no frame")
         return self.record(self._latest_id)
+
+    def _abandoned(self) -> bool:
+        """Was this thread's capture given up on by `release_stuck`?"""
+        mine = self._owner_generation.get(threading.get_ident())
+        return mine is not None and mine != self._generation
+
+    def release_stuck(self) -> bool:
+        """Free the camera from a capture whose thread is stuck in the driver.
+
+        The thread is left where it is - it cannot be interrupted - but the
+        service stops counting it as busy, so a reconnected camera can take
+        the next frame. Whatever the stuck thread returns later is dropped.
+        True when there was something to release.
+        """
+        with self._start_lock:
+            thread = self._thread
+            if thread is None or not thread.is_alive() \
+                    or thread is threading.current_thread():
+                return False
+            self._generation += 1
+            self._thread = None
+            self._state = "idle"
+        self.manager.log("Gave up on a capture stuck in the camera driver", "warn")
+        return True
 
     def abort(self) -> None:
         self._loop = False
@@ -438,6 +624,11 @@ class CaptureService:
                 camera.abort_exposure()
             except Exception as exc:
                 self.manager.log(f"Abort failed: {exc}", "warn")
+                # A driver that will not even take an Abort is stuck; the
+                # capture is not left waiting on it (0.2.52e). Its thread is
+                # given up on and the camera is free for a reconnect.
+                with contextlib.suppress(Exception):
+                    self.release_stuck()
         self._state = "idle"
         self.manager.log("Capture aborted", "warn")
 
@@ -445,11 +636,55 @@ class CaptureService:
         """Turn looping off mid-run; the current frame still finishes."""
         self._loop = bool(loop)
 
+    def _reconnect_and_retry(self, exc: Exception) -> bool:
+        """After a frame failed: bring the camera back, if that is wanted.
+
+        A camera that misses a download is usually a driver that has wedged
+        or a USB link that dropped, and a disconnect-reconnect on the
+        remembered driver is what puts it right.  Optional (Equipment >
+        Recovery): True when the camera is back and the frame is worth
+        trying once more, False when the failure should stand.
+        """
+        if self.reconnect_camera is None:
+            return False
+        if isinstance(exc, CameraLostError):
+            # The camera check has already reconnected it - three times - and
+            # said it is gone; one more reconnect here would only hold up Stop.
+            return False
+        settings = self.config.section("recovery") if hasattr(self.config, "section") else {}
+        if not settings.get("enabled", True) or not settings.get("reconnectManualCaptures", True):
+            return False
+        self.manager.log(f"Camera failed ({exc}); disconnecting and reconnecting it, "
+                         "then trying the frame again", "warn")
+        self._state = "recovering"
+        camera = self.manager.get("camera")
+        if camera is not None:
+            with contextlib.suppress(Exception):
+                camera.abort_exposure()
+        with contextlib.suppress(Exception):
+            self.manager.disconnect("camera")
+        try:
+            self.reconnect_camera()
+        except Exception as again:                # noqa: BLE001 - reported below
+            self.manager.log(f"Could not reconnect the camera: {again}", "error")
+            return False
+        camera = self.manager.get("camera")
+        if camera is None or not camera.connected:
+            self.manager.log("The camera did not come back", "error")
+            return False
+        self.manager.log("The camera is back", "success")
+        return True
+
     def _run(self, exposure: float, frame_type: str, count: int) -> None:
         taken = 0
         try:
             while not self._abort.is_set():
-                self._capture_one(exposure, frame_type)
+                try:
+                    self._capture_one(exposure, frame_type)
+                except Exception as exc:          # noqa: BLE001 - decided below
+                    if self._abort.is_set() or not self._reconnect_and_retry(exc):
+                        raise
+                    self._capture_one(exposure, frame_type)
                 taken += 1
                 self._frames_taken = taken
                 if self._abort.is_set() or (not self._loop and taken >= count):
@@ -513,12 +748,28 @@ class CaptureService:
             self.manager.log(f"Could not open the light path: {exc}", "warn")
         return done
 
-    def _capture_one(self, exposure: float, frame_type: str) -> None:
+    def _capture_one(self, exposure: float, frame_type: str,
+                     again: bool = True) -> None:
         camera = self.manager.require("camera")
+        # Is anybody there (0.2.52e)? A camera its driver has lost is
+        # reconnected - it alone - before anything is sent to it, and one that
+        # will not come back stops this frame with the plain warning, instead
+        # of StartExposure putting up the driver's "between 0 and 0s" box.
+        health = self.health
+        if health is not None:
+            health.ensure("before an exposure", self._abort.is_set)
+            if self._abort.is_set():
+                return
+            camera = self.manager.require("camera")
         # Only frames that want sky: a flat wants the panel exactly as the
         # calibration run has just set it, and a dark wants the cover shut.
+        wanted = None
         if frame_type == "light":
             self.open_light_path()
+            # Gain and offset read back from the driver, and set again if the
+            # camera is not at them, before every light (0.2.53). A
+            # calibration frame keeps whatever its own run set.
+            wanted = self._ensure_settings(camera)
         metadata = self._snapshot_rig()
 
         self._state = "exposing"
@@ -534,15 +785,47 @@ class CaptureService:
         self.manager.log(
             f"Exposing {exposure:g}s {frame_type}"
             + (f" [{metadata['filter']}]" if metadata.get("filter") else ""))
-        camera.start_exposure(exposure, light=frame_type in LIGHT_PATH_TYPES)
+        try:
+            camera.start_exposure(exposure, light=frame_type in LIGHT_PATH_TYPES)
+        except CameraLostError as exc:
+            # Lost between the check and the shutter: not sent, so nothing is
+            # stuck. Reconnected once here, then the frame is started again.
+            if health is None or self._abort.is_set():
+                raise
+            if not health.heal(f"StartExposure: {exc}", self._abort.is_set):
+                raise CameraLostError(health.plain(str(exc))) from exc
+            camera = self.manager.require("camera")
+            if frame_type == "light":
+                # A reopened camera is at its driver's defaults.
+                wanted = self._ensure_settings(camera)
+            self._exposure_started = time.time()
+            metadata["startedAt"] = self._exposure_started
+            camera.start_exposure(exposure, light=frame_type in LIGHT_PATH_TYPES)
 
-        # Wait for the driver, with a generous allowance for download.
-        deadline = time.monotonic() + exposure + 300.0
+        # Wait for the driver, with an allowance for download. A camera that
+        # has not said it is done this long after it should have is treated
+        # as failed, so the reconnect can happen instead of a wait for ever.
+        try:
+            hung = float(self.config.get("recovery", "hungSeconds", 120.0) or 120.0)
+        except Exception:                         # noqa: BLE001 - a bare config
+            hung = 120.0
+        deadline = time.monotonic() + exposure + max(30.0, hung)
         while not camera.image_ready:
             if self._abort.is_set():
                 return
+            lost = getattr(camera, "lost_reason", None)
+            if isinstance(lost, str) and lost:
+                # A driver box closed on the camera's thread (driverdialogs):
+                # this exposure is not coming. Reconnected, and the frame
+                # started once more.
+                if health is None or not again or self._abort.is_set():
+                    raise CameraLostError(f"{camera.name} is not responding: {lost}")
+                if not health.heal(f"during the exposure: {lost}", self._abort.is_set):
+                    raise CameraLostError(health.plain(lost))
+                return self._capture_one(exposure, frame_type, again=False)
             if time.monotonic() > deadline:
-                raise DeviceError("timed out waiting for the camera")
+                raise DeviceError(f"the camera has not finished its exposure "
+                                  f"{hung:g}s after it should have")
             time.sleep(0.05)
         if self._abort.is_set():
             return
@@ -552,12 +835,27 @@ class CaptureService:
         # a plan used to guess at.
         download_started = time.monotonic()
         self._state = "downloading"
-        frame = camera.get_image()
+        # With a deadline (0.2.51): on 2026-10-14 02:24 a download never came
+        # back and the program sat "running" for twelve and a half hours. A
+        # native call cannot be cancelled, so an overrun is left on its own
+        # thread and the frame is reported failed - which is what lets the
+        # reconnect, the power box and the rest of the night happen.
+        try:
+            download = float(self.config.get("recovery", "downloadTimeoutSeconds", 120.0)
+                             or 0.0)
+        except Exception:                         # noqa: BLE001 - a bare config
+            download = 120.0
+        from .recovery import call_with_timeout
+        frame = call_with_timeout(camera.get_image, download, "the camera download")
+        if self._abandoned():
+            raise DeviceError("the frame was given up on while it downloaded")
         if frame is None or frame.size == 0:
             raise DeviceError("camera returned an empty frame")
 
         self._state = "saving"
         record = self._store(frame, exposure, frame_type, camera, metadata)
+        if frame_type == "light":
+            self._check_header_settings(record, wanted)
         if self.overheads is not None:
             self.overheads.record("download", time.monotonic() - download_started)
         self._latest_id = record.id
@@ -565,6 +863,131 @@ class CaptureService:
             f"{'Saved' if record.saved else 'Captured (not saved)'} {record.filename}  "
             f"median {record.stats.get('median')} ADU, max {record.stats.get('max')}",
             "success")
+
+    # -- gain and offset (0.2.53) ------------------------------------------
+    def _wanted(self) -> dict[str, Any] | None:
+        if self._explicit_settings is not None:
+            return self._explicit_settings
+        if callable(self.wanted_settings):
+            try:
+                return self.wanted_settings()
+            except Exception:                     # noqa: BLE001 - no target is no check
+                return None
+        return None
+
+    @staticmethod
+    def _read_back(camera: Any) -> dict[str, int | None]:
+        read = getattr(camera, "read_settings", None)
+        if callable(read):
+            return dict(read())
+        return {"gain": getattr(camera, "gain", None), "offset": getattr(camera, "offset", None)}
+
+    def _ensure_settings(self, camera: Any) -> dict[str, Any] | None:
+        """Put the camera at the wanted gain/offset and prove it, before a light.
+
+        2026-11-04, EAGLE (twin FSQ): the telescope's profile had no gain or
+        offset, so nothing was ever sent; the ASICamera2 driver happened to be
+        at 100 / 50 at dusk. A failed StartExposure at 02:54 reconnected the
+        camera, the reopened driver came up at 0 / 0, the restore had nothing
+        to put back, and the next 36 subs were shot at gain 0 / offset 0.
+
+        Reads first, so a camera that is already right is only read. Writes go
+        through the driver wrapper's own checks (a lost ASICamera2 is never
+        written to - that is the "between 0 and 0" box), after the camera
+        check has already run. Returns what was wanted, for the header check.
+        """
+        wanted = self._wanted()
+        try:
+            actual = self._read_back(camera)
+        except CameraLostError:
+            raise
+        except Exception as exc:                  # noqa: BLE001 - said, not fatal
+            self.manager.log(f"Could not read the camera's gain/offset: {exc}", "warn")
+            actual = {"gain": None, "offset": None}
+        if wanted is None:
+            # Nothing set anywhere: hold what the camera is at now, so a
+            # reconnect later tonight puts it back rather than 0 / 0.
+            if callable(self.note_settings) and (actual.get("gain") is not None
+                                                 or actual.get("offset") is not None):
+                with contextlib.suppress(Exception):
+                    self.note_settings(actual.get("gain"), actual.get("offset"),
+                                       "the camera at the first light frame")
+            if not self._said_unset:
+                self._said_unset = True
+                self.manager.log(
+                    f"No gain/offset is set for {self.telescope or 'this telescope'}, "
+                    "and no past lights of this camera to take them from: "
+                    f"holding the camera's gain {actual.get('gain')} / offset "
+                    f"{actual.get('offset')} for this session. Set them under "
+                    "Equipment > Camera so every frame matches the calibration "
+                    "library.", "warn")
+            return None
+        fix = {key: int(wanted[key]) for key in ("gain", "offset")
+               if wanted.get(key) is not None and actual.get(key) != int(wanted[key])}
+        if not fix:
+            return wanted
+        source = wanted.get("source") or {}
+        self.manager.log(
+            "Camera " + ", ".join(f"{key} was {actual.get(key)}" for key in fix)
+            + "; setting " + ", ".join(f"{key} {value} ({source.get(key, 'wanted')})"
+                                       for key, value in fix.items())
+            + " before the light frame", "warn")
+        try:
+            camera.set_settings(gain=fix.get("gain"), offset=fix.get("offset"))
+        except CameraLostError:
+            raise
+        except Exception as exc:                  # noqa: BLE001 - flagged below
+            self.manager.log(f"Could not set the camera's gain/offset: {exc}", "error")
+        try:
+            after = self._read_back(camera)
+        except CameraLostError:
+            raise
+        except Exception:                         # noqa: BLE001 - unreadable
+            after = {"gain": None, "offset": None}
+        still = {key: after.get(key) for key, value in fix.items()
+                 if after.get(key) is not None and after.get(key) != value}
+        if still:
+            self.manager.log(
+                "The camera did not take the gain/offset: "
+                + ", ".join(f"{key} reads {value}, wanted {fix[key]}"
+                            for key, value in still.items())
+                + "; the frame is taken anyway and flagged", "error")
+        return wanted
+
+    def _check_header_settings(self, record: Any, wanted: dict[str, Any] | None) -> None:
+        """Say so when a saved light's GAIN/OFFSET is not the profile's."""
+        if wanted is None:
+            self.settings_mismatch = {"kind": "unset", "file": record.filename,
+                                      "gain": record.gain, "offset": record.offset,
+                                      "at": time.time()}
+            return
+        wrong = {key: {"header": getattr(record, key), "wanted": int(wanted[key]),
+                       "source": (wanted.get("source") or {}).get(key, "")}
+                 for key in ("gain", "offset")
+                 if wanted.get(key) is not None and getattr(record, key) != int(wanted[key])}
+        if not wrong:
+            sources = wanted.get("source") or {}
+            held = [key for key in ("gain", "offset")
+                    if wanted.get(key) is None or sources.get(key) != "profile"]
+            # Right, but only because this session remembered it: still worth
+            # a notice until the profile says it for itself.
+            history = wanted.get("history") or {}
+            from_history = bool(held) and all(sources.get(k) == "history" for k in held)
+            self.settings_mismatch = None if not held or self._explicit_settings else {
+                "kind": "history" if from_history else "unset",
+                "file": record.filename, "gain": record.gain,
+                "offset": record.offset, "at": time.time(), "keys": held,
+                "count": history.get("count"), "lights": history.get("lights")}
+            return
+        self.settings_mismatch = {"kind": "mismatch", "file": record.filename,
+                                  "fields": wrong, "at": time.time(),
+                                  "saved": bool(record.saved)}
+        self.manager.log(
+            f"{record.filename} was taken at "
+            + ", ".join(f"{key.upper()} {w['header']}" for key, w in wrong.items())
+            + " but this telescope's settings say "
+            + ", ".join(f"{key} {w['wanted']}" for key, w in wrong.items())
+            + " - it will not match the calibration frames", "warn")
 
     def _snapshot_rig(self) -> dict[str, Any]:
         """Read the rest of the rig so the FITS header describes this frame."""
@@ -719,7 +1142,10 @@ class CaptureService:
                     "mount Dec in degrees"),
             "PIERSIDE": ((str(metadata["pierSide"]).upper() if metadata.get("pierSide")
                           else None), "side of pier"),
-            "TELESCOP": (self.telescope or None, "telescope"),
+            "TELESCOP": (self.header_telescope() or None, "telescope"),
+            "OBSERVAT": (self._observatory(), "observatory"),
+            "RIGNAME": (pc_name(self.config) or None, "Starfront PC / rig name"),
+            "RIGID": (self.rig_id() or None, "stable rig id: PC-telescope index"),
             # Focal length lets a plate solver work out the field on its own,
             # so it is worth carrying even though no driver reports it.
             "FOCALLEN": (focal, "millimetres"),
@@ -787,6 +1213,117 @@ class CaptureService:
             header["COLTASK"] = (context.get("collabTask"), "collaboration task id")
         return header
 
+    # -- the camera's usual gain/offset (0.2.53a) ---------------------------
+    #: How many of the newest lights are read. Headers only, a few KB each.
+    HISTORY_FILES = 300
+
+    def historical_settings(self, instrument: str) -> dict[str, Any] | None:
+        """The gain/offset this camera has shot most of its lights at.
+
+        The mode (gain, offset) pair across the newest HISTORY_FILES lights in
+        this telescope's own capture folders (`<root>/<target>/<night>[/<rig>]`)
+        whose INSTRUME is this camera. TELESCOP is not used: it changed in
+        0.2.53a. 0 / 0 frames - the ASICamera2 reopen bug - are left out when
+        any other value exists. Cached with its source and count; None when
+        there is no history.
+        """
+        name = (instrument or "").strip()
+        key = (name.lower(), str(self.root_dir), self.subfolder or "")
+        if key == self._history_key:
+            return self._history
+        result: dict[str, Any] | None = None
+        try:
+            result = self._scan_history(name)
+        except Exception as exc:                          # noqa: BLE001 - no history
+            self.manager.log(f"Could not read past lights for the usual gain/offset: {exc}",
+                             "warn")
+        self._history_key, self._history = key, result
+        if result:
+            self.manager.log(
+                f"{self.telescope or 'This telescope'}: no gain/offset set; using historical "
+                f"gain {result['gain']} / offset {result['offset']} (from {result['count']} "
+                f"of {result['lights']} lights of {name or 'this camera'} in {result['folder']}"
+                + (f"; {result['zeroes']} 0/0 frames ignored" if result["zeroes"] else "")
+                + ")", "info")
+        return result
+
+    def _scan_history(self, instrument: str) -> dict[str, Any] | None:
+        from collections import Counter
+        root = Path(self.root_dir)
+        if not root.is_dir():
+            return None
+        pattern = (f"*/*/{self.subfolder}/*.fit*" if self.subfolder else "*/*/*.fit*")
+        files = []
+        for path in root.glob(pattern):
+            with contextlib.suppress(OSError):
+                files.append((path.stat().st_mtime, path))
+        files.sort(key=lambda item: item[0], reverse=True)
+        pairs: list[tuple[int, int]] = []
+        for _, path in files[: self.HISTORY_FILES]:
+            try:
+                header = fits.read_header(path)
+            except Exception:                             # noqa: BLE001 - skip a bad file
+                continue
+            if not str(header.get("IMAGETYP") or "").strip().lower().startswith("light"):
+                continue
+            if instrument and str(header.get("INSTRUME") or "").strip().lower() \
+                    != instrument.lower():
+                continue
+            try:
+                pairs.append((int(header["GAIN"]), int(header["OFFSET"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not pairs:
+            return None
+        real = [p for p in pairs if p != (0, 0)]
+        zeroes = len(pairs) - len(real)
+        use = real or pairs
+        (gain, offset), count = Counter(use).most_common(1)[0]   # newest wins a tie
+        return {"gain": gain, "offset": offset, "count": count, "lights": len(pairs),
+                "zeroes": zeroes if real else 0, "folder": str(root),
+                "source": f"history of {count} lights"}
+
+    # -- which telescope, for the header (0.2.53a) -------------------------
+    def header_telescope(self) -> str:
+        """TELESCOP: the configured scope name, never a generic "Telescope N".
+
+        Processing tells rigs apart by this card, and every rig that was never
+        renamed said "Telescope 1". In order: the telescope's own
+        `optics.telescopeName`; its name in Starfront unless that is generic;
+        this PC's name (with "-N" when it carries more than one telescope).
+        """
+        configured = ""
+        try:
+            configured = str(self.config.get("optics", "telescopeName", "") or "").strip()
+        except Exception:                                # noqa: BLE001
+            configured = ""
+        if configured:
+            return configured[:68]
+        name = (self.telescope or "").strip()
+        if name and not is_generic_telescope(name):
+            return name[:68]
+        pc = pc_name(self.config)
+        if not pc:
+            return name
+        return (f"{pc}-{self.rig_index}" if self.rig_count > 1 else pc)[:68]
+
+    def rig_id(self) -> str:
+        pc = pc_name(self.config)
+        return f"{pc}-{int(self.rig_index)}"[:68] if pc else ""
+
+    def telescope_names(self) -> list[str]:
+        """Every name this telescope's calibration may carry: the TELESCOP of
+        frames from 0.2.53a on, and its Starfront name from before."""
+        names = [n for n in (self.header_telescope(), self.telescope or "") if n]
+        return list(dict.fromkeys(names))
+
+    def _observatory(self) -> str | None:
+        try:
+            value = self.config.get("site", "observatory", "Starfront Observatories")
+        except Exception:                                # noqa: BLE001
+            value = "Starfront Observatories"
+        return str(value).strip()[:68] or None
+
     def _observer(self) -> str | None:
         who = (self.config.get("collab", "user", {}) or {}).get("name")
         return str(who) if who else None
@@ -823,10 +1360,27 @@ class CaptureService:
             self.images.insert(0, record)
             self._by_id[record.id] = record
             self._remember(record.id, frame)
+            if not record.saved:
+                self._keep_preview(record.id, frame)
         if frame_type == "light":
             self._queue_calibration(record, camera, metadata)
             self._queue_stack(record, frame, header, camera)
+            self._queue_upload(record, camera)
         return record
+
+    def _queue_upload(self, record: ImageRecord, camera) -> None:
+        """Put a saved collaboration light on the auto-upload queue, with the
+        masters that calibrate it. Only appends to a list: the sending is the
+        uploader's own thread, in the daytime, and never touches the file."""
+        uploader = self.uploader or CaptureService.shared_uploader
+        if uploader is None or not record.saved or not record.path:
+            return
+        try:
+            uploader.light_saved(record.path, dict(self.frame_context or {}),
+                                 self.telescope or "", self._calibration_want(record, camera),
+                                 night=self.night_name(), filter_name=record.filter or "")
+        except Exception:                               # noqa: BLE001 - never stops a night
+            pass
 
     # -- stacking what was just taken --------------------------------------
     def _calibration_want(self, record: ImageRecord, camera) -> dict[str, Any]:
@@ -837,6 +1391,9 @@ class CaptureService:
             "temperature": record.ccd_temperature,
             "filter": record.filter or "",
             "telescope": self.telescope or "",
+            # 0.2.53a: TELESCOP may now differ from the Starfront name, so a
+            # master carrying either is this telescope's own.
+            "telescopes": self.telescope_names(),
             "camera": getattr(camera, "name", "") or "",
             "exposure": record.exposure,
         }
@@ -854,13 +1411,6 @@ class CaptureService:
         """
         stacker = self.stacker
         if stacker is None or not stacker.enabled:
-            return
-        # Only the subs. Autofocus sweeps, centring solves and framing shots
-        # are lights too, and they are never saved - a focus run is nine
-        # frames at nine different focus positions, and stacking those on
-        # top of the night's subs smears every star. The same rule the
-        # viewer's own frame stepping uses: a sub is a saved light.
-        if not record.saved:
             return
         settings = stacker.settings()
         if not self.frame_context.get("collabProject") and \
@@ -881,12 +1431,10 @@ class CaptureService:
                 return
             across, down = solution.field
             ra, dec = solution.centre
-            # A cap of zero is no cap: the canvas is the camera's own
-            # resolution, which is what anybody looking at their stars wants.
             plan = Plan(ra=ra, dec=dec, width=across * STACK_MARGIN,
                         height=down * STACK_MARGIN, scale=solution.scale,
                         rotation=solution.rotation,
-                        maxPixels=int(settings.get("maxPixels") or 0))
+                        maxPixels=int(settings.get("maxPixels") or 3000))
 
         want = self._calibration_want(record, camera)
         library = self.library
@@ -998,6 +1546,41 @@ class CaptureService:
         while len(self._cache) > self.MAX_CACHED_FRAMES:
             self._cache.popitem(last=False)
 
+    def _keep_preview(self, image_id: str, frame: np.ndarray) -> None:
+        """A reduced copy of an unsaved frame, kept after the full one is let go."""
+        long_side = max(frame.shape[0], frame.shape[1])
+        factor = max(1, -(-long_side // self.PREVIEW_LONG_SIDE))
+        self._previews[image_id] = (render.downsample(frame, factor), factor)
+        self._previews.move_to_end(image_id)
+        while len(self._previews) > self.MAX_PREVIEWS:
+            self._previews.popitem(last=False)
+
+    def viewable(self, image_id: str) -> bool:
+        """Whether the viewer can be given something for this frame."""
+        record = self._by_id.get(image_id)
+        if record is None:
+            return False
+        if record.path:
+            return True
+        with self._lock:
+            return image_id in self._cache or image_id in self._previews
+
+    def frame_for_view(self, image_id: str) -> tuple[np.ndarray, int]:
+        """The frame for looking at, and how many times smaller than the
+        real one it is: 1 for the frame itself, more for the reduced copy
+        that stands in once an unsaved frame has left the cache."""
+        with self._lock:
+            cached = self._cache.get(image_id)
+            if cached is not None:
+                self._cache.move_to_end(image_id)
+                return cached, 1
+            record = self._by_id.get(image_id)
+            if record is not None and not record.path:
+                preview = self._previews.get(image_id)
+                if preview is not None:
+                    return preview
+        return self.frame(image_id), 1
+
     def has(self, image_id: str) -> bool:
         """Whether this camera took a given frame.
 
@@ -1029,4 +1612,119 @@ class CaptureService:
         return frame
 
     def listing(self, limit: int = 200) -> list[dict[str, Any]]:
-        return [record.summary() for record in self.images[:limit]]
+        return [{**record.summary(), "viewable": self.viewable(record.id)}
+                for record in self.images[:limit]]
+
+    # -- the night before --------------------------------------------------
+    def recall_recent(self, limit: int = 100) -> int:
+        """Bring the most recent night's subs back into the list.
+
+        The list of frames is memory: it empties when the program closes, and
+        the morning after a run the viewer opened on nothing at all however
+        many subs were on disk. So at startup the newest night folder under the
+        capture root is read back - headers only, the pixels come off the file
+        when a frame is actually looked at - and its saved lights take their
+        place in the list as if they had just been shot. Only lights: a focus
+        or centring frame is never saved, and a flat or dark is not what
+        anybody wants to open the morning on.
+
+        Returns how many frames came back.
+        """
+        root = self.root_dir
+        if not root.is_dir():
+            return 0
+        nights: list[Path] = []
+        try:
+            for target_dir in root.iterdir():
+                if not target_dir.is_dir():
+                    continue
+                for night_dir in target_dir.iterdir():
+                    if night_dir.is_dir() and _NIGHT_NAME.match(night_dir.name):
+                        nights.append(night_dir)
+        except OSError:
+            return 0
+        if not nights:
+            return 0
+        newest = max(night.name for night in nights)
+        folders = [night for night in nights if night.name == newest]
+        if self.subfolder:
+            folders = [night / self.subfolder for night in folders
+                       if (night / self.subfolder).is_dir()]
+
+        files: list[Path] = []
+        for folder in folders:
+            with contextlib.suppress(OSError):
+                files.extend(path for path in folder.iterdir()
+                             if path.is_file() and path.suffix.lower() in (".fits", ".fit"))
+        files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+
+        recalled: list[ImageRecord] = []
+        for path in files[:limit]:
+            record = self._recall_one(path)
+            if record is not None:
+                recalled.append(record)
+        if not recalled:
+            return 0
+        with self._lock:
+            known = {record.path for record in self.images if record.path}
+            fresh = [record for record in recalled if record.path not in known]
+            for record in fresh:
+                self.images.append(record)
+                self._by_id[record.id] = record
+            self.images.sort(key=lambda record: record.timestamp, reverse=True)
+        return len(fresh)
+
+    @staticmethod
+    def _recall_one(path: Path) -> ImageRecord | None:
+        """One saved light as a list entry, from its header. None if it is not a light."""
+        try:
+            header = fits.read_header(path)
+        except Exception:
+            return None
+        kind = str(header.get("IMAGETYP") or "").strip().lower()
+        if "light" not in kind:
+            return None
+
+        def text(key: str) -> str | None:
+            value = header.get(key)
+            if value is None:
+                return None
+            value = str(value).strip()
+            return value if value and value != "None" else None
+
+        def number(key: str) -> float | None:
+            value = header.get(key)
+            if value is None or isinstance(value, bool):
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        try:
+            taken = path.stat().st_mtime
+        except OSError:
+            taken = time.time()
+        when = text("DATE-OBS")
+        if when:
+            for form in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+                try:
+                    taken = datetime.strptime(when, form).replace(
+                        tzinfo=timezone.utc).timestamp()
+                    break
+                except ValueError:
+                    continue
+        ra = number("RA")
+        focus = number("FOCUSPOS")
+        return ImageRecord(
+            id=uuid.uuid4().hex[:12], filename=path.name, path=str(path), saved=True,
+            timestamp=taken, frame_type="light",
+            exposure=number("EXPTIME") or number("EXPOSURE") or 0.0,
+            binning=int(number("XBINNING") or 1),
+            gain=int(number("GAIN") or 0), offset=int(number("OFFSET") or 0),
+            width=int(number("NAXIS1") or 0), height=int(number("NAXIS2") or 0),
+            filter=text("FILTER"), object_name=text("OBJECT"), telescope=text("TELESCOP"),
+            focuser_position=None if focus is None else int(focus),
+            focuser_temperature=number("FOCTEMP"), ccd_temperature=number("CCD-TEMP"),
+            ra=None if ra is None else ra / 15.0, dec=number("DEC"),
+            stats={})

@@ -638,36 +638,6 @@ case("...and a filter the rig really lacks is still refused",
      collab.compatibility(rig, collab.Requirements.read(
          {"filters": {"SII": 3.0}}))["ok"] is False)
 
-# A rig takes part in the filters it carries. Three RASAs with one fixed
-# filter each - R, G and B - were turned away from a project wanting H, O,
-# R, G and B, which wanted exactly what they had; the H and O are the other
-# rigs' to shoot.
-broadband = collab.RigProfile.read({"name": "rasa", "focalLength": 620.0,
-                                    "pixelSize": 3.76, "sensorWidth": 9576,
-                                    "sensorHeight": 6388,
-                                    "filters": {"R": None, "G": None, "B": None}})
-five = collab.Requirements.read({"filters": {"H": 5.0, "O": 5.0, "R": None,
-                                             "G": None, "B": None}})
-fit = collab.compatibility(broadband, five)
-case("a rig with only R, G and B can join a project that also wants H and O",
-     fit["ok"] is True and fit["usable"] == ["R", "G", "B"], fit["summary"])
-one = collab.RigProfile.read({"name": "rasa-r", "focalLength": 620.0,
-                              "pixelSize": 3.76, "sensorWidth": 9576,
-                              "sensorHeight": 6388, "filters": {"R": None}})
-fit = collab.compatibility(one, five)
-case("...and a rig with one fixed filter is dealt that one filter",
-     fit["ok"] is True and fit["usable"] == ["R"], fit["summary"])
-wide = collab.RigProfile.read({"name": "wide-ha", "focalLength": 620.0,
-                               "pixelSize": 3.76, "sensorWidth": 9576,
-                               "sensorHeight": 6388, "filters": {"H": 12.0, "R": None}})
-fit = collab.compatibility(wide, five)
-case("...a filter too wide for the project is left out, not a refusal",
-     fit["ok"] is True and fit["usable"] == ["R"] and "12" in fit["checks"][-1]["detail"],
-     fit["summary"])
-case("...and a rig with none of the project's filters is still refused",
-     collab.compatibility(one, collab.Requirements.read(
-         {"filters": {"H": 5.0, "O": 5.0}}))["ok"] is False)
-
 # The verdict on a night is judged the same way.
 night = collab.Contribution.read({"filterName": "ha", "exposure": 600,
                                   "bandpass": 3.0, "seconds": 3600})

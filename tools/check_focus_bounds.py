@@ -79,6 +79,20 @@ class Capture:
         self.focuser = focuser
         self.save_enabled = True
         self.limit = limit
+        self._suspended = 0
+
+    def suspend_saving(self):
+        if self._suspended == 0:
+            self._save_before = self.save_enabled
+            self.save_enabled = False
+        self._suspended += 1
+
+    def resume_saving(self):
+        if self._suspended == 0:
+            return
+        self._suspended -= 1
+        if self._suspended == 0:
+            self.save_enabled = self._save_before
 
     def capture_blocking(self, exposure, frame_type="light"):
         self.sky.frames += 1

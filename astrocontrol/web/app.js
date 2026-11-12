@@ -24,7 +24,7 @@ const KINDS = [
 ];
 
 const BACKEND_LABELS = { ascom: 'ASCOM', zwo: 'ZWO direct', alpaca: 'Alpaca',
-  phd2: 'PHD2' };
+  phd2: 'PHD2', pegasus: 'Pegasus Unity' };
 
 /* What the server sends in place of a stored password. Never sent back. */
 const MASKED = '***';
@@ -40,8 +40,17 @@ const MASTER_KINDS = ['mount', 'guider', 'piercam', 'safetymonitor', 'dome',
    real width. */
 const LEFTLESS_TABS = ['plan', 'planner', 'sky', 'collab'];
 
+// The live stack's view state. The live-stack page wiring (btnLiveStack,
+// stackInfo, stackPick, /api/livestack) is not in this tree yet, so the viewer
+// is never on the stack; the FSQ106 changes ported in 0.2.49 test this before
+// following the camera, as livestack.js will once it is wired in.
+const stackView = { on: false, updated: 0 };
+
 const state = {
   status: null,
+  // The big, slow-changing sections of the status, kept from the last tick
+  // that carried them: the server sends them only when they change.
+  lastBig: {},
   // Which telescope the camera, focuser, filter and rotator panels drive. Null
   // means the master, which is the only telescope most rigs ever have.
   rig: null,
@@ -91,14 +100,71 @@ const nativeApi = () => (window.pywebview && window.pywebview.api) || null;
 
 /* ------------------------------------------------------------------ api */
 
+/* Every request made from a press acknowledges the press on its button; one
+   that changes something on the rig also says what it started. This sits on
+   the one helper every module goes through, so a press on the Plan tab or
+   the live stack is acknowledged the same as one on the camera panel. */
 async function api(path, method = 'GET', body = null) {
+  const button = performance.now() - pressed.at < 1500 ? pressed.button : null;
+  const name = actionName(path, method);
+  const action = button || name ? beginAction(name, button) : null;
+  try {
+    const result = await apiRaw(path, method, body);
+    // A slow device command answers "pending" (0.2.50): the button stays busy
+    // and the toast says it is still going until the status reports the task
+    // done or failed, instead of the request itself hanging for a minute.
+    if (action && result && result.pending && result.task) trackTask(action, result.task);
+    else if (action) endAction(action, true);
+    return result;
+  } catch (error) {
+    if (action) {
+      endAction(action, false, error && error.message);
+      // The busy toast became the error: whoever catches this need not say it again.
+      if (action.toast && error && typeof error === 'object') error.reported = true;
+    }
+    throw error;
+  }
+}
+
+/* No request waits forever (0.2.50). A press used to leave its button
+   disabled for as long as the server took, and a request lost with the
+   connection never answered at all. These few do real work inline and get
+   longer; everything else is given up on after REQUEST_TIMEOUT_MS, with a
+   message saying the command may still be running on the rig. */
+const REQUEST_TIMEOUT_MS = 45000;
+const LONG_REQUEST_MS = 240000;
+const LONG_REQUESTS = ['/api/connect', '/api/disconnect', '/api/devices/', '/api/solve', '/api/center',
+  '/api/drivers', '/api/nina', '/api/calibration', '/api/livestack', '/api/import', '/api/library'];
+
+function requestTimeout(path, method) {
+  const clean = String(path).split('?')[0];
+  if (LONG_REQUESTS.some((prefix) => clean.startsWith(prefix))) return LONG_REQUEST_MS;
+  return method === 'GET' ? REQUEST_TIMEOUT_MS / 2 : REQUEST_TIMEOUT_MS;
+}
+
+async function apiRaw(path, method = 'GET', body = null, timeoutMs = null) {
   const options = { method, headers: {} };
   if (body !== null) {
     options.headers['Content-Type'] = 'application/json';
     options.body = JSON.stringify(body);
   }
-  const response = await fetch(path, options);
-  const text = await response.text();
+  const limit = timeoutMs || requestTimeout(path, method);
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  if (controller) options.signal = controller.signal;
+  const timer = controller ? setTimeout(() => controller.abort(), limit) : null;
+  let response;
+  let text;
+  try {
+    response = await fetch(path, options);
+    text = await response.text();
+  } catch (error) {
+    if (controller && controller.signal.aborted) {
+      throw new Error(`no answer after ${Math.round(limit / 1000)}s — it may still be running; check the status before trying again`);
+    }
+    throw new Error(`could not reach Starfront (${(error && error.message) || 'network error'})`);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
   let payload = null;
   try { payload = text ? JSON.parse(text) : null; } catch { payload = { detail: text }; }
   if (!response.ok) {
@@ -176,11 +242,123 @@ function selectRig(rigId) {
 }
 
 /** Fire an API call and surface any driver error as a toast. */
+/* The button that was just pressed, so the request it starts can be shown on
+   it. A press is remembered for a moment only: a request made later, by a
+   timer or a status tick, is nobody's press. */
+let pressed = { button: null, at: 0 };
+// On the capture phase, so it runs before the button's own handler sends
+// anything; on click rather than pointerdown, so a button pressed from the
+// keyboard counts too.
+document.addEventListener('click', (event) => {
+  const button = event.target instanceof Element ? event.target.closest('button') : null;
+  pressed = { button, at: performance.now() };
+}, true);
+
+/* What a request to the rig is called while it is in flight, by the path it
+   goes to. A press that gets no answer for a second looks like a press that
+   did nothing, and gets pressed again; naming what it started, the moment it
+   is pressed, is most of what "responsive" means on a rig where the answer
+   genuinely takes a while. */
+const ACTION_NAMES = [
+  ['/api/mount/slew', 'Slewing'], ['/api/mount/sync', 'Syncing the mount'],
+  ['/api/mount/abort', 'Stopping the mount'], ['/api/mount/tracking', 'Switching tracking'],
+  ['/api/mount/park', 'Parking the mount'], ['/api/mount/unpark', 'Releasing the mount from park'],
+  ['/api/mount/home', 'Homing the mount'], ['/api/mount', 'Mount'],
+  ['/api/focuser/move', 'Moving the focuser'], ['/api/focuser/halt', 'Halting the focuser'],
+  ['/api/focuser', 'Focuser'], ['/api/focus/run', 'Starting autofocus'], ['/api/focus/abort', 'Stopping autofocus'],
+  ['/api/filterwheel', 'Changing filter'], ['/api/camera/expose', 'Starting the exposure'],
+  ['/api/camera/loop', 'Looping'], ['/api/camera/abort', 'Aborting the exposure'],
+  ['/api/camera/cooler', 'Setting the cooler'], ['/api/camera/settings', 'Setting the camera'],
+  ['/api/camera', 'Camera'], ['/api/guider/guide', 'Starting guiding'], ['/api/guider/stop', 'Stopping guiding'],
+  ['/api/guider/dither', 'Dithering'], ['/api/guider', 'Guider'], ['/api/solve', 'Plate solving'],
+  ['/api/rotator', 'Rotating'], ['/api/flatpanel', 'Flat panel'], ['/api/dome', 'Dome'],
+  ['/api/sequence/start', 'Starting the sequence'], ['/api/sequence/loop', 'Starting the loop'],
+  ['/api/sequence/stop', 'Stopping the sequence'], ['/api/sequence/pause', 'Pausing the sequence'],
+  ['/api/sequence/resume', 'Resuming the sequence'], ['/api/sequence/skip', 'Skipping'],
+  ['/api/sequence/abort', 'Aborting and parking'], ['/api/sequence', 'Sequence'],
+  ['/api/connect', 'Connecting'], ['/api/disconnect', 'Disconnecting'],
+  ['/api/devices/connect', 'Connecting'], ['/api/devices/disconnect', 'Disconnecting'],
+  ['/api/livestack', 'Live stack'], ['/api/calibration', 'Calibration'], ['/api/collab', 'Collaboration'],
+];
+
+function actionName(path, method) {
+  if (!method || method === 'GET') return '';
+  const clean = String(path).split('?')[0];
+  const hit = ACTION_NAMES.find(([prefix]) => clean === prefix || clean.startsWith(prefix + '/') || clean.startsWith(prefix));
+  return hit ? hit[1] : 'Working';
+}
+
+/* A request in flight, shown two ways: the pressed button goes busy with a
+   spinner until the answer comes, and a toast names what was started, then
+   turns into a tick or the error. The button is held busy for a third of a
+   second at least, so a quick answer still shows the press was taken. */
+function beginAction(name, button) {
+  const action = { name, button, started: performance.now(), toast: null, ticker: null };
+  if (button && !button.disabled) {
+    button.classList.add('busy');
+    button.disabled = true;
+    action.restore = true;
+  }
+  if (name) {
+    action.toast = toast(`${name}…`, 'busy', 0);
+    action.ticker = setInterval(() => {
+      const seconds = Math.round((performance.now() - action.started) / 1000);
+      if (seconds >= 3 && action.toast) action.toast.textContent = `${name}… still waiting, ${seconds}s`;
+    }, 1000);
+  }
+  return action;
+}
+
+function endAction(action, ok, detail) {
+  clearInterval(action.ticker);
+  const elapsed = performance.now() - action.started;
+  const release = () => {
+    if (!action.restore) return;
+    action.button.classList.remove('busy');
+    action.button.disabled = false;
+  };
+  setTimeout(release, Math.max(0, 350 - elapsed));
+  const node = action.toast;
+  if (!node) return;
+  if (ok) {
+    node.className = 'toast success';
+    node.textContent = `${action.name} ✓`;
+    setTimeout(() => node.remove(), 1800);
+  } else {
+    node.className = 'toast error';
+    node.textContent = `${action.name}: ${detail || 'failed'}`;
+    setTimeout(() => node.remove(), 6000);
+  }
+}
+
+/* Commands that answered "pending": resolved from `status.tasks`. */
+const pendingTasks = new Map();
+
+function trackTask(action, task) {
+  pendingTasks.set(task.id, { action, seenAt: performance.now() });
+  if (action.toast) action.toast.textContent = `${action.name}… running`;
+}
+
+function settleTasks(tasks) {
+  if (!pendingTasks.size) return;
+  const byId = new Map((tasks || []).map((task) => [task.id, task]));
+  for (const [id, entry] of pendingTasks) {
+    const task = byId.get(id);
+    if (task && task.state === 'running') { entry.seenAt = performance.now(); continue; }
+    // Gone from the list (the server restarted, or it was over long ago):
+    // nobody can say how it ended, so the button is released without a tick.
+    if (!task && performance.now() - entry.seenAt < 5000) continue;
+    pendingTasks.delete(id);
+    if (!task) endAction(entry.action, false, 'no longer reported by Starfront — check the device');
+    else endAction(entry.action, task.state === 'done', task.error);
+  }
+}
+
 function send(path, method, body, okMessage) {
   return api(path, method, body)
     .then((result) => { if (okMessage) toast(okMessage, 'success'); return result; })
     .catch((error) => {
-      toast(error.message, 'error');
+      if (!(error && error.reported)) toast(error.message, 'error');
       // So a caller that also reports failures does not toast the same thing
       // twice.
       if (error && typeof error === 'object') error.reported = true;
@@ -376,16 +554,27 @@ function watchForScriptErrors() {
       event.error || event.message);
   });
   window.addEventListener('unhandledrejection', (event) => {
+    // A request that failed and was shown as a toast is not a broken
+    // script; only the ones nobody caught are worth a line in the log.
+    if (event.reason && event.reason.reported) { event.preventDefault(); return; }
     reportBrokenScript('Unhandled promise rejection', event.reason);
   });
 }
 
 function toast(message, kind = 'info', ms = 4200) {
+  // A failure is often caught twice - by the helper and by the caller - and
+  // the operator needs to read it once.
+  if (kind === 'error') {
+    const twin = [...$('toasts').children].find((n) => n.textContent === message && n.className.includes('error'));
+    if (twin) return twin;
+  }
   const node = document.createElement('div');
   node.className = `toast ${kind}`;
   node.textContent = message;
   $('toasts').appendChild(node);
-  setTimeout(() => node.remove(), ms);
+  // 0 keeps it until whoever asked for it takes it down.
+  if (ms > 0) setTimeout(() => node.remove(), ms);
+  return node;
 }
 
 /* ------------------------------------------------------- equipment panel */
@@ -1155,7 +1344,8 @@ const NINA_LABELS = {
   focusBacklash: 'Backlash (steps)', useFilterOffsets: 'Use filter offsets',
   parkAtEnd: 'Park at end', meridianFlipEnabled: 'Meridian flip',
   flipAfterMinutes: 'Flip minutes after meridian',
-  flipPauseMinutes: 'Pause before meridian (min)', flipSolve: 'Re-centre after flip',
+  flipLimitMinutes: 'Mount tracks past meridian (min)',
+  flipPauseMinutes: 'Stop imaging before the limit (min)', flipSolve: 'Re-centre after flip',
   settleSeconds: 'Settle after slew (s)',
   phd2Path: 'PHD2 path', ditherPixels: 'Dither (px)', ditherRaOnly: 'Dither RA only',
   settlePixels: 'Settle (px)', settleTime: 'Settle time (s)', settleTimeout: 'Settle timeout (s)',
@@ -1694,9 +1884,15 @@ function updatePills(devices) {
     const device = devices[kind.key] || {};
     let cls = device.connected ? 'on' : '';
     if (device.connected && (device.slewing || device.moving || device.exposing)) cls = 'on busy';
+    // Its driver has not answered a status read lately (0.2.50): what the
+    // panel shows is the last known state, not the present one.
+    if (device.stale) cls += ' stale';
     const pill = document.createElement('span');
     pill.className = `pill ${cls}`;
     pill.innerHTML = `<span class="dot"></span>${kind.label}`;
+    if (device.stale) {
+      pill.title = `${kind.label} is not answering — shown as it was ${Math.round(device.statusAge || 0)}s ago`;
+    }
     host.appendChild(pill);
   }
 }
@@ -2129,6 +2325,7 @@ function updateObservatory(status) {
 
   const banner = $('safetyBanner');
   banner.className = 'safety-banner';
+  renderSafetySource(safety);
   if (!safety.connected) {
     banner.textContent = safety.enabled === false
       ? 'Weather watching is switched off' : 'No safety monitor connected';
@@ -2175,6 +2372,21 @@ function updateObservatory(status) {
   $('switchHeading').hidden = !channels.length;
   $('switchList').hidden = !channels.length;
   if (channels.length) renderSwitches(channels);
+  // The box's own meters, where it has them: a supply sagging under three
+  // coolers shows here before it shows as a camera leaving the bus.
+  const readings = sw.connected ? (sw.readings || {}) : {};
+  const meter = [];
+  if (readings.voltage !== undefined) meter.push(`${Number(readings.voltage).toFixed(1)} V`);
+  if (readings.current !== undefined) meter.push(`${Number(readings.current).toFixed(2)} A`);
+  if (readings.power !== undefined) meter.push(`${Number(readings.power).toFixed(1)} W`);
+  if (readings.temperature !== undefined) meter.push(`${Number(readings.temperature).toFixed(1)} °C`);
+  if (readings.humidity !== undefined) meter.push(`${Number(readings.humidity).toFixed(0)} % RH`);
+  const meterNode = $('switchReadings');
+  if (meterNode) {
+    meterNode.hidden = !meter.length;
+    meterNode.textContent = (sw.model ? `${sw.model} · ` : '') + meter.join(' · ');
+  }
+  syncPowerUi();
 
   $('observatoryNote').hidden = !!(safety.connected || haveDome || channels.length);
 }
@@ -2197,6 +2409,10 @@ function renderSwitches(channels) {
       label.className = 'switch-name';
       label.textContent = channel.name;
       label.title = channel.description || '';
+      // What the outlet feeds, as assigned on the Power page.
+      const feeds = document.createElement('span');
+      feeds.className = 'switch-feeds';
+      label.appendChild(feeds);
       row.appendChild(label);
 
       if (channel.boolean) {
@@ -2228,9 +2444,12 @@ function renderSwitches(channels) {
     }
   }
 
+  const feeds = outletFeeds();
   for (const channel of channels) {
     const row = host.querySelector(`[data-index="${channel.index}"]`);
     if (!row) continue;
+    const feedsNode = row.querySelector('.switch-feeds');
+    if (feedsNode) feedsNode.textContent = feeds[channel.index] || '';
     const toggle = row.querySelector('[data-role="toggle"]');
     if (toggle) {
       const on = Number(channel.value) >= 0.5;
@@ -2528,7 +2747,20 @@ function updateWarnings(status) {
     const spacer = document.createElement('span');
     spacer.className = 'spacer';
     head.appendChild(spacer);
-    if (!w.acknowledged) {
+    if (w.sticky) {
+      // A run's own warning marks an event, and only the run clears it: at
+      // its next start, or when the thing comes right. Neither has happened
+      // by the morning after, so this one can be taken down by hand.
+      const dismiss = document.createElement('button');
+      dismiss.className = 'btn small ghost';
+      dismiss.textContent = 'Dismiss';
+      dismiss.title = 'Take it off the board';
+      dismiss.addEventListener('click', () => {
+        api(`/api/warnings/${encodeURIComponent(w.key)}/dismiss`, 'POST')
+          .catch((error) => toast(error.message, 'error'));
+      });
+      head.appendChild(dismiss);
+    } else if (!w.acknowledged) {
       const seen = document.createElement('button');
       seen.className = 'btn small ghost';
       seen.textContent = 'Seen it';
@@ -2561,16 +2793,48 @@ function updateRecoveryBar(status) {
   const bar = $('recoveryBar');
   if (!bar) return;
   const sequence = (status && status.sequence) || {};
+  updateRigRecovery(sequence.rigRecovery || {});
   const recovery = sequence.recovery;
   if (!recovery) { bar.hidden = true; return; }
   bar.hidden = false;
   const kinds = {
     guiding: 'Guide star', pointing: 'Pointing', camera: 'Camera',
+    telescope: 'Recovering', mount: 'Mount', watchdog: 'Watchdog',
   };
   setText('recoveryKind', kinds[recovery.kind] || 'Recovering');
-  setText('recoveryReason', recovery.reason || '');
+  // "RASA 2: recovering, attempt 2/6: exposure failed (reconnecting the camera)"
+  const rigs = (recovery.rigs || []).map((rec) => {
+    let text = `${rec.name}: ${rec.state}`;
+    if (rec.attempts) text += `, attempt ${rec.attempt}/${rec.attempts}`;
+    if (rec.reason) text += `: ${rec.reason}`;
+    if (rec.step && rec.state === 'recovering') text += ` (${rec.step})`;
+    return text;
+  });
+  setText('recoveryReason', rigs.length ? rigs.join(' · ') : (recovery.reason || ''));
   const total = sequence.rescues || 0;
   setText('recoveryCount', total ? `${total} rescue${total === 1 ? '' : 's'} this run` : '');
+}
+
+/** A badge on each telescope's card while it is recovering or has failed. */
+function updateRigRecovery(byRig) {
+  const host = $('rigOverview');
+  if (!host) return;
+  for (const card of host.querySelectorAll('.rig-card[data-rig]')) {
+    const rec = byRig[card.dataset.rig];
+    const bad = rec && rec.state && rec.state !== 'ok';
+    card.classList.toggle('recovering', Boolean(bad && rec.state === 'recovering'));
+    card.classList.toggle('failed', Boolean(bad && rec.state === 'failed'));
+    let badge = card.querySelector('.rig-recovery');
+    if (!bad) { if (badge) badge.remove(); continue; }
+    if (!badge) {
+      badge = document.createElement('div');
+      badge.className = 'rig-recovery';
+      card.appendChild(badge);
+    }
+    badge.textContent = `${rec.state}${rec.attempts ? ` ${rec.attempt}/${rec.attempts}` : ''}`
+      + (rec.reason ? ` — ${rec.reason}` : '');
+    badge.title = rec.step || '';
+  }
 }
 
 function updateLog(events) {
@@ -2587,7 +2851,15 @@ function updateLog(events) {
 }
 
 function applyStatus(status) {
+  // The server leaves out the big sections that have not changed since the
+  // last tick it sent this page; the page keeps the last it saw.
+  for (const key of ['collab', 'events', 'warnings']) {
+    if (key in status) state.lastBig[key] = status[key];
+    else if (key in state.lastBig) status[key] = state.lastBig[key];
+  }
   state.status = status;
+  noteFreshStatus(status);
+  settleTasks(status.tasks);
   // The panels describe the selected telescope. The mount and the guider come
   // from the master whatever is selected, because there is only one of each.
   const rig = currentRig();
@@ -2647,16 +2919,21 @@ function applyStatus(status) {
   if (mine || anyNew) {
     // A new frame is pulled into the view only while the viewer is following
     // the camera. Somebody stepping back through the night's frames keeps
-    // the one they are on; Newest brings them back. Following is what the
-    // operator last asked for, not where the frame on view happens to sit
-    // in the list — every new sub pushes the one on view down a place, and
-    // reading that as "browsing" is how the viewer stopped following the
-    // camera after the first sub of every night.
+    // the one they are on; Newest brings them back.
     refreshImages().then(() => {
       // While the stack is on view a new sub updates the stack, not the
-      // viewer; `livestack.js` redraws it when the stack says it has grown.
-      if (mine && !state.browsing && !stackView.on) selectImage(latest, true, false);
-      else updateFramePosition();
+      // viewer. A focus or centring frame is the exception to both that and
+      // browsing: it is never saved and never stacked, so the moment it is
+      // captured is the only chance to see it, and seeing the sweep is how
+      // an operator knows the focuser is doing something sensible. It pulls
+      // the viewer back to following, and the subs after it follow too.
+      const fresh = (state.images || []).find((image) => image.id === latest);
+      const transient = !!fresh && !fresh.saved;
+      if (mine && (transient || (!state.browsing && !stackView.on))) {
+        selectImage(latest, true, false);
+      } else {
+        updateFramePosition();
+      }
     });
   }
 
@@ -2847,7 +3124,7 @@ function updateRigViews() {
         selectRig(rig.id);
         const now = rigList().find((one) => one.id === rig.id) || {};
         const shot = (now.capture || {}).latestImageId;
-        if (shot) selectImage(shot, false, false);
+        if (shot) selectImage(shot);
       });
       host.appendChild(card);
     }
@@ -3630,7 +3907,6 @@ function fillSettingsForm(settings) {
   $('siteLatitude').value = site.latitude ?? '';
   $('siteLongitude').value = site.longitude ?? '';
   $('siteElevation').value = site.elevation ?? 0;
-  $('siteBortle').value = site.bortle ?? '';
   const schedule = settings.schedule || {};
   $('schedMinAltitude').value = schedule.minAltitude ?? 30;
   $('schedPerFrame').value = schedule.perFrameSeconds ?? 15;
@@ -3709,8 +3985,11 @@ const EQUIPMENT_FIELDS = [
   ['camera', 'coolToleranceC', 'camTolerance', 'number'],
   ['camera', 'coolTimeoutMinutes', 'camCoolTimeout', 'number'],
   ['camera', 'warmRateCPerMinute', 'camWarmRate', 'number'],
+  ['camera', 'coolAllAtStart', 'camCoolAll', 'check'],
   ['camera', 'coolAtStart', 'camCoolStart', 'check'],
   ['camera', 'warmAtEnd', 'camWarmEnd', 'check'],
+  ['camera', 'warmOnStop', 'camWarmOnStop', 'check'],
+  ['camera', 'warmAtDawnIfCold', 'camWarmAtDawn', 'check'],
   ['camera', 'waitForCooling', 'camWaitCooling', 'check'],
   ['sequencer', 'autofocusHfrPercent', 'afHfrPercent', 'number'],
   ['sequencer', 'focusStepSize', 'afStepSize', 'number'],
@@ -3728,6 +4007,7 @@ const EQUIPMENT_FIELDS = [
   ['sequencer', 'autofocusFilter', 'afFilter', 'text'],
   ['sequencer', 'useFilterOffsets', 'afUseOffsets', 'check'],
   ['sequencer', 'meridianFlipEnabled', 'flipEnabled', 'check'],
+  ['sequencer', 'flipLimitMinutes', 'flipLimit', 'number'],
   ['sequencer', 'flipPauseMinutes', 'flipPause', 'number'],
   ['sequencer', 'flipAfterMinutes', 'flipAfter', 'number'],
   ['sequencer', 'flipSolve', 'flipSolve', 'check'],
@@ -3736,6 +4016,11 @@ const EQUIPMENT_FIELDS = [
   ['sequencer', 'stopTrackingAtEnd', 'seqStopTracking', 'check'],
   ['sequencer', 'homeAtStart', 'seqHomeAtStart', 'check'],
   ['sequencer', 'homeTimeoutMinutes', 'seqHomeTimeout', 'number'],
+  ['sequencer', 'openRoofAtStart', 'seqOpenRoof', 'check'],
+  ['sequencer', 'requireSafetyToOpen', 'seqRoofNeedsSafety', 'check'],
+  ['sequencer', 'roofOpenTimeoutSeconds', 'seqRoofOpenTimeout', 'number'],
+  ['sequencer', 'pauseLightsUnlessRoofOpen', 'seqRoofGate', 'check'],
+  ['sequencer', 'closeRoofAtEnd', 'seqRoofCloseAtEnd', 'check'],
   ['sequencer', 'loopLeadMinutes', 'seqLoopLead', 'number'],
   ['sequencer', 'measureFrames', 'seqMeasure', 'check'],
   ['sequencer', 'solveEveryFrames', 'seqSolveEvery', 'number'],
@@ -3760,7 +4045,9 @@ const EQUIPMENT_FIELDS = [
   ['recovery', 'guideGraceSeconds', 'recGuideGrace', 'number'],
   ['recovery', 'guideRestartAttempts', 'recGuideAttempts', 'number'],
   ['recovery', 'recalibrateAfterAttempts', 'recRecalAfter', 'number'],
-  ['recovery', 'guideRmsFaultArcsec', 'recGuideRough', 'number'],
+  ['recovery', 'roughGuidingArcsec', 'recRoughArcsec', 'number'],
+  ['recovery', 'roughGuidingFrames', 'recRoughFrames', 'number'],
+  ['recovery', 'roughGuidingRetryMinutes', 'recRoughRetry', 'number'],
   ['recovery', 'discardLostFrames', 'recDiscardLost', 'check'],
   ['recovery', 'pointingRecovery', 'recPointing', 'check'],
   ['recovery', 'recentreArcmin', 'recRecentre', 'number'],
@@ -3768,6 +4055,12 @@ const EQUIPMENT_FIELDS = [
   ['recovery', 'frameRetryAttempts', 'recFrameRetries', 'number'],
   ['recovery', 'frameRetrySeconds', 'recFrameWait', 'number'],
   ['recovery', 'reconnectDevices', 'recReconnect', 'check'],
+  ['recovery', 'reconnectManualCaptures', 'recReconnectManual', 'check'],
+  ['recovery', 'hungSeconds', 'recHungSeconds', 'number'],
+  ['recovery', 'powerCycleCameras', 'recPowerCycle', 'check'],
+  ['recovery', 'powerCycleAfterReconnects', 'recPowerAfter', 'number'],
+  ['recovery', 'powerCycleOffSeconds', 'recPowerOff', 'number'],
+  ['recovery', 'powerCycleBootSeconds', 'recPowerBoot', 'number'],
   ['recovery', 'maxPerTarget', 'recMaxPerTarget', 'number'],
   ['recovery', 'cooldownSeconds', 'recCooldown', 'number'],
   ['recovery', 'onGiveUp', 'recOnGiveUp', 'text'],
@@ -3791,6 +4084,19 @@ const EQUIPMENT_FIELDS = [
   ['safety', 'onUnsafe', 'safOnUnsafe', 'text'],
   ['safety', 'graceSeconds', 'safGrace', 'number'],
   ['safety', 'resumeAfterSeconds', 'safResume', 'number'],
+  ['safety', 'source', 'safSource', 'text'],
+  ['safety', 'alpacaScheme', 'safAlpacaScheme', 'text'],
+  ['safety', 'alpacaHost', 'safAlpacaHost', 'text'],
+  ['safety', 'alpacaPort', 'safAlpacaPort', 'number'],
+  ['safety', 'alpacaBasePath', 'safAlpacaPath', 'text'],
+  ['safety', 'alpacaDevice', 'safAlpacaDevice', 'number'],
+  ['safety', 'alpacaCheckRoofState', 'safAlpacaRoofState', 'check'],
+  ['safety', 'staleSeconds', 'safStale', 'number'],
+  ['safety', 'maxClockSkewSeconds', 'safSkew', 'number'],
+  ['safety', 'debounceSeconds', 'safDebounce', 'number'],
+  ['safety', 'autoRestart', 'safAutoRestart', 'check'],
+  ['safety', 'autoRestartMaxPerNight', 'safRestartMax', 'number'],
+  ['safety', 'autoRestartCoolTimeoutMinutes', 'safRestartCool', 'number'],
   ['notify', 'enabled', 'notEnabled', 'check'],
   ['notify', 'webhookUrl', 'notWebhook', 'text'],
   ['notify', 'messageField', 'notField', 'text'],
@@ -3841,6 +4147,8 @@ function fillEquipmentForm(settings) {
   const camera = settings.camera || {};
   filterBandpass = { ...(camera.filterBandpass || {}) };
   if ($('camColour')) $('camColour').checked = !!camera.colour;
+  renderPowerPage(settings);
+  updatePowerNote();
   renderFilterChips(camera.filterNames || []);
   renderScopeFilters();
   renderFilterOffsets((settings.sequencer || {}).filterOffsets || {});
@@ -3851,6 +4159,288 @@ function fillEquipmentForm(settings) {
   updateCapturePreview();
   updateCalibrationPreview();
   refreshPhd2Note();
+}
+
+/* ------------------------------------------ the outlets feeding a camera */
+
+/* "RASA-1", "rasa1" and "Rasa 1" are the same outlet label. */
+const normOutlet = (text) => String(text || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+
+/** The power box's channels, from the master's status (there is one box). */
+function switchChannels() {
+  const sw = (state.status && state.status.devices && state.status.devices.switch) || {};
+  return sw.connected ? (sw.channels || []) : [];
+}
+
+const OUTLET_GROUPS = { power: '12 V', usb: 'USB', dew: 'dew', relay: 'relay',
+  hub: '12 V', dualusb: 'USB', buck: 'adjustable', boost: 'adjustable' };
+
+const kindLabel = (key) => ((KINDS.find((k) => k.key === key) || {}).label || key);
+
+/* What a device key (what the server stores against an outlet) reads as:
+   "rasa1 camera", "mount". */
+function powerTargetLabel(key) {
+  if (!key) return '';
+  const colon = String(key).lastIndexOf(':');
+  if (colon < 0) return kindLabel(key).toLowerCase();
+  const rig = rigList().find((r) => r.id === key.slice(0, colon));
+  const kind = kindLabel(key.slice(colon + 1)).toLowerCase();
+  return `${rig ? rig.name : '(removed telescope)'} ${kind}`;
+}
+
+/* Everything an outlet can be assigned to: the gear on each telescope, then
+   the things there is one of on the mount. */
+function powerTargets() {
+  const groups = [];
+  for (const rig of rigList()) {
+    const kinds = (rig.kinds || []).filter((k) => !MASTER_KINDS.includes(k));
+    // The telescope is in the label as well as the group: a closed picker
+    // reading "Focuser" would not say whose.
+    groups.push({ label: rig.name,
+      options: kinds.map((k) => ({ key: `${rig.id}:${k}`, label: `${rig.name} · ${kindLabel(k)}` })) });
+  }
+  groups.push({ label: 'Observatory',
+    options: MASTER_KINDS.filter((k) => k !== 'switch')
+      .map((k) => ({ key: k, label: kindLabel(k) })) });
+  return groups;
+}
+
+/** The saved table: outlet name -> device key. */
+function storedOutlets(settings) {
+  return { ...(((settings || state.settings || {}).power || {}).outlets || {}) };
+}
+
+/* The saved entry for one outlet, matched the way the server matches it: the
+   exact name, then its position, then the name spelt loosely. */
+function storedFor(channel, stored) {
+  if (Object.prototype.hasOwnProperty.call(stored, channel.name)) return stored[channel.name];
+  if (stored[`index:${channel.index}`]) return stored[`index:${channel.index}`];
+  const loose = Object.keys(stored).find((k) => normOutlet(k) === normOutlet(channel.name));
+  return loose ? stored[loose] : '';
+}
+
+/* Outlet index -> what it feeds, read from every telescope's live mapping, so
+   the Observatory panel can say it without loading the settings. */
+function outletFeeds() {
+  const feeds = {};
+  for (const rig of rigList()) {
+    const devices = (rig.power && rig.power.devices) || {};
+    for (const [kind, mapping] of Object.entries(devices)) {
+      const who = (MASTER_KINDS.includes(kind) ? '' : `${rig.name} `) + kindLabel(kind).toLowerCase()
+        + (mapping.source === 'byName' ? ' (by name)' : '');
+      for (const c of mapping.channels || []) {
+        feeds[c.index] = feeds[c.index] ? `${feeds[c.index]}, ${who}` : who;
+      }
+    }
+  }
+  return feeds;
+}
+
+/* What the Power page was drawn from; redrawn only when it changes, so a
+   picker being used is not rebuilt under the pointer four times a second. */
+function powerSignature() {
+  return JSON.stringify([switchChannels().map((c) => [c.index, c.name, c.group, c.writable]),
+    rigList().map((r) => [r.id, r.name, r.kinds]), state.powerStored || {}]);
+}
+
+/** The Power page: one row per outlet with a picker, then the gear list. */
+function renderPowerPage(settings) {
+  const host = $('powerOutlets');
+  if (!host) return;
+  settings = settings || state.settings || {};
+  const stored = storedOutlets(settings);
+  state.powerStored = stored;
+  const channels = switchChannels();
+  const sw = (state.status && state.status.devices && state.status.devices.switch) || {};
+  setText('powerBoxName', sw.connected ? (sw.model || sw.name || '') : '');
+  const note = $('powerPageNote');
+  host.innerHTML = '';
+  host.dataset.live = channels.length ? '1' : '';
+  if (!channels.length) {
+    const names = Object.keys(stored);
+    note.textContent = 'No power box is connected. Connect one on the Connection page '
+      + '(Power) — a Pegasus box shows up there by itself while Unity is running.'
+      + (names.length ? ` Saved: ${names.map((n) => `${n} → ${powerTargetLabel(stored[n])}`)
+        .join(', ')}.` : '');
+  } else {
+    note.textContent = 'Pick what each outlet feeds, then save. The labels are the '
+      + "box's own; an outlet with nothing picked shows what it is taken for by name.";
+    const feeds = outletFeeds();
+    const groups = powerTargets();
+    for (const channel of channels) {
+      if (!channel.writable) continue;
+      const row = document.createElement('div');
+      row.className = 'outlet-row';
+      const name = document.createElement('span');
+      name.className = 'outlet-name';
+      name.textContent = channel.name;
+      const group = document.createElement('span');
+      group.className = 'outlet-group';
+      group.textContent = OUTLET_GROUPS[channel.group] || '';
+      name.appendChild(group);
+      row.appendChild(name);
+      const select = document.createElement('select');
+      select.dataset.outlet = channel.name;
+      select.appendChild(new Option('— not assigned —', ''));
+      for (const g of groups) {
+        const optgroup = document.createElement('optgroup');
+        optgroup.label = g.label;
+        for (const o of g.options) optgroup.appendChild(new Option(o.label, o.key));
+        select.appendChild(optgroup);
+      }
+      const current = storedFor(channel, stored) || '';
+      select.value = current;
+      // A key for a telescope that no longer exists is shown as unassigned.
+      if (select.value !== current) select.value = '';
+      row.appendChild(select);
+      const hint = document.createElement('span');
+      hint.className = 'outlet-hint small muted';
+      hint.textContent = !select.value && feeds[channel.index] ? feeds[channel.index] : '';
+      select.addEventListener('change', () => {
+        hint.textContent = !select.value && feeds[channel.index] ? feeds[channel.index] : '';
+      });
+      row.appendChild(hint);
+      host.appendChild(row);
+    }
+  }
+  host.dataset.signature = powerSignature();
+  renderPowerGear(true);
+}
+
+/* One row per device that has outlets, or has a driver remembered: what a
+   power cycle of it would switch, and the button that does it. */
+function renderPowerGear(force) {
+  const host = $('powerGear');
+  if (!host) return;
+  const remembered = ((state.equipment && state.equipment.telescopes) || []);
+  const rows = [];
+  for (const rig of rigList()) {
+    const devices = (rig.power && rig.power.devices) || {};
+    const kept = (remembered.find((r) => r.id === rig.id) || {}).devices || {};
+    for (const kind of rig.kinds || []) {
+      const mapping = devices[kind];
+      if (!mapping || kind === 'switch') continue;
+      const live = (rig.devices || {})[kind] || {};
+      if (!mapping.channels.length && !kept[kind] && !live.connected) continue;
+      rows.push({ rig, kind, mapping });
+    }
+  }
+  const signature = JSON.stringify(rows.map((r) => [r.rig.id, r.rig.name, r.kind,
+    r.mapping.source, r.mapping.channels.map((c) => c.name), r.mapping.lastCycled]));
+  if (!force && host.dataset.signature === signature) return;
+  host.dataset.signature = signature;
+  host.innerHTML = '';
+  if (!rows.length) {
+    host.textContent = 'Nothing to show yet: connect a device or assign an outlet above.';
+    host.classList.add('small', 'muted');
+    return;
+  }
+  host.classList.remove('small', 'muted');
+  for (const { rig, kind, mapping } of rows) {
+    const row = document.createElement('div');
+    row.className = 'gear-row';
+    const label = document.createElement('span');
+    label.className = 'gear-name';
+    label.textContent = (MASTER_KINDS.includes(kind) ? '' : `${rig.name} · `) + kindLabel(kind);
+    row.appendChild(label);
+    const names = mapping.channels.map((c) => c.name);
+    const outlets = document.createElement('span');
+    outlets.className = 'gear-outlets small';
+    outlets.textContent = names.length
+      ? names.join(', ') + (mapping.source === 'byName' ? ' (by name)'
+        : mapping.source === 'configured' ? ' (from the Camera page of 0.2.46)' : '')
+      : 'no outlet assigned';
+    if (!names.length) outlets.classList.add('muted');
+    if (mapping.lastCycled) {
+      outlets.textContent += ` · last cycled ${new Date(mapping.lastCycled * 1000).toLocaleTimeString()}`;
+    }
+    row.appendChild(outlets);
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn small';
+    button.textContent = 'Power-cycle';
+    button.disabled = !names.length;
+    button.addEventListener('click', () => powerCycleDevice(rig, kind, names));
+    row.appendChild(button);
+    host.appendChild(row);
+  }
+}
+
+/* Keep both pages in step with the status: the Camera page's note and the
+   Power page's table and gear list. */
+function syncPowerUi() {
+  updatePowerNote();
+  const host = $('powerOutlets');
+  if (!host || !state.settings) return;
+  if (host.dataset.signature !== powerSignature()) renderPowerPage(state.settings);
+  else renderPowerGear(false);
+}
+
+/** The table as picked, or null when there is no box to pick on. */
+function readPowerOutlets() {
+  const host = $('powerOutlets');
+  if (!host || host.dataset.live !== '1') return null;
+  const outlets = {};
+  for (const select of host.querySelectorAll('select[data-outlet]')) {
+    outlets[select.dataset.outlet] = select.value || null;
+  }
+  return outlets;
+}
+
+/** Ask, then cut and restore one device's outlets and reconnect it. */
+async function powerCycleDevice(rig, kind, names) {
+  const what = MASTER_KINDS.includes(kind)
+    ? `the ${kindLabel(kind).toLowerCase()}` : `${rig.name}'s ${kindLabel(kind).toLowerCase()}`;
+  const ok = await confirmAction(
+    `Switch ${names.join(', ') || 'its outlets'} off for a few seconds and back on, `
+    + `then reconnect ${what}?` + (kind === 'mount' ? ' The mount will need homing afterwards.' : ''),
+    { title: `Power-cycle ${what}`, confirmLabel: 'Power cycle', danger: true });
+  if (!ok) return;
+  try {
+    const result = await send(rigQuery(`/api/power/cycle?kind=${encodeURIComponent(kind)}`, rig.id), 'POST');
+    if (result && result.started) {
+      toast(`Power-cycling ${result.channels.join(', ')} — watch the log`, 'info');
+    }
+  } catch (error) {
+    if (!(error && error.reported)) toast(String(error && error.message || error), 'error');
+  }
+}
+
+function updatePowerNote() {
+  const note = $('camPowerNote');
+  const last = $('camPowerLast');
+  const button = $('btnPowerCycle');
+  if (!note) return;
+  const rig = currentRig();
+  const mapping = (rig && rig.power) || {};
+  const channels = switchChannels();
+  const name = rig ? rig.name : 'this telescope';
+  if (!channels.length) {
+    note.textContent = 'No power box is connected. Connect one on the Connection page '
+      + '(Power) — a Pegasus box shows up there by itself while Unity is running.';
+    if (button) button.disabled = true;
+  } else {
+    const names = (mapping.channels || []).map((c) => c.name);
+    if (mapping.source === 'assigned') {
+      note.textContent = names.length
+        ? `Recovery will switch ${names.join(', ')} for ${name}'s camera, as assigned on the Power page.`
+        : `The outlets assigned to ${name}'s camera are not on this box — assign the ones that are.`;
+    } else if (mapping.source === 'configured') {
+      note.textContent = `Recovery will switch ${names.join(', ')} for ${name}'s camera, as `
+        + 'ticked on the Camera page of 0.2.46. Assign them on the Power page to replace that.';
+    } else if (mapping.source === 'byName') {
+      note.textContent = `Recovery will switch ${names.join(', ')} for ${name}'s camera — `
+        + 'matched by the telescope name. Assign outlets on the Power page to choose by hand.';
+    } else {
+      note.textContent = `Nothing on the box is assigned to ${name}'s camera or named after `
+        + `${name}, so recovery cannot power-cycle it yet — assign its outlets on the Power page.`;
+    }
+    if (button) button.disabled = !names.length;
+  }
+  if (last) {
+    const when = mapping.lastCycled;
+    last.textContent = when ? `last cycled ${new Date(when * 1000).toLocaleTimeString()}` : '';
+  }
 }
 
 /* Names offered as suggestions while typing a slot. Not a menu to pick from and
@@ -4445,6 +5035,59 @@ function updateCapturePreview() {
   node.classList.toggle('warn-text', !!capture.customDir);
 }
 
+/** The network safety source's status line (0.2.53a): source, age, skew. */
+function safetySourceLine(safety) {
+  const src = (safety || {}).source;
+  if (!src) return '';
+  const age = src.lastUpdateAge == null ? 'no good answer yet'
+    : `updated ${Math.round(src.lastUpdateAge)} s ago`;
+  const skew = src.skewSeconds == null ? 'clock skew unknown'
+    : `clock skew ${src.skewSeconds > 0 ? '+' : ''}${Math.round(src.skewSeconds)} s`;
+  const data = src.dataAge == null ? '' : ` · roof report ${Math.round(src.dataAge)} s old`;
+  const said = src.serverSafe === true ? 'server says SAFE'
+    : src.serverSafe === false ? 'server says UNSAFE' : 'UNKNOWN (reads unsafe)';
+  return `${src.name}: ${said} · ${age} · ${skew}${data}`
+    + (src.error ? ` · ${src.error}` : '')
+    + safetyHoldText(safety) + autoRestartText(safety);
+}
+
+function safetyHoldText(safety) {
+  if (safety.safe !== false || safety.acted === false) return '';
+  if (safety.confirmed) return ' · confirmed closed: shutting down';
+  if (safety.unsafeFor == null || !safety.holdSeconds) return '';
+  const left = Math.max(0, Math.round(safety.holdSeconds - safety.unsafeFor));
+  return ` · unconfirmed: shutdown in ${left} s if it lasts`;
+}
+
+function autoRestartText(safety) {
+  const r = (safety || {}).autoRestart;
+  if (!r || !r.state || r.state === 'idle') return '';
+  const n = `${r.restarts}/${r.max} tonight`;
+  if (r.state === 'armed') {
+    return r.restartIn == null ? ` · auto-restart armed (${n}), waiting for safe`
+      : ` · auto-restart in ${Math.round(r.restartIn)} s if still safe (${n})`;
+  }
+  if (r.state === 'restarting') return ` · auto-restart: ${r.step || 'starting'} (${n})`;
+  if (r.state === 'resumed') return ` · auto-restarted (${n})`;
+  return ` · auto-restart ${r.state}: ${r.reason || ''}`;
+}
+
+function renderSafetySource(safety) {
+  const line = safetySourceLine(safety);
+  const failing = !!(safety.source && safety.source.error);
+  const node = $('safSourceStatus');
+  if (node) {
+    node.textContent = line || 'No network safety source configured.';
+    node.classList.toggle('warn-text', failing);
+  }
+  const under = $('safetySourceLine');
+  if (under) {
+    under.hidden = !line;
+    under.textContent = line;
+    under.classList.toggle('warn-text', failing);
+  }
+}
+
 async function saveEquipmentSettings() {
   const payload = { camera: {}, sequencer: {}, guiding: {}, recovery: {},
     piercam: {}, safety: {}, notify: {} };
@@ -4472,6 +5115,9 @@ async function saveEquipmentSettings() {
     if (Object.keys(payload.camera).length) {
       await api(rigQuery('/api/settings/camera'), 'POST', payload.camera);
     }
+    // The power box is the mount's, so what its outlets feed goes in unscoped.
+    const outlets = readPowerOutlets();
+    if (outlets !== null) await api('/api/settings/power', 'POST', { outlets });
     // The camera angle is this telescope's, so it goes in scoped.
     const angle = Number($('opticsAngle').value);
     await api(rigQuery('/api/settings/optics'), 'POST', {
@@ -4518,8 +5164,6 @@ async function saveSettings() {
   if (longitude !== null) site.longitude = longitude;
   const elevation = numberOrNull('siteElevation');
   if (elevation !== null) site.elevation = elevation;
-  const bortle = numberOrNull('siteBortle');
-  site.bortle = bortle === null ? null : Math.round(bortle);
 
   const optics = {};
   for (const [id, key] of [['opticsFocalLength', 'focalLength'],
@@ -4641,9 +5285,16 @@ function pushOutput(body) {
 
 /* ------------------------------------------------------------- image list */
 
+/* Each refresh is numbered and only the newest one's answer is drawn
+   (0.2.50): two refreshes in flight could answer out of order, and the older
+   list - without the frame just taken - was drawn last. */
+let imageListRequest = 0;
+
 async function refreshImages() {
+  const mine = ++imageListRequest;
   try {
     const result = await api('/api/images');
+    if (mine !== imageListRequest) return;
     state.images = result.images;
     setText('imageCount', String(state.images.length));
     const host = $('imageList');
@@ -4669,6 +5320,13 @@ async function refreshImages() {
       row.innerHTML = `<div class="name"></div><div class="time">${time}</div><div class="meta"></div>`;
       row.querySelector('.name').textContent = image.filename;
       row.querySelector('.meta').textContent = bits.join(' · ');
+      if (image.viewable === false) {
+        // Taken with saving off and no longer held: the row stays as a
+        // record of the night, dimmed, and a click says why rather than
+        // waiting on a request that can only fail.
+        row.classList.add('gone');
+        row.title = 'No longer in memory: a frame taken without saving is kept only while it is recent';
+      }
       row.addEventListener('click', () => selectImage(image.id));
       host.appendChild(row);
     }
@@ -4798,40 +5456,6 @@ const viewer = {
   // computed as zero and kept forever.
   needsFit: false,
 };
-
-/* What the viewer is drawing: a single frame, or tonight's live stack. The
-   stack is served through the same endpoints shape - stats, render.png with a
-   region crop, pixel - so everything from the stretch sliders to the sharp
-   crop at the screen's resolution works on it unchanged; only the base URL
-   differs. `livestack.js` switches this and keeps it fed. */
-const stackView = {
-  on: false,
-  rig: null,          // telescope id, null for the master
-  project: '',
-  filter: '',
-  updated: 0,         // the stack's own update time the picture was drawn from
-};
-
-function stackQuery() {
-  const parts = [`project=${encodeURIComponent(stackView.project)}`,
-    `filter=${encodeURIComponent(stackView.filter)}`];
-  if (stackView.rig && stackView.rig !== masterRigId()) {
-    parts.push(`rig=${encodeURIComponent(stackView.rig)}`);
-  }
-  return parts.join('&');
-}
-
-/** The URL a viewer request starts from, for whatever is on view. */
-function viewUrl(what, extra = '') {
-  if (stackView.on) {
-    return `/api/livestack/${what}?${stackQuery()}&t=${stackView.updated || 0}`
-      + (extra ? `&${extra}` : '');
-  }
-  return `/api/images/${state.currentId}/${what}` + (extra ? `?${extra}` : '');
-}
-
-/** Whether there is anything to draw at all. */
-const hasView = () => (stackView.on ? Boolean(stackView.project) : Boolean(state.currentId));
 
 function initViewer() {
   viewer.canvas = $('view');
@@ -4997,7 +5621,7 @@ function screenToImage(px, py) {
 
 let pixelTimer = null;
 function updateCursorReadout() {
-  if (!viewer.preview || !viewer.cursor || !hasView()) return;
+  if (!viewer.preview || !viewer.cursor || !state.currentId) return;
   const { x, y } = screenToImage(viewer.cursor.px, viewer.cursor.py);
   if (x < 0 || y < 0 || x >= viewer.width || y >= viewer.height) {
     setText('cursorReadout', '—');
@@ -5007,11 +5631,8 @@ function updateCursorReadout() {
   clearTimeout(pixelTimer);
   pixelTimer = setTimeout(async () => {
     try {
-      const result = await api(viewUrl('pixel', `x=${x}&y=${y}`));
-      // On the stack the number is a display value and the depth is what
-      // matters: how many subs reached this pixel.
-      const depth = result.frames !== undefined ? `   ${result.frames} frames deep` : '';
-      setText('cursorReadout', `x ${x}  y ${y}   ${result.value} ADU   (5×5 mean ${result.boxMean})${depth}`);
+      const result = await api(`/api/images/${state.currentId}/pixel?x=${x}&y=${y}`);
+      setText('cursorReadout', `x ${x}  y ${y}   ${result.value} ADU   (5×5 mean ${result.boxMean})`);
     } catch { /* the pointer moved on; ignore */ }
   }, 110);
 }
@@ -5029,7 +5650,7 @@ function scheduleDetail() {
  * fetched again, cropped and decimated to just fit the screen, and drawn on
  * top; at 1:1 and beyond that is the full-resolution crop it always was. */
 async function loadDetail() {
-  if (!hasView() || !viewer.preview) return;
+  if (!state.currentId || !viewer.preview) return;
   if (viewer.scale * viewer.previewFactor <= 1.02) { viewer.detail = null; draw(); return; }
 
   const wrap = $('canvasWrap');
@@ -5049,7 +5670,8 @@ async function loadDetail() {
   const factor = maxDim === 0 ? 1 : Math.ceil(Math.max(w, h) / maxDim);
 
   const token = ++viewer.detailToken;
-  const url = viewUrl('render.png', `${stretchQuery()}&region=${x},${y},${w},${h}&maxDim=${maxDim}`);
+  const url = `/api/images/${state.currentId}/render.png?${stretchQuery()}` +
+    `&region=${x},${y},${w},${h}&maxDim=${maxDim}`;
   const img = new Image();
   img.onload = () => {
     if (token !== viewer.detailToken) return;
@@ -5076,16 +5698,16 @@ function frameIndex() {
   return steppableImages().findIndex((image) => image.id === state.currentId);
 }
 
-/** "3 / 41" on the toolbar, and the Newest button while the viewer is looking
- *  back. `state.browsing` itself is set where a frame is chosen — this only
- *  reports it. Deriving it from the frame's place in the list was the bug:
- *  each new sub moved the one on view to second place, so the viewer
- *  decided it was browsing and never followed the camera again. */
+/** "3 / 41" on the toolbar, and whether the viewer is following the camera. */
 function updateFramePosition() {
   const subs = steppableImages();
   const index = frameIndex();
   const label = $('viewerPos');
   if (!label) return;
+  // Whether the viewer follows the camera is the operator's choice, made in
+  // `selectImage`; it is not inferred here (0.2.50). Inferring it from the
+  // position meant the frame on view became "browsing" the moment a newer
+  // sub arrived, and from then on the viewer stopped showing new frames.
   if (!subs.length || index < 0) {
     label.textContent = subs.length ? `${subs.length} sub${subs.length === 1 ? '' : 's'}` : '';
   } else {
@@ -5104,39 +5726,54 @@ function stepFrame(delta) {
   const index = frameIndex();
   const next = index < 0 ? 0 : Math.max(0, Math.min(subs.length - 1, index + delta));
   if (next === index) return;
-  // Stepping back is browsing; stepping forward onto the newest sub is
-  // following the camera again.
-  selectImage(subs[next].id, true, next > 0);
+  selectImage(subs[next].id, true);
 }
 
 function newestFrame() {
   const images = state.images || [];
   if (!images.length) return;
+  state.browsing = false;
   selectImage(images[0].id, true, false);
 }
 
-/** Show a frame. `browse` says whether the operator is now looking back
- *  through the night (true), following the camera (false), or — left out, as
- *  from a click on the list — whichever the frame's place in the list says:
- *  the newest sub, or a focus frame, is following; anything older is not. */
+/* Numbered like the image list: only the newest selection is shown, so a
+   slow answer for an older frame cannot replace the newest one. */
+let imageSelectRequest = 0;
+
+/** Show a frame. `browse` says whether the viewer stops following the
+ *  camera: true or false as the caller decides, and left out (a click on a
+ *  row, a step) it is "anything but the newest sub". */
 async function selectImage(imageId, keepView = false, browse = undefined) {
   if (!imageId) return;
-  // Picking a frame is leaving the stack: the list and the arrow keys mean
-  // "show me that sub", and the stack button brings the stack back.
-  if (stackView.on && window.astro && window.astro.leaveStack) window.astro.leaveStack();
+  const known = (state.images || []).find((image) => image.id === imageId);
+  if (known && known.viewable === false) {
+    toast('That frame is no longer in memory: it was taken without saving and only recent ones are kept', 'info');
+    return;
+  }
+  if (browse === undefined) {
+    // Anything but the newest frame of the telescope that took it. With
+    // several telescopes the list interleaves them, so "the top row" would
+    // make a click on this telescope's newest frame stop following.
+    const rigId = known && known.rig;
+    const owner = rigId ? rigList().find((one) => one.id === rigId) : null;
+    const capture = (owner && owner.capture) || (state.status && state.status.capture) || {};
+    browse = !!known && known.saved !== false && capture.latestImageId !== imageId;
+  }
+  state.browsing = !!browse;
+  const mine = ++imageSelectRequest;
   let payload;
   try {
     payload = await api(`/api/images/${imageId}/stats`);
   } catch (error) {
-    toast(error.message, 'error');
+    if (mine === imageSelectRequest) toast(error.message, 'error');
     return;
   }
+  if (mine !== imageSelectRequest) return;
   const record = payload.image;
   const sameGeometry = viewer.width === record.width && viewer.height === record.height;
   state.currentId = imageId;
   state.currentRecord = record;
   state.currentStats = payload.stats;
-  state.browsing = browse === undefined ? frameIndex() > 0 : !!browse;
 
   if ($('chkAuto').checked) setStretchSliders(payload.autoStretch);
   drawHistogram(payload.stats);
@@ -5153,50 +5790,19 @@ async function selectImage(imageId, keepView = false, browse = undefined) {
   await loadPreview(keepView && sameGeometry);
 }
 
-/** Put tonight's live stack in the viewer. `keepView` holds the pan and zoom
- *  across refreshes of the same stack, which is every refresh after the first:
- *  a stack's canvas never changes size during a night. */
-async function selectStack(rigId, project, filterName, keepView = false) {
-  const same = stackView.on && stackView.project === project
-    && stackView.filter === filterName && stackView.rig === rigId;
-  stackView.on = true;
-  stackView.rig = rigId;
-  stackView.project = project;
-  stackView.filter = filterName;
-  let payload;
-  try {
-    payload = await api(`/api/livestack/stats?${stackQuery()}`);
-  } catch (error) {
-    toast(error.message, 'error');
-    return false;
-  }
-  const record = payload.image;
-  stackView.updated = (payload.summary && payload.summary.updated) || 0;
-  const sameGeometry = viewer.width === record.width && viewer.height === record.height;
-  state.currentRecord = record;
-  state.currentStats = payload.stats;
-
-  if ($('chkAuto').checked) setStretchSliders(payload.autoStretch);
-  drawHistogram(payload.stats);
-  document.querySelectorAll('.image-row').forEach((row) => row.classList.remove('active'));
-  const summary = payload.summary || {};
-  setText('viewerTitle', `${record.filename}   ·   ${summary.frames || 0} frames`);
-  const download = $('btnDownload');
-  download.href = `/api/livestack/download?${stackQuery()}`;
-  download.classList.remove('disabled');
-
-  await loadPreview(keepView && same && sameGeometry);
-  return true;
-}
+let previewRequest = 0;
 
 function loadPreview(keepView) {
   return new Promise((resolve) => {
-    if (!hasView()) { resolve(); return; }
+    if (!state.currentId) { resolve(); return; }
     const record = state.currentRecord;
+    const mine = ++previewRequest;
     $('viewerLoading').hidden = false;
-    const url = viewUrl('render.png', `${stretchQuery()}&maxDim=1600`);
+    const url = `/api/images/${state.currentId}/render.png?${stretchQuery()}&maxDim=1600`;
     const img = new Image();
     img.onload = () => {
+      // A render that was overtaken by a newer one is dropped (0.2.50).
+      if (mine !== previewRequest) { resolve(); return; }
       viewer.preview = img;
       viewer.width = record.width;
       viewer.height = record.height;
@@ -5213,6 +5819,7 @@ function loadPreview(keepView) {
       resolve();
     };
     img.onerror = () => {
+      if (mine !== previewRequest) { resolve(); return; }
       $('viewerLoading').hidden = true;
       toast('Could not render the image', 'error');
       resolve();
@@ -5225,29 +5832,108 @@ let restretchTimer = null;
 function restretch() {
   clearTimeout(restretchTimer);
   restretchTimer = setTimeout(() => {
-    if (hasView()) loadPreview(true);
+    if (state.currentId) loadPreview(true);
     if (state.currentRecord) drawHistogram(state.currentStats);
   }, 160);
 }
 
 /* ------------------------------------------------------------ live link */
 
+/* How fresh is what the page shows (0.2.50)? The server sends a status
+   several times a second; "live" used to mean only that the socket was open,
+   and stayed lit while nothing arrived. Now the badge and a banner say when
+   the last status came, and a socket that has gone quiet is reopened. */
+const link = { socket: null, lastAt: 0, serverTime: 0, seq: 0, open: false, timer: null };
+const LINK_STALE_MS = 3000;
+const LINK_DEAD_MS = 10000;
+
+function noteFreshStatus(status) {
+  link.lastAt = Date.now();
+  if (status && typeof status.serverTime === 'number') link.serverTime = status.serverTime;
+  if (status && typeof status.seq === 'number') link.seq = status.seq;
+  if (status && status.sectionErrors && Object.keys(status.sectionErrors).length) {
+    const text = Object.entries(status.sectionErrors).map(([k, v]) => `${k}: ${v}`).join('; ');
+    if (text !== link.sectionErrors) console.warn('status sections failing:', text);
+    link.sectionErrors = text;
+  } else {
+    link.sectionErrors = '';
+  }
+  updateLinkState();
+}
+
+function linkBanner() {
+  let node = document.getElementById('linkBanner');
+  if (!node) {
+    node = document.createElement('div');
+    node.id = 'linkBanner';
+    node.className = 'link-banner';
+    node.hidden = true;
+    document.body.appendChild(node);
+  }
+  return node;
+}
+
+function updateLinkState() {
+  const badge = $('linkState');
+  if (!badge) return;
+  const since = Math.max(link.lastAt, link.openedAt || 0);
+  const age = since ? Date.now() - since : Infinity;
+  const banner = linkBanner();
+  const asOf = link.lastAt ? new Date(link.lastAt).toLocaleTimeString([], { hour12: false }) : null;
+  if (link.open && age < LINK_STALE_MS) {
+    badge.textContent = 'live';
+    badge.className = 'link-state online';
+    badge.title = `Status updated ${asOf}`;
+    banner.hidden = true;
+    return;
+  }
+  const seconds = Number.isFinite(age) ? Math.round(age / 1000) : null;
+  badge.textContent = link.open ? `no data ${seconds}s` : 'offline';
+  badge.className = `link-state ${link.open ? 'stale' : 'offline'}`;
+  badge.title = asOf ? `Last status ${asOf}` : 'No status received yet';
+  banner.textContent = (link.open ? 'Starfront is not sending updates' : 'Connection to Starfront lost — reconnecting')
+    + (asOf ? `. What you see is from ${asOf} (${seconds}s ago).` : '.');
+  banner.hidden = false;
+}
+
 function connectSocket() {
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
   const socket = new WebSocket(`${protocol}://${location.host}/ws`);
+  link.socket = socket;
   socket.onopen = () => {
-    $('linkState').textContent = 'live';
-    $('linkState').className = 'link-state online';
+    if (link.socket !== socket) return;
+    link.open = true;
+    link.openedAt = Date.now();
+    updateLinkState();
   };
   socket.onmessage = (event) => {
+    if (link.socket !== socket) return;
     try { applyStatus(JSON.parse(event.data)); } catch (error) { console.error(error); }
   };
   socket.onclose = () => {
-    $('linkState').textContent = 'offline';
-    $('linkState').className = 'link-state offline';
+    if (link.socket !== socket) return;
+    link.open = false;
+    link.socket = null;
+    updateLinkState();
     setTimeout(connectSocket, 1500);
   };
   socket.onerror = () => socket.close();
+  if (!link.timer) {
+    link.timer = setInterval(() => {
+      updateLinkState();
+      // Open but silent: a half-dead connection (sleep, Wi-Fi change, a proxy)
+      // never says it closed. Drop it and dial again.
+      const s = link.socket;
+      const since = Math.max(link.lastAt, link.openedAt || 0);
+      if (s && link.open && Date.now() - since > LINK_DEAD_MS) {
+        link.socket = null;
+        link.open = false;
+        try { s.close(); } catch { /* already gone */ }
+        updateLinkState();
+        setTimeout(connectSocket, 500);
+      }
+    }, 1000);
+  }
 }
 
 /* --------------------------------------------------- equipment dialog */
@@ -5495,6 +6181,19 @@ function bindControls() {
     }
     return result;
   };
+  const powerCycle = $('btnPowerCycle');
+  if (powerCycle) {
+    powerCycle.addEventListener('click', () => {
+      const rig = currentRig();
+      if (!rig) return;
+      const names = ((rig.power && rig.power.channels) || []).map((c) => c.name);
+      powerCycleDevice(rig, 'camera', names);
+    });
+  }
+  const powerPage = $('btnPowerPage');
+  if (powerPage) {
+    powerPage.addEventListener('click', () => openPrefPage('equipmentDialog', 'power'));
+  }
   $('btnCooler').addEventListener('click', () => {
     const rig = currentRig();
     const camera = ((rig && rig.devices) || state.status.devices).camera;
@@ -5877,7 +6576,6 @@ function bindControls() {
     if (event.key === 'ArrowLeft') { event.preventDefault(); stepFrame(1); }
     if (event.key === 'ArrowRight') { event.preventDefault(); stepFrame(-1); }
     if (event.key === 'End') { event.preventDefault(); newestFrame(); }
-    if (event.key === 's') { const button = $('btnLiveStack'); if (button) button.click(); }
     if (event.key === ' ') { event.preventDefault(); $('btnCapture').click(); }
   });
 }
@@ -5922,13 +6620,6 @@ window.astro = {
   /** Re-render everything from the status already held. */
   refresh: () => { if (state.status) applyStatus(state.status); },
   onStatus: (listener) => statusListeners.push(listener),
-  /** The viewer, for the live stack to drive. */
-  stackView,
-  selectStack,
-  selectImage,
-  masterRigId,
-  /** Set by livestack.js: what to do when a frame is picked while the stack is up. */
-  leaveStack: null,
 };
 
 function init() {
@@ -5951,7 +6642,15 @@ function init() {
     buildConnectRows();
     return refreshDrivers();
   });
-  refreshImages();
+  refreshImages().then(() => {
+    // The window opens on the newest sub - the morning after a run, or a
+    // window opened mid-night - rather than on an empty canvas until the
+    // camera next delivers. A sub, not whatever was shot last: the last
+    // frame of a night is as likely a focus sweep as a light.
+    if (state.currentId || stackView.on) return;
+    const subs = steppableImages();
+    if (subs.length) selectImage(subs[0].id, false, false);
+  });
   loadSettings();
   connectSocket();
 }

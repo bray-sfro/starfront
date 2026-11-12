@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import random
 import socket
+import ssl
 import struct
 import threading
 import time
@@ -84,15 +85,137 @@ def discover(timeout: float = 1.5) -> list[dict[str, Any]]:
     return found
 
 
-def configured_devices(host: str, port: int, timeout: float = 4.0) -> list[dict[str, Any]]:
-    """Ask one Alpaca server for its device list."""
-    url = f"http://{host}:{port}/management/v1/configureddevices"
+# -- addressing and transport (0.2.53a) ----------------------------------------
+#
+# Until 0.2.53 every Alpaca address was ``host:port/type/number`` and always
+# plain http.  A server on the internet - the Starfront roof API at
+# https://alpaca-api.tx.starfront.space - is https only (http answers 500), and
+# may sit under a path prefix.  So an address may now also be a URL:
+#
+#     https://host[:port][/base/path]/type/number
+#
+# and an address without a scheme means exactly what it always did: http.
+
+DEFAULT_PORTS = {"http": 11111, "https": 443}
+
+
+def tls_context() -> ssl.SSLContext:
+    """A verifying TLS context: the system's roots plus a bundled CA file.
+
+    Python on Windows reads the Windows certificate store, but only the roots
+    already in it (it never fetches one on demand the way the OS does), so a
+    frozen build also carries a CA bundle: certifi's when it is importable,
+    otherwise the copy shipped next to this module (cacert.pem). Verification
+    is never turned off here.
+    """
+    from pathlib import Path                      # noqa: PLC0415
+    context = ssl.create_default_context()        # CERT_REQUIRED + hostname check
+    bundle = None
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        import certifi                            # noqa: PLC0415 - optional
+        bundle = certifi.where()
+    except Exception:                             # noqa: BLE001 - fall back to ours
+        bundle = None
+    for path in (bundle, str(Path(__file__).with_name("cacert.pem"))):
+        if path and Path(path).is_file():
+            try:
+                context.load_verify_locations(cafile=path)
+                break
+            except Exception:                     # noqa: BLE001 - try the next
+                continue
+    return context
+
+
+_TLS: ssl.SSLContext | None = None
+_TLS_LOCK = threading.Lock()
+
+
+def _shared_tls() -> ssl.SSLContext:
+    global _TLS
+    with _TLS_LOCK:
+        if _TLS is None:
+            _TLS = tls_context()
+        return _TLS
+
+
+def urlopen(request: Any, timeout: float, context: ssl.SSLContext | None = None):
+    """urllib's urlopen, with a verifying TLS context for https URLs."""
+    url = request.full_url if isinstance(request, urllib.request.Request) else str(request)
+    if url.lower().startswith("https:"):
+        return urllib.request.urlopen(request, timeout=timeout,
+                                      context=context or _shared_tls())
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+def server_root(scheme: str, host: str, port: int | None = None,
+                base_path: str = "") -> str:
+    """('https', 'example.org', 443, '/alpaca') -> 'https://example.org:443/alpaca'."""
+    scheme = (scheme or "http").strip().lower()
+    if scheme not in DEFAULT_PORTS:
+        raise DeviceError(f"Alpaca scheme must be http or https, not {scheme!r}")
+    host = (host or "").strip()
+    if not host or "/" in host or " " in host or ":" in host:
+        raise DeviceError(f"malformed Alpaca host {host!r}")
+    port = int(port or DEFAULT_PORTS[scheme])
+    if not 0 < port < 65536:
+        raise DeviceError(f"Alpaca port {port} is out of range")
+    base = "/".join(part for part in str(base_path or "").split("/") if part)
+    return f"{scheme}://{host}:{port}" + (f"/{base}" if base else "")
+
+
+def parse_address(driver_id: str) -> tuple[str, str, int]:
+    """An Alpaca device address -> (server root, alpaca type, device number).
+
+    ``host:port/type/number`` (plain http, as before 0.2.53a) or
+    ``http[s]://host[:port][/base]/type/number``.
+    """
+    text = str(driver_id or "").strip()
+    try:
+        if "://" in text:
+            parsed = urllib.parse.urlsplit(text)
+            parts = [part for part in parsed.path.split("/") if part]
+            if len(parts) < 2:
+                raise ValueError("no type/number")
+            alpaca_type, number = parts[-2].lower(), int(parts[-1])
+            root = server_root(parsed.scheme, parsed.hostname or "", parsed.port,
+                               "/".join(parts[:-2]))
+            return root, alpaca_type, number
+        location, alpaca_type, number = text.rsplit("/", 2)
+        host, port = location.split(":")
+        return server_root("http", host, int(port)), alpaca_type, int(number)
+    except DeviceError:
+        raise
+    except Exception as exc:
+        raise DeviceError(
+            f"malformed Alpaca address {driver_id!r}; expected host:port/type/number "
+            "or https://host[:port][/path]/type/number") from exc
+
+
+def configured_devices(host: str, port: int | None, timeout: float = 4.0,
+                       scheme: str | None = None, base_path: str = "") -> list[dict[str, Any]]:
+    """Ask one Alpaca server for its device list.
+
+    `host` may also be a URL (``https://alpaca-api.tx.starfront.space``), in
+    which case its scheme, port and path are used.
+    """
+    if "://" in str(host or ""):
+        parsed = urllib.parse.urlsplit(str(host).strip())
+        scheme = parsed.scheme
+        base_path = parsed.path
+        port = parsed.port or (None if port in (None, 11111) else port)
+        host = parsed.hostname or ""
+    root = server_root(scheme or "http", host, port, base_path)
+    url = f"{root}/management/v1/configureddevices"
+    try:
+        with urlopen(url, timeout) as response:
             body = json.loads(response.read().decode("utf-8"))
     except Exception as exc:
-        raise DeviceError(f"no Alpaca server at {host}:{port} ({exc})") from exc
+        raise DeviceError(f"no Alpaca server at {root} ({exc})") from exc
 
+    # Plain http with no path keeps the old host:port/... id, so the choices
+    # remembered before 0.2.53a still match.
+    plain = (scheme or "http").lower() == "http" and not root.split("://", 1)[1].count("/")
+    location = f"{host}:{int(port or DEFAULT_PORTS['http'])}" if plain else root
     devices = []
     for entry in body.get("Value", []):
         alpaca_type = str(entry.get("DeviceType", "")).lower()
@@ -102,8 +225,8 @@ def configured_devices(host: str, port: int, timeout: float = 4.0) -> list[dict[
         number = int(entry.get("DeviceNumber", 0))
         devices.append({
             "kind": kind,
-            "id": f"{host}:{port}/{alpaca_type}/{number}",
-            "name": f"{entry.get('DeviceName', alpaca_type)} ({host}:{port})",
+            "id": f"{location}/{alpaca_type}/{number}",
+            "name": f"{entry.get('DeviceName', alpaca_type)} ({location})",
         })
     return devices
 
@@ -112,14 +235,8 @@ class _Client:
     """HTTP plumbing for one Alpaca device, with a short read cache."""
 
     def __init__(self, driver_id: str, kind: str) -> None:
-        try:
-            location, alpaca_type, number = driver_id.rsplit("/", 2)
-            host, port = location.split(":")
-            self.base = f"http://{host}:{int(port)}/api/v1/{alpaca_type}/{int(number)}"
-        except Exception as exc:
-            raise DeviceError(
-                f"malformed Alpaca address {driver_id!r}; expected host:port/type/number"
-            ) from exc
+        root, alpaca_type, number = parse_address(driver_id)
+        self.base = f"{root}/api/v1/{alpaca_type}/{number}"
         self.kind = kind
         self._transaction = 0
         self._lock = threading.Lock()
@@ -141,7 +258,7 @@ class _Client:
         query.update(params)
         url = f"{self.base}/{name.lower()}?{urllib.parse.urlencode(query)}"
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as response:
+            with urlopen(url, timeout) as response:
                 return self._unwrap(json.loads(response.read().decode("utf-8")))
         except DeviceError:
             raise
@@ -169,7 +286,7 @@ class _Client:
             f"{self.base}/{name.lower()}", data=data, method="PUT",
             headers={"Content-Type": "application/x-www-form-urlencoded"})
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with urlopen(request, timeout) as response:
                 result = self._unwrap(json.loads(response.read().decode("utf-8")))
         except DeviceError:
             raise
@@ -185,7 +302,7 @@ class _Client:
         url = f"{self.base}/imagearray?{urllib.parse.urlencode(query)}"
         request = urllib.request.Request(
             url, headers={"Accept": "application/imagebytes, application/json"})
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urlopen(request, timeout) as response:
             content_type = (response.headers.get("Content-Type") or "").lower()
             payload = response.read()
 
@@ -262,6 +379,20 @@ class AlpacaCamera(_AlpacaDevice, Camera):
                 setattr(self, attribute, int(client.get(name) or default))
             except DeviceError:
                 setattr(self, attribute, default)
+
+    def read_settings(self) -> dict[str, int | None]:
+        """Gain and offset read from the device now (0.2.53); reads only."""
+        self._require()
+        found: dict[str, int | None] = {"gain": None, "offset": None}
+        for key in ("gain", "offset"):
+            try:
+                value = self._client.get(key, timeout=10.0)
+            except Exception:                   # noqa: BLE001 - unreadable is None
+                continue
+            if value is not None:
+                found[key] = int(value)
+                setattr(self, key, int(value))
+        return found
 
     def start_exposure(self, seconds: float, light: bool = True) -> None:
         self._require()
@@ -382,6 +513,13 @@ class AlpacaMount(_AlpacaDevice, Mount):
     @property
     def slewing(self) -> bool:
         return bool(self._client.get_cached("slewing", 0.3, False)) or self._jogging
+
+    @property
+    def pulse_guiding(self) -> bool:
+        try:
+            return bool(self._client.get_cached("ispulseguiding", 0.3, False))
+        except Exception:                          # noqa: BLE001 - a driver without it
+            return False
 
     @property
     def tracking(self) -> bool:
@@ -825,6 +963,9 @@ class AlpacaSwitch(_AlpacaDevice, SwitchBank):
                 entry["value"] = None
             out.append(entry)
         return out
+
+    def describe_channels(self) -> list[dict[str, Any]]:
+        return [dict(channel) for channel in self._channels]
 
     def get_value(self, index: int) -> float:
         self._require()

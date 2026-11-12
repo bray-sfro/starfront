@@ -319,6 +319,73 @@ nothing = collab.compatibility(rgb, collab.Requirements.read({"filters": {"Ha": 
 case("...but a rig carrying none of them is still refused", nothing["ok"] is False,
      nothing["summary"])
 
+print("\n-- saving survives overlapping borrowers --")
+# The night of 2026-10-08: a focus sweep from a stopped run was still
+# restoring saving when the next run's sweep began; each put back the other's
+# answer and rasa1's lights for a whole target went unsaved.
+import types                                                               # noqa: E402
+from astrocontrol.capture import CaptureService                            # noqa: E402
+cs = CaptureService(types.SimpleNamespace(log=lambda *a, **k: None, get=lambda k: None,
+                                          require=lambda k: None))
+cs.save_enabled = True
+cs.suspend_saving()                      # sweep A starts
+cs.suspend_saving()                      # sweep B starts while A is running
+case("saving is off while any borrower holds it", cs.save_enabled is False)
+cs.resume_saving()                       # A finishes
+case("...and stays off until the last one is done", cs.save_enabled is False)
+cs.resume_saving()                       # B finishes
+case("...then comes back to what it was", cs.save_enabled is True)
+cs.suspend_saving()
+cs.set_output(save=False)                # the person turns saving off mid-sweep
+cs.resume_saving()
+case("a choice made during a sweep is what comes back afterwards", cs.save_enabled is False)
+cs.set_output(save=True)
+cs.resume_saving()                       # one resume too many
+case("a stray resume does nothing", cs.save_enabled is True and cs._save_suspended == 0)
+
+print("\n-- a dropped frame gets the camera back --")
+# Capture, Loop, a focus frame or a centring frame: when the camera fails
+# the frame, it is disconnected, brought back on its remembered driver and
+# the frame tried once more. Off by a setting; nothing happens without a
+# way to reconnect.
+camera_stub = types.SimpleNamespace(connected=True, binning=1, gain=0, offset=0,
+                                    abort_exposure=lambda: None)
+events = []
+mgr = types.SimpleNamespace(log=lambda m, *a, **k: events.append(m),
+                            get=lambda k: camera_stub if k == "camera" else None,
+                            require=lambda k: camera_stub,
+                            disconnect=lambda k: events.append(f"disconnect {k}"))
+cs = CaptureService(mgr)
+attempts = {"n": 0}
+def flaky(exposure, frame_type):
+    attempts["n"] += 1
+    if attempts["n"] == 1:
+        raise DeviceError("the camera reported the exposure failed")
+    cs._latest_id = "frame-1"
+cs._capture_one = flaky
+cs.record = lambda image_id: {"id": image_id}
+cs.reconnect_camera = lambda: events.append("reconnect")
+cs.capture_blocking(1.0)
+case("a failed frame reconnects the camera and tries once more",
+     attempts["n"] == 2 and "disconnect camera" in events and "reconnect" in events,
+     str(events[-4:]))
+attempts["n"] = 0; events.clear()
+cs.config.update("recovery", {"reconnectManualCaptures": False})
+try:
+    cs.capture_blocking(1.0)
+    case("...and with the setting off the failure stands", False)
+except DeviceError as exc:
+    case("...and with the setting off the failure stands",
+         attempts["n"] == 1 and "reconnect" not in events, str(exc))
+cs.config.update("recovery", {"reconnectManualCaptures": True})
+cs.reconnect_camera = None
+attempts["n"] = 0
+try:
+    cs.capture_blocking(1.0)
+    case("...and with nothing to reconnect with, likewise", False)
+except DeviceError:
+    case("...and with nothing to reconnect with, likewise", attempts["n"] == 1)
+
 print("\n-- what each telescope shoots for a target --")
 # One allocation typed for the master (R), R, G and B fitted across the three
 # drawers: the followers shoot the master's frames through their own filter.
@@ -445,6 +512,20 @@ class FakeCapture:
         self.save_enabled = True
         self.busy = False
         self._frames = {}
+        self._suspended = 0
+
+    def suspend_saving(self):
+        if self._suspended == 0:
+            self._save_before = self.save_enabled
+            self.save_enabled = False
+        self._suspended += 1
+
+    def resume_saving(self):
+        if self._suspended == 0:
+            return
+        self._suspended -= 1
+        if self._suspended == 0:
+            self.save_enabled = self._save_before
 
     def capture_blocking(self, exposure, frame_type="light"):
         self.busy = True

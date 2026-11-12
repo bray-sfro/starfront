@@ -971,95 +971,29 @@
     }
   }
 
-  /* This telescope's own mark. It has to be found at a glance among a dozen
-     others' dots and a thousand stars, so it is the one thing on the chart
-     with a glow: the owner's own Discord picture in a bright ring, a halo
-     behind it, crosshair arms outside the ring, and a bold label on a dark
-     pill that no other label is allowed to push aside. Amber while slewing,
-     green when it is where it was sent. A small dot at the centre marks the
-     exact pointing, so the ring's size never reads as a field of view. */
-  const OWN_RADIUS = 15;
-
   function drawTelescope() {
     const point = project(sky.scope.ra, sky.scope.dec);
     if (!point) return;
     const ctx = sky.ctx;
     const [x, y] = point;
-    const colour = sky.scope.slewing ? '#f0b35b' : '#5be39a';
-    const me = sky.me || {};
-    const picture = avatarFor(me.avatar);
+    const colour = sky.scope.slewing ? '#d9a03d' : '#4bb87a';
 
     ctx.save();
-    // The halo: a soft disc of the mark's own colour under everything.
-    const halo = ctx.createRadialGradient(x, y, OWN_RADIUS, x, y, OWN_RADIUS * 2.6);
-    halo.addColorStop(0, sky.scope.slewing ? 'rgba(240, 179, 91, 0.35)' : 'rgba(91, 227, 154, 0.35)');
-    halo.addColorStop(1, 'rgba(0, 0, 0, 0)');
-    ctx.fillStyle = halo;
-    ctx.beginPath(); ctx.arc(x, y, OWN_RADIUS * 2.6, 0, Math.PI * 2); ctx.fill();
-
-    // Crosshair arms, clear of the ring.
     ctx.strokeStyle = colour;
-    ctx.lineWidth = 2.4;
-    ctx.lineCap = 'round';
+    ctx.lineWidth = 1.8;
     ctx.shadowColor = 'rgba(0, 0, 0, 0.9)';
     ctx.shadowBlur = 4;
-    const gap = OWN_RADIUS + 5, arm = OWN_RADIUS + 22;
+    const arm = 22, gap = 6;
     ctx.beginPath();
     ctx.moveTo(x - arm, y); ctx.lineTo(x - gap, y);
     ctx.moveTo(x + gap, y); ctx.lineTo(x + arm, y);
     ctx.moveTo(x, y - arm); ctx.lineTo(x, y - gap);
     ctx.moveTo(x, y + gap); ctx.lineTo(x, y + arm);
     ctx.stroke();
-
-    // The ring, with the picture inside it when there is one.
-    ctx.beginPath(); ctx.arc(x, y, OWN_RADIUS + 2, 0, Math.PI * 2);
-    ctx.fillStyle = 'rgba(5, 8, 16, 0.85)';
-    ctx.fill();
-    ctx.stroke();
+    ctx.beginPath(); ctx.arc(x, y, gap * 1.3, 0, Math.PI * 2); ctx.stroke();
     ctx.shadowBlur = 0;
-    if (picture) {
-      ctx.save();
-      ctx.beginPath(); ctx.arc(x, y, OWN_RADIUS, 0, Math.PI * 2); ctx.clip();
-      ctx.drawImage(picture, x - OWN_RADIUS, y - OWN_RADIUS, OWN_RADIUS * 2, OWN_RADIUS * 2);
-      ctx.restore();
-      // A thin white edge inside the coloured ring makes the picture read
-      // as a badge rather than a blur against a dark sky.
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
-      ctx.lineWidth = 1;
-      ctx.beginPath(); ctx.arc(x, y, OWN_RADIUS, 0, Math.PI * 2); ctx.stroke();
-    } else {
-      ctx.fillStyle = colour;
-      ctx.font = '700 13px "Segoe UI", system-ui, sans-serif';
-      ctx.textAlign = 'center';
-      ctx.textBaseline = 'middle';
-      ctx.fillText((me.owner || me.name || 'you').slice(0, 1).toUpperCase(), x, y + 1);
-      ctx.textBaseline = 'alphabetic';
-    }
-    // The exact pointing.
-    ctx.fillStyle = '#ffffff';
-    ctx.strokeStyle = 'rgba(0, 0, 0, 0.9)';
-    ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.arc(x, y, 2.2, 0, Math.PI * 2); ctx.fill(); ctx.stroke();
-
-    // The label, on a pill, placed without asking the other labels.
-    const who = me.owner ? `You · ${me.owner}` : 'You';
-    const what = sky.scope.slewing ? 'slewing' : (me.target ? me.target : (me.name || ''));
-    const text = what ? `${who} — ${what}` : who;
-    ctx.font = '600 12px "Segoe UI", system-ui, sans-serif';
-    ctx.textAlign = 'left';
-    const width = ctx.measureText(text).width;
-    const labelX = x + arm + 6;
-    const labelY = y + 5;
-    ctx.fillStyle = 'rgba(5, 8, 16, 0.8)';
-    ctx.beginPath();
-    ctx.roundRect(labelX - 6, labelY - 13, width + 12, 18, 9);
-    ctx.fill();
-    ctx.strokeStyle = colour;
-    ctx.lineWidth = 1;
-    ctx.stroke();
-    ctx.fillStyle = '#ffffff';
-    ctx.fillText(text, labelX, labelY);
-    labelBoxes.push({ x: labelX - 6, y: labelY - 13, w: width + 12, h: 18 });
+    placeLabel(sky.scope.slewing ? 'slewing' : 'telescope', x + arm + 5, y + 4, colour,
+      '600 11px "Segoe UI", system-ui, sans-serif');
 
     // The camera's real footprint, so framing can be judged here rather than
     // after a test exposure.
@@ -1616,27 +1550,13 @@
     // from the mount, so it is left out of this list.
     const collab = status.collab || {};
     const mine = collab.agentId || '';
-    const everyone = (collab.presence || {}).telescopes || [];
-    const others = everyone
+    const others = ((collab.presence || {}).telescopes || [])
       .filter((t) => t.id !== mine && t.ra !== null && t.ra !== undefined
         && t.dec !== null && t.dec !== undefined)
       .map((t) => ({ ...t, ra: raDegrees(t.ra) }));
-    // Our own entry: the picture and name the server has for us, or the
-    // sign-in's own when the server has not listed us yet.
-    const ownEntry = everyone.find((t) => t.id === mine) || {};
-    const me = collab.me || {};
-    const masterName = (((status.rigs || []).find((r) => r.id === status.masterRig)) || {}).name || '';
-    const self = {
-      avatar: ownEntry.avatar || me.avatar || '',
-      name: ownEntry.name || masterName,
-      owner: ownEntry.ownerName || me.name || '',
-      target: ((status.capture || {}).target || ownEntry.target || ''),
-    };
-    const othersKey = JSON.stringify(others.map((t) => [t.id, t.ra, t.dec, t.online, t.target, t.avatar, t.ownerName])
-      .concat([[self.avatar, self.name, self.owner, self.target]]));
+    const othersKey = JSON.stringify(others.map((t) => [t.id, t.ra, t.dec, t.online, t.target, t.avatar, t.ownerName]));
     const othersMoved = othersKey !== sky.othersKey;
     sky.others = others;
-    sky.me = self;
     sky.othersKey = othersKey;
 
     if (!sky.ready) return;

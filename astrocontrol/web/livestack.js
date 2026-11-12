@@ -203,8 +203,7 @@
     set('stackShare', live.share !== false);
     set('stackGradient', live.removeGradient !== false);
     set('stackRaw', live.stackUncalibrated !== false);
-    // Zero is a value: the camera's own resolution.
-    if ($('stackMaxPixels')) $('stackMaxPixels').value = Number(live.maxPixels) || 0;
+    if ($('stackMaxPixels')) $('stackMaxPixels').value = live.maxPixels || 3000;
   }
 
   async function saveSettings() {
@@ -215,7 +214,7 @@
       share: get('stackShare', true),
       removeGradient: get('stackGradient', true),
       stackUncalibrated: get('stackRaw', true),
-      maxPixels: Number($('stackMaxPixels') && $('stackMaxPixels').value) || 0,
+      maxPixels: Number($('stackMaxPixels') && $('stackMaxPixels').value) || 3000,
     };
     try {
       await app.api('/api/settings/livestack', 'POST', values);

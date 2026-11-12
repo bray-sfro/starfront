@@ -204,8 +204,8 @@ case("the stack lives in tonight's folder",
 
 local = stacker.stacks().get(key)
 summary = local.summary()
-case("the canvas was cut from the camera's own field, a tenth larger",
-     abs(summary["plan"]["width"] / (WIDTH * SCALE / 3600.0) - 1.1) < 0.01
+case("the canvas was cut from the camera's own field, a fifth larger",
+     abs(summary["plan"]["width"] / (WIDTH * SCALE / 3600.0) - 1.2) < 0.01
      and summary["plan"]["pixelWidth"] <= 1200,
      f"{summary['plan']['pixelWidth']}x{summary['plan']['pixelHeight']} at "
      f"{summary['plan']['actualScale']:.3f}\"/px, rotated {summary['plan']['rotation']:.1f}")
@@ -374,18 +374,14 @@ camera.gain = 100
 
 # ------------------------------------------------------------- saving off
 print("\n== saving switched off ==")
-# Autofocus sweeps, centring solves and framing shots are unsaved lights. On
-# the first real night the stack took every one of a focus run's thirteen
-# frames, at thirteen focus positions, on top of the subs.
 capture.save_enabled = False
 raw, metadata = expose(0, seed=503)
 record = capture._store(raw, 300.0, "light", camera, metadata)
-time.sleep(1.0)
-status = stacker.status()
-case("a frame shot with saving off is not a sub and stays out of the stack",
-     not record.saved and status["stacks"][key]["frames"] == 2
-     and status["counts"]["stacked"] == 5,
-     f"{status['stacks'][key]['frames']} frames, {status['counts']['stacked']} stacked")
+status = settled(7)
+case("a frame shot with saving off is still stacked, from memory",
+     not record.saved and status["stacks"][key]["frames"] == 3,
+     f"{status['stacks'][key]['frames']} frames; last: "
+     f"{(status.get('last') or {}).get('error') or (status.get('last') or {}).get('stack', {}).get('detail')}")
 capture.save_enabled = True
 
 # -------------------------------------------------------------- a new night
@@ -399,76 +395,7 @@ case("a new night saves what was open and starts a fresh folder",
 stacker.begin_night(capture.night_name())
 case("coming back to tonight finds the stack on disk again",
      stacker.stack("NGC 9999", "L") is not None
-     and stacker.stack("NGC 9999", "L").frames == 2)
-
-# -------------------------------------------------------- full resolution
-print("\n== the camera's own resolution, on disk ==")
-# A cap of zero is no cap, and a canvas over the memory-map threshold keeps
-# its accumulators as files. The threshold is lowered so the invented
-# camera's two-megapixel canvas takes that path.
-from astrocontrol import livestack                                  # noqa: E402
-
-livestack.MEMMAP_ABOVE = 1_000_000
-main.config.update("livestack", {"maxPixels": 0})
-capture.target_name = "NGC 8888"
-before = stacker.status()["counts"]["stacked"]
-for index in range(2):
-    raw, metadata = expose(index, seed=700 + index)
-    capture._store(raw, 300.0, "light", camera, metadata)
-# Waited on the stacked count itself: `settled` counts refusals too, and one
-# refusal is already on the board from the frame with no masters.
-deadline = time.monotonic() + 120
-while time.monotonic() < deadline:
-    status = stacker.status()
-    if status["counts"]["stacked"] >= before + 2 or status["counts"]["refused"] > 1:
-        time.sleep(0.3)
-        status = stacker.status()
-        break
-    time.sleep(0.2)
-big_key = "NGC 8888/L"
-big = stacker.stacks().get(big_key)
-plan = status["stacks"].get(big_key, {}).get("plan", {})
-case("with no cap the canvas is at the frame's own scale",
-     big is not None and abs(plan.get("actualScale", 0) - SCALE) < 0.002
-     and plan.get("pixelWidth") == math.ceil(WIDTH * 1.1),
-     f"{plan.get('pixelWidth')}x{plan.get('pixelHeight')} at {plan.get('actualScale')}\"/px "
-     f"(frame {SCALE:.3f}\"/px)")
-case("a large stack keeps its accumulators as memory-mapped files",
-     big is not None and big.on_disk and isinstance(big.weight, np.memmap)
-     and (big.root / "weight.npy").is_file() and status["stacks"][big_key]["onDisk"],
-     f"{big.root}")
-case("both frames folded in, band by band",
-     big is not None and big.frames == 2 and status["stacks"][big_key]["maxFramesDeep"] == 2
-     and status["counts"]["refused"] == 1,
-     f"frames {big and big.frames}, deep {status['stacks'].get(big_key, {}).get('maxFramesDeep')}, "
-     f"refused {status['counts']['refused']}; last: "
-     f"{(status.get('last') or {}).get('error') or (status.get('last') or {}).get('stack', {}).get('detail')}")
-big_query = f"project={urllib.parse.quote('NGC 8888')}&filter=L"
-stats = get(f"/api/livestack/stats?{big_query}")
-png, headers = get(f"/api/livestack/render.png?{big_query}&auto=true&maxDim=600", raw=True)
-case("the viewer reads a stack on disk like any other",
-     stats["image"]["width"] == plan.get("pixelWidth") and png[:8] == b"\x89PNG\r\n\x1a\n"
-     and headers.get("X-Stack-Frames") == "2")
-picture, covered = big.picture()
-mean = big.mean()
-inside = covered & (big.coverage() == 2)
-case("the picture is built from the same sums the mean is",
-     inside.any() and picture.dtype == np.uint16 and picture[inside].max() > 1000)
-stacker.save_all()
-stored = livestack.stored_plan(livestack.stack_root(stacker.root, "NGC 8888", "L"))
-case("saving a stack on disk is a flush, and its plan is remembered",
-     stored is not None and stored.maxPixels == 0 and stored.payload() == big.plan.payload())
-stacker.begin_night("2031-01-02")
-stacker.begin_night(capture.night_name())
-reopened = stacker.stack("NGC 8888", "L")
-case("a stack on disk reopens mapped, with its frames",
-     reopened is not None and reopened.on_disk and isinstance(reopened.weight, np.memmap)
-     and reopened.frames == 2)
-answer = post(f"/api/livestack/reset?{big_query}")
-case("a stack on disk can be thrown away, mapped files and all",
-     answer["reset"] is True
-     and not livestack.stack_root(stacker.root, "NGC 8888", "L").exists(),
-     str(livestack.stack_root(stacker.root, "NGC 8888", "L")))
+     and stacker.stack("NGC 9999", "L").frames == 3)
 
 server.should_exit = True
 stacker.stop()

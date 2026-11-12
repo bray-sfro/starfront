@@ -951,10 +951,12 @@ class CalibrationRunner:
         rig.capture.open_light_path()
 
         night = rig.capture.night_name()
-        folder = self.library.subs_dir / night / clean_target(rig.name) / "skyflat"
+        # calib-layout: <root>/RASA1/Flats/<night>/sky.  exact=True stops the
+        # capture adding its per-telescope subfolder a second time.
+        folder = self.library.sub_folder(rig.name, "skyflat", night)
         rig.capture.calibration_context = ""
         rig.capture.set_output(save=True, directory=str(folder),
-                               target="cal", object_name="", panel="")
+                               target="cal", object_name="", panel="", exact=True)
 
     def _sky_flat_frame(self, rig, st: dict[str, Any], spec: dict[str, Any],
                         aim: float, accept: float, lowest: float, highest: float,
@@ -1079,10 +1081,13 @@ class CalibrationRunner:
         # numbered — the unnamed form falls back to a timestamp to the second,
         # and a run of bias frames goes faster than that.
         night = rig.capture.night_name()
-        folder = self.library.subs_dir / night / clean_target(rig.name) / kind
+        # calib-layout: <root>/RASA1/{Bias,Darks,Flats,DarkFlats}/<night>.  The
+        # folder already names the telescope, so exact=True stops the capture
+        # appending `rasa1` again (the old .../rasa1/bias/rasa1 doubling).
+        folder = self.library.sub_folder(rig.name, kind, night)
         rig.capture.calibration_context = ""
         rig.capture.set_output(save=True, directory=str(folder),
-                               target="cal", object_name="", panel="")
+                               target="cal", object_name="", panel="", exact=True)
 
         wanted = (self.filters_for(spec, rig)
                   if kind in calibration.FILTERED_TYPES else [""])

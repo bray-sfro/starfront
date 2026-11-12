@@ -13,18 +13,17 @@ from __future__ import annotations
 
 import contextlib
 import itertools
-import logging
 import threading
 import time
 from concurrent.futures import Future
 from concurrent.futures import TimeoutError as FutureTimeout
-from queue import Empty, PriorityQueue, Queue
+from queue import PriorityQueue, Queue
 from typing import Any, Callable
 
 import numpy as np
 
-from .base import (Camera, DeviceError, Dome, FilterWheel, FlatPanel, Focuser,
-                   Mount, Rotator, SafetyMonitor, SwitchBank)
+from .base import (Camera, CameraLostError, DeviceError, Dome, FilterWheel,
+                   FlatPanel, Focuser, Mount, Rotator, SafetyMonitor, SwitchBank)
 
 try:                                    # pragma: no cover - platform dependent
     import pythoncom
@@ -32,16 +31,6 @@ try:                                    # pragma: no cover - platform dependent
     _HAVE_PYWIN32 = True
 except Exception:                       # pragma: no cover
     _HAVE_PYWIN32 = False
-
-
-LOG = logging.getLogger("astrocontrol.devices")
-
-#: A call that has been running this long has not been slow, it has stopped:
-#: nothing a driver does legitimately takes a minute without returning — an
-#: ImageArray download is seconds, a Dispatch is seconds, a StartExposure is
-#: instant — but a driver whose USB device has gone sits inside the SDK
-#: forever, and every call queued behind it sits with it.
-WEDGE_SECONDS = 60.0
 
 
 class _ComExecutor:
@@ -53,89 +42,61 @@ class _ComExecutor:
     That was a hand-controller press arriving at the mount ten seconds
     late.  An urgent call goes to the front: a jog, a stop, a park, an
     abort - the things a person is waiting on with their hand on a button.
-
-    And one way out.  A driver call that never returns — the ZWO SDK with
-    the camera gone from the bus — would otherwise hold this thread, and
-    the queue behind it, until the program exits: the status feed waited
-    three minutes per property for a camera that was never going to
-    answer, and the window went dead for twenty minutes.  A caller that
-    times out behind a call stuck for longer than `WEDGE_SECONDS` declares
-    the executor dead: everything queued fails at once, the channel gets a
-    fresh thread for the reconnect, and the devices opened on this one
-    report themselves disconnected rather than waiting again.  The stuck
-    thread is left where it is; it is a daemon and dies with the process.
     """
 
-    def __init__(self, name: str = "ascom-com", channel: str = "default") -> None:
-        self.channel = channel
-        self.dead = False
-        self.dead_reason = ""
+    def __init__(self, name: str = "ascom-com") -> None:
         self._queue: PriorityQueue = PriorityQueue()
         self._order = itertools.count()
-        self._running: tuple[str, float] | None = None
-        self._lock = threading.Lock()
+        #: What the thread is inside right now, and since when (0.2.52e): a
+        #: driver that has put up a modal message box never returns from the
+        #: call that raised it, and everything queued behind it waits too.
+        self.current: str | None = None
+        self.current_since: float | None = None
+        self.native_id: int | None = None
+        #: Set when this thread was given up on and replaced (`reset_channel`).
+        self.abandoned = False
         self._thread = threading.Thread(target=self._run, daemon=True, name=name)
         self._thread.start()
 
     def _run(self) -> None:
+        self.native_id = threading.get_native_id()
         pythoncom.CoInitialize()
         try:
             while True:
                 _lane, _seq, job, future, label = self._queue.get()
                 if job is None:
                     return
-                if self.dead:
-                    future.set_exception(DeviceError(self.dead_reason))
-                    continue
                 if future.set_running_or_notify_cancel():
-                    self._running = (label, time.monotonic())
+                    self.current, self.current_since = label, time.monotonic()
                     try:
                         future.set_result(job())
                     except Exception as exc:       # noqa: BLE001 - relayed to caller
                         future.set_exception(exc)
                     finally:
-                        self._running = None
+                        self.current, self.current_since = None, None
         finally:
             pythoncom.CoUninitialize()
 
     def call(self, job: Callable[[], Any], timeout: float = 180.0,
-             urgent: bool = False, label: str = "a driver call") -> Any:
-        if self.dead:
-            raise DeviceError(self.dead_reason)
+             urgent: bool = False, label: str = "") -> Any:
         future: Future = Future()
         self._queue.put((0 if urgent else 1, next(self._order), job, future, label))
         try:
             return future.result(timeout=timeout)
         except FutureTimeout:
-            running = self._running
-            if (running is not None and not self.dead
-                    and time.monotonic() - running[1] > WEDGE_SECONDS):
-                self._declare_dead(running[0], time.monotonic() - running[1])
-                raise DeviceError(self.dead_reason) from None
-            raise DeviceError(f"no answer within {timeout:g}s") from None
+            # Not left queued: a call nobody is waiting for any more must not
+            # run later, against a camera that has since moved on.
+            future.cancel()
+            busy = self.stuck_for()
+            inside = (f" (the driver has been inside {self.current} for {busy:.0f}s)"
+                      if busy and self.current else "")
+            raise DeviceError(f"{label or 'the driver call'} did not answer within "
+                              f"{timeout:g}s{inside}") from None
 
-    def _declare_dead(self, label: str, stuck_for: float) -> None:
-        with self._lock:
-            if self.dead:
-                return
-            self.dead = True
-            self.dead_reason = (
-                f"the driver has stopped answering — {label} has been stuck for "
-                f"{stuck_for:.0f}s. The device must be reconnected; if that fails, "
-                f"power-cycle it and check its USB link")
-        LOG.error("%s: %s", self.channel, self.dead_reason)
-        with _executor_lock:
-            if _executors.get(self.channel) is self:
-                del _executors[self.channel]
-        # Everything waiting behind the stuck call fails now rather than each
-        # after its own three minutes.
-        while True:
-            try:
-                _lane, _seq, _job, future, _label = self._queue.get_nowait()
-            except Empty:
-                break
-            with contextlib.suppress(Exception):
-                future.set_exception(DeviceError(self.dead_reason))
+    def stuck_for(self) -> float:
+        """Seconds the call in progress has taken so far; 0 when idle."""
+        since = self.current_since
+        return 0.0 if since is None else max(0.0, time.monotonic() - since)
 
 
 # One apartment thread per channel.  A channel is a telescope: its devices are
@@ -150,12 +111,45 @@ _executor_lock = threading.Lock()
 def _com(channel: str = "default") -> _ComExecutor:
     with _executor_lock:
         existing = _executors.get(channel)
-        if existing is None or existing.dead:
+        if existing is None:
             if not _HAVE_PYWIN32:
                 raise DeviceError("pywin32 is not installed; ASCOM is unavailable")
-            existing = _ComExecutor(name=f"ascom-com-{channel}", channel=channel)
+            existing = _ComExecutor(name=f"ascom-com-{channel}")
             _executors[channel] = existing
         return existing
+
+
+def channel_stuck(channel: str) -> tuple[str | None, float]:
+    """What a channel's apartment thread is stuck in, and for how long."""
+    with _executor_lock:
+        existing = _executors.get(channel)
+    if existing is None:
+        return None, 0.0
+    return existing.current, existing.stuck_for()
+
+
+def channel_thread_id(channel: str) -> int | None:
+    """The Windows thread id of a channel's apartment thread, if it has one."""
+    with _executor_lock:
+        existing = _executors.get(channel)
+    return None if existing is None else existing.native_id
+
+
+def reset_channel(channel: str) -> bool:
+    """Give up on a channel's apartment thread and start a fresh one.
+
+    Only ever for a camera's own channel, whose one device is being
+    reconnected: a thread stuck inside the driver cannot be interrupted, so
+    the new connection is opened on a new thread instead of queueing behind
+    the old one for ever. True when there was a stuck thread to replace.
+    """
+    with _executor_lock:
+        existing = _executors.get(channel)
+        if existing is None or not existing.stuck_for():
+            return False
+        existing.abandoned = True
+        _executors.pop(channel, None)
+    return True
 
 
 def available() -> bool:
@@ -256,63 +250,55 @@ class _AscomDevice:
     #: never opened from sharing one dict with every other.
     _cache: dict[str, tuple[Any, float]] | None = None
 
-    #: The apartment thread this wrapper's driver object lives on.  A COM
-    #: object belongs to the thread that created it, so once that thread is
-    #: declared dead the object is unreachable - a call from any other
-    #: thread would marshal back to the stuck one and stick with it - and
-    #: the only way on is a fresh Dispatch on a fresh thread, which is what
-    #: `connect` does.
-    _executor: _ComExecutor | None = None
-
     def _open(self, prog_id: str) -> None:
         self._cache = {}
-        self._executor = _com(self._channel)
-        self._driver = self._executor.call(
-            lambda: win32com.client.Dispatch(prog_id), timeout=60, label="opening the driver")
-
-    def _exec(self) -> _ComExecutor:
-        executor = self._executor
-        if executor is None:
-            return _com(self._channel)
-        if executor.dead:
-            # The thread this driver lived on is gone with it.  Say so once
-            # on the device's own state: the status panel shows it
-            # disconnected, and the sequencer's reconnect is what brings it
-            # back, on a new thread.
-            self._connected = False
-            raise DeviceError(executor.dead_reason)
-        return executor
+        self._driver = _com(self._channel).call(
+            lambda: win32com.client.Dispatch(prog_id), timeout=60)
 
     def _get(self, name: str, default: Any = None) -> Any:
         try:
-            return self._exec().call(lambda: getattr(self._driver, name), label=name)
+            return _com(self._channel).call(lambda: getattr(self._driver, name),
+                                            label=name)
         except Exception:
             return default
 
+    def _read(self, name: str, timeout: float) -> Any:
+        """A live property read that raises, with a deadline of its own."""
+        try:
+            return _com(self._channel).call(lambda: getattr(self._driver, name),
+                                            timeout=timeout, label=name)
+        except DeviceError:
+            raise
+        except Exception as exc:
+            raise DeviceError(f"{name}: {exc}") from exc
+
     def _need(self, name: str) -> Any:
         try:
-            return self._exec().call(lambda: getattr(self._driver, name), label=name)
+            return _com(self._channel).call(lambda: getattr(self._driver, name))
         except Exception as exc:
             raise DeviceError(f"{name}: {exc}") from exc
 
     def _set(self, name: str, value: Any) -> None:
         try:
-            self._exec().call(lambda: setattr(self._driver, name, value), label=name)
+            _com(self._channel).call(lambda: setattr(self._driver, name, value))
         except Exception as exc:
             raise DeviceError(f"{name}: {exc}") from exc
 
-    def _invoke(self, name: str, *args: Any, urgent: bool = False) -> Any:
+    def _invoke(self, name: str, *args: Any, urgent: bool = False,
+                timeout: float = 180.0) -> Any:
         try:
-            return self._exec().call(lambda: getattr(self._driver, name)(*args),
-                                     urgent=urgent, label=name)
+            return _com(self._channel).call(lambda: getattr(self._driver, name)(*args),
+                                            urgent=urgent, timeout=timeout, label=name)
+        except DeviceError:
+            raise                                  # a deadline: already says which
         except Exception as exc:
             raise DeviceError(f"{name}: {exc}") from exc
 
     def _set_urgent(self, name: str, value: Any) -> None:
         """A property write that jumps the polling queue."""
         try:
-            self._exec().call(lambda: setattr(self._driver, name, value),
-                              urgent=True, label=name)
+            _com(self._channel).call(lambda: setattr(self._driver, name, value),
+                                     urgent=True)
         except Exception as exc:
             raise DeviceError(f"{name}: {exc}") from exc
 
@@ -341,16 +327,39 @@ class _AscomDevice:
 
 
 class AscomCamera(_AscomDevice, Camera):
+    #: Each of the health probe's reads may take this long (0.2.52e). A live
+    #: camera answers a property in milliseconds; one that does not answer in
+    #: this time is a driver that is stuck.
+    PROBE_SECONDS = 8.0
+    #: How long Abort waits for the driver before giving up on it.
+    ABORT_SECONDS = 10.0
+    #: Longer than this inside one driver call, outside an exposure, and the
+    #: driver is taken to be stuck (a modal box of its own, as often as not).
+    STUCK_SECONDS = 20.0
+
     def __init__(self, prog_id: str, name: str) -> None:
         Camera.__init__(self, prog_id, name)
         self._prog_id = prog_id
         self._light = True
+        #: Set when the camera is known to be gone without asking it: a
+        #: driver message box was found and closed (`driverdialogs`).
+        self.lost_reason: str | None = None
+        self.exposure_min: float | None = None
+        self.exposure_max: float | None = None
 
     def connect(self) -> None:
+        # A camera thread left stuck by the last connection (a driver box
+        # nobody closed) is not queued behind: the new driver object is made
+        # on a fresh thread, and the old one is left to itself.
+        if channel_stuck(self._channel)[1] > self.STUCK_SECONDS:
+            reset_channel(self._channel)
         self._open(self._prog_id)
         self._set("Connected", True)
         self._connected = True
+        self.lost_reason = None
         self._forget_cooler()
+        from . import driverdialogs
+        driverdialogs.watch(self)
         self.sensor_width = int(self._get("CameraXSize", 0) or 0)
         self.sensor_height = int(self._get("CameraYSize", 0) or 0)
         self.pixel_size_um = float(self._get("PixelSizeX", 0.0) or 0.0)
@@ -373,21 +382,133 @@ class AscomCamera(_AscomDevice, Camera):
         self.offset = int(offset or 0)
         if int(self._get("SensorType", 0) or 0) > 1:
             self.bayer_pattern = "RGGB"
+        self.exposure_min, self.exposure_max = self._exposure_limits()
 
     def disconnect(self) -> None:
+        from . import driverdialogs
+        driverdialogs.unwatch(self)
         try:
-            self._set("Connected", False)
+            if self.stuck():
+                # Closing a driver that is stuck inside a call would queue
+                # behind it for ever; its thread is given up on instead.
+                driverdialogs.dismiss(self)
+                if self.stuck():
+                    reset_channel(self._channel)
+                    return
+            _com(self._channel).call(lambda: setattr(self._driver, "Connected", False),
+                                     timeout=15.0, label="Connected")
+        except Exception as exc:
+            raise DeviceError(f"Connected: {exc}") from exc
         finally:
             self._connected = False
 
+    # -- is anybody there (0.2.52e) ---------------------------------------
+    #
+    # 2026-11-04, FSQ106: ZWO's ASCOM driver had lost the camera but still
+    # said Connected; its exposure limits read 0 to 0 s, and StartExposure put
+    # up "Please input Exposure Duration between 0 and 0s, and restart
+    # exposure!" - a modal box on the thread making the call, which does not
+    # return until somebody clicks OK. The exposure never started, Abort
+    # queued behind the box, and the run sat there. So the camera is asked a
+    # few cheap questions first, and StartExposure is not called on one that
+    # is not there.
+
+    def stuck(self) -> bool:
+        """Whether the camera's thread is stuck inside a driver call."""
+        label, busy = channel_stuck(self._channel)
+        if not busy:
+            return False
+        limit = self.STUCK_SECONDS
+        if label == "ImageArray":
+            limit += 180.0                       # a big sensor on a slow hub
+        return busy > limit
+
+    def _exposure_limits(self) -> tuple[float | None, float | None]:
+        def number(name: str) -> float | None:
+            try:
+                value = self._read(name, self.PROBE_SECONDS)
+                return None if value is None else float(value)
+            except Exception:                    # noqa: BLE001 - optional in ASCOM
+                return None
+        return number("ExposureMin"), number("ExposureMax")
+
+    def probe(self) -> str | None:
+        """Why this camera is not there, or None when it answers sensibly."""
+        if not self._connected:
+            return None
+        if self.lost_reason:
+            return self.lost_reason
+        label, busy = channel_stuck(self._channel)
+        if self.stuck():
+            return (f"its driver has been stuck inside {label or 'a call'} for "
+                    f"{busy:.0f}s")
+        try:
+            if not bool(self._read("Connected", self.PROBE_SECONDS)):
+                return "its driver says it is no longer connected"
+        except DeviceError as exc:
+            return f"it does not answer ({exc})"
+        low, high = self._exposure_limits()
+        self.exposure_min, self.exposure_max = low, high
+        if high is not None and high <= 0 and (low is None or low <= 0):
+            return ("its driver reports exposure limits of 0 to 0 s, which is "
+                    "what it says once it has lost the camera")
+        try:
+            width = int(self._read("CameraXSize", self.PROBE_SECONDS) or 0)
+        except DeviceError as exc:
+            return f"it does not answer ({exc})"
+        if width <= 0:
+            return "its driver reports a 0-pixel sensor"
+        if self.can_cool:
+            with contextlib.suppress(DeviceError, TypeError, ValueError):
+                temperature = self._read("CCDTemperature", self.PROBE_SECONDS)
+                if temperature is not None and float(temperature) <= -270.0:
+                    return (f"its sensor reads {float(temperature):g} C, the value "
+                            "its driver gives with no camera behind it")
+        return None
+
+    def _checked(self, what: str) -> None:
+        reason = self.probe()
+        if reason:
+            raise CameraLostError(f"{self.name} is not responding: {reason}. "
+                                  f"{what} was not sent to the driver")
+
+    def clamp_exposure(self, seconds: float) -> float:
+        """An exposure inside the driver's own limits - when they are real."""
+        low, high = self.exposure_min, self.exposure_max
+        value = float(seconds)
+        if high is not None and high > 0 and (low is None or low <= high):
+            if value > high:
+                value = high
+            if low is not None and value < low:
+                value = low
+        return value
+
     def start_exposure(self, seconds: float, light: bool = True) -> None:
         self._require()
+        self._checked("StartExposure")
+        value = self.clamp_exposure(seconds)
         self._light = light
-        self._invoke("StartExposure", float(seconds), bool(light))
+        # A healthy driver returns from StartExposure at once (some take the
+        # exposure synchronously); either way it is not waited on for ever.
+        self._invoke("StartExposure", value, bool(light),
+                     timeout=max(60.0, value + 60.0))
 
     def abort_exposure(self) -> None:
-        if self._connected and self.can_abort:
-            self._invoke("AbortExposure")
+        if not (self._connected and self.can_abort):
+            return
+        from . import driverdialogs
+        if channel_stuck(self._channel)[1] > 1.0:
+            # Something is in the way on the camera's thread. A driver box
+            # is closed; the abort is then sent, and waited on only briefly.
+            driverdialogs.dismiss(self)
+        try:
+            self._invoke("AbortExposure", urgent=True, timeout=self.ABORT_SECONDS)
+        except DeviceError as exc:
+            if "did not answer" in str(exc):
+                raise DeviceError(
+                    f"the camera driver is not answering - gave up waiting on Abort "
+                    f"after {self.ABORT_SECONDS:g}s ({exc})") from exc
+            raise
 
     @property
     def image_ready(self) -> bool:
@@ -417,12 +538,6 @@ class AscomCamera(_AscomDevice, Camera):
     #: cooling or warming - even flat out, a cooler moves about a degree in
     #: that time - so it is a driver misreading until said twice.
     _COOLER_JUMP_C = 1.5
-    #: A reading that has not moved by a hundredth of a degree in this long,
-    #: while the driver says nothing is cooling it, is a driver that has
-    #: stopped asking the camera. Seen after a reconnect: ZWO's answered
-    #: -2.0 C for sixteen minutes while the sensor warmed to +3, and woke up
-    #: the moment the cooler was commanded. So that is what is done.
-    _COOLER_STALE_S = 180.0
 
     def _cooler(self) -> dict[str, Any]:
         now = time.monotonic()
@@ -432,7 +547,6 @@ class AscomCamera(_AscomDevice, Camera):
         # 3 is "reading out" in ASCOM's CameraStates; the driver is busiest then.
         if cached is not None and int(self._get("CameraState", 0) or 0) == 3:
             return cached
-        self._nudge_if_stale(cached, now)
 
         def number(name: str, digits: int) -> float | None:
             value = self._get(name)
@@ -447,18 +561,7 @@ class AscomCamera(_AscomDevice, Camera):
             "setpoint": number("SetCCDTemperature", 2),
             "coolerOn": bool(self._get("CoolerOn", False)),
             "coolerPower": number("CoolerPower", 1),
-            "stale": False,
         }
-        # Three exact zeros at once is not a reading, it is a driver that
-        # has lost the camera: ZWO's answers 0 for every number once the USB
-        # link drops, with the cooler still "on". Taken as no reading at all,
-        # so the last real one stands and the status says the link is gone.
-        if (reading["temperature"] == 0.0 and reading["setpoint"] == 0.0
-                and (reading["coolerPower"] or 0.0) == 0.0):
-            reading["temperature"] = None
-            reading["setpoint"] = None
-            reading["coolerPower"] = None
-            reading["stale"] = True
         if cached is not None:
             before = cached.get("temperature")
             after = reading["temperature"]
@@ -480,60 +583,9 @@ class AscomCamera(_AscomDevice, Camera):
         self._cooler_cache = reading
         return reading
 
-    def _nudge_if_stale(self, cached: dict[str, Any] | None, now: float) -> None:
-        """Re-send the setpoint when the driver's temperature has frozen.
-
-        Only when the reading is identical for minutes *and* the driver says
-        the cooler is off or idle *and* the sensor is below room temperature:
-        a cooler at its setpoint can honestly report the same number for an
-        hour, and that case is left alone. A sensor below fifteen degrees
-        with nothing cooling it cannot hold still, so a driver saying it does
-        has stopped reading - and writing the setpoint back, unchanged, is
-        the one call that was seen to start it reading again.
-        """
-        if cached is None:
-            self._cooler_same_since = now
-            self._cooler_nudged = False
-            return
-        temperature = cached.get("temperature")
-        last = getattr(self, "_cooler_last_seen", None)
-        if temperature is None or temperature != last:
-            self._cooler_last_seen = temperature
-            self._cooler_same_since = now
-            self._cooler_nudged = False
-            return
-        idle = (not cached.get("coolerOn")) or not (cached.get("coolerPower") or 0)
-        if (now - getattr(self, "_cooler_same_since", now) < self._COOLER_STALE_S
-                or not idle or temperature >= 15.0 or getattr(self, "_cooler_nudged", False)):
-            return
-        self._cooler_nudged = True
-        # The setpoint this program asked for, never the one the driver
-        # reports: a driver that has stopped reading reports nonsense, and
-        # writing its nonsense back as the setpoint set a camera to 0 C once.
-        setpoint = getattr(self, "_wanted_setpoint", None)
-        if setpoint is None:
-            return
-        try:
-            if self.can_cool:
-                self._set("SetCCDTemperature", float(setpoint))
-            self._log(f"the camera's temperature has read {temperature:g} C for "
-                      f"{self._COOLER_STALE_S / 60:.0f} minutes with the cooler reported "
-                      f"off; re-sent the {setpoint:g} C setpoint to wake the driver's "
-                      "reading", "warn")
-        except Exception:                          # noqa: BLE001 - a nudge, not a need
-            pass
-
-    def _log(self, message: str, level: str = "info") -> None:
-        """Into the file log: a device has no line to the event strip."""
-        import logging
-        logging.getLogger("astrocontrol.devices").log(
-            logging.WARNING if level == "warn" else logging.INFO, message)
-
     def _forget_cooler(self) -> None:
         self._cooler_cache = None
         self._cooler_pending = None
-        self._cooler_same_since = time.monotonic()
-        self._cooler_nudged = False
 
     @property
     def temperature(self) -> float | None:
@@ -557,19 +609,7 @@ class AscomCamera(_AscomDevice, Camera):
         if not self.can_cool:
             raise DeviceError("camera cannot set a temperature setpoint")
         self._set("SetCCDTemperature", float(celsius))
-        self._wanted_setpoint = float(celsius)
         self._forget_cooler()
-
-    @property
-    def reading_stale(self) -> bool:
-        """Whether the driver has stopped giving real cooler numbers.
-
-        True while every number it answers is zero at once, which is how
-        ZWO's driver reports a camera whose USB link has dropped, and the
-        values on show are the last real ones. A sequencer waiting for the
-        camera to cool must not wait on these.
-        """
-        return bool(self._cooler().get("stale"))
 
     @property
     def cooler_power(self) -> float | None:
@@ -578,16 +618,65 @@ class AscomCamera(_AscomDevice, Camera):
     def set_settings(self, binning: int | None = None, gain: int | None = None,
                      offset: int | None = None) -> None:
         self._require()
+        if binning is None and gain is None and offset is None:
+            return
+        # The same driver puts up the same sort of box for a gain or a bin
+        # outside limits it has forgotten (0.2.52e): nothing is written to a
+        # camera that is not there, and nothing outside limits that are real.
+        self._checked("The camera settings")
         if binning is not None:
-            self._set("BinX", int(binning))
-            self._set("BinY", int(binning))
-            self.binning = int(binning)
+            binning = int(binning)
+            if self.max_bin and self.max_bin >= 1:
+                binning = max(1, min(binning, int(self.max_bin)))
+            self._set("BinX", binning)
+            self._set("BinY", binning)
+            self.binning = binning
         if gain is not None and getattr(self, "has_gain", True):
-            self._set("Gain", int(gain))
-            self.gain = int(gain)
+            gain = int(gain)
+            if self.gain_max > self.gain_min:
+                gain = max(self.gain_min, min(gain, self.gain_max))
+            self._set("Gain", gain)
+            self.gain = gain
         if offset is not None and getattr(self, "has_offset", True):
-            self._set("Offset", int(offset))
-            self.offset = int(offset)
+            offset = int(offset)
+            if self.offset_max > self.offset_min:
+                offset = max(self.offset_min, min(offset, self.offset_max))
+            self._set("Offset", offset)
+            self.offset = offset
+
+    def read_settings(self) -> dict[str, int | None]:
+        """Gain and offset read from the driver, not remembered (0.2.53).
+
+        Only property reads - never a write, so never the driver's "between 0
+        and 0" box. A Gain/Offset that could not be read at connect (a driver
+        still waking up after a reconnect) made `has_gain` False for the life
+        of the connection and every later gain write was silently skipped;
+        one that can be read now is believed again.
+        """
+        self._require()
+        found: dict[str, int | None] = {"gain": None, "offset": None}
+        for key, prop, flag in (("gain", "Gain", "has_gain"), ("offset", "Offset", "has_offset")):
+            try:
+                value = self._read(prop, self.READ_SETTINGS_SECONDS)
+            except DeviceError:
+                continue
+            if value is None:
+                continue
+            found[key] = int(value)
+            setattr(self, key, int(value))
+            setattr(self, flag, True)
+        if found["gain"] is not None and not self.gain_max:
+            # Limits that read 0/0 at connect are asked for again, so a write
+            # is clamped into the camera's real range rather than refused.
+            self.gain_min = int(self._get("GainMin", 0) or 0)
+            self.gain_max = int(self._get("GainMax", 0) or 0)
+        if found["offset"] is not None and not self.offset_max:
+            self.offset_min = int(self._get("OffsetMin", 0) or 0)
+            self.offset_max = int(self._get("OffsetMax", 0) or 0)
+        return found
+
+    #: How long one Gain/Offset read may take before it counts as unreadable.
+    READ_SETTINGS_SECONDS = 10.0
 
     def status(self) -> dict[str, Any]:
         if not self._connected:
@@ -606,8 +695,6 @@ class AscomCamera(_AscomDevice, Camera):
             "setpoint": cooler["setpoint"],
             "coolerOn": cooler["coolerOn"],
             "coolerPower": cooler["coolerPower"],
-            # The numbers above are the last real ones when this is set.
-            "readingStale": bool(cooler.get("stale")),
             "canCool": self.can_cool,
             "gain": self.gain,
             "offset": self.offset,
@@ -656,7 +743,7 @@ class AscomMount(_AscomDevice, Mount):
                         item = collection.Item(index)
                         found.append((float(item.Minimum), float(item.Maximum)))
                     return found
-                ranges = self._exec().call(read, label="AxisRates")
+                ranges = _com(self._channel).call(read)
                 if ranges:
                     rates[axis] = sorted(ranges)
             except Exception:                     # noqa: BLE001 - optional in ASCOM
@@ -704,6 +791,12 @@ class AscomMount(_AscomDevice, Mount):
     @property
     def slewing(self) -> bool:
         return bool(self._get("Slewing", False)) or self._jogging
+
+    @property
+    def pulse_guiding(self) -> bool:
+        with contextlib.suppress(Exception):
+            return bool(self._get("IsPulseGuiding", False))
+        return False
 
     @property
     def tracking(self) -> bool:
@@ -900,15 +993,7 @@ class AscomFocuser(_AscomDevice, Focuser):
     @property
     def temperature(self) -> float | None:
         value = self._get("Temperature")
-        if value is None:
-            return None
-        # ZWO's focuser driver answers -273 when it cannot reach the probe -
-        # a device that has dropped off its USB hub, as much as one with no
-        # probe fitted. Absolute zero is not a temperature anybody wants a
-        # refocus trigger or a header built on; it is "no reading".
-        if float(value) < -100.0:
-            return None
-        return round(float(value), 2)
+        return None if value is None else round(float(value), 2)
 
     def move_to(self, position: int) -> None:
         self._require()
@@ -1140,8 +1225,13 @@ class AscomDome(_AscomDevice, Dome):
     def shutter_state(self) -> str:
         if not self.can_shutter:
             return "notpresent"
-        return self._SHUTTER_STATES.get(
-            int(self._get("ShutterStatus", 4) or 4), "error")
+        # 0.2.53b: ShutterStatus 0 *is* shutterOpen. `... or 4` turned every
+        # open roof into "error", so nothing could ever see one open.
+        value = self._get("ShutterStatus", None)
+        try:
+            return self._SHUTTER_STATES.get(int(value), "error")
+        except (TypeError, ValueError):
+            return "error"
 
     @property
     def at_park(self) -> bool:
@@ -1254,6 +1344,9 @@ class AscomSwitch(_AscomDevice, SwitchBank):
             out.append(entry)
         return out
 
+    def describe_channels(self) -> list[dict[str, Any]]:
+        return [dict(channel) for channel in self._channels]
+
     def get_value(self, index: int) -> float:
         self._require()
         return float(self._invoke("GetSwitchValue", int(index)))
@@ -1295,7 +1388,14 @@ def create(kind: str, driver_id: str, name: str, channel: str = "default"):
     if factory is None:
         raise DeviceError(f"no ASCOM driver class for {kind}")
     device = factory(driver_id, name)
-    device._channel = channel
+    # A camera gets an apartment thread of its own (0.2.52e). Its driver is
+    # the one that puts up modal message boxes ("Please input Exposure
+    # Duration between 0 and 0s") that never return; on the telescope's
+    # shared thread that also froze the focuser, the filter wheel and the
+    # mount behind it, and nothing could be reconnected without breaking the
+    # others. Each device's COM object still lives on, and is only called
+    # from, the one thread it was made on.
+    device._channel = f"{channel}/{kind}" if kind in ("camera", "piercam") else channel
     return device
 
 

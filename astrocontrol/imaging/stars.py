@@ -36,15 +36,7 @@ import numpy as np
 # pixels across, so the shape survives shrinking, while a hot pixel becomes a
 # single faint dot that the minimum-size filter then discards. Measurement
 # happens back at full resolution, so nothing is lost from the number itself.
-#
-# Not too far down, though. At 2200 across, a 60 megapixel frame was shrunk
-# four times, and a focused star became a one-pixel dot the size filter threw
-# away - so the only stars that survived were the brightest few hundred, whose
-# wings at 3.5 sigma spread over a dozen shrunken pixels, and the "star" that
-# was measured was a fifty-pixel box of wings. The median came out at nine
-# pixels on a sub ASTAP measured at 1.6, and every star size this program
-# reported to a collaboration was five or six times too large.
-TARGET_WIDTH = 4400
+TARGET_WIDTH = 2200
 
 # Blob filters, in downsampled pixels.
 MIN_BLOB_PIXELS = 5          # below this it is a hot pixel or a cosmic ray
@@ -53,16 +45,9 @@ MAX_BLOB_SIDE = 90           # a whole defocused disc, but not a nebula
 MAX_ASPECT = 2.5             # trails, diffraction spikes and gradients
 MIN_FILL = 0.30              # blob area against its bounding box
 
-# Measured per frame. The median wants the frame's ordinary stars, and the
-# brightest hundred of a deep sub are not ordinary: they are the ones with
-# wings, halos and a core past the sensor's linear range.
-MAX_STARS = 500
+MAX_STARS = 100              # measured per frame; the median needs no more
 DETECTION_SIGMA = 3.5        # above the local background
 SATURATION = 65000
-# A star whose peak is above this is left out of the measurement: the top of
-# its profile is clipped or nonlinear, so its radius reads large however
-# well focused it is. Defocused discs are spread thin and never reach it.
-LINEAR_PEAK = 40000
 
 
 def _downsample(image: np.ndarray) -> tuple[np.ndarray, int]:
@@ -205,19 +190,10 @@ def measure_star(image: np.ndarray, y0: int, y1: int, x0: int,
     as a whole, exactly as NINA does it: the sky under a star in the corner of a
     vignetted frame is not the sky in the middle, and an error there goes
     straight into the radius.
-
-    The radius is then measured inside an aperture of three times itself
-    around the centroid, twice over, rather than across the detection box with
-    its margin. The box is the star's footprint above the detection threshold
-    plus a margin of the same order, and on a long sub that is wings, noise
-    and whatever gradient the ring's median missed, every pixel of it weighted
-    by its distance; the aperture holds the star and little else, and
-    tightens onto it as the estimate improves. On the same subs this agrees
-    with ASTAP to a tenth of a pixel where the box read five times too large.
     """
     height, width = image.shape
     box_height, box_width = y1 - y0, x1 - x0
-    margin = max(3, int(round(max(box_height, box_width) * 0.5)))
+    margin = max(4, int(round(max(box_height, box_width) * 0.6)))
 
     oy0, oy1 = max(0, y0 - margin), min(height, y1 + margin)
     ox0, ox1 = max(0, x0 - margin), min(width, x1 + margin)
@@ -234,42 +210,23 @@ def measure_star(image: np.ndarray, y0: int, y1: int, x0: int,
     sky = float(np.median(surrounding))
     noise = float(np.median(np.abs(surrounding - sky))) * 1.4826
 
-    # A first centre and radius from the star's own box.
-    inner = image[y0:y1, x0:x1].astype(np.float32) - sky
+    values = outer - sky
     # Only pixels that are actually the star contribute; anything at or below
     # the sky would otherwise pull the centroid towards the middle of the box.
-    inner[inner < max(2.0 * noise, 1e-3)] = 0.0
-    total = float(inner.sum())
+    values[values < max(2.0 * noise, 1e-3)] = 0.0
+    total = float(values.sum())
     if total <= 0:
         return None
-    rows, columns = np.mgrid[0:inner.shape[0], 0:inner.shape[1]]
-    centre_y = y0 + float((inner * rows).sum() / total)
-    centre_x = x0 + float((inner * columns).sum() / total)
-    hfr = float((inner * np.hypot(rows - (centre_y - y0),
-                                  columns - (centre_x - x0))).sum() / total)
+
+    rows, columns = np.mgrid[0:values.shape[0], 0:values.shape[1]]
+    centre_y = float((values * rows).sum() / total)
+    centre_x = float((values * columns).sum() / total)
+
+    radius = np.hypot(rows - centre_y, columns - centre_x)
+    hfr = float((values * radius).sum() / total)
     if not np.isfinite(hfr) or hfr <= 0:
         return None
-
-    # Then the aperture, tightened onto the star.
-    for _ in range(2):
-        reach = max(3.0, 3.0 * hfr)
-        ay0, ay1 = max(0, int(centre_y - reach)), min(height, int(centre_y + reach) + 1)
-        ax0, ax1 = max(0, int(centre_x - reach)), min(width, int(centre_x + reach) + 1)
-        patch = image[ay0:ay1, ax0:ax1].astype(np.float32) - sky
-        if patch.size == 0:
-            return None
-        rows, columns = np.mgrid[ay0:ay1, ax0:ax1]
-        distance = np.hypot(rows - centre_y, columns - centre_x)
-        patch[(distance > reach) | (patch < 0)] = 0.0
-        total = float(patch.sum())
-        if total <= 0:
-            return None
-        centre_y = float((patch * rows).sum() / total)
-        centre_x = float((patch * columns).sum() / total)
-        hfr = float((patch * distance).sum() / total)
-        if not np.isfinite(hfr) or hfr <= 0:
-            return None
-    return centre_y, centre_x, hfr
+    return oy0 + centre_y, ox0 + centre_x, hfr
 
 
 def detect(image: np.ndarray, sigma: float = DETECTION_SIGMA
@@ -307,8 +264,8 @@ def detect(image: np.ndarray, sigma: float = DETECTION_SIGMA
         if fy1 <= fy0 or fx1 <= fx0:
             continue
         patch = image[fy0:fy1, fx0:fx1]
-        if patch.size == 0 or float(patch.max()) > LINEAR_PEAK:
-            continue                            # clipped or nonlinear; the radius is a lie
+        if patch.size and float((patch >= SATURATION).mean()) > 0.2:
+            continue                            # burnt out; the radius is a lie
         measured = measure_star(image, fy0, fy1, fx0, fx1)
         if measured is None:
             continue

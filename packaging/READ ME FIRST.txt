@@ -5,20 +5,13 @@ Telescope control and collaborative imaging for Windows.
 
 Install
 -------
-The easy way is the installer, Starfront-Setup-<version>.exe, from
-   https://collab.starfront.space/download
-Run it; it puts Starfront under your own Programs folder with a Start-menu
-shortcut and an uninstaller, with no administrator prompt. Windows may say it
-protected your PC the first time: More info -> Run anyway.
-
-If you have the zip instead:
 1. Unzip this folder anywhere you like - e.g. C:\Starfront.
    Keep everything together; the program looks beside itself for its files.
 2. Double-click  Starfront.exe.
+   Windows may say it protected your PC the first time: More info -> Run anyway.
 3. The window opens on its own. Your settings, targets and plans live in
    C:\Users\<you>\Starfront (C:\Users\<you>\AstroControl on a PC that ran an
    earlier build), so replacing this folder with a newer one never loses them.
-   The same is true of an upgrade through the installer.
 
 Windows 10
 ----------

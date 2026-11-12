@@ -57,8 +57,6 @@ anybody with NumPy and no knowledge of this program.
 
 from __future__ import annotations
 
-import contextlib
-import gc
 import json
 import math
 import threading
@@ -112,26 +110,6 @@ REFERENCE_MERGE = 1.5
 #: save without thinking about it.
 MAX_REFERENCE_STARS = 40_000
 
-#: A canvas with more pixels than this keeps its accumulators on disk, as
-#: memory-mapped `.npy` files, rather than in memory. Thirty bytes a pixel is
-#: 500 MB at sixteen megapixels and 2.6 GB for a sixty-megapixel camera at
-#: its own resolution, which a PC that is also driving the mount cannot
-#: give up; the operating system pages in whatever part is being folded or
-#: drawn and the rest costs nothing. Below this the arrays stay in memory
-#: and are written out whole, as they always were.
-MEMMAP_ABOVE = 16_000_000
-
-#: Pixels per band when a contribution is folded in or the picture is drawn.
-#: Whole-frame arithmetic on a sixty-megapixel box wants a dozen temporaries
-#: of its own size; bands keep the working set to a few hundred megabytes
-#: whatever the canvas.
-FOLD_BAND = 4_000_000
-
-#: The accumulators, in the order they are saved, and their types.
-ACCUMULATORS = (("weight", np.float64), ("total", np.float64),
-                ("squares", np.float64), ("count", np.uint16),
-                ("exposure", np.float32))
-
 
 class StackError(ValueError):
     """A contribution that cannot be added, with the reason a person needs."""
@@ -172,14 +150,11 @@ class Plan:
 
     @classmethod
     def read(cls, data: dict[str, Any]) -> "Plan":
-        # Zero is a value here - no cap, the frame's own resolution - and
-        # must not be read as "unsaid".
-        cap = data.get("maxPixels")
         return cls(ra=float(data["ra"]), dec=float(data["dec"]),
                    width=float(data["width"]), height=float(data["height"]),
                    scale=float(data["scale"]),
                    rotation=float(data.get("rotation") or 0.0),
-                   maxPixels=int(4096 if cap is None else cap))
+                   maxPixels=int(data.get("maxPixels") or 4096))
 
     @classmethod
     def for_region(cls, ra: float, dec: float, width: float, height: float,
@@ -415,28 +390,21 @@ class LiveStack:
     contribution would spend the night doing that instead.
     """
 
-    def __init__(self, root: Path | str, plan: Plan, fresh: bool = True) -> None:
+    def __init__(self, root: Path | str, plan: Plan) -> None:
         self.root = Path(root)
         self.plan = plan
         self.canvas = plan.canvas()
         self._lock = threading.RLock()
 
         shape = (self.canvas.height, self.canvas.width)
-        self.shape = shape
-        self.pixels = shape[0] * shape[1]
-        #: Whether the accumulators are memory-mapped files rather than
-        #: arrays in memory. See `MEMMAP_ABOVE`.
-        self.on_disk = self.pixels > MEMMAP_ABOVE
         #: Sum of weights, sum of weight*value, sum of weight*value^2 — the
         #: three running sums a weighted mean and variance come out of — plus
         #: a count of contributing frames and the exposure behind each pixel.
-        self.weight: np.ndarray
-        self.total: np.ndarray
-        self.squares: np.ndarray
-        self.count: np.ndarray
-        self.exposure: np.ndarray
-        if fresh:
-            self._allocate()
+        self.weight = np.zeros(shape, dtype=np.float64)
+        self.total = np.zeros(shape, dtype=np.float64)
+        self.squares = np.zeros(shape, dtype=np.float64)
+        self.count = np.zeros(shape, dtype=np.uint16)
+        self.exposure = np.zeros(shape, dtype=np.float32)
 
         #: Tile ids already taken, so a retry is not a doubling.
         self.taken: dict[str, dict[str, Any]] = {}
@@ -458,49 +426,6 @@ class LiveStack:
         #: what the machine did while somebody looked at their picture.
         self._picture: tuple[float, np.ndarray, np.ndarray] | None = None
 
-    # -- the accumulators, in memory or on disk ------------------------------
-    def _allocate(self) -> None:
-        """Fresh, zeroed accumulators: arrays, or files under the root."""
-        if self.on_disk:
-            self.root.mkdir(parents=True, exist_ok=True)
-            for name, dtype in ACCUMULATORS:
-                setattr(self, name, np.lib.format.open_memmap(
-                    self.root / f"{name}.npy", mode="w+", dtype=dtype,
-                    shape=self.shape))
-        else:
-            for name, dtype in ACCUMULATORS:
-                setattr(self, name, np.zeros(self.shape, dtype=dtype))
-
-    def close(self) -> None:
-        """Let go of the accumulators, flushing any that live on disk.
-
-        A memory-mapped file cannot be deleted or replaced while it is
-        mapped, on Windows at least, so a stack being thrown away or set
-        aside is closed first. The object is not usable afterwards.
-        """
-        with self._lock:
-            for name, _dtype in ACCUMULATORS:
-                array = getattr(self, name, None)
-                if isinstance(array, np.memmap):
-                    with contextlib.suppress(Exception):
-                        array.flush()
-                    with contextlib.suppress(Exception):
-                        array._mmap.close()          # noqa: SLF001 - the handle
-                setattr(self, name, None)
-            self._picture = None
-        gc.collect()
-
-    def _bands(self, start: int = 0, stop: int | None = None
-               ) -> list[tuple[int, int]]:
-        """Row ranges of at most `FOLD_BAND` pixels over the canvas's width."""
-        stop = self.shape[0] if stop is None else stop
-        rows = max(1, FOLD_BAND // max(1, self.shape[1]))
-        return [(a, min(stop, a + rows)) for a in range(start, stop, rows)]
-
-    def _stride(self, wanted: int) -> int:
-        """A sampling stride that leaves about `wanted` pixels of the canvas."""
-        return max(1, int(math.sqrt(self.pixels / max(1, wanted))))
-
     # -- reading it --------------------------------------------------------
     @property
     def frames(self) -> int:
@@ -513,42 +438,23 @@ class LiveStack:
         crop code as a single sub, so the stack can be panned, zoomed and
         stretched exactly as a frame can. The covered pixels' own spread sets
         the range, as for `preview`, and empty canvas is zero.
-
-        Built a band at a time: the mean of a sixty-megapixel canvas is half
-        a gigabyte in double precision, and three of those at once is what
-        this used to allocate.
         """
         with self._lock:
             cached = self._picture
             if cached is not None and cached[0] == self.updated:
                 return cached[1], cached[2]
-            frame = np.zeros(self.shape, dtype=np.uint16)
-            covered = np.zeros(self.shape, dtype=bool)
-
-            # The range, from a sample of the covered pixels: a couple of
-            # million settle two percentiles to far better than a stretch
-            # can show.
-            stride = self._stride(2_000_000)
-            weight = np.asarray(self.weight[::stride, ::stride])
-            total = np.asarray(self.total[::stride, ::stride])
-            has = weight > 0
-            if has.any():
-                seen = total[has] / weight[has]
+            data = self.mean()
+            covered = self.count > 0
+            if not covered.any():
+                frame = np.zeros(data.shape, dtype=np.uint16)
+            else:
+                seen = data[covered]
                 low = float(np.percentile(seen, 0.5))
                 high = float(np.percentile(seen, 99.9))
                 if high - low < 1e-9:
                     high = low + 1.0
-                span = np.float32(high - low)
-                for start, stop in self._bands():
-                    weight = np.asarray(self.weight[start:stop])
-                    has = weight > 0
-                    if not has.any():
-                        continue
-                    mean = np.asarray(self.total[start:stop]) / np.where(has, weight, 1.0)
-                    scaled = np.clip((mean.astype(np.float32) - np.float32(low)) / span,
-                                     0.0, 1.0) * np.float32(65535.0)
-                    frame[start:stop] = np.where(has, scaled, 0.0).astype(np.uint16)
-                    covered[start:stop] = has
+                scaled = np.clip((data - low) / (high - low), 0.0, 1.0) * 65535.0
+                frame = np.where(covered, scaled, 0.0).astype(np.uint16)
             self._picture = (self.updated, frame, covered)
             return frame, covered
 
@@ -706,11 +612,8 @@ class LiveStack:
             y1 = min(self.canvas.height, y1)
             if x1 <= x0 or y1 <= y0:
                 raise StackError("this tile's box is not on the canvas")
-            # Kept in the tile's own single precision and converted a band
-            # at a time inside the fold: two sixty-megapixel doubles up front
-            # were a gigabyte before any arithmetic started.
-            values = tile.values[:y1 - y0, :x1 - x0]
-            weight = tile.weight[:y1 - y0, :x1 - x0]
+            values = tile.values[:y1 - y0, :x1 - x0].astype(np.float64)
+            weight = tile.weight[:y1 - y0, :x1 - x0].astype(np.float64)
             here = (slice(y0, y1), slice(x0, x1))
             covered = weight > 0
             if not covered.any():
@@ -744,35 +647,18 @@ class LiveStack:
     def _fold(self, values: np.ndarray, weight: np.ndarray,
               covered: np.ndarray, here: tuple[slice, slice],
               tile: Tile) -> dict[str, Any]:
-        """The arithmetic of one contribution, under the lock.
-
-        In two passes over the tile's box. The photometric match first, on
-        a sample of the overlap - a few hundred thousand pixels settle a
-        scale and an offset, and the whole overlap of a large frame is a
-        quarter of a gigabyte that `scale_to` would only thin out again.
-        Then the rejection and the fold, a band of rows at a time, so the
-        temporaries are a band's size rather than the frame's.
-        """
-        rows, cols = here
-        y0, x0 = rows.start, cols.start
-        box_pixels = values.shape[0] * values.shape[1]
+        """The arithmetic of one contribution, under the lock."""
+        existing_weight = self.weight[here]
+        existing_total = self.total[here]
+        established = existing_weight > 0
 
         # -- put it on the stack's photometric scale -----------------------
         match: dict[str, Any] = {"matched": False, "detail": "first frame in "
                                                             "the stack"}
         gain = 1.0
-        offset = 0.0
         if self.anchored:
-            stride = max(1, int(math.sqrt(box_pixels / 400_000)))
-            sample = (slice(y0, rows.stop, stride), slice(x0, cols.stop, stride))
-            existing_weight = np.asarray(self.weight[sample])
-            existing_total = np.asarray(self.total[sample])
-            established = existing_weight > 0
-            incoming = values[::stride, ::stride]
-            incoming_weight = weight[::stride, ::stride]
-            shared = (established & covered[::stride, ::stride]
-                      & (np.asarray(self.count[sample]) >= 1))
-            safe = np.where(established, existing_weight, 1.0)
+            shared = established & covered & (self.count[here] >= 1)
+            safe = np.where(existing_weight > 0, existing_weight, 1.0)
             reference = existing_total / safe
             # Both sides' noise is known here exactly rather than estimated.
             # Every weight in this stack is an inverse variance, so the
@@ -782,12 +668,11 @@ class LiveStack:
             # statistics, and measuring them back off the pixels — which is
             # what it falls back to — would be a worse answer for no reason.
             reference_noise = self._typical_noise(existing_weight, shared)
-            incoming_noise = self._typical_noise(incoming_weight, shared)
+            incoming_noise = self._typical_noise(weight, shared)
             gain, offset, match = reproject.scale_to(
-                reference, incoming, shared,
+                reference, values, shared,
                 reference_noise=reference_noise,
                 incoming_noise=incoming_noise)
-            del existing_weight, existing_total, established, reference, shared
             # A frame that could not be measured against the stack is added
             # unscaled rather than refused: a panel landing on virgin sky at
             # the edge of a mosaic has nothing to overlap with, and that is
@@ -799,60 +684,44 @@ class LiveStack:
                         f"this frame would have to be scaled by {gain:.3g} to "
                         "match the stack, which means it is not the same sky, "
                         "not the same filter, or badly registered")
-            else:
-                gain, offset = 1.0, 0.0
-        # The weight is an inverse variance, so rescaling the values by
-        # 1/gain scales the variance by 1/gain^2 and the weight by gain^2.
-        # Forgetting this is the subtle way a stack ends up dominated by
-        # whichever telescope happens to record the largest numbers rather
-        # than by the one with the best data.
-        weight_gain = gain * gain
+                values = (values - offset) / gain
+                # The weight is an inverse variance, so rescaling the values
+                # by 1/gain scales the variance by 1/gain^2 and the weight by
+                # gain^2. Forgetting this is the subtle way a stack ends up
+                # dominated by whichever telescope happens to record the
+                # largest numbers rather than by the one with the best data.
+                weight = weight * (gain * gain)
 
-        # -- reject what disagrees, and fold in, a band at a time ----------
+        # -- reject what disagrees with what is already known --------------
+        keep = covered
         rejected = 0
-        pixels = 0
-        seconds = np.float32(tile.seconds) if tile.seconds else None
-        for start, stop in self._bands(0, values.shape[0]):
-            band = (slice(y0 + start, y0 + stop), cols)
-            band_values = values[start:stop].astype(np.float64)
-            if gain != 1.0 or offset != 0.0:
-                band_values = (band_values - offset) / gain
-            band_weight = weight[start:stop].astype(np.float64) * weight_gain
-            band_covered = covered[start:stop]
+        ready = established & (self.count[here] >= REJECT_AFTER)
+        if ready.any():
+            safe = np.where(existing_weight > 0, existing_weight, 1.0)
+            mean = existing_total / safe
+            variance = self.squares[here] / safe - mean * mean
+            spread = np.sqrt(np.maximum(variance, 0.0))
+            # A pixel whose scatter has not yet been established — every frame
+            # agreed exactly — gets the stack's own median scatter rather than
+            # zero, or the first frame to differ by an ADU would be thrown out.
+            floor = float(np.median(spread[ready])) if ready.any() else 0.0
+            limit = REJECT_SIGMA * np.maximum(spread, max(floor, 1e-6))
+            wild = ready & (np.abs(values - mean) > limit)
+            rejected = int(wild.sum())
+            keep = covered & ~wild
 
-            existing_weight = self.weight[band]
-            keep = band_covered
-            count = self.count[band]
-            ready = (existing_weight > 0) & (count >= REJECT_AFTER)
-            if ready.any():
-                safe = np.where(existing_weight > 0, existing_weight, 1.0)
-                mean = self.total[band] / safe
-                variance = self.squares[band] / safe - mean * mean
-                spread = np.sqrt(np.maximum(variance, 0.0))
-                # A pixel whose scatter has not yet been established — every
-                # frame agreed exactly — gets the stack's own median scatter
-                # rather than zero, or the first frame to differ by an ADU
-                # would be thrown out.
-                floor = float(np.median(spread[ready]))
-                limit = REJECT_SIGMA * np.maximum(spread, max(floor, 1e-6))
-                wild = ready & (np.abs(band_values - mean) > limit)
-                rejected += int(wild.sum())
-                keep = band_covered & ~wild
-                del mean, variance, spread, limit, wild
-
-            contribution = np.where(keep, band_weight, 0.0)
-            kept_values = np.where(keep, band_values, 0.0)
-            self.weight[band] += contribution
-            self.total[band] += contribution * kept_values
-            self.squares[band] += contribution * kept_values * kept_values
-            self.count[band] += keep.astype(np.uint16)
-            if seconds is not None:
-                self.exposure[band] += (keep * seconds).astype(np.float32)
-            pixels += int(keep.sum())
-            del contribution, kept_values, band_values, band_weight
+        # -- fold it in -----------------------------------------------------
+        contribution = np.where(keep, weight, 0.0)
+        self.weight[here] += contribution
+        self.total[here] += contribution * np.where(keep, values, 0.0)
+        self.squares[here] += contribution * np.where(keep, values * values, 0.0)
+        self.count[here] += keep.astype(np.uint16)
+        if tile.seconds:
+            self.exposure[here] += (keep * np.float32(tile.seconds)).astype(np.float32)
 
         self.anchored = True
         self.rejected_pixels += rejected
+        pixels = int(keep.sum())
         return {
             "added": True,
             "duplicate": False,
@@ -913,31 +782,11 @@ class LiveStack:
         }
 
     def summary(self) -> dict[str, Any]:
-        """Everything a person or a page wants to know, without the pixels.
-
-        Coverage and depth are walked in bands, and the typical depth is
-        taken on a sample: one pass over a large canvas, not three copies of it.
-        """
+        """Everything a person or a page wants to know, without the pixels."""
         with self._lock:
-            covered_pixels = 0
-            deepest = 0.0
-            deepest_frames = 0
-            for start, stop in self._bands():
-                count = np.asarray(self.count[start:stop])
-                has = count > 0
-                if not has.any():
-                    continue
-                covered_pixels += int(has.sum())
-                deepest_frames = max(deepest_frames, int(count.max()))
-                deepest = max(deepest, float(np.asarray(self.exposure[start:stop])[has].max()))
-            any_covered = covered_pixels > 0
-            median_seconds = 0.0
-            if any_covered:
-                stride = self._stride(2_000_000)
-                count = np.asarray(self.count[::stride, ::stride])
-                depth = np.asarray(self.exposure[::stride, ::stride])[count > 0]
-                if depth.size:
-                    median_seconds = float(np.median(depth))
+            covered = self.count > 0
+            any_covered = bool(covered.any())
+            depth = self.exposure[covered] if any_covered else np.zeros(1)
             return {
                 "plan": self.plan.payload(),
                 "frames": self.frames,
@@ -947,11 +796,10 @@ class LiveStack:
                                    if row.get("filter")}),
                 "seconds": round(sum(float(row.get("seconds") or 0.0)
                                      for row in self.taken.values()), 1),
-                "covered": round(covered_pixels / self.pixels, 4) if self.pixels else 0.0,
-                "deepestSeconds": round(deepest, 1),
-                "medianSeconds": round(median_seconds, 1),
-                "maxFramesDeep": deepest_frames,
-                "onDisk": self.on_disk,
+                "covered": round(float(covered.mean()), 4) if covered.size else 0.0,
+                "deepestSeconds": round(float(depth.max()), 1) if any_covered else 0.0,
+                "medianSeconds": round(float(np.median(depth)), 1) if any_covered else 0.0,
+                "maxFramesDeep": int(self.count.max()),
                 "rejectedPixels": self.rejected_pixels,
                 "referenceStars": int(len(self.reference)),
                 "updated": self.updated or None,
@@ -972,22 +820,10 @@ class LiveStack:
         """
         with self._lock:
             self.root.mkdir(parents=True, exist_ok=True)
-            if self.on_disk:
-                # Already files: a flush is the save. There is no temporary
-                # copy to swap in - a two-gigabyte copy per save is the thing
-                # the mapping exists to avoid - so a power cut mid-flush can
-                # cost this stack, and the subs it was made of are on disk.
-                for name, _dtype in ACCUMULATORS:
-                    array = getattr(self, name)
-                    if isinstance(array, np.memmap):
-                        array.flush()
-                arrays = (("reference", self.reference),)
-            else:
-                arrays = (("weight", self.weight), ("total", self.total),
-                          ("squares", self.squares), ("count", self.count),
-                          ("exposure", self.exposure),
-                          ("reference", self.reference))
-            for name, array in arrays:
+            for name, array in (("weight", self.weight), ("total", self.total),
+                                ("squares", self.squares), ("count", self.count),
+                                ("exposure", self.exposure),
+                                ("reference", self.reference)):
                 temporary = self.root / f"{name}.part"
                 # Written through an open handle rather than by path: `np.save`
                 # appends `.npy` to any path that does not already end in it,
@@ -1023,13 +859,13 @@ class LiveStack:
             ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
             stored = Plan.read(ledger["plan"])
             if plan is None or stored.payload() == plan.payload():
-                stack = cls(root, stored, fresh=False)
+                stack = cls(root, stored)
                 try:
-                    # A large stack is mapped in place and written through;
-                    # a small one is read into memory as it always was.
-                    mode = "r+" if stack.on_disk else None
-                    for name, _dtype in ACCUMULATORS:
-                        setattr(stack, name, np.load(root / f"{name}.npy", mmap_mode=mode))
+                    stack.weight = np.load(root / "weight.npy")
+                    stack.total = np.load(root / "total.npy")
+                    stack.squares = np.load(root / "squares.npy")
+                    stack.count = np.load(root / "count.npy")
+                    stack.exposure = np.load(root / "exposure.npy")
                     stars_path = root / "reference.npy"
                     if stars_path.is_file():
                         stack.reference = np.load(stars_path)

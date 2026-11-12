@@ -9,7 +9,7 @@ import time
 from collections import deque
 from typing import Any
 
-from . import alpaca, ascom, phd2, zwo
+from . import alpaca, ascom, pegasus, phd2, zwo
 from .base import KINDS, Device, DeviceError
 
 _FILE_LOG = logging.getLogger("astrocontrol.session")
@@ -60,6 +60,10 @@ class DeviceManager:
         # picking a profile and connecting its equipment, and all three are
         # settings rather than driver properties.
         self.config = config
+        # The last status each device gave, and the read in flight for it
+        # (0.2.50): see `_read_status`.
+        self._status_lock = threading.Lock()
+        self._status_slots: dict[str, dict[str, Any]] = {}
 
     # -- event log ---------------------------------------------------------
     def log(self, message: str, level: str = "info") -> None:
@@ -85,6 +89,10 @@ class DeviceManager:
              "note": "Network devices. Scan or enter host:port."},
             {"id": "phd2", "name": "PHD2", "available": phd2.available(),
              "note": "Autoguider. Enter the host and port PHD2 listens on."},
+            {"id": "pegasus", "name": "Pegasus Unity", "available": pegasus.available(),
+             "note": "Pegasus Astro power boxes through the Unity Platform's "
+                     "own web service on this PC: no ASCOM driver to set up, "
+                     "and the port names typed into Unity come through."},
         ]
 
     def drivers(self, kind: str, refresh: bool = False) -> list[dict[str, Any]]:
@@ -109,6 +117,11 @@ class DeviceManager:
         for entry in self._alpaca_cache:
             if entry["kind"] == kind:
                 found.append({"backend": "alpaca", "id": entry["id"], "name": entry["name"]})
+        # A Pegasus box Unity has plugged in, listed as itself. Quiet when
+        # Unity is not running: that is a machine without one, not a fault.
+        for entry in pegasus.list_devices(kind):
+            found.append({"backend": "pegasus", "id": entry["id"],
+                          "name": entry["name"], "device": entry.get("device", "")})
         return found
 
     def scan_alpaca(self, host: str | None = None, port: int | None = None) -> int:
@@ -157,6 +170,8 @@ class DeviceManager:
                 device = zwo.create(kind, driver_id, name or driver_id)
             elif backend == "alpaca":
                 device = alpaca.create(kind, driver_id, name or driver_id)
+            elif backend == "pegasus":
+                device = pegasus.create(kind, driver_id, name or driver_id)
             else:
                 raise DeviceError(f"unknown backend {backend!r}")
 
@@ -164,6 +179,11 @@ class DeviceManager:
             # profile is shared by every telescope using that ProgID, so another
             # one must not write over the choice in between.
             options = driver_options if backend == "ascom" else None
+            if kind in ("camera", "piercam"):
+                # Where a camera says what it found on its own thread - a
+                # driver box closed, say (0.2.52e).
+                with contextlib.suppress(Exception):
+                    device.say = self.log
             guard = ascom.connect_guard() if options else contextlib.nullcontext()
             try:
                 with guard:
@@ -254,17 +274,77 @@ class DeviceManager:
             raise DeviceError(f"{KIND_LABELS.get(kind, kind)} is not connected")
         return device
 
+    #: How long the status panel waits on one device's read before showing
+    #: the last answer it had instead (0.2.50).
+    STATUS_WAIT_SECONDS = 0.3
+
+    def _kick_status(self, kind: str, device: Device) -> dict[str, Any]:
+        """One device's status, never held up for longer than STATUS_WAIT_SECONDS.
+
+        A status read is a string of driver calls, and on ASCOM they queue on
+        the telescope's one apartment thread behind whatever it is doing: a
+        synchronous Park or slew, a filter move, an image download. Read in
+        line, that froze the whole status - every telescope, the sequencer,
+        the warnings - for as long as the slowest read took, and the page
+        went on showing the moment before as if it were now. So the read runs
+        on a thread of its own, one at a time per device: when it answers in
+        time the answer is fresh; when it does not, the last answer is shown
+        marked `stale` with `statusAge` in seconds, and the read finishes on
+        its own for the next tick.
+        """
+        with self._status_lock:
+            slot = self._status_slots.get(kind)
+            if slot is None or slot["device"] is not device:
+                slot = {"device": device, "value": None, "at": 0.0,
+                        "thread": None, "done": None}
+                self._status_slots[kind] = slot
+            thread = slot["thread"]
+            if thread is None or not thread.is_alive():
+                done = threading.Event()
+
+                def read() -> None:
+                    try:
+                        value = device.status()
+                    except Exception as exc:              # noqa: BLE001 - shown, not raised
+                        value = {"connected": False, "error": str(exc)}
+                    with self._status_lock:
+                        slot["value"] = value
+                        slot["at"] = time.monotonic()
+                    done.set()
+
+                slot["done"] = done
+                slot["thread"] = threading.Thread(
+                    target=read, daemon=True,
+                    name=f"status-{self.label or 'master'}-{kind}")
+                slot["thread"].start()
+        return slot
+
+    def _collect_status(self, slot: dict[str, Any], deadline: float) -> dict[str, Any]:
+        device = slot["device"]
+        fresh = slot["done"].wait(max(0.0, deadline - time.monotonic()))
+        with self._status_lock:
+            value, at = slot["value"], slot["at"]
+        if fresh and value is not None:
+            return dict(value)
+        state = dict(value) if value is not None else {"connected": device.connected}
+        state["stale"] = True
+        state["statusAge"] = round(time.monotonic() - at, 1) if at else None
+        return state
+
     def status(self) -> dict[str, Any]:
         out: dict[str, Any] = {}
+        # Every device's read is started first and then all are waited on
+        # together, so two slow devices cost one wait, not two.
+        slots = {kind: self._kick_status(kind, device)
+                 for kind in KINDS
+                 if (device := self._devices.get(kind)) is not None}
+        deadline = time.monotonic() + self.STATUS_WAIT_SECONDS
         for kind in KINDS:
             device = self._devices.get(kind)
-            if device is None:
+            if device is None or kind not in slots:
                 out[kind] = {"connected": False, "name": None, "backend": None}
                 continue
-            try:
-                state = device.status()
-            except Exception as exc:
-                state = {"connected": False, "error": str(exc)}
+            state = self._collect_status(slots[kind], deadline)
             state["name"] = device.name
             state["backend"] = self._backends.get(kind)
             state["driverId"] = device.driver_id

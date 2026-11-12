@@ -38,3 +38,8 @@ equipment.json
 # Scratch that lives beside the project but is not part of it.
 rockwood_planetarium*.py
 run-test.log
+
+# Check scratch folders written by tools/check_*.py
+checks*/
+*.orig
+*.rej

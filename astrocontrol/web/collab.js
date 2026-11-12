@@ -23,20 +23,7 @@
     targets: [],         // your own targets, to aim a simple collaboration at
     settingsSynced: false,
     loading: false,
-    // Cards opened with a double-click, by project id, and what each has
-    // fetched about who contributed: {at, data} or {at, error}.
-    expanded: new Set(),
-    people: new Map(),
-    lastRefresh: 0,
-    // What has happened lately across the open collaborations: the feed
-    // behind the live strip and the "today" figures on each card.
-    activity: null,
   };
-
-  /* How often the open collaborations are re-read while the tab is showing.
-     Progress moves as frames are reported, a few times an hour, so a
-     minute is plenty and a page left open overnight keeps up. */
-  const REFRESH_SECONDS = 60;
 
   /* ------------------------------------------------------------- helpers */
 
@@ -123,6 +110,20 @@
     node.title = names.length ? names.join('\n') : 'nobody has checked in lately';
     const share = $('colShare');
     if (share && status.sharePosition !== undefined) share.checked = status.sharePosition !== false;
+    drawUpload();
+  }
+
+  /** The auto-upload switch and its one-line status. */
+  function drawUpload() {
+    const up = (col.state || {}).autoUpload || {};
+    const box = $('colAutoUpload');
+    if (box && up.enabled !== undefined) box.checked = !!up.enabled;
+    const line = $('colUploadLine');
+    if (!line) return;
+    line.hidden = !up.enabled && !(up.counts && Object.keys(up.counts).length);
+    line.textContent = up.line || '';
+    const refused = (up.refused || []).map((r) => `${r.file}: ${r.why}`);
+    line.title = [up.lastError ? `Last error: ${up.lastError}` : '', ...refused].filter(Boolean).join('\n');
   }
 
   /** Who this program is on the server, and the buttons that follow from it. */
@@ -371,8 +372,7 @@
     const name = ($('colPName').value || '').trim();
     if (!name) { app.toast('Give it a name', 'error'); return; }
 
-    const body = { name, notes: ($('colPNotes').value || '').trim(),
-                   collectFiles: !!($('colPCollect') && $('colPCollect').checked) };
+    const body = { name, notes: ($('colPNotes').value || '').trim() };
     // Editing keeps the region it has unless a new one was chosen; starting
     // needs one either way.
     const editing = col.editing;
@@ -419,16 +419,9 @@
       minMoonSeparation: num('colRMoonSep'),
       minAltitude: num('colRMinAlt'),
       requireCalibrated: $('colRCalibrated').checked,
-      // A colour camera's data is its own band, taken only when the
-      // project lists it: ticking a box puts the band among the filters.
-      acceptOscRgb: $('colROscRgb').checked,
-      acceptOscNarrowband: $('colROscNb').checked,
-      acceptColour: $('colROscRgb').checked || $('colROscNb').checked,
+      acceptColour: $('colRColour').checked,
       colourMaxMoon: colourMoon === null ? null : colourMoon / 100,
-      maxBortle: num('colRMaxBortle'),
     };
-    if ($('colROscRgb').checked && !('OSC-RGB' in filters)) filters['OSC-RGB'] = null;
-    if ($('colROscNb').checked && !('OSC-Ha+OIII' in filters)) filters['OSC-Ha+OIII'] = null;
     body.goals = goals;
     // One target or a region to cover. A saved mosaic target picked under
     // "one target" is still a region to cover; a single framing is one spot.
@@ -449,7 +442,6 @@
       endEdit();
       $('colPName').value = '';
       $('colPNotes').value = '';
-      if ($('colPCollect')) $('colPCollect').checked = false;
       col.filters = [];
       app.state.collabRegion = null;
       drawFilterRows();
@@ -472,70 +464,6 @@
    *  target and puts that target in the plan — three steps only in the sense
    *  that the program does three things.
    */
-  /** A person's picture as a small round face, or their initial. */
-  function face(person, extra = '', title = '') {
-    const cls = `col-face${extra ? ` ${extra}` : ''}`;
-    const name = person.ownerName || person.person || person.name || '?';
-    const hint = title || name;
-    return person.avatar
-      ? `<img class="${cls}" src="${esc(person.avatar)}" alt="" title="${esc(hint)}" loading="lazy">`
-      : `<span class="${cls} blank" title="${esc(hint)}">${esc(name.slice(0, 1).toUpperCase())}</span>`;
-  }
-
-  /** One face per person among a list of telescopes, the shooting ones ringed. */
-  function faces(telescopes) {
-    const seen = new Map();
-    for (const t of telescopes) {
-      const key = t.ownerName || t.name || t.id;
-      const shooting = ['imaging', 'exposing'].includes(t.state || '');
-      const held = seen.get(key);
-      if (!held) {
-        seen.set(key, { ...t, shooting, hint: `${t.ownerName || t.name}${t.ownerName ? ` · ${t.name}` : ''}${t.target ? ` — ${t.target}` : ''}` });
-      } else if (shooting && !held.shooting) {
-        held.shooting = true;
-      }
-    }
-    return [...seen.values()].map((p) => face(p, p.shooting ? 'shooting' : '', p.hint)).join('');
-  }
-
-  /** The night as it is happening: who is on the sky, who is shooting,
-   *  and the frames landing, scrolling past. The list of collaborations
-   *  below is the ledger; this is the reason to open the tab. */
-  function drawLive() {
-    const node = $('colLive');
-    if (!node) return;
-    const status = col.state || {};
-    const who = status.presence || {};
-    if (!status.configured || who.online === undefined) { node.hidden = true; return; }
-    const online = (who.telescopes || []).filter((t) => t.online);
-    const shooting = online.filter((t) => ['imaging', 'exposing'].includes(t.state || ''));
-    const people = who.people || 0;
-    const feed = ((col.activity || {}).events || []).slice(0, 14);
-    const now = Number((col.activity || {}).serverTime) || (Date.now() / 1000);
-    const lines = feed.map((e) => {
-      const whoDid = esc(e.person || e.telescope || 'somebody');
-      if (e.kind === 'frames') {
-        return `<span class="col-ticker-item">${esc(ago(now - e.at))} · <b>${whoDid}</b> put `
-          + `${e.frames} × ${esc(e.filter)} on <b>${esc(e.projectName)}</b> (${(e.seconds / 3600).toFixed(1)} h)</span>`;
-      }
-      return `<span class="col-ticker-item">${esc(ago(now - e.at))} · <b>${whoDid}</b> joined `
-        + `<b>${esc(e.projectName)}</b>${e.telescope ? ` with ${esc(e.telescope)}` : ''}</span>`;
-    });
-    const count = `${online.length} telescope${online.length === 1 ? '' : 's'} on the sky`
-      + (people ? ` · ${people} ${people === 1 ? 'person' : 'people'}` : '')
-      + (shooting.length ? ` · <b class="shooting-count">${shooting.length} shooting right now</b>` : '');
-    const quiet = !online.length && !lines.length;
-    node.hidden = false;
-    node.className = `col-live${shooting.length ? ' busy' : ''}`;
-    node.innerHTML = `
-      <div class="col-live-head"><span class="live-dot"></span><b>Live</b>
-        <span class="col-live-count">${quiet ? 'quiet for the moment — the first telescope out tonight starts the party' : count}</span></div>
-      ${online.length ? `<div class="col-faces">${faces(online)}</div>` : ''}
-      ${lines.length ? `<div class="col-ticker" title="The latest frames and joins across every collaboration">
-          <div class="col-ticker-track" style="animation-duration:${Math.max(40, lines.length * 7)}s">${lines.join('')}${lines.join('')}</div>
-        </div>` : ''}`;
-  }
-
   function drawBrowse() {
     const box = $('colBrowse');
     if (!box) return;
@@ -543,9 +471,6 @@
     const projects = status.open || [];
     const joined = new Set((status.tasks || []).map((task) => task.project));
     if ($('colOpenCount')) $('colOpenCount').textContent = String(projects.length);
-    drawLive();
-    const who = status.presence || {};
-    const today = (col.activity || {}).projects || {};
 
     if (!status.configured) {
       box.innerHTML = '<p class="small muted">Press <b>Join with Discord</b> '
@@ -570,17 +495,10 @@
       else if (wants.maxFocalLength) limits.push(`${wants.maxFocalLength} mm or shorter`);
       if (wants.minScale) limits.push(`${wants.minScale}"/px or coarser`);
       if (wants.maxScale) limits.push(`${wants.maxScale}"/px or finer`);
-      const osc = [];
-      if (wants.acceptColour !== false && wants.acceptOscRgb !== false) osc.push('OSC-RGB');
-      if (wants.acceptColour !== false && wants.acceptOscNarrowband !== false) osc.push('OSC narrowband');
-      if (!osc.length) limits.push('mono cameras only');
-      else {
-        limits.push(`takes ${osc.join(' and ')}`);
-        if (wants.colourMaxMoon !== null && wants.colourMaxMoon !== undefined) {
-          limits.push(`colour cameras with the Moon under ${Math.round(wants.colourMaxMoon * 100)}%`);
-        }
+      if (wants.acceptColour === false) limits.push('mono cameras only');
+      else if (wants.colourMaxMoon !== null && wants.colourMaxMoon !== undefined) {
+        limits.push(`colour cameras with the Moon under ${Math.round(wants.colourMaxMoon * 100)}%`);
       }
-      if (wants.maxBortle) limits.push(`Bortle ${wants.maxBortle} or darker`);
       if (wants.maxHfr) limits.push(`stars within ${wants.maxHfr}"`);
       if (wants.maxGuideRms) limits.push(`guiding within ${wants.maxGuideRms}"`);
       // The project's rules for the night, which every rig on it follows.
@@ -637,33 +555,11 @@
              <input type="checkbox" data-col-turn="${esc(project.id)}" checked>
              turn to ${pa.toFixed(0)}°</label>`
         : '';
-      // Who is on it right now, and what the last day brought: the pulse of
-      // the thing, above the ledger. A card with telescopes shooting on it
-      // glows; the button to join one that is moving tonight glows too.
-      const onIt = (who.telescopes || []).filter((t) => t.online && t.project === project.id);
-      const shooting = onIt.filter((t) => ['imaging', 'exposing'].includes(t.state || ''));
-      const day = today[project.id] || {};
-      const prog = project.progress || {};
-      const thin = Object.entries(prog)
-        .map(([name, p]) => [name, Number((p || {}).average || 0)])
-        .sort((a, b) => a[1] - b[1])[0];
-      const nowText = shooting.length
-        ? `<b>${shooting.length} shooting right now</b>${onIt.length > shooting.length ? ` · ${onIt.length - shooting.length} more on it` : ''}`
-        : (onIt.length ? `${onIt.length} telescope${onIt.length === 1 ? '' : 's'} on it right now` : 'nobody on it right now');
-      const chips = [
-        day.hoursToday ? `<span class="col-chip today">+${Number(day.hoursToday).toFixed(1)} h in the last day${
-          day.peopleToday ? ` · ${day.peopleToday} ${day.peopleToday === 1 ? 'person' : 'people'}` : ''}</span>` : '',
-        thin && Object.keys(prog).length > 1
-          ? `<span class="col-chip needs" title="The filter the field is thinnest in: tonight's deals go there first">needs ${esc(thin[0])} most</span>` : '',
-      ].filter(Boolean).join('');
-      const live = `<div class="col-now">${onIt.length ? `<div class="col-faces">${faces(onIt)}</div>` : ''}
-        <span>${nowText}</span>${chips}</div>`;
-
       const action = fit.ok === false
         // Why, not just no. "Your scale is fine, your Ha is too wide" is
         // actionable; a greyed-out button is not.
         ? `<span class="small warn-text">${esc(fit.summary)}</span>`
-        : `${turn}<button class="btn small primary${!mine && (shooting.length || day.hoursToday) ? ' glow' : ''}" data-col-take="${esc(project.id)}">
+        : `${turn}<button class="btn small primary" data-col-take="${esc(project.id)}">
              ${mine ? 'Add to tonight' : 'Take part tonight'}</button>`;
 
       // Yours to change. The server owner may change anything; a member may
@@ -675,14 +571,10 @@
         || (person.signedIn && project.ownerId && project.ownerId === person.id);
       const owner = owned
         ? `<button class="btn small ghost" data-col-edit="${esc(project.id)}">Edit</button>
-           <button class="btn small ghost" data-col-redeal="${esc(project.id)}"
-                   title="Forget tonight's lists so every telescope is dealt afresh on its next poll - after changing the filters or goals">Re-deal tonight</button>
            <button class="btn small ghost danger" data-col-close="${esc(project.id)}">Close</button>`
         : '';
 
-      const open = col.expanded.has(project.id);
-      return `<div class="col-open${mine ? ' joined' : ''}${open ? ' open' : ''}${shooting.length ? ' live' : ''}" data-col-id="${esc(project.id)}"
-                   title="Double-click for the depth map and who has contributed">
+      return `<div class="col-open${mine ? ' joined' : ''}">
         <canvas class="col-sky" data-col-sky="${esc(project.id)}" width="240" height="160"
                 title="${esc(project.name)} on the sky survey"></canvas>
         <div class="col-open-body">
@@ -701,16 +593,9 @@
                 + (project.participantsOnline ? ` · ${project.participantsOnline} online now` : '')
               : 'nobody on it yet'}</div>
           ${project.notes ? `<p class="small">${esc(project.notes)}</p>` : ''}
-          ${project.filesUrl
-            ? `<p class="small">Collects the lights: upload yours at <a href="${esc(project.filesUrl)}" target="_blank" rel="noopener">${esc(project.filesUrl.replace(/^https?:\/\//, '').replace(/#.*$/, ''))}</a></p>` : ''}
           ${limits.length
             ? `<div class="small muted">Takes: ${esc(limits.join(', '))}</div>` : ''}
-          ${live}
           ${depth ? `<div class="depth-grid">${depth}</div>` : ''}
-          ${open
-            ? `<div class="col-depth" data-col-depth="${esc(project.id)}"></div>
-               <div class="col-detail" data-col-detail="${esc(project.id)}">${renderPeople(project.id)}</div>`
-            : '<div class="small muted col-hint">double-click for the depth map and who has contributed</div>'}
         </div>
       </div>`;
     }).join('');
@@ -720,40 +605,6 @@
     box.querySelectorAll('[data-col-sky]').forEach((canvas) => {
       const project = projects.find((p) => p.id === canvas.dataset.colSky);
       if (project) drawSky(canvas, project);
-    });
-
-    // An opened card carries the field's depth map: everybody's accepted
-    // frames where they really landed, each camera's field drawn at its
-    // angle. The Plan tab's own map, so the two never disagree; it keeps
-    // what it fetched across redraws, so a card opened a minute ago does
-    // not flash "Fetching…" on every refresh.
-    box.querySelectorAll('[data-col-depth]').forEach((host) => {
-      if (typeof app.buildDepthMap !== 'function') return;
-      const id = host.dataset.colDepth;
-      const task = (status.tasks || []).find((t) => t.project === id) || {};
-      const map = app.buildDepthMap({
-        collab: { project: id, share: task.share || [], visit: task.visit || {} },
-        target: {},
-      });
-      host.appendChild(map);
-      if (map.show) map.show();
-    });
-
-    // Double-click opens a card on who has contributed, as a target in the
-    // Planner opens on its framing; a click on a button or a box is not that.
-    box.querySelectorAll('[data-col-id]').forEach((card) => {
-      card.addEventListener('dblclick', (event) => {
-        if (event.target.closest('button, input, label, a')) return;
-        const id = card.dataset.colId;
-        if (col.expanded.has(id)) col.expanded.delete(id); else col.expanded.add(id);
-        window.getSelection && window.getSelection().removeAllRanges();
-        drawBrowse();
-        if (col.expanded.has(id)) loadPeople(id);
-        if (col.expanded.has(id)) {
-          const opened = box.querySelector(`[data-col-id="${CSS.escape(id)}"]`);
-          if (opened) opened.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-        }
-      });
     });
 
     box.querySelectorAll('[data-col-take]').forEach((button) => {
@@ -767,118 +618,6 @@
       button.addEventListener('click', () => closeProject(
         projects.find((p) => p.id === button.dataset.colClose)));
     });
-    box.querySelectorAll('[data-col-redeal]').forEach((button) => {
-      button.addEventListener('click', () => redealProject(
-        projects.find((p) => p.id === button.dataset.colRedeal), button));
-    });
-  }
-
-  /** Have every telescope on a collaboration dealt afresh. A list dealt
-   *  for a night holds for the night; after changing the filters or the
-   *  goals this is how the coordinator makes tonight follow. */
-  async function redealProject(project, button) {
-    if (!project) return;
-    const ok = await app.confirmAction(
-      `Deal “${project.name}” afresh for tonight? Every telescope on it gets a new `
-      + 'list the next time it polls - within ten minutes - and yours right now. '
-      + 'A telescope already shooting keeps its list until it polls.',
-      { title: 'Re-deal tonight', confirmLabel: 'Re-deal' });
-    if (!ok) return;
-    button.disabled = true;
-    try {
-      const answer = await app.api(
-        `/api/collab/projects/${encodeURIComponent(project.id)}/redeal`, 'POST');
-      col.state = answer.state || col.state;
-      const n = Number(answer.forgotten || 0);
-      app.toast(`“${project.name}”: ${n} list${n === 1 ? '' : 's'} forgotten — each telescope is dealt `
-        + 'afresh on its next poll; yours is on the plan now', 'success', 7000);
-      await load(true);
-    } catch (error) {
-      app.toast(error.message, 'error');
-    } finally {
-      button.disabled = false;
-    }
-  }
-
-  /* ------------------------------------------------- who has contributed */
-
-  const ago = (seconds) => {
-    const mins = Math.round(seconds / 60);
-    if (mins < 2) return 'just now';
-    if (mins < 90) return `${mins} min ago`;
-    const hours = Math.round(mins / 60);
-    if (hours < 36) return `${hours} h ago`;
-    return `${Math.round(hours / 24)} days ago`;
-  };
-
-  /** The opened part of a card: each person, their picture, their hours. */
-  function renderPeople(id) {
-    const held = col.people.get(id);
-    if (!held) return '<div class="small muted">fetching who has contributed…</div>';
-    if (held.error) return `<div class="small warn-text">${esc(held.error)}</div>`;
-    const data = held.data || {};
-    const people = data.people || [];
-    if (!people.length) {
-      return '<div class="small muted">Nothing accepted yet from anybody.</div>';
-    }
-    const now = Number(data.serverTime) || (Date.now() / 1000);
-    const rows = people.map((person) => {
-      const picture = person.avatar
-        ? `<img class="col-avatar" src="${esc(person.avatar)}" alt="" loading="lazy">`
-        : `<span class="col-avatar blank">${esc((person.name || '?').slice(0, 1).toUpperCase())}</span>`;
-      const filters = Object.entries(person.byFilter || {})
-        .map(([name, hours]) => `<span class="col-chip">${esc(name)} ${Number(hours).toFixed(1)}h</span>`)
-        .join('');
-      const when = person.lastReported ? `last report ${ago(now - person.lastReported)}` : '';
-      const scopes = (person.telescopes || []).join(', ');
-      return `<div class="col-person">
-        ${picture}
-        <div class="col-person-body">
-          <div><b>${esc(person.name)}</b>${scopes ? ` <span class="small muted">${esc(scopes)}</span>` : ''}</div>
-          <div class="col-chips">${filters}</div>
-          <div class="small muted">${person.frames ? `${person.frames} frames · ` : ''}${
-            person.nights ? `${person.nights} night${person.nights === 1 ? '' : 's'} · ` : ''}${esc(when)}</div>
-        </div>
-        <div class="col-person-hours mono">${Number(person.hours).toFixed(1)} h</div>
-      </div>`;
-    }).join('');
-    const total = Number(data.hours || 0).toFixed(1);
-    return `<div class="small muted col-detail-head">${people.length} ${people.length === 1 ? 'person' : 'people'} · ${total} h accepted${
-      data.refused ? ` · ${data.refused} report${data.refused === 1 ? '' : 's'} refused` : ''}</div>${rows}`;
-  }
-
-  /** Fetch who has contributed to one collaboration and fill its open card. */
-  async function loadPeople(id) {
-    try {
-      const data = await app.api(`/api/collab/projects/${encodeURIComponent(id)}/people`);
-      col.people.set(id, { at: Date.now(), data });
-    } catch (error) {
-      col.people.set(id, { at: Date.now(), error: error.message || String(error) });
-    }
-    const box = document.querySelector(`[data-col-detail="${CSS.escape(id)}"]`);
-    if (box) box.innerHTML = renderPeople(id);
-  }
-
-  /** Re-read the open collaborations and redraw them, keeping what is open.
-   *  The create form is left alone: it is the one place on the page somebody
-   *  may be in the middle of typing. */
-  async function refreshBrowse() {
-    col.lastRefresh = Date.now();
-    try {
-      col.state = await app.api('/api/collab');
-    } catch (error) {
-      console.error(error);
-      return;
-    }
-    // A ticked-off "turn to angle" box survives the redraw.
-    const turned = {};
-    document.querySelectorAll('[data-col-turn]').forEach((box) => { turned[box.dataset.colTurn] = box.checked; });
-    drawBrowse();
-    document.querySelectorAll('[data-col-turn]').forEach((box) => {
-      if (box.dataset.colTurn in turned) box.checked = turned[box.dataset.colTurn];
-    });
-    drawTask();
-    for (const id of col.expanded) loadPeople(id);
   }
 
   /** A collaboration's patch of sky on the survey, with its rectangle drawn.
@@ -890,6 +629,7 @@
    *  rectangle over a dark frame.
    */
   const skyCache = new Map();
+  const skyPending = new Set();
 
   function drawSky(canvas, project) {
     const region = project.region || {};
@@ -931,12 +671,17 @@
       ctx.fillText('E', 8, H - 5);
     };
 
-    paint(skyCache.get(url) || null);
-    if (skyCache.has(url)) return;
-    const image = new Image();
-    image.onload = () => { skyCache.set(url, image); if (canvas.isConnected) paint(image); };
-    image.onerror = () => { skyCache.set(url, null); };
-    image.src = url;
+    paint(skyCache.get(url) || window.surveyImages.cached(url) || null);
+    // Once per picture, through the shared survey fetcher: a redraw while one
+    // is loading shares it, and while the survey service is down nothing is
+    // asked for at all (see surveyimg.js).
+    if (skyCache.has(url) || skyPending.has(url)) return;
+    if (window.surveyImages.isDown()) return;
+    skyPending.add(url);
+    window.surveyImages.image(url)
+      .then((image) => { skyCache.set(url, image); if (canvas.isConnected) paint(image); })
+      .catch(() => { /* the rectangle over a dark frame is drawn already */ })
+      .finally(() => skyPending.delete(url));
   }
 
   /** Whether this program may start collaborations: the Start fold is only
@@ -961,15 +706,11 @@
     const set = (id, value) => { if ($(id)) $(id).value = value === null || value === undefined ? '' : value; };
     set('colPName', project.name || '');
     set('colPNotes', project.notes || '');
-    if ($('colPCollect')) $('colPCollect').checked = !!project.collectFiles;
     set('colRMinFocal', wants.minFocalLength);
     set('colRMaxFocal', wants.maxFocalLength);
-    const takesColour = wants.acceptColour !== false;
-    if ($('colROscRgb')) $('colROscRgb').checked = takesColour && wants.acceptOscRgb !== false;
-    if ($('colROscNb')) $('colROscNb').checked = takesColour && wants.acceptOscNarrowband !== false;
+    if ($('colRColour')) $('colRColour').checked = wants.acceptColour !== false;
     set('colRColourMoon', wants.colourMaxMoon === null || wants.colourMaxMoon === undefined
       ? '' : Math.round(wants.colourMaxMoon * 100));
-    set('colRMaxBortle', wants.maxBortle);
     if ($('colShapeMosaic') && $('colShapeOne')) {
       $('colShapeMosaic').checked = project.kind !== 'single';
       $('colShapeOne').checked = project.kind === 'single';
@@ -1129,13 +870,6 @@
     } catch (error) {
       console.error(error);
     }
-    // The feed is a nicety: an older server has none, and the tab must not
-    // wait on it or complain about it.
-    if ((col.state || {}).configured) {
-      try {
-        col.activity = await app.api('/api/collab/activity');
-      } catch (error) { /* the strip shows what presence alone can say */ }
-    }
     col.loading = false;
     drawServer();
     drawBrowse();
@@ -1159,13 +893,18 @@
       } catch (error) { app.toast(error.message, 'error'); }
     });
 
+    on('colAutoUpload', 'change', async () => {
+      const on = $('colAutoUpload').checked;
+      try {
+        await app.api('/api/settings/collab', 'POST', { autoUpload: on });
+        app.toast(on ? 'Collaboration lights will be uploaded as they are captured'
+          : 'Auto-upload is off; nothing more will be sent', 'info');
+        load(true);
+      } catch (error) { app.toast(error.message, 'error'); }
+    });
+
     on('btnColLogin', 'click', login);
     on('btnColLogout', 'click', logout);
-    // Opening the Start form puts the cursor in the name.
-    on('colStartFold', 'toggle', () => {
-      const fold = $('colStartFold');
-      if (fold && fold.open && $('colPName')) setTimeout(() => $('colPName').focus(), 150);
-    });
     on('btnColCreate', 'click', createProject);
     on('btnColAddFilter', 'click', () => {
       col.filters.push({ name: '', bandpass: null, hours: null });
@@ -1214,16 +953,10 @@
   app.onStatus((status, tab) => {
     syncSettings(app.state.settings);
     if (tab !== 'collab') { arrived = false; return; }
-    if (!arrived) {
-      arrived = true;
-      drawTargetPick();
-      col.lastRefresh = Date.now();
-      load(true);
-      return;
-    }
-    // While the tab stays open, the cards follow the server: progress moves
-    // as reports land, and a card opened on its contributors keeps up.
-    if (!col.loading && Date.now() - col.lastRefresh > REFRESH_SECONDS * 1000) refreshBrowse();
+    if (arrived) return;
+    arrived = true;
+    drawTargetPick();
+    load(true);
   });
 
   if (document.readyState === 'loading') {

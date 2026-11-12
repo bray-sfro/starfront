@@ -24,7 +24,7 @@ import urllib.error
 import urllib.request
 from typing import Any
 
-from . import collab, filters
+from . import collab
 from .capture import CaptureService
 
 #: Short: this is a poll of a few hundred bytes, and a request that hangs is a
@@ -234,10 +234,6 @@ class CollabClient:
             sensorHeight=height,
             binning=int(rig.config.get("camera", "binning", 1) or 1),
             filters={name: bandpasses.get(name) for name in names},
-            # What a sub through each delivers: a colour camera's clear
-            # filter is red, green and blue at once; a dual-band is its
-            # two lines. Read from the names; the server does the same.
-            channels={name: filters.channels(name, colour) for name in names},
             colour=colour,
             typicalHfr=self._typical_hfr(),
             typicalGuideRms=self._typical_guiding(),
@@ -258,16 +254,7 @@ class CollabClient:
                            or self._hours_from_plan() or None),
             windowFrom=str(settings.get("fromClock") or ""),
             windowTo=str(settings.get("toClock") or ""),
-            # The sky, as the operator rated it under Site.
-            bortle=self._bortle(),
         ).payload()
-
-    def _bortle(self) -> int | None:
-        try:
-            value = int(self.rigs.master.config.get("site", "bortle", None) or 0)
-        except (TypeError, ValueError):
-            return None
-        return value if 1 <= value <= 9 else None
 
     def _carried_filters(self) -> tuple[list[str], dict[str, Any]]:
         """The filters on the mount tonight, in the order the telescopes come.
@@ -366,16 +353,6 @@ class CollabClient:
             return None
         value = status.get("rmsTotal")
         return round(float(value), 2) if value else None
-
-    def requirements_for(self, project_id: str) -> dict[str, Any]:
-        """A project's rules as last heard from the server, by project id."""
-        with self._lock:
-            wants = self._by_project.get(project_id or "")
-            return dict(wants or {})
-
-    def scale(self) -> float | None:
-        """The master camera's image scale in arcseconds per pixel."""
-        return self._scale()
 
     def _scale(self) -> float | None:
         optics = self.rigs.master.config.section("optics")
@@ -534,10 +511,6 @@ class CollabClient:
                     "hfr": (hfr_px * scale) if (hfr_px is not None and scale) else None,
                     "guideRms": (row["rmsSum"] / row["rmsCount"]) if row.get("rmsCount") else None,
                     "bandpass": bandpasses.get(row["filter"]),
-                    # The channels the frames carry; a night through a
-                    # dual-band filter on a colour camera is two of them.
-                    "channels": filters.channels(row["filter"], colour),
-                    "bortle": self._bortle(),
                 })
             answer = self.report(batch)
             for row, recorded in zip(pending, answer.get("recorded") or []):
@@ -596,14 +569,6 @@ class CollabClient:
     def depth(self, project_id: str) -> dict[str, Any]:
         """Everybody's exposure on every cell of a project's region, per filter."""
         return self._call("GET", f"/api/v1/agent/projects/{project_id}/depth")
-
-    def people(self, project_id: str) -> dict[str, Any]:
-        """Who has put what into a project: each person's accepted hours."""
-        return self._call("GET", f"/api/v1/agent/projects/{project_id}/people")
-
-    def activity(self) -> dict[str, Any]:
-        """What has happened lately across the open collaborations."""
-        return self._call("GET", "/api/v1/agent/activity")
 
     def tasks(self) -> list[dict[str, Any]]:
         with self._lock:

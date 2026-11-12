@@ -45,14 +45,16 @@
   async function refresh(force = false) {
     if (!force && Date.now() - wiz.fetchedAt < 4000) return;
     wiz.fetchedAt = Date.now();
-    const [targets, plan, collab] = await Promise.all([
+    const [targets, plan, collab, pairing] = await Promise.all([
       app.api('/api/targets').then((r) => r.targets || []).catch(() => wiz.targets),
       app.api('/api/plan').catch(() => wiz.plan),
       app.api('/api/collab').catch(() => wiz.collab),
+      app.api('/api/equipment/identify').catch(() => wiz.pairing),
     ]);
     wiz.targets = targets;
     wiz.plan = plan;
     wiz.collab = collab;
+    wiz.pairing = pairing;
   }
 
   /* --------------------------------------------------------------- steps */
@@ -129,13 +131,14 @@
       key: 'equipment',
       title: 'Connect the equipment',
       body: [
-        'Pick a driver for each slot — camera, mount, filter wheel, focuser, '
-        + 'guider — once, and it is remembered: on later nights one button brings '
-        + 'the whole rig up. If you set up from N.I.N.A., the drivers are already '
-        + 'chosen; just press Connect everything.',
-        'A camera and the mount are enough to go on with; the rest can wait. If '
-        + 'N.I.N.A. is still running, close it first — a camera can only be held '
-        + 'by one program.',
+        'Each slot — camera, mount, filter wheel, focuser, guider, flat panel — is '
+        + 'connected once and remembered, so on later nights one button brings the '
+        + 'whole rig up. If you set up from N.I.N.A., the drivers are already '
+        + 'chosen; press Connect everything. The Equipment window shows every '
+        + 'telescope on the mount at a glance, with what is connected on each.',
+        'A camera on every telescope and the mount on the master are enough to go '
+        + 'on with. The rest can wait. If N.I.N.A. is still running, close it '
+        + 'first — a camera can only be held by one program.',
       ],
       actions: [['Open Equipment…', () => app.openEquipment(), true]],
       check: () => {
@@ -157,12 +160,44 @@
       },
     },
     {
+      key: 'focusers',
+      title: 'Which focuser is which',
+      body: [
+        'Three identical focusers cannot be told apart from a driver list, and on a '
+        + 'remote telescope they cannot be told apart by looking either. What can be '
+        + 'seen from anywhere is cause and effect: a focuser only changes the stars of '
+        + 'the camera it is bolted to.',
+        'Point the rig at some stars, then press the button. Each focuser is moved out '
+        + 'and back while every camera takes a frame; the camera whose star size moved '
+        + 'is on the same telescope, and one more click puts each focuser on the '
+        + 'telescope it belongs to. With one telescope there is nothing to tell apart.',
+      ],
+      actions: [['Which focuser is which?…', () => app.openIdentify(), true]],
+      check: () => {
+        if (!multiple()) return 'one telescope — nothing to tell apart';
+        const result = (wiz.pairing || {}).result;
+        if (!result) return '';
+        if (result.applied) return 'each focuser now on the telescope whose stars it moves';
+        if (result.allMatched) return 'every focuser is on its own telescope';
+        return '';
+      },
+      partial: () => {
+        const pairing = wiz.pairing || {};
+        if (pairing.running) return pairing.message || 'checking';
+        const result = pairing.result;
+        if (result && (result.moves || []).length) return 'crossed focusers found — press the button to move them';
+        if (result && result.conflict) return result.conflict;
+        return '';
+      },
+    },
+    {
       key: 'frame',
       title: 'Frame a target',
       body: [
         'The Planner shows the sky with your camera’s field drawn on it. Search for '
-        + 'an object, drag the frame, turn it, and make it a mosaic only if the '
-        + 'object is bigger than the sensor — then Save target.',
+        + 'an object, drag the frame, turn it, make it a mosaic if the object is '
+        + 'bigger than the sensor — then Save target. That framing is the thing '
+        + 'everything else refers to.',
         'Save as many as you like; the list on the right is your target list.',
       ],
       actions: [['Open the Planner', () => app.showTab('planner'), true]],
@@ -178,9 +213,10 @@
       body: [
         'The Plan tab is tonight: drag targets into it, give each one its filters '
         + 'and frame counts, and see on the graph when each is up. Auto-arrange '
-        + 'orders the night for you.',
+        + 'does the ordering and the exposures for you from the Moon and what each '
+        + 'target already has.',
         'Run sequence starts it; Run on loop runs it every night, opening at '
-        + 'dusk and parking at dawn.',
+        + 'dusk and parking at dawn. Stop, Pause and Abort & park are always there.',
       ],
       actions: [['Open the Plan', () => app.showTab('plan'), true]],
       check: () => {
@@ -200,12 +236,11 @@
       key: 'join',
       title: 'Join the collaboration',
       body: [
-        'A collaboration is a target many telescopes shoot together — usually one '
-        + 'object everybody points at, sometimes a mosaic too big for one of them. '
-        + 'The server tells each telescope what to shoot each night and keeps '
-        + 'count of the depth for all of you.',
+        'Collaborations are shared targets: a mosaic too big for one telescope, or '
+        + 'one object everybody points at, with the server handing each rig its '
+        + 'panels for the night and keeping the depth map for all of you.',
         'One button: Join with Discord. It signs you in and enrols this telescope. '
-        + 'You need to be a member of the Starfront Discord server.',
+        + 'You need to be a member of the Discord server.',
       ],
       actions: [['Open Collab', () => app.showTab('collab'), true]],
       check: () => {
@@ -221,10 +256,10 @@
       body: [
         'Every active collaboration is listed on the Collab tab with its patch of '
         + 'sky drawn on the survey. Take part tonight puts it in your plan; the '
-        + 'server chooses the filters and how deep, and the Plan tab shows what '
+        + 'server chooses which panels and how deep, and the Plan tab shows what '
         + 'your telescope will shoot.',
-        'To start your own, frame the target in the Planner and say what you '
-        + 'will accept — filters, focal length, star size.',
+        'Start a collaboration frames one target or draws a mosaic region in the '
+        + 'Planner and sets what you will accept — filters, focal length, star size.',
       ],
       actions: [
         ['Take part in one', () => app.showTab('collab'), true],

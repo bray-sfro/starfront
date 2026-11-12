@@ -132,7 +132,10 @@ case("IMAGETYP, EXPTIME, GAIN, OFFSET, XBINNING, CCD-TEMP, FILTER-less mono",
      header.get("IMAGETYP") == "Light" and header.get("EXPTIME") == 2.0
      and header.get("GAIN") == 100 and header.get("OFFSET") == 30
      and header.get("XBINNING") == 1 and abs(header.get("CCD-TEMP") - -10.2) < 1e-6)
-case("TELESCOP says which scope", header.get("TELESCOP") == "Telescope 1")
+# 0.2.53a: a generic "Telescope 1" is replaced by this PC's name (check_telescop.py).
+case("TELESCOP says which scope, never a generic 'Telescope N'",
+     header.get("TELESCOP") == svc.header_telescope()
+     and not capture_module.is_generic_telescope(str(header.get("TELESCOP"))))
 
 # Timing: the shutter, not the save.
 stamp = datetime.strptime(header["DATE-OBS"], "%Y-%m-%dT%H:%M:%S.%f").replace(tzinfo=timezone.utc)

@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as _dt
+import json
 import math
 import os
 import threading
+import itertools
 import time
 import uuid
 from pathlib import Path
@@ -18,25 +20,31 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import (allsky, astro, autoplan, calibrating, calibration, catalog,
+from . import (allsky, astro, autoplan, autoupload, calibrating, calibration, catalog,
                collabadmin, collabclient, filteroffsets, framing, logs, notify,
                overheads,
                piercam, plans, safety, schedule, solarsystem, survey)
 from . import collab
+from . import autorestart
+from .tasks import DeviceTasks, TaskBusy, TaskFailed
 from . import filters
 from . import identify
 from . import ninaimport
 from . import warnings
 from .capture import clean_target
-from .config import Config, data_root, effective_site
+from .capture import CaptureService
+from .config import Config, effective_site
 from .coverage import CoverageStore
 from .devices import phd2
 from .devices.base import DeviceError
+from .devices.manager import KIND_LABELS
 from .devices.phd2 import DEFAULT_HOST as DEFAULT_PHD2_HOST
 from .devices.phd2 import DEFAULT_PORT as DEFAULT_PHD2_PORT
-from .equipment import (MASTER_DEVICE_KINDS, RIG_SECTIONS, EquipmentStore)
+from .equipment import (MASTER_DEVICE_KINDS, RIG_DEVICE_KINDS, RIG_SECTIONS,
+                        EquipmentStore)
 from .imaging import fits, png, render
 from .plans import PlanStore
+from .camerahealth import CameraWatch
 from .rigs import RigSet
 from .sequencer import Sequencer
 from .targets import TargetStore
@@ -46,7 +54,7 @@ WEB_DIR = Path(__file__).parent / "web"
 # Settings sections that describe the observatory rather than one telescope, and
 # so travel with an equipment profile as a single shared block.
 SHARED_SECTIONS = ("site", "capture", "schedule", "guiding", "solver",
-                   "calibration", "recovery", "livestack")
+                   "calibration", "recovery")
 
 # Idempotent, and here as well as in run.py because uvicorn can import this
 # module directly (--reload, or `uvicorn astrocontrol.main:app`).
@@ -59,6 +67,28 @@ library = calibration.Library(config)
 # telescope: they download over the same bus and slew on the same mount.
 overhead_store = overheads.OverheadStore()
 rigs = RigSet(config, equipment, library, overhead_store)
+
+
+def _recall_last_night() -> None:
+    """Put the most recent night's subs back in the viewer's list.
+
+    Off the main thread: the capture root may be a Dropbox folder, and a
+    program that opens only once the disk has been read is one that opens
+    late on a slow morning.
+    """
+    for telescope in rigs.all:
+        try:
+            count = telescope.capture.recall_recent()
+        except Exception as exc:                        # noqa: BLE001
+            rigs.log(f"Could not read back last night's frames: {exc}", "warn")
+            continue
+        if count:
+            plural = "s" if count != 1 else ""
+            rigs.log(f"{telescope.name}: {count} sub{plural} from the most recent "
+                     "night are back in the viewer")
+
+
+threading.Thread(target=_recall_last_night, name="recall-frames", daemon=True).start()
 targets = TargetStore()
 surveys = survey.SurveyImages()
 coverage = CoverageStore()
@@ -92,6 +122,16 @@ sequencer.extra_aborts.append(pairing.abort)
 collab_client = collabclient.CollabClient(rigs, config, targets, log=rigs.log)
 collab_client.start()
 
+# Sending the collaboration lights this PC shoots, and their masters, to the
+# server - off until switched on, in the daytime by default, on a thread of
+# its own at low priority. Every rig's capture feeds the one queue.
+uploader = autoupload.AutoUploader(
+    config, collab_client, library, log=rigs.log,
+    site=lambda: effective_site(config, rigs.master.manager))
+# On the class, so a rig added later feeds it too.
+CaptureService.shared_uploader = uploader
+uploader.start()
+
 # The other half of the same conversation: administering a collaboration rather
 # than contributing to one. Stateless, starts nothing, and holds the coordinator
 # token so it never has to reach the browser.
@@ -114,15 +154,20 @@ safety_watcher = safety.SafetyWatcher(
     log=rigs.log)
 sequencer.safety = safety_watcher
 
+# After a weather shutdown, the night started again once it has been safe a
+# while (0.2.53a). Alerts go through the same "safety" channel.
+auto_restart = autorestart.AutoRestart(
+    lambda: config.section("safety"), sequencer,
+    notify=lambda subject, body: notifier.send("safetyRestart", subject, body),
+    log=rigs.log)
+safety_watcher.auto_restart = auto_restart
+sequencer.on_weather_shutdown = auto_restart.arm
+
 # Everything that could quietly go wrong, watched on a timer and said out
 # loud: the board the strip at the top of the window reads, and the source
 # of the "warning" notifications.
 warning_board = warnings.WarningBoard(log=rigs.log, notifier=notifier)
 sequencer.warnings = warning_board
-# The run refuses a sub the collaboration's star-size rule would refuse, so
-# it needs the rules and the scale the report is made in.
-sequencer.collab_rules = collab_client.requirements_for
-sequencer.collab_scale = collab_client.scale
 
 
 def _night_bounds() -> tuple[float | None, float | None] | None:
@@ -179,6 +224,86 @@ safety_watcher.start()
 app = FastAPI(title="Starfront", version="0.1.0")
 
 
+# ---------------------------------------------------------------------------
+# Who may talk to this PC (0.2.52)
+# ---------------------------------------------------------------------------
+#
+# Starfront has always listened on 127.0.0.1 only. The fleet dashboard needs
+# to reach it over the observatory LAN, so LAN access is a setting (Settings
+# server.lanAccess, off by default); with it on, a request from anywhere but
+# this PC needs the shared fleet token in an X-Fleet-Token header. Requests
+# from this PC are never asked for anything. Started by hand with an explicit
+# --host (the old "use it from a tablet" switch) and LAN access off, the old
+# open behaviour is kept for that run only.
+
+_LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
+def _is_local(host: str | None) -> bool:
+    host = (host or "").strip()
+    return (host in _LOCAL_HOSTS or host.startswith("127.")
+            or host.startswith("::ffff:127."))
+
+
+def _lan_allowed(host: str | None, token: str | None) -> bool:
+    if _is_local(host):
+        return True
+    settings = config.section("server")
+    if settings.get("lanAccess"):
+        wanted = str(settings.get("fleetToken") or "")
+        import hmac
+        return bool(wanted) and hmac.compare_digest(str(token or ""), wanted)
+    return os.environ.get("STARFRONT_OPEN_LAN") == "1"
+
+
+@app.middleware("http")
+async def _lan_guard(request, call_next):
+    host = request.client.host if request.client else None
+    if not _lan_allowed(host, request.headers.get("x-fleet-token")):
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "LAN access to this Starfront needs the fleet token "
+                               "(Settings: server.lanAccess, server.fleetToken)"})
+    return await call_next(request)
+
+
+#: A person doing any of these takes over from an armed auto-restart (0.2.53a).
+_RESTART_CANCELLERS = (
+    "/api/sequence/", "/api/sequences/", "/api/mount/", "/api/camera/expose",
+    "/api/camera/loop", "/api/camera/cooler", "/api/focuser/", "/api/focus/run",
+    "/api/focus/offsets/run", "/api/guider/", "/api/dome/", "/api/flatpanel/",
+    "/api/calibration/")
+
+
+@app.middleware("http")
+async def _user_cancels_restart(request, call_next):
+    host = request.client.host if request.client else None
+    if request.method in ("POST", "PUT", "DELETE") \
+            and request.url.path.startswith(_RESTART_CANCELLERS) \
+            and _lan_allowed(host, request.headers.get("x-fleet-token")):
+        with contextlib.suppress(Exception):
+            auto_restart.cancel(f"user action: {request.method} {request.url.path}")
+    return await call_next(request)
+
+
+@app.post("/api/safety/autorestart/cancel")
+def cancel_auto_restart() -> dict[str, Any]:
+    cancelled = auto_restart.cancel("cancelled by hand")
+    return {"cancelled": cancelled, "status": auto_restart.status()}
+
+
+def _ensure_fleet_token() -> None:
+    settings = config.section("server")
+    if settings.get("lanAccess") and not settings.get("fleetToken"):
+        import secrets
+        config.update("server", {"fleetToken": secrets.token_urlsafe(24)})
+        rigs.log("LAN access is on: a fleet token was generated (Settings > server)",
+                 "warn")
+
+
+_ensure_fleet_token()
+
+
 def _rig(rig_id: str | None = None):
     """The telescope a request is about; the master when it does not say."""
     return _guard(rigs.get, rig_id)
@@ -220,6 +345,31 @@ def _guard(action, *args, **kwargs) -> Any:
         raise
     except Exception as exc:                       # noqa: BLE001 - driver misbehaviour
         raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+
+
+def _task(key: str, label: str, action, *args, **kwargs) -> dict[str, Any]:
+    """A device command that may take a while: see `tasks.DeviceTasks` (0.2.50).
+
+    Answers as `_guard` would when the command is over within a couple of
+    seconds; otherwise answers `pending` at once and the status carries the
+    task. The same command on the same telescope while one runs is a 409.
+    """
+    try:
+        return device_tasks.run(key, label, action, *args, **kwargs)
+    except TaskBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except TaskFailed as exc:
+        cause = exc.cause
+        if isinstance(cause, HTTPException):
+            raise cause from None
+        if isinstance(cause, DeviceError):
+            raise HTTPException(status_code=400, detail=str(cause)) from cause
+        raise HTTPException(status_code=500,
+                            detail=f"{type(cause).__name__}: {cause}") from cause
+
+
+def _rig_key(target, kind: str, what: str) -> str:
+    return f"{target.id}:{kind}:{what}"
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +476,6 @@ class SiteRequest(BaseModel):
     longitude: float | None = Field(default=None, ge=-180, le=180)
     elevation: float | None = Field(default=None, ge=-500, le=9000)
     useMount: bool | None = None
-    bortle: int | None = Field(default=None, ge=1, le=9)
 
 
 class OpticsRequest(BaseModel):
@@ -362,11 +511,32 @@ class CameraSettingsStoreRequest(BaseModel):
     offset: int | None = Field(default=None, ge=0, le=100000)
     setpoint: float | None = Field(default=None, ge=-60, le=40)
     coolAtStart: bool | None = None
+    # One switch for the whole mount: every camera that can cool is cooled
+    # when a sequence starts, whatever each telescope's own box says.
+    coolAllAtStart: bool | None = None
     warmAtEnd: bool | None = None
+    warmOnStop: bool | None = None
+    warmAtDawnIfCold: bool | None = None
     waitForCooling: bool | None = None
     coolToleranceC: float | None = Field(default=None, gt=0, le=20)
     coolTimeoutMinutes: float | None = Field(default=None, ge=1, le=180)
     warmRateCPerMinute: float | None = Field(default=None, gt=0, le=30)
+    # The power box outlets that fed this camera in 0.2.46; the Power page
+    # (`power.outlets`) is where they are assigned now.
+    powerChannels: list[str] | None = Field(default=None, max_length=16)
+
+
+class PowerSettingsRequest(BaseModel):
+    """Which piece of gear each outlet on the power box feeds.
+
+    Outlet name (as the box reports it) -> device key: "<telescope id>:<kind>"
+    for the gear on one optical train, the bare kind for the mount, guider,
+    pier camera, safety monitor and dome.  Null or blank unassigns.  The whole
+    table is sent at once: the page shows every outlet, so a save says where
+    every outlet goes.
+    """
+
+    outlets: dict[str, str | None] = Field(default_factory=dict, max_length=64)
 
 
 class SafetySettingsRequest(BaseModel):
@@ -376,6 +546,25 @@ class SafetySettingsRequest(BaseModel):
     resumeAfterSeconds: float | None = Field(default=None, ge=0, le=86400)
     unreachableIsUnsafe: bool | None = None
     blockStart: bool | None = None
+    # The network safety source (0.2.53a).
+    source: str | None = Field(default=None, pattern="^(|alpaca)$")
+    alpacaScheme: str | None = Field(default=None, pattern="^(http|https)$")
+    alpacaHost: str | None = Field(default=None, max_length=200,
+                                   pattern=r"^[A-Za-z0-9.\-]*$")
+    alpacaPort: int | None = Field(default=None, ge=0, le=65535)
+    alpacaBasePath: str | None = Field(default=None, max_length=200,
+                                       pattern=r"^[A-Za-z0-9._~/\-]*$")
+    alpacaDevice: int | None = Field(default=None, ge=0, le=9999)
+    alpacaCheckRoofState: bool | None = None
+    alpacaTimeoutSeconds: float | None = Field(default=None, ge=1, le=60)
+    alpacaPollSeconds: float | None = Field(default=None, ge=5, le=300)
+    staleSeconds: float | None = Field(default=None, ge=30, le=3600)
+    maxClockSkewSeconds: float | None = Field(default=None, ge=5, le=3600)
+    debounceSeconds: float | None = Field(default=None, ge=0, le=900)
+    confirmReads: int | None = Field(default=None, ge=1, le=10)
+    autoRestart: bool | None = None
+    autoRestartMaxPerNight: int | None = Field(default=None, ge=0, le=20)
+    autoRestartCoolTimeoutMinutes: float | None = Field(default=None, ge=1, le=120)
 
 
 class NotifySettingsRequest(BaseModel):
@@ -415,6 +604,11 @@ class CollabSettingsRequest(BaseModel):
     # Whether the others may see where this telescope points and what it is
     # shooting. Never the observatory's location.
     sharePosition: bool | None = None
+    # Auto-upload of collaboration lights (astrocontrol/autoupload.py).
+    autoUpload: bool | None = None
+    autoUploadRigs: list[str] | None = Field(default=None, max_length=20)
+    autoUploadMbit: float | None = Field(default=None, ge=0, le=1000)
+    autoUploadDaytimeOnly: bool | None = None
 
 
 class CollabTaskRequest(BaseModel):
@@ -458,8 +652,6 @@ class CollabProjectRequest(BaseModel):
     # Hours wanted at every point in the region, per filter.
     goals: dict[str, float] = Field(default_factory=dict)
     notes: str = Field(default="", max_length=2000)
-    # Collect contributors' lights on the server, for stacking.
-    collectFiles: bool = False
 
 
 class CollabDelegateRequest(BaseModel):
@@ -558,6 +750,7 @@ class SequencerSettingsRequest(BaseModel):
     filterOffsets: dict[str, int] | None = Field(default=None)
     useFilterOffsets: bool | None = None
     meridianFlipEnabled: bool | None = None
+    flipLimitMinutes: float | None = Field(default=None, ge=0, le=180)
     flipPauseMinutes: float | None = Field(default=None, ge=0, le=120)
     flipAfterMinutes: float | None = Field(default=None, ge=0, le=120)
     flipSolve: bool | None = None
@@ -571,6 +764,13 @@ class SequencerSettingsRequest(BaseModel):
     solveEveryFrames: int | None = Field(default=None, ge=0, le=200)
     pointingWarnArcmin: float | None = Field(default=None, gt=0, le=120)
     focusWarnPercent: float | None = Field(default=None, ge=0, le=200)
+    # 0.2.53b: the roof at the start of a target.
+    openRoofAtStart: bool | None = None
+    requireSafetyToOpen: bool | None = None
+    roofOpenTimeoutSeconds: float | None = Field(default=None, ge=10, le=1800)
+    pauseLightsUnlessRoofOpen: bool | None = None
+    closeRoofAtEnd: bool | None = None
+    reopenRoofOnAutoRestart: bool | None = None
 
 
 class GuidingSettingsRequest(BaseModel):
@@ -624,7 +824,9 @@ class RecoverySettingsRequest(BaseModel):
     guideGraceSeconds: float | None = Field(default=None, ge=0, le=600)
     guideRestartAttempts: int | None = Field(default=None, ge=0, le=20)
     recalibrateAfterAttempts: int | None = Field(default=None, ge=0, le=20)
-    guideRmsFaultArcsec: float | None = Field(default=None, ge=0, le=600)
+    roughGuidingArcsec: float | None = Field(default=None, ge=0, le=60)
+    roughGuidingFrames: int | None = Field(default=None, ge=1, le=20)
+    roughGuidingRetryMinutes: float | None = Field(default=None, ge=0, le=240)
     discardLostFrames: bool | None = None
     pointingRecovery: bool | None = None
     recentreArcmin: float | None = Field(default=None, gt=0, le=600)
@@ -632,6 +834,12 @@ class RecoverySettingsRequest(BaseModel):
     frameRetryAttempts: int | None = Field(default=None, ge=0, le=20)
     frameRetrySeconds: float | None = Field(default=None, ge=0, le=600)
     reconnectDevices: bool | None = None
+    reconnectManualCaptures: bool | None = None
+    hungSeconds: float | None = Field(default=None, ge=30, le=1800)
+    powerCycleCameras: bool | None = None
+    powerCycleAfterReconnects: int | None = Field(default=None, ge=0, le=10)
+    powerCycleOffSeconds: float | None = Field(default=None, ge=1, le=300)
+    powerCycleBootSeconds: float | None = Field(default=None, ge=0, le=600)
     maxPerTarget: int | None = Field(default=None, ge=0, le=100)
     cooldownSeconds: float | None = Field(default=None, ge=0, le=3600)
     onGiveUp: str | None = Field(default=None, pattern="^(next|stop|park)$")
@@ -792,16 +1000,6 @@ class AllSkySettingsRequest(BaseModel):
     decMin: float | None = Field(default=None, ge=-90, le=90)
     decMax: float | None = Field(default=None, ge=-90, le=90)
     overlap: float | None = Field(default=None, ge=0, le=0.9)
-
-
-class LiveStackSettingsRequest(BaseModel):
-    enabled: bool | None = None
-    stackOwnTargets: bool | None = None
-    share: bool | None = None
-    removeGradient: bool | None = None
-    stackUncalibrated: bool | None = None
-    # Zero is the camera's own resolution.
-    maxPixels: int | None = Field(default=None, ge=0, le=16384)
 
 
 class CalibrationSettingsRequest(BaseModel):
@@ -1181,7 +1379,51 @@ def add_log(body: LogRequest) -> dict[str, Any]:
     return {"logged": True}
 
 
+_snapshot_seq = itertools.count(1)
+
+
 def _snapshot() -> dict[str, Any]:
+    """The whole status, every section guarded (0.2.50).
+
+    One section that raised - a pier camera feed gone wrong, a collab client
+    mid-reconnect - used to take the whole status with it: /api/status was a
+    500 and the socket closed, so the page went "offline" and reconnected into
+    the same exception, over and over, showing the last good tick as if it
+    were now. A failing section now comes back as its fallback, named in
+    `sectionErrors`, and everything else still flows. `serverTime` and `seq`
+    let the page tell a live status from a stale one.
+    """
+    errors: dict[str, str] = {}
+
+    def part(name: str, read, fallback: Any = None) -> Any:
+        try:
+            return read()
+        except Exception as exc:                        # noqa: BLE001 - reported, not raised
+            errors[name] = f"{type(exc).__name__}: {exc}"
+            return {} if fallback is None else fallback
+
+    payload = part("core", _snapshot_core)
+    for name, read in (("sequence", lambda: {**sequencer.status(),
+                                             "shutdown": dict(shutdown_task)}),
+                       ("piercam", pier.status), ("safety", safety_watcher.status),
+                       ("notify", notifier.status), ("filterOffsets", offsets_run.status),
+                       ("collab", collab_client.status),
+                       ("calibration", lambda: {**calibrator.status(),
+                                                "libraryRoot": str(library.root)}),
+                       ("events", lambda: rigs.recent_events(60)),
+                       ("warnings", warning_board.snapshot),
+                       ("tasks", device_tasks.snapshot)):
+        payload[name] = part(name, read, [] if name in ("events", "tasks") else None)
+    payload.setdefault("devices", {})
+    payload.setdefault("rigs", [])
+    payload["serverTime"] = time.time()
+    payload["seq"] = next(_snapshot_seq)
+    if errors:
+        payload["sectionErrors"] = errors
+    return payload
+
+
+def _snapshot_core() -> dict[str, Any]:
     master = rigs.master
     site = effective_site(config, master.manager)
     # Every telescope's state, gathered once. The master's slice is then reused
@@ -1206,27 +1448,15 @@ def _snapshot() -> dict[str, Any]:
         "devices": mine.get("devices", {}),
         "capture": mine.get("capture", {}),
         "solver": mine.get("solver", {}),
-        "livestack": mine.get("livestack", {}),
         "rigs": everything,
         "masterRig": master.id,
-        "sequence": {**sequencer.status(), "shutdown": dict(shutdown_task)},
-        # Carries the frame token, so the feed knows when to fetch a new picture
-        # without polling the image itself.
-        "piercam": pier.status(),
-        # The weather, and whether anybody is being told about it.
-        "safety": safety_watcher.status(),
-        "notify": notifier.status(),
-        "filterOffsets": offsets_run.status(),
-        "collab": {**collab_client.status(), "me": _me_brief()},
-        # The run, plus where the library resolved to — the settings form shows
-        # the folder a blank field actually means.
-        "calibration": {**calibrator.status(), "libraryRoot": str(library.root)},
+        # sequence, piercam (carries the frame token), safety, notify,
+        # filterOffsets, collab, calibration (with where the library resolved
+        # to), events, warnings and tasks are added by `_snapshot`, each on
+        # its own guard.
         "site": site,
         "lst": (round(astro.local_sidereal_hours(site["longitude"]), 6)
                 if site.get("longitude") is not None else None),
-        "events": rigs.recent_events(60),
-        # What is wrong right now, most serious first.
-        "warnings": warning_board.snapshot(),
     }
 
 
@@ -1240,6 +1470,21 @@ def acknowledge_warning(key: str) -> dict[str, Any]:
     """Seen it: the warning stays on the list but leaves the strip until it
     changes level or comes back after clearing."""
     if not warning_board.acknowledge(key):
+        raise HTTPException(status_code=404, detail="no such warning")
+    return warning_board.snapshot()
+
+
+@app.post("/api/warnings/{key}/dismiss")
+def dismiss_warning(key: str) -> dict[str, Any]:
+    """Take a warning off the board altogether.
+
+    Meant for the sticky ones: a run's own warnings mark an event, and the
+    run is the only thing that clears them - at its next start, or when the
+    thing comes right. The morning after, neither has happened, and a
+    warning about last night's cloud has nothing left to say. A condition
+    the watchdog can see for itself just comes back on its next pass.
+    """
+    if not warning_board.clear(key):
         raise HTTPException(status_code=404, detail="no such warning")
     return warning_board.snapshot()
 
@@ -1413,6 +1658,8 @@ def set_cooler(body: CoolerRequest, rig: str | None = None,
         if body.on is not None:
             _guard(camera.set_cooler, body.on)
             target.manager.log(f"Cooler {'on' if body.on else 'off'}")
+        # So a camera reconnected after a failed frame comes back the same.
+        target.note_cooler(on=body.on, setpoint=body.setpoint)
         return {"ok": True}
 
     done: list[str] = []
@@ -1434,6 +1681,7 @@ def set_cooler(body: CoolerRequest, rig: str | None = None,
             if body.on is not None:
                 camera.set_cooler(body.on)
                 telescope.manager.log(f"Cooler {'on' if body.on else 'off'}")
+            telescope.note_cooler(on=body.on, setpoint=body.setpoint)
             done.append(telescope.name)
         except DeviceError as exc:
             skipped.append({"rig": telescope.id, "name": telescope.name,
@@ -1449,8 +1697,14 @@ def set_cooler(body: CoolerRequest, rig: str | None = None,
 @app.post("/api/camera/settings")
 def set_camera_settings(body: CameraSettingsRequest,
                         rig: str | None = None) -> dict[str, Any]:
-    camera = _guard(_rig(rig).manager.require, "camera")
+    target = _rig(rig)
+    camera = _guard(target.manager.require, "camera")
     _guard(camera.set_settings, body.binning, body.gain, body.offset)
+    # With no gain/offset in the telescope's settings, what the panel was set
+    # to is what a reconnect puts back and what each light is checked against.
+    if body.gain is not None or body.offset is not None:
+        with contextlib.suppress(Exception):
+            target.note_camera_settings(body.gain, body.offset, "the Camera panel")
     return {"ok": True}
 
 
@@ -1462,11 +1716,12 @@ def set_camera_settings(body: CameraSettingsRequest,
 def set_filter(body: FilterRequest, rig: str | None = None) -> dict[str, Any]:
     target = _rig(rig)
     wheel = _guard(target.manager.require, "filterwheel")
-    _guard(wheel.set_position, body.position)
     names = wheel.names
     label = names[body.position] if body.position < len(names) else str(body.position)
+    result = _task(_rig_key(target, "filterwheel", "position"),
+                   f"{target.name}: filter to {label}", wheel.set_position, body.position)
     target.manager.log(f"Filter -> {label}")
-    return {"ok": True}
+    return result
 
 
 @app.post("/api/filterwheel/names")
@@ -1485,15 +1740,29 @@ def set_filter_names(body: FilterNamesRequest,
 def move_focuser(body: FocuserMoveRequest, rig: str | None = None) -> dict[str, Any]:
     target = _rig(rig)
     focuser = _guard(target.manager.require, "focuser")
+    key = _rig_key(target, "focuser", "move")
+    # A focuser that has stopped answering (Move Failure, 0 steps at -273 C)
+    # is reconnected - it alone - and the move made once more (0.2.52d).
+    health = getattr(target, "focus_health", None)
+
+    def moved(action, value, what):
+        if health is None:
+            return action(focuser, value)
+        return health.call(lambda f: action(f, value), what)
+
     if body.position is not None:
-        _guard(focuser.move_to, body.position)
+        result = _task(key, f"{target.name}: focuser to {body.position}",
+                       moved, lambda f, v: f.move_to(v), body.position,
+                       "moving the focuser")
         target.manager.log(f"Focuser -> {body.position}")
     elif body.delta is not None:
-        _guard(focuser.move_relative, body.delta)
+        result = _task(key, f"{target.name}: focuser {body.delta:+d} steps",
+                       moved, lambda f, v: f.move_relative(v), body.delta,
+                       "moving the focuser")
         target.manager.log(f"Focuser {body.delta:+d} steps")
     else:
         raise HTTPException(status_code=400, detail="provide either position or delta")
-    return {"ok": True}
+    return result
 
 
 @app.post("/api/focuser/halt")
@@ -1515,17 +1784,17 @@ def halt_focuser(rig: str | None = None) -> dict[str, Any]:
 @app.post("/api/mount/slew")
 def slew(body: SlewRequest) -> dict[str, Any]:
     mount = _guard(manager.require, "mount")
-    _guard(mount.slew_to, body.ra, body.dec)
+    result = _task("mount:slew", "Slewing", mount.slew_to, body.ra, body.dec)
     manager.log(f"Slewing to RA {body.ra:.4f}h  Dec {body.dec:+.3f}")
-    return {"ok": True}
+    return result
 
 
 @app.post("/api/mount/sync")
 def sync(body: SlewRequest) -> dict[str, Any]:
     mount = _guard(manager.require, "mount")
-    _guard(mount.sync_to, body.ra, body.dec)
+    result = _task("mount:sync", "Syncing the mount", mount.sync_to, body.ra, body.dec)
     manager.log(f"Synced to RA {body.ra:.4f}h  Dec {body.dec:+.3f}")
-    return {"ok": True}
+    return result
 
 
 @app.post("/api/mount/abort")
@@ -1539,25 +1808,26 @@ def abort_slew() -> dict[str, Any]:
 @app.post("/api/mount/tracking")
 def set_tracking(body: TrackingRequest) -> dict[str, Any]:
     mount = _guard(manager.require, "mount")
-    _guard(mount.set_tracking, body.on)
+    result = _task("mount:tracking", f"Tracking {'on' if body.on else 'off'}",
+                   mount.set_tracking, body.on)
     manager.log(f"Tracking {'on' if body.on else 'off'}")
-    return {"ok": True}
+    return result
 
 
 @app.post("/api/mount/park")
 def park() -> dict[str, Any]:
     mount = _guard(manager.require, "mount")
-    _guard(mount.park)
+    result = _task("mount:park", "Parking the mount", mount.park)
     manager.log("Parking mount")
-    return {"ok": True}
+    return result
 
 
 @app.post("/api/mount/unpark")
 def unpark() -> dict[str, Any]:
     mount = _guard(manager.require, "mount")
-    _guard(mount.unpark)
+    result = _task("mount:unpark", "Releasing the mount from park", mount.unpark)
     manager.log("Mount unparked")
-    return {"ok": True}
+    return result
 
 
 @app.post("/api/mount/jog")
@@ -1603,15 +1873,18 @@ def stop_jog(body: JogStopRequest | None = None) -> dict[str, Any]:
 def move_rotator(body: RotatorMoveRequest, rig: str | None = None) -> dict[str, Any]:
     target = _rig(rig)
     rotator = _guard(target.manager.require, "rotator")
+    key = _rig_key(target, "rotator", "move")
     if body.position is not None:
-        _guard(rotator.move_absolute, body.position)
+        result = _task(key, f"{target.name}: rotator to {body.position:g}°",
+                       rotator.move_absolute, body.position)
         target.manager.log(f"Rotator -> position angle {body.position:g}°")
     elif body.delta is not None:
-        _guard(rotator.move_relative, body.delta)
+        result = _task(key, f"{target.name}: rotator {body.delta:+g}°",
+                       rotator.move_relative, body.delta)
         target.manager.log(f"Rotator {body.delta:+g}°")
     else:
         raise HTTPException(status_code=400, detail="provide either position or delta")
-    return {"ok": True}
+    return result
 
 
 @app.post("/api/rotator/halt")
@@ -1681,6 +1954,8 @@ def set_output(body: OutputRequest, rig: str | None = None) -> dict[str, Any]:
 
 #: The guider command in flight, if any. One at a time, because PHD2 is one
 #: program with one socket and two overlapping `guide` calls confuse it.
+device_tasks = DeviceTasks(log=lambda message, level: rigs.log(message, level))
+
 guider_task: dict[str, Any] = {"busy": False, "what": "", "error": None,
                                "since": 0.0}
 
@@ -1839,10 +2114,6 @@ def collab_login_poll() -> dict[str, Any]:
         config.update("collab", {"userToken": answer["token"],
                                  "user": {"id": user.get("id") or "",
                                           "name": user.get("name") or "",
-                                          # The Discord picture's hash, for
-                                          # this telescope's own mark on the
-                                          # planetarium.
-                                          "avatar": str(user.get("avatar") or ""),
                                           "admin": bool(user.get("admin")),
                                           "canStart": bool(user.get("canStart"))},
                                  "coordinator": user.get("name") or ""})
@@ -2033,8 +2304,97 @@ def _collab_geometry(task: dict[str, Any], region: Any, field: Any,
                + ")")
     elif not match_rotation:
         how = " (rotator left where it is, not turned to the project's angle)"
+    if not single:
+        # The server deals *cells*, and a share is only the server's share if
+        # every cell lands on a panel of its own. When the server cut its
+        # cells another way than the one above - a rotator rig is tiled
+        # north-up with the camera's raw field, while the grid above is laid
+        # at the project's angle, which at 270 degrees swaps the rows and the
+        # columns - matching by nearest centre folded eight contiguous cells
+        # onto six panels in two separate columns. So the grid follows the
+        # server's cells whenever this camera can lay them.
+        fitted = _grid_on_cells(task, region, field, overlap,
+                                [angle] + ([angle + 180.0, angle + 90.0, angle + 270.0]
+                                           if turnable and match_rotation
+                                           else [angle + 180.0]))
+        if fitted is not None:
+            if _angle_gap(fitted["angle"], angle) > ANGLE_TOLERANCE:
+                how += (f" (laid on the server's cells: camera at "
+                        f"{fitted['angle'] % 360.0:.0f}° rather than {angle % 360.0:.0f}°)")
+                angle = fitted["angle"] % 360.0
+            rows, columns = fitted["rows"], fitted["columns"]
     return {"angle": angle, "align": align, "rows": rows, "columns": columns,
             "overlap": overlap, "turnable": turnable, "single": single, "how": how}
+
+
+#: How far a server cell's centre may sit from the panel it is matched to,
+#: as a fraction of the panel's short side. The server spreads its cells
+#: evenly over the region and the program steps by the overlap, so the same
+#: grid differs by a few hundredths of a degree per step; a cell a third of a
+#: panel away from every panel is a different grid, not the same one.
+CELL_MATCH_FRACTION = 0.35
+
+
+def _match_cells(cells: list[dict[str, Any]], panels: list[dict[str, Any]],
+                 limit: float) -> dict[int, int]:
+    """Server cell index -> panel index, one to one, nearest pairs first.
+
+    Pairs further apart than `limit` degrees are never made: a cell with no
+    panel under it is left out rather than folded onto a neighbour's panel,
+    which is how two cells used to become one panel and a contiguous share
+    came out with holes in it.
+    """
+    pairs = []
+    for ci, cell in enumerate(cells):
+        try:
+            cra, cdec = float(cell["ra"]) / 15.0, float(cell["dec"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        for panel in panels:
+            gap = astro.separation_degrees(float(panel["ra"]), float(panel["dec"]), cra, cdec)
+            if gap <= limit:
+                pairs.append((gap, ci, int(panel["index"])))
+    pairs.sort()
+    taken_cells: dict[int, int] = {}
+    taken_panels: set[int] = set()
+    for _gap, ci, pi in pairs:
+        if ci in taken_cells or pi in taken_panels:
+            continue
+        taken_cells[ci] = pi
+        taken_panels.add(pi)
+    return taken_cells
+
+
+def _grid_on_cells(task: dict[str, Any], region: Any, field: Any, overlap: float,
+                   angles: list[float]) -> dict[str, Any] | None:
+    """The first grid, at one of `angles`, whose panels are the server's cells.
+
+    Tried in the order given - the angle this rig would choose first - and
+    with the server's rows and columns either way round, because whether a
+    row of cells is a row of panels depends on which way the camera is
+    turned. A fit is every cell on a panel of its own and no panel spare.
+    """
+    cells = task.get("cells") or []
+    if len(cells) < 2 or not field or field[0] <= 0 or field[1] <= 0:
+        return None
+    try:
+        rows = len({int(cell["row"]) for cell in cells})
+        columns = len({int(cell["column"]) for cell in cells})
+    except (KeyError, TypeError, ValueError):
+        return None
+    if rows * columns != len(cells):
+        return None
+    limit = CELL_MATCH_FRACTION * min(field[0], field[1])
+    shapes = [(rows, columns)] + ([(columns, rows)] if rows != columns else [])
+    for angle in angles:
+        for r, c in shapes:
+            laid = framing.mosaic_panels(region.ra, region.dec, field[0], field[1],
+                                         rows=r, columns=c, overlap=overlap,
+                                         position_angle=angle % 360.0)
+            panels = [{"index": i, **p} for i, p in enumerate(laid, start=1)]
+            if len(_match_cells(cells, panels, limit)) == len(cells):
+                return {"angle": float(angle), "rows": r, "columns": c}
+    return None
 
 
 def _make_target(task: dict[str, Any], region: Any, field: Any,
@@ -2157,7 +2517,8 @@ def _camera_angle_measured(target_id: str, measured: float) -> None:
         collab_client.poll()
 
 
-def _share_panels(task: dict[str, Any], target: dict[str, Any]) -> list[int]:
+def _share_panels(task: dict[str, Any], target: dict[str, Any],
+                  quiet: bool = False) -> list[int]:
     """The task's share, as indices of the target's own panels.
 
     Matched by where the centres fall on the sky rather than by row and
@@ -2174,18 +2535,27 @@ def _share_panels(task: dict[str, Any], target: dict[str, Any]) -> list[int]:
     panels = target.get("panels") or []
     if not cells or not share or not panels:
         return []
+    # One cell, one panel. Matched over the whole grid at once, nearest
+    # pairs first, so a cell can never be folded onto a panel another cell
+    # already has; a cell with no panel near it is reported, not guessed.
+    short = min(float(target.get("panelWidth") or 0.0) or 1e9,
+                float(target.get("panelHeight") or 0.0) or 1e9)
+    limit = CELL_MATCH_FRACTION * short if short < 1e9 else 180.0
+    mapping = _match_cells(cells, panels, limit)
     chosen: list[int] = []
+    missing = []
     for index in share:
         if not 0 <= index < len(cells):
             continue
-        cell = cells[index]
-        nearest = min(
-            panels,
-            key=lambda panel: astro.separation_degrees(
-                float(panel["ra"]), float(panel["dec"]),
-                float(cell["ra"]) / 15.0, float(cell["dec"])))
-        if nearest["index"] not in chosen:
-            chosen.append(int(nearest["index"]))
+        if index in mapping:
+            if mapping[index] not in chosen:
+                chosen.append(mapping[index])
+        else:
+            missing.append(index)
+    if missing and not quiet:
+        rigs.log(f"Collaboration: {len(missing)} of the server's cells for "
+                 f"{target.get('name') or 'this target'} fall on none of its panels - "
+                 "the server's tiling and this mosaic do not match", "warn")
     return sorted(chosen)
 
 
@@ -2342,6 +2712,29 @@ def _plan_share(entry_id: str, target: dict[str, Any]) -> None:
     _guard(plan.set_options, entry_id, {"panels": list(share)})
 
 
+def _share_out_of_step(task: dict[str, Any], target: dict[str, Any],
+                       entry: dict[str, Any]) -> bool:
+    """Whether a target's grid or stamped share no longer matches its task."""
+    try:
+        if not task.get("cells") or not task.get("share") or task.get("kind") == "single":
+            return False
+        width = float(target.get("panelWidth") or 0.0)
+        height = float(target.get("panelHeight") or 0.0)
+        if width <= 0 or height <= 0:
+            return False
+        match_rotation = bool(plans.options_for(entry or {}).get("collabMatchRotation", True))
+        layout = _collab_geometry(task, collab.Region.read(task["region"]),
+                                  (width, height), match_rotation)
+        if (int(target.get("rows") or 1) != layout["rows"]
+                or int(target.get("columns") or 1) != layout["columns"]
+                or _angle_gap(target.get("rotation") or 0.0, layout["angle"]) > ANGLE_TOLERANCE):
+            return True
+        stamped = sorted(int(i) for i in ((target.get("collab") or {}).get("share") or []))
+        return stamped != _share_panels(task, target, quiet=True)
+    except Exception:                               # noqa: BLE001 - a check, never fatal
+        return False
+
+
 def _resync_task(task: dict[str, Any]) -> dict[str, Any] | None:
     """Bring an adopted target back into step with what the server now says.
 
@@ -2366,7 +2759,13 @@ def _resync_task(task: dict[str, Any]) -> dict[str, Any] | None:
     version = int(task.get("version") or 1)
     stamped = (target.get("collab") or {}).get("version")
     if stamped is not None and int(stamped) == version:
-        return None
+        # Same revision of the task - but a target laid or mapped by an older
+        # program may not match the server's cells, and would go on showing
+        # the wrong panels until the server next changed the task. Repaired
+        # here, never under a running sequence: the panels must not move
+        # beneath the telescope.
+        if sequencer.running or not _share_out_of_step(task, target, entry):
+            return None
 
     # The server may have re-tiled its cells - the camera's angle moved, or
     # this rig's rotator choice did - and the panels have to follow before the
@@ -2456,6 +2855,7 @@ def _collab_state() -> dict[str, Any]:
 
     return {
         **status,
+        "autoUpload": uploader.status(),
         # Two different questions, and they used to share one answer. A chunk
         # becomes a *target* when it is joined or accepted; whether it is being
         # shot tonight is decided separately, in the Planner, alongside every
@@ -2528,19 +2928,6 @@ def _admin_token_known() -> bool:
         return True                                # offline: believe the file
     _admin_check.update({"at": time.time(), "token": token})
     return True
-
-
-def _me_brief() -> dict[str, Any]:
-    """The signed-in person as the planetarium draws them: a name and a
-    picture. From the settings alone, so it costs nothing on the status tick."""
-    user = dict(config.get("collab", "user", {}) or {})
-    user_id = str(user.get("id") or "")
-    avatar = str(user.get("avatar") or "")
-    url = ""
-    if user_id and avatar:
-        kind = "gif" if avatar.startswith("a_") else "png"
-        url = f"https://cdn.discordapp.com/avatars/{user_id}/{avatar}.{kind}?size=64"
-    return {"name": str(user.get("name") or ""), "avatar": url}
 
 
 def _person_state() -> dict[str, Any]:
@@ -2998,26 +3385,6 @@ def collab_project_depth(project_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
-@app.get("/api/collab/projects/{project_id}/people")
-def collab_project_people(project_id: str) -> dict[str, Any]:
-    """Who has contributed what to a collaboration, for the opened card on
-    the Collab tab. Fetched as this telescope, so any participant can see it."""
-    try:
-        return collab_client.people(project_id)
-    except Exception as exc:                       # noqa: BLE001 - the server's words
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
-@app.get("/api/collab/activity")
-def collab_activity() -> dict[str, Any]:
-    """What has happened lately across the open collaborations: the life
-    behind the numbers on the Collab tab. Fetched as this telescope."""
-    try:
-        return collab_client.activity()
-    except Exception as exc:                       # noqa: BLE001 - the server's words
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
-
 @app.post("/api/collab/projects")
 def collab_add_project(body: CollabProjectRequest) -> dict[str, Any]:
     source = body.region
@@ -3043,7 +3410,7 @@ def collab_add_project(body: CollabProjectRequest) -> dict[str, Any]:
     made = _admin(collab_admin.add_project, body.name.strip(), region,
                   body.requirements, body.goals,
                   str(config.get("collab", "coordinator", "") or ""),
-                  body.notes, kind, body.collectFiles)
+                  body.notes, kind)
     # So it appears in the list straight away. A collaboration you started that
     # you cannot see is one you cannot join, and the list is fetched as an
     # *agent* while this was created as a coordinator — two different calls, and
@@ -3093,24 +3460,7 @@ class CollabProjectUpdateRequest(BaseModel):
     requirements: dict[str, Any] | None = None
     goals: dict[str, float] | None = None
     notes: str | None = Field(default=None, max_length=2000)
-    collectFiles: bool | None = None
     status: str | None = Field(default=None, pattern="^(open|closed)$")
-
-
-@app.post("/api/collab/projects/{project_id}/redeal")
-def collab_redeal_project(project_id: str) -> dict[str, Any]:
-    """Deal every rig on a collaboration afresh the next time it polls.
-
-    A list dealt for a night holds for the night, and the coordinator is
-    the one who may break that: after changing the project's filters or
-    goals, or when the dealing rules have changed under it. The server
-    forgets which night each live list was made for; this telescope polls
-    at once so its own plan follows, and the others follow on theirs.
-    """
-    made = _admin(collab_admin.redeal_project, project_id)
-    with contextlib.suppress(Exception):
-        collab_client.poll()
-    return {**made, "state": _collab_state()}
 
 
 @app.post("/api/collab/projects/{project_id}/update")
@@ -3327,6 +3677,55 @@ def switch_channels() -> dict[str, Any]:
             "channels": _guard(lambda: device.channels)}
 
 
+@app.post("/api/camera/powercycle")
+def camera_power_cycle(rig: str | None = None) -> dict[str, Any]:
+    """Cut and restore the outlets feeding one telescope's camera, by hand."""
+    return power_cycle(kind="camera", rig=rig)
+
+
+@app.post("/api/power/cycle")
+def power_cycle(kind: str = "camera", rig: str | None = None) -> dict[str, Any]:
+    """Cut and restore the outlets assigned to one device, by hand.
+
+    The same cycle recovery runs on its own at night for a camera that has
+    dropped off the USB bus and will not open for a reconnect.  Refused while
+    a sequence is running — recovery handles that case itself — and while
+    the telescope's camera is mid-frame.  Runs in the background: the off
+    time and the boot wait together are the best part of a minute.
+    """
+    target = _rig(rig)
+    label = KIND_LABELS.get(kind, kind).lower()
+    if kind == "switch" or kind not in target.kinds:
+        raise HTTPException(status_code=400,
+                            detail=f"{target.name} has no {label} slot to power-cycle")
+    if sequencer.running:
+        raise HTTPException(status_code=409, detail="the sequence is running; its own "
+                            "recovery power-cycles a camera when it has to")
+    if target.capture.busy:
+        raise HTTPException(status_code=409,
+                            detail=f"{target.name}'s camera is exposing; abort first")
+    mapping = _guard(rigs.power_mapping, target)
+    if not mapping["available"]:
+        raise HTTPException(status_code=400, detail="no power box is connected")
+    channels = (mapping["devices"].get(kind) or {}).get("channels") or []
+    if not channels:
+        raise HTTPException(status_code=400, detail=f"no outlet is assigned to "
+                            f"{target.name}'s {label} — assign its outlets under "
+                            "Equipment > Power")
+
+    def run() -> None:
+        try:
+            outcome = rigs.power_cycle_device(target, kind)
+            for message in outcome["failed"]:
+                target.manager.log(message, "error")
+        except Exception as exc:                  # noqa: BLE001 - reported in the log
+            target.manager.log(f"Power cycle failed: {exc}", "error")
+
+    threading.Thread(target=run, name=f"powercycle-{target.id}-{kind}", daemon=True).start()
+    return {"started": True, "rig": target.id, "kind": kind,
+            "channels": [c["name"] for c in channels]}
+
+
 @app.post("/api/switch")
 def switch_set(body: SwitchRequest) -> dict[str, Any]:
     """Turn an outlet on or off, or set a dew heater's level.
@@ -3423,7 +3822,11 @@ def list_images(limit: int = Query(default=200, ge=1, le=1000),
 def image_stats(image_id: str) -> dict[str, Any]:
     source = _image_source(image_id)
     record = _guard(source.record, image_id)
-    frame = _guard(source.frame, image_id)
+    frame, _ = _guard(source.frame_for_view, image_id)
+    if not record.stats:
+        # A frame recalled from disk at startup came back header-only; its
+        # statistics are worked out the first time somebody looks at it.
+        record.stats = render.statistics(frame)
     return {"image": record.summary(), "stats": record.stats,
             "autoStretch": render.auto_stretch(frame)}
 
@@ -3444,7 +3847,10 @@ def image_render(
     how the viewer keeps what is on screen sharp at any zoom."""
     if not region and maxDim < 64:
         maxDim = 64
-    frame = _guard(_image_source(image_id).frame, image_id)
+    # An unsaved frame that has left the cache is drawn from its reduced copy;
+    # the crop the viewer asks for is in the real frame's pixels, so it is
+    # scaled down with the copy and the factor reported is scaled back up.
+    frame, scale = _guard(_image_source(image_id).frame_for_view, image_id)
 
     stretch = render.auto_stretch(frame) if auto else {"black": black, "white": white,
                                                        "midtone": midtone}
@@ -3454,7 +3860,7 @@ def image_render(
     if region:
         try:
             x, y, w, h = (int(float(part)) for part in region.split(","))
-            crop = (x, y, w, h)
+            crop = (x // scale, y // scale, max(1, w // scale), max(1, h // scale))
         except Exception as exc:
             raise HTTPException(status_code=400,
                                 detail="region must be 'x,y,width,height'") from exc
@@ -3463,7 +3869,7 @@ def image_render(
     body = png.encode(array)
     return Response(content=body, media_type="image/png", headers={
         "Cache-Control": "public, max-age=3600",
-        "X-Render-Factor": str(info["factor"]),
+        "X-Render-Factor": str(info["factor"] * scale),
         "X-Render-Black": f"{info['stretch']['black']:.6f}",
         "X-Render-Midtone": f"{info['stretch']['midtone']:.6f}",
     })
@@ -3472,7 +3878,9 @@ def image_render(
 @app.get("/api/images/{image_id}/pixel")
 def image_pixel(image_id: str, x: int = Query(ge=0), y: int = Query(ge=0)) -> dict[str, Any]:
     """Raw ADU under the cursor, plus the mean of a small box around it."""
-    frame = _guard(_image_source(image_id).frame, image_id)
+    frame, scale = _guard(_image_source(image_id).frame_for_view, image_id)
+    x //= scale
+    y //= scale
     height, width = frame.shape
     if not (0 <= x < width and 0 <= y < height):
         raise HTTPException(status_code=400, detail="pixel is outside the frame")
@@ -3488,170 +3896,6 @@ def image_download(image_id: str) -> FileResponse:
         raise HTTPException(status_code=400,
                             detail="this frame was captured with saving switched off")
     return FileResponse(record.path, media_type="application/fits", filename=record.filename)
-
-
-# ---------------------------------------------------------------------------
-# The live stack
-# ---------------------------------------------------------------------------
-#
-# Tonight's lights, calibrated and folded into one picture as they land,
-# shown in the same viewer as a single sub: the same stretch, the same crop
-# at the screen's resolution, the same pan and zoom. A stack is named by the
-# target and the filter, as query parameters rather than path parts, because
-# a target is called whatever the operator typed and that can hold a slash.
-
-def _live_stack(rig: str | None, project: str, filter_name: str):
-    found = _rig(rig).stacker.stack(project, filter_name or "none")
-    if found is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"there is no live stack of {project!r} through "
-                   f"{filter_name or 'no filter'!r} tonight")
-    return found
-
-
-@app.get("/api/livestack")
-def get_livestack(rig: str | None = None) -> dict[str, Any]:
-    """What this telescope is stacking tonight, and how each stack is doing."""
-    return _rig(rig).stacker.status()
-
-
-@app.post("/api/settings/livestack")
-def set_livestack_settings(body: LiveStackSettingsRequest) -> dict[str, Any]:
-    values = body.model_dump(exclude_none=True)
-    if not values:
-        raise HTTPException(status_code=400, detail="nothing to change")
-    saved = config.update("livestack", values)
-    return {"livestack": saved}
-
-
-@app.get("/api/livestack/stats")
-def livestack_stats(project: str, filter: str = "", rig: str | None = None
-                    ) -> dict[str, Any]:
-    """The stack in the shape the viewer reads a frame in: size, statistics
-    and an auto-stretch, plus what went into it."""
-    stack = _live_stack(rig, project, filter)
-    frame, covered = stack.picture()
-    summary = stack.summary()
-    seen = frame[covered] if covered.any() else frame
-    return {
-        "image": {
-            "id": f"stack:{project}/{filter or 'none'}",
-            "filename": f"Live stack · {project} · {filter or 'no filter'}",
-            "width": int(frame.shape[1]), "height": int(frame.shape[0]),
-            "frame_type": "stack", "saved": True,
-            "object_name": project, "filter": filter or None,
-            "exposure": summary["seconds"],
-        },
-        "stats": render.statistics(frame),
-        "autoStretch": render.auto_stretch(seen.reshape(1, -1)),
-        "summary": summary,
-    }
-
-
-@app.get("/api/livestack/render.png")
-def livestack_render(
-    project: str,
-    filter: str = "",
-    rig: str | None = None,
-    auto: bool = True,
-    black: float = Query(default=0.0, ge=0.0, le=1.0),
-    white: float = Query(default=1.0, ge=0.0, le=1.0),
-    midtone: float = Query(default=0.5, gt=0.0, lt=1.0),
-    invert: bool = False,
-    maxDim: int = Query(default=1600, ge=0, le=8192),
-    region: str | None = None,
-) -> Response:
-    """The stack as a picture, exactly as `image_render` draws a frame."""
-    if not region and maxDim < 64:
-        maxDim = 64
-    stack = _live_stack(rig, project, filter)
-    frame, covered = stack.picture()
-
-    if auto:
-        # From the covered part only: an empty canvas is black, and letting
-        # it into the histogram drags the black point to zero and renders the
-        # finished part invisible.
-        seen = frame[covered] if covered.any() else frame
-        stretch = render.auto_stretch(seen.reshape(1, -1))
-    else:
-        stretch = {"black": black, "white": white, "midtone": midtone}
-    stretch["invert"] = invert
-
-    crop = None
-    if region:
-        try:
-            x, y, w, h = (int(float(part)) for part in region.split(","))
-            crop = (x, y, w, h)
-        except Exception as exc:
-            raise HTTPException(status_code=400,
-                                detail="region must be 'x,y,width,height'") from exc
-
-    array, info = render.render_png_array(frame, stretch, maxDim, crop)
-    body = png.encode(array)
-    return Response(content=body, media_type="image/png", headers={
-        # Different every few minutes and the URL carries the stack's own
-        # update time, so a long cache is safe and a stale one impossible.
-        "Cache-Control": "public, max-age=3600",
-        "X-Render-Factor": str(info["factor"]),
-        "X-Stack-Frames": str(stack.frames),
-    })
-
-
-@app.get("/api/livestack/pixel")
-def livestack_pixel(project: str, x: int = Query(ge=0), y: int = Query(ge=0),
-                    filter: str = "", rig: str | None = None) -> dict[str, Any]:
-    """The stack under the cursor: its display value and how many frames deep."""
-    stack = _live_stack(rig, project, filter)
-    frame, _ = stack.picture()
-    height, width = frame.shape
-    if not (0 <= x < width and 0 <= y < height):
-        raise HTTPException(status_code=400, detail="pixel is outside the stack")
-    box = frame[max(0, y - 2):y + 3, max(0, x - 2):x + 3]
-    return {"x": x, "y": y, "value": int(frame[y, x]),
-            "boxMean": round(float(box.mean()), 1), "boxMax": int(box.max()),
-            "frames": int(stack.coverage()[y, x])}
-
-
-@app.get("/api/livestack/download")
-def livestack_download(project: str, filter: str = "", rig: str | None = None
-                       ) -> FileResponse:
-    """The stack as a 16-bit FITS with its canvas WCS.
-
-    A quick look to keep or share, not the night's data: the values are the
-    stack's mean stretched into sixteen bits for viewing, which the header
-    says. The subs themselves are in the session folder for the real stack.
-    """
-    stack = _live_stack(rig, project, filter)
-    frame, _ = stack.picture()
-    summary = stack.summary()
-    header = {
-        **stack.canvas.header(),
-        "OBJECT": (project, "target"),
-        "FILTER": (filter or None, ""),
-        "IMAGETYP": ("Stack", "a live stack, not a single frame"),
-        "NFRAMES": (stack.frames, "frames in the stack"),
-        "EXPTIME": (float(summary["seconds"]), "total exposure, seconds"),
-        "SFSCALED": (True, "mean scaled to 16 bits for viewing"),
-        "SWCREATE": ("Starfront", ""),
-    }
-    folder = data_root() / "livestacks" / "export"
-    folder.mkdir(parents=True, exist_ok=True)
-    stem = clean_target(f"{project}_{filter or 'none'}_livestack") or "livestack"
-    path = fits.write(folder / f"{stem}.fits", frame, header)
-    return FileResponse(str(path), media_type="application/fits",
-                        filename=f"{stem}.fits")
-
-
-@app.post("/api/livestack/reset")
-def livestack_reset(project: str, filter: str = "", rig: str | None = None
-                    ) -> dict[str, Any]:
-    """Throw tonight's stack of this target away; the next frame starts it again."""
-    target = _rig(rig)
-    gone = target.stacker.discard(project, filter or "none")
-    target.manager.log(f"Live stack of {project} ({filter or 'no filter'}) "
-                       + ("started again" if gone else "was already empty"))
-    return {"reset": gone, "livestack": target.stacker.status()}
 
 
 # ---------------------------------------------------------------------------
@@ -3686,6 +3930,10 @@ def get_settings(rig: str | None = None) -> dict[str, Any]:
         collab_settings["adminToken"] = "***"
     if collab_settings.get("userToken"):
         collab_settings["userToken"] = "***"
+    server_settings = dict(everything.get("server") or config.section("server"))
+    if server_settings.get("fleetToken"):
+        server_settings["fleetToken"] = "***"
+    everything["server"] = server_settings
     return {
         **everything,
         "notify": notify_settings,
@@ -3703,6 +3951,49 @@ class MetaRequest(BaseModel):
 
     firstLightDone: bool | None = None
     firstLightStep: int | None = Field(default=None, ge=0, le=20)
+
+
+class ServerSettingsRequest(BaseModel):
+    lanAccess: bool | None = None
+    lanPort: int | None = Field(default=None, ge=1024, le=65535)
+    fleetToken: str | None = Field(default=None, min_length=16, max_length=200)
+    nodeName: str | None = Field(default=None, max_length=80)
+    regenerateToken: bool = False
+
+
+@app.get("/api/settings/server")
+def get_server_settings() -> dict[str, Any]:
+    """LAN access for the fleet dashboard. The token is shown here because
+    only this PC (or a holder of the token) can ask."""
+    return {"server": config.section("server"),
+            "restartNeeded": "LAN access and the port take effect at the next start"}
+
+
+@app.post("/api/settings/server")
+def set_server_settings(body: ServerSettingsRequest) -> dict[str, Any]:
+    values = body.model_dump(exclude_none=True)
+    regenerate = values.pop("regenerateToken", False)
+    if regenerate:
+        import secrets
+        values["fleetToken"] = secrets.token_urlsafe(24)
+    saved = config.update("server", values)
+    _ensure_fleet_token()
+    manager.log("Fleet / LAN access settings changed; restart Starfront to apply", "warn")
+    return {"server": config.section("server"), "saved": bool(saved)}
+
+
+@app.get("/api/fleet/node")
+def fleet_node() -> dict[str, Any]:
+    """What the fleet dashboard needs to know about this PC."""
+    import socket as _socket
+    from . import __version__
+    return {
+        "version": __version__,
+        "hostname": _socket.gethostname(),
+        "name": config.section("server").get("nodeName") or _socket.gethostname(),
+        "rigs": [{"id": rig.id, "name": rig.name, "role": rig.role} for rig in rigs.all],
+        "serverTime": time.time(),
+    }
 
 
 @app.post("/api/settings/meta")
@@ -3765,6 +4056,13 @@ def set_camera_defaults(body: CameraSettingsStoreRequest,
                 renamed = "and used in place of the wheel's own slot numbers"
 
     before = list(target.config.get("camera", "filterNames", []) or [])
+    # One setting for the whole mount, whichever telescope's page it was
+    # ticked on: it lives in the shared settings, never in a telescope's own.
+    if "coolAllAtStart" in values:
+        _guard(rigs.master.config.update, "camera",
+               {"coolAllAtStart": values.pop("coolAllAtStart")})
+        if not values:
+            return {"camera": target.config.section("camera")}
     saved = _guard(target.config.update, "camera", values)
     if "filterNames" in values:
         # The authority, whatever the driver did with them: applied to the live
@@ -3947,6 +4245,34 @@ def set_recovery_settings(body: RecoverySettingsRequest) -> dict[str, Any]:
     if not values:
         raise HTTPException(status_code=400, detail="nothing to change")
     return {"recovery": config.update("recovery", values)}
+
+
+@app.post("/api/settings/power")
+def set_power_settings(body: PowerSettingsRequest) -> dict[str, Any]:
+    """Which piece of gear each outlet on the power box feeds.
+
+    Shared: there is one box on the mount.  A device key has to name a
+    telescope that exists and a slot it has, so a stale key cannot be saved;
+    an unassigned outlet is simply left out of the table.
+    """
+    known = {rig.id for rig in rigs.all}
+    outlets: dict[str, str] = {}
+    for raw_name, raw_who in body.outlets.items():
+        name = " ".join(str(raw_name or "").split())[:60]
+        who = " ".join(str(raw_who or "").split())
+        if not name or not who:
+            continue
+        rig_id, _, kind = who.rpartition(":")
+        if rig_id:
+            if rig_id not in known or kind not in RIG_DEVICE_KINDS:
+                raise HTTPException(status_code=400,
+                                    detail=f"{name}: {who!r} is not a telescope's device")
+        elif kind not in MASTER_DEVICE_KINDS or kind == "switch":
+            raise HTTPException(status_code=400,
+                                detail=f"{name}: {who!r} is not something that can be fed")
+        outlets[name] = who
+    stored = config.update("power", {"outlets": outlets})
+    return {"power": stored}
 
 
 @app.post("/api/settings/solver")
@@ -4217,8 +4543,17 @@ def survey_image(
     rotation: float = Query(default=0.0, ge=-360, le=360),
     hips: str = Query(default="CDS/P/DSS2/color"),
 ) -> Response:
-    payload, cached = _guard(surveys.cutout, ra * 15.0, dec, fov, width, height,
-                             rotation, hips)
+    try:
+        payload, cached = _guard(surveys.cutout, ra * 15.0, dec, fov, width, height,
+                                 rotation, hips)
+    except HTTPException as exc:
+        cause = exc.__cause__
+        if isinstance(cause, survey.SurveyDown):
+            # 503 + Retry-After: the page backs off every survey picture for
+            # that long instead of asking again on each redraw (2026-11-03).
+            raise HTTPException(status_code=503, detail=str(cause),
+                                headers={"Retry-After": str(cause.retry_after)}) from cause
+        raise
     return Response(content=payload, media_type="image/jpeg", headers={
         "Cache-Control": "private, max-age=86400",
         "X-Survey-Cache": "hit" if cached else "miss",
@@ -5168,12 +5503,10 @@ def set_plan_filters(entry_id: str, body: PlanFiltersRequest,
     target = _rig(rig)
     rig_id = None if target.is_master else target.id
 
-    # Typed in by the operator, so Auto-arrange keeps it. Clearing every
-    # filter here hands the target back to the arranger.
     result = _guard(plan.set_filters, entry_id,
                     [f.model_dump() for f in body.filters],
                     info["panels"], info["availableSeconds"], _overheads(),
-                    rig_id, pinned=True)
+                    rig_id)
     return {**result, "availableSeconds": info["availableSeconds"],
             "panels": info["panels"], "rig": target.id}
 
@@ -5422,20 +5755,6 @@ def arrange_plan(body: ArrangeRequest | None = None) -> dict[str, Any]:
                                          "filters and frames; only its place in the "
                                          "night was arranged"]})
                 continue
-            # Filters the operator typed in are a decision, not a request.
-            # On a dim-Moon night the arranger used to swap a target's
-            # fourteen OIII subs for the broadband set and say so in a
-            # report that then disagreed with what was shot once they had
-            # been put back by hand.
-            if entry.get("filtersPinned") and any(
-                    int(row.get("count") or 0) > 0
-                    for row in (entry.get("filters") or [])):
-                chosen.append({"id": entry["id"], "name": entry["name"],
-                               "filters": entry.get("filters") or [],
-                               "notes": ["kept the filters you set on it; clear "
-                                         "them (every count to 0) to let "
-                                         "Auto-arrange choose"]})
-                continue
             separation = schedule.dark_overlap(
                 info["window"]["intervals"], moon,
                 astro.normalise_ra_hours(float(target.get("ra") or 0.0)),
@@ -5456,7 +5775,7 @@ def arrange_plan(body: ArrangeRequest | None = None) -> dict[str, Any]:
                 continue
             saved = _guard(plan.set_filters, entry["id"], picked["filters"],
                            info["panels"], info["availableSeconds"], overheads,
-                           None, pinned=False)
+                           None)
             chosen.append({
                 "id": entry["id"],
                 "name": entry["name"],
@@ -5923,6 +6242,8 @@ def _calibration_needs(target) -> list[dict[str, Any]]:
         "offset": offset,
         "temperature": temperature,
         "telescope": target.name,
+        # 0.2.53a: and the TELESCOP its frames now carry, if different.
+        "telescopes": target.capture.telescope_names(),
         "camera": camera.name if connected else "",
     }
     if connected and camera.sensor_width:
@@ -6777,10 +7098,29 @@ def delete_profile(profile_id: str) -> dict[str, Any]:
 
 @app.websocket("/ws")
 async def status_socket(socket: WebSocket) -> None:
+    host = socket.client.host if socket.client else None
+    if not _lan_allowed(host, socket.headers.get("x-fleet-token")
+                        or socket.query_params.get("fleetToken")):
+        await socket.close(code=4403)
+        return
     await socket.accept()
+    # The big sections that change slowly - every open collaboration and who
+    # is on it, the event log, the warnings - go only when they have changed
+    # since this socket last had them. They were four fifths of a payload
+    # sent two and a half times a second, and every byte of it was parsed and
+    # walked by the page before a button press could be drawn.
+    sent: dict[str, str] = {}
     try:
         while True:
             payload = await asyncio.to_thread(_snapshot)
+            for key in ("collab", "events", "warnings"):
+                if key not in payload:
+                    continue
+                text = json.dumps(payload[key], sort_keys=True, default=str)
+                if sent.get(key) == text:
+                    del payload[key]
+                else:
+                    sent[key] = text
             await socket.send_json(payload)
             await asyncio.sleep(0.4)
     except WebSocketDisconnect:
@@ -6790,8 +7130,91 @@ async def status_socket(socket: WebSocket) -> None:
             await socket.close()
 
 
+def _resume_after_restart() -> None:
+    """Pick up tonight's run if the program went away in the middle of it.
+
+    0.2.51. FSQ106 in September and October: eleven runs ended with the
+    program killed or the PC off, and none of them carried on. The sequencer
+    writes its progress after every frame; on start-up, a run that was still
+    going on the same night (not finished, not failed, not stopped by hand) is
+    resumed at the frame it was on, once the devices are connected again.
+    """
+    try:
+        if sequencer.resumable() is None:
+            return
+        settings = config.section("recovery")
+        time.sleep(float(settings.get("resumeDelaySeconds") or 0.0))
+        data = sequencer.resumable()
+        if data is None or sequencer.running:
+            return
+        manager.log("Starfront stopped in the middle of tonight's run; resuming it",
+                    "warn")
+        deadline = time.monotonic() + float(settings.get("resumeWaitMinutes") or 10.0) * 60.0
+        needs_mount = any(not plans_module_is_calibration(e)
+                          for e in plan.raw().get("entries") or [])
+        while True:
+            for rig in rigs.all:
+                with contextlib.suppress(Exception):
+                    outcome = rigs.connect_remembered(rig)
+                    for message in outcome.get("failed") or []:
+                        rig.manager.log(message, "warn")
+            camera = manager.get("camera")
+            mount = manager.get("mount")
+            if camera is not None and camera.connected and (
+                    not needs_mount or (mount is not None and mount.connected)):
+                break
+            if time.monotonic() > deadline:
+                manager.log("Could not resume tonight's run: the camera or the mount "
+                            "did not connect", "error")
+                notifier.send("failure", "Starfront restarted but could not resume",
+                              "The camera or the mount did not connect.")
+                sequencer.journal.close("resume failed")
+                return
+            time.sleep(5.0)
+        sequencer.start(loop=bool(data.get("loop")), resume=data)
+        notifier.send("activity", "Resumed after a restart",
+                      "Starfront restarted during the night and picked the run up again.")
+    except Exception as exc:                      # noqa: BLE001 - reported
+        with contextlib.suppress(Exception):
+            manager.log(f"Could not resume tonight's run: {exc}", "error")
+
+
+def plans_module_is_calibration(entry: dict[str, Any]) -> bool:
+    from . import plans as _plans
+    return _plans.is_calibration(entry)
+
+
+def _camera_idle(rig: Any) -> bool:
+    """Nothing is using this telescope's camera: no sequence, no capture."""
+    if getattr(sequencer, "running", False):
+        return False
+    return not rig.capture.busy
+
+
+def _camera_watch_seconds() -> float:
+    value = float(config.get("recovery", "cameraWatchSeconds", 60.0) or 0.0)
+    if value <= 0 or not config.get("recovery", "enabled", True):
+        return 3600.0                       # off: look again in an hour
+    return value
+
+
+# A camera that drops off its driver between runs is noticed and reconnected
+# (it alone) before the next run needs it, or reported (0.2.52e).
+camera_watch = CameraWatch(lambda: rigs.all, _camera_idle, _camera_watch_seconds)
+
+
+@app.on_event("startup")
+def _startup() -> None:
+    threading.Thread(target=_resume_after_restart, daemon=True,
+                     name="resume-after-restart").start()
+    with contextlib.suppress(Exception):
+        camera_watch.start()
+
+
 @app.on_event("shutdown")
 def _shutdown() -> None:
+    with contextlib.suppress(Exception):
+        camera_watch.stop()
     with contextlib.suppress(Exception):
         safety_watcher.stop()
     with contextlib.suppress(Exception):
@@ -6803,9 +7226,6 @@ def _shutdown() -> None:
             rig.solver.abort()
         with contextlib.suppress(Exception):
             rig.capture.abort()
-        # Tonight's stack goes to disk, so a restart carries on where it was.
-        with contextlib.suppress(Exception):
-            rig.stacker.save_all()
     rigs.disconnect_all()
 
 

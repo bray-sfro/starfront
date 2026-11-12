@@ -1,0 +1,209 @@
+{
+ "id": "485b7146ac0f",
+ "project": "97fcae827a9f",
+ "projectName": "m42 horse test mosaic",
+ "agent": "143074d244d4",
+ "region": {
+  "ra": 85.60833,
+  "dec": -3.25222,
+  "width": 13.79,
+  "height": 12.03,
+  "rotation": 270.0
+ },
+ "filters": [
+  {
+   "filter": "L",
+   "exposure": 300.0,
+   "hours": 25.0,
+   "channels": [
+    "L"
+   ]
+  },
+  {
+   "filter": "R",
+   "exposure": 300.0,
+   "hours": 25.0,
+   "channels": [
+    "R"
+   ]
+  },
+  {
+   "filter": "G",
+   "exposure": 300.0,
+   "hours": 25.0,
+   "channels": [
+    "G"
+   ]
+  },
+  {
+   "filter": "B",
+   "exposure": 300.0,
+   "hours": 25.0,
+   "channels": [
+    "B"
+   ]
+  },
+  {
+   "filter": "H",
+   "exposure": 600.0,
+   "hours": 25.0,
+   "channels": [
+    "H"
+   ]
+  },
+  {
+   "filter": "O",
+   "exposure": 600.0,
+   "hours": 1.0,
+   "channels": [
+    "O"
+   ]
+  },
+  {
+   "filter": "S",
+   "exposure": 600.0,
+   "hours": 1.0,
+   "channels": [
+    "S"
+   ]
+  }
+ ],
+ "state": "accepted",
+ "version": 2,
+ "issued": 1793771765.8421724,
+ "note": "joined by Telescope 1",
+ "seconds": 457200.0,
+ "cells": [
+  {
+   "row": 0,
+   "column": 0,
+   "ra": 80.96914130501202,
+   "dec": -7.76347,
+   "width": 5.303290550128534,
+   "height": 3.537742275921165,
+   "rotation": 270.0
+  },
+  {
+   "row": 0,
+   "column": 1,
+   "ra": 85.60833,
+   "dec": -7.76347,
+   "width": 5.303290550128534,
+   "height": 3.537742275921165,
+   "rotation": 270.0
+  },
+  {
+   "row": 0,
+   "column": 2,
+   "ra": 90.24751869498797,
+   "dec": -7.76347,
+   "width": 5.303290550128534,
+   "height": 3.537742275921165,
+   "rotation": 270.0
+  },
+  {
+   "row": 1,
+   "column": 0,
+   "ra": 80.99578172441294,
+   "dec": -4.7559700000000005,
+   "width": 5.303290550128534,
+   "height": 3.537742275921165,
+   "rotation": 270.0
+  },
+  {
+   "row": 1,
+   "column": 1,
+   "ra": 85.60833,
+   "dec": -4.7559700000000005,
+   "width": 5.303290550128534,
+   "height": 3.537742275921165,
+   "rotation": 270.0
+  },
+  {
+   "row": 1,
+   "column": 2,
+   "ra": 90.22087827558705,
+   "dec": -4.7559700000000005,
+   "width": 5.303290550128534,
+   "height": 3.537742275921165,
+   "rotation": 270.0
+  },
+  {
+   "row": 2,
+   "column": 0,
+   "ra": 81.00952215584067,
+   "dec": -1.7484700000000002,
+   "width": 5.303290550128534,
+   "height": 3.537742275921165,
+   "rotation": 270.0
+  },
+  {
+   "row": 2,
+   "column": 1,
+   "ra": 85.60833,
+   "dec": -1.7484700000000002,
+   "width": 5.303290550128534,
+   "height": 3.537742275921165,
+   "rotation": 270.0
+  },
+  {
+   "row": 2,
+   "column": 2,
+   "ra": 90.20713784415932,
+   "dec": -1.7484700000000002,
+   "width": 5.303290550128534,
+   "height": 3.537742275921165,
+   "rotation": 270.0
+  },
+  {
+   "row": 3,
+   "column": 0,
+   "ra": 81.01055332230416,
+   "dec": 1.2590299999999992,
+   "width": 5.303290550128534,
+   "height": 3.537742275921165,
+   "rotation": 270.0
+  },
+  {
+   "row": 3,
+   "column": 1,
+   "ra": 85.60833,
+   "dec": 1.2590299999999992,
+   "width": 5.303290550128534,
+   "height": 3.537742275921165,
+   "rotation": 270.0
+  },
+  {
+   "row": 3,
+   "column": 2,
+   "ra": 90.20610667769583,
+   "dec": 1.2590299999999992,
+   "width": 5.303290550128534,
+   "height": 3.537742275921165,
+   "rotation": 270.0
+  }
+ ],
+ "share": [
+  1,
+  5,
+  11,
+  8,
+  2,
+  4,
+  7,
+  10
+ ],
+ "kind": "mosaic",
+ "tiledRotation": null,
+ "assignedAt": 1793771765.843506,
+ "assignedNight": "2026-11-03",
+ "dealtHours": 6.68,
+ "visit": {
+  "seconds": 2700.0,
+  "frames": {
+   "G": 9
+  },
+  "filter": "G",
+  "moon": 0.075392
+ }
+}

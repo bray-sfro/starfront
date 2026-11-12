@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Starfront fleet</title>
+<link rel="stylesheet" href="/style.css">
+<style>
+  html, body { overflow: auto; height: auto; min-height: 100%; }
+  body { padding: 0 0 40px; }
+  header.fleet { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 16px;
+    padding: 10px 18px; background: #0d1016ee; border-bottom: 1px solid var(--line); backdrop-filter: blur(4px); }
+  header.fleet h1 { font-size: 15px; margin: 0; font-weight: 600; letter-spacing: .02em; }
+  header.fleet h1 span { color: var(--accent); }
+  .summary { display: flex; gap: 8px; flex-wrap: wrap; }
+  .count { padding: 4px 10px; border-radius: 14px; border: 1px solid var(--line); background: var(--panel); font-size: 12px; }
+  .count b { font-size: 14px; margin-right: 4px; }
+  .count.imaging b { color: var(--good); } .count.recovering b { color: var(--warn); }
+  .count.offline b { color: var(--bad); } .count.busy b { color: var(--blue); }
+  header.fleet .spacer { flex: 1; }
+  #updated { color: var(--muted); font-size: 11.5px; }
+  main.fleet { padding: 14px 18px; display: flex; flex-direction: column; gap: 18px; }
+  #alerts { display: flex; flex-direction: column; gap: 6px; }
+  .alert { padding: 7px 11px; border-radius: 6px; border: 1px solid #4a2721; background: #24120f; color: #f1b9ae; font-size: 12.5px; display: flex; gap: 10px; }
+  .alert.warning { border-color: #5d4720; background: #211a0d; color: #ecd09a; }
+  .alert .since { margin-left: auto; color: var(--muted); white-space: nowrap; }
+  section.node { border: 1px solid var(--line); border-radius: 9px; background: #0d1016; }
+  .node-head { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  .node-head h2 { margin: 0; font-size: 13.5px; font-weight: 600; }
+  .node-head .meta { color: var(--muted); font-size: 11.5px; }
+  .node-head .ctl { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; }
+  .node-warn { padding: 6px 12px; border-bottom: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 6px; }
+  .node-warn span, .card .warns span { font-size: 11.5px; padding: 2px 8px; border-radius: 10px; background: #2a2210; color: #e9c983; }
+  .node-warn span.critical, .card .warns span.critical { background: #2c1410; color: #f0a596; }
+  .fresh { font-size: 11.5px; padding: 2px 8px; border-radius: 10px; border: 1px solid var(--line); }
+  .fresh.live { color: var(--good); border-color: #2c5d43; }
+  .fresh.stale { color: var(--warn); border-color: #6b5324; }
+  .fresh.offline, .fresh.connecting { color: var(--bad); border-color: #5a2a22; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(370px, 1fr)); gap: 12px; padding: 12px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 11px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .card.offline, .card.stale { opacity: .6; }
+  .card.recovering { border-color: #6b5324; } .card.failed { border-color: #7a3328; }
+  .card.imaging { border-color: #2c5d43; }
+  .card .top { display: flex; align-items: center; gap: 8px; }
+  .card .top h3 { margin: 0; font-size: 14px; }
+  .card .role { color: var(--muted); font-size: 11px; }
+  .state { margin-left: auto; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; padding: 2px 8px; border-radius: 10px; background: var(--panel-2); }
+  .state.imaging { color: var(--good); } .state.recovering, .state.paused { color: var(--warn); }
+  .state.failed, .state.offline, .state.stale { color: var(--bad); } .state.busy { color: var(--blue); }
+  .body { display: grid; grid-template-columns: 1fr 120px; gap: 10px; }
+  dl.facts { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; font-size: 12px; }
+  dl.facts dt { color: var(--muted); } dl.facts dd { margin: 0; overflow-wrap: anywhere; font-family: var(--mono); font-size: 11.5px; }
+  .thumb { width: 120px; display: flex; flex-direction: column; gap: 3px; font-size: 10.5px; color: var(--muted); text-align: center; }
+  .thumb img, .thumb .none { width: 120px; height: 90px; object-fit: cover; border-radius: 5px; background: #07080b; border: 1px solid var(--line); }
+  .thumb .none { display: flex; align-items: center; justify-content: center; }
+  .recovery { font-size: 12px; padding: 5px 8px; border-radius: 5px; background: #241c0c; color: #ecd09a; }
+  .recovery.failed { background: #2c1410; color: #f0a596; }
+  .controls { display: flex; flex-wrap: wrap; gap: 6px; }
+  .cmds { display: flex; flex-direction: column; gap: 2px; font-size: 11.5px; }
+  .cmd.pending, .cmd.sending { color: var(--blue); } .cmd.done { color: var(--good); }
+  .cmd.failed, .cmd.unknown { color: var(--bad); }
+  .error-line { color: var(--bad); font-size: 11.5px; }
+  #tokenbar { padding: 10px 18px; background: #24120f; color: #f1b9ae; }
+</style>
+</head>
+<body>
+<header class="fleet">
+  <h1><span>Starfront</span> fleet</h1>
+  <div class="summary" id="summary"></div>
+  <div class="spacer"></div>
+  <span id="updated">connecting…</span>
+  <button class="btn small ghost" id="notify-btn" title="Show a desktop notification for each new alert">Notifications off</button>
+  <button class="btn small ghost" id="quit-btn" title="Stop the dashboard (it keeps no state; the telescopes are not touched)">Stop dashboard</button>
+</header>
+<div id="tokenbar" hidden>This dashboard needs its token from this computer:
+  <input id="token-input" type="password" placeholder="dashboardToken"> <button class="btn small" id="token-save">Use</button></div>
+<main class="fleet">
+  <div id="alerts"></div>
+  <div id="nodes"></div>
+</main>
+<script src="/fleet.js"></script>
+</body>
+</html>

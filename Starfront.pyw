@@ -14,6 +14,15 @@ from astrocontrol import logs
 
 logs.setup()
 
+# `Starfront.exe --fleet`: the fleet dashboard for every Starfront PC, in the
+# browser, from the same program (0.2.52).
+if "--fleet" in sys.argv[1:]:
+    from astrocontrol.fleet.__main__ import serve
+    args = sys.argv[1:]
+    path = args[args.index("--fleet-config") + 1] if "--fleet-config" in args[:-1] else None
+    serve(config_path=path, browser=True)
+    sys.exit(0)
+
 from astrocontrol import desktop
 
 try:

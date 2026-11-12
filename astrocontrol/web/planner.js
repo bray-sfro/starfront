@@ -708,22 +708,9 @@
       + `&width=${width}&height=${height}&hips=${encodeURIComponent(survey)}`;
 
     try {
-      const response = await fetch(url);
-      if (!response.ok) {
-        let detail = `HTTP ${response.status}`;
-        try {
-          const body = await response.json();
-          if (body && body.detail) detail = body.detail;
-        } catch { /* not JSON; the status will do */ }
-        throw new Error(detail);
-      }
-      const blob = await response.blob();
-      const image = await new Promise((resolve, reject) => {
-        const element = new Image();
-        element.onload = () => resolve(element);
-        element.onerror = () => reject(new Error('the image could not be decoded'));
-        element.src = URL.createObjectURL(blob);
-      });
+      // Through the shared fetcher (surveyimg.js): one request per picture,
+      // a 15 s limit, and an immediate answer while the service is down.
+      const image = await window.surveyImages.image(url);
       plan.image = image;
       plan.imageCentre = { ra: plan.centre.ra, dec: plan.centre.dec };
       plan.imageFov = fov;

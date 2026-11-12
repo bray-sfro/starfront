@@ -38,13 +38,15 @@ class Guider:
         self.stopped = 0
         self.starts = []
         self.recover_after = None      # start_guiding succeeds on this attempt
+        self.rms = 0.8                 # arcsec, what status() reports
+        self.samples = 40
 
     @property
     def guiding(self):
         return self.state == "Guiding"
 
     def status(self):
-        return {"starLost": "low SNR"}
+        return {"starLost": "low SNR", "rmsTotal": self.rms, "samples": self.samples}
 
     def stop_guiding(self):
         self.stopped += 1
@@ -181,23 +183,78 @@ results.append(case("guide star returns inside the grace period",
                     guider.starts == [] and seq._guide_lost_since is None,
                     f"restarts={len(guider.starts)}"))
 
-# 2. It does not, so guiding is restarted — and recalibrates on the third try.
+# 2. It does not, so guiding is restarted on a fresh star. A lost star never
+#    recalibrates (0.2.49, FSQ106 0003): PHD2 cannot calibrate on a star it
+#    cannot see, and the calibration it writes replaces the good one.
 guider = Guider()
 guider.state = "LostLock"
 guider.recover_after = 3
 seq, rig, config = build({"guider": guider})
 config.update("recovery", {"guideGraceSeconds": 0.0, "guideRestartAttempts": 4,
                            "recalibrateAfterAttempts": 2, "cooldownSeconds": 0.0})
-config.update("guiding", {"settleTimeoutSeconds": 2.0})
 seq._guiding_wanted = True
 seq._check_guiding()
 recal = [bool(s.get("recalibrate")) for s in guider.starts]
-results.append(case("guiding is restarted, recalibrating only on the later tries",
-                    guider.guiding and recal == [False, False, True],
+results.append(case("guiding is restarted, never recalibrating on a lost star",
+                    guider.guiding and recal == [False, False, False],
                     f"recalibrate flags={recal}"))
 results.append(case("the rescue is recorded",
                     seq._rescues == 1 and seq._recoveries[-1]["ok"],
                     f"rescues={seq._rescues}"))
+
+# 2b. Rough guiding on a well-seen star: a fresh star first, the calibration on
+#     the rough restart the setting names - unless the star is too faint.
+class SeenGuider(Guider):
+    snr = 25.0
+
+    def status(self):
+        return {"guiding": self.guiding, "starLost": None, "snr": self.snr,
+                "rmsTotal": self.rms, "samples": self.samples}
+
+
+def rough_run(snr):
+    g = SeenGuider()
+    g.snr = snr
+    g.rms = 4.0
+    g.recover_after = 1
+    s, _, c = build({"guider": g})
+    c.update("recovery", {"guideGraceSeconds": 0.0, "guideRestartAttempts": 2,
+                          "recalibrateAfterAttempts": 2, "cooldownSeconds": 0.0,
+                          "roughGuidingArcsec": 2.0, "roughGuidingFrames": 1,
+                          "roughGuidingRetryMinutes": 0})
+    s._guiding_wanted = True
+    s._check_guiding()
+    s._check_guiding()
+    return [bool(x.get("recalibrate")) for x in g.starts]
+
+
+flags = rough_run(25.0)
+results.append(case("rough guiding on a bright star recalibrates on rough restart 2",
+                    flags == [False, True], f"recalibrate flags={flags}"))
+flags = rough_run(4.0)
+results.append(case("...but not when the star is too faint to calibrate on",
+                    flags == [False, False], f"recalibrate flags={flags}"))
+
+
+# 2c. A calibration far off square is refused: guiding stops, the night goes on.
+class SkewGuider(Guider):
+    def __init__(self, ortho):
+        super().__init__()
+        self.ortho = ortho
+
+    def calibration_data(self):
+        return {"calibrated": True, "xAngle": 10.0, "yAngle": 10.0 + 90.0 + self.ortho,
+                "orthoError": self.ortho}
+
+
+for ortho, sound in ((53.0, False), (4.0, True)):
+    g = SkewGuider(ortho)
+    s, _, _ = build({"guider": g})
+    ok = s._calibration_sound(g)
+    results.append(case(f"a calibration {ortho:g} deg off square is "
+                        + ("guided on" if sound else "refused and guiding stopped"),
+                        ok is sound and (sound or (g.stopped == 1 and not s._guiding_wanted)),
+                        f"sound={ok} stopped={g.stopped}"))
 
 # 3. It never comes back: the night carries on unguided rather than stopping.
 guider = Guider()
@@ -205,7 +262,6 @@ guider.state = "LostLock"
 seq, rig, config = build({"guider": guider})
 config.update("recovery", {"guideGraceSeconds": 0.0, "guideRestartAttempts": 2,
                            "cooldownSeconds": 0.0, "maxPerTarget": 0})
-config.update("guiding", {"settleTimeoutSeconds": 2.0})
 seq._guiding_wanted = True
 seq._check_guiding()
 results.append(case("a guider that will not come back leaves the run going",
@@ -272,161 +328,6 @@ config.update("sequencer", {"filterOffsets": {"Ha": -180}, "useFilterOffsets": F
 seq._select_filter(rig, "Ha")
 results.append(case("offsets switched off leave the focuser where it is",
                     focuser.position == 30000, f"position={focuser.position}"))
-
-# 8b. Guiding that is running but rough — a held star chased at hundreds of
-# arcseconds by a reversed calibration — is a fault, not a notice. The night
-# of the pier side the TheSky driver never reported: 564" RMS, "Guiding" all
-# the way, every sub trailed, nothing restarted.
-class RoughGuider(Guider):
-    def __init__(self, rms_until_start):
-        super().__init__()
-        self.rms_until_start = rms_until_start     # rough until this many starts
-
-    def status(self):
-        rough = len(self.starts) < self.rms_until_start
-        return {"rmsTotal": 564.5 if rough else 0.6, "samples": 50}
-
-    def start_guiding(self, **kw):
-        self.starts.append(kw)
-        self.state = "Guiding"
-
-
-guider = RoughGuider(rms_until_start=2)
-seq, rig, config = build({"guider": guider})
-config.update("recovery", {"guideGraceSeconds": 25.0, "guideRestartAttempts": 3,
-                           "recalibrateAfterAttempts": 2, "cooldownSeconds": 0.0,
-                           "guideRmsFaultArcsec": 5.0})
-seq._guiding_wanted = True
-started = time.monotonic()
-seq._check_guiding()                 # slot 1: rough -> fresh star
-first = [bool(s.get("recalibrate")) for s in guider.starts]
-seq._check_guiding()                 # slot 2: still rough -> recalibrate
-recal = [bool(s.get("recalibrate")) for s in guider.starts]
-seq._check_guiding()                 # slot 3: fine -> nothing, counter reset
-results.append(case("rough guiding on a held star is restarted on a fresh star, then recalibrated",
-                    first == [False] and recal == [False, True]
-                    and len(guider.starts) == 2 and seq._recoveries[-1]["ok"]
-                    and seq._guiding_wanted and seq._rough_restarts == 0,
-                    f"recalibrate flags={recal}, restarts={seq._rough_restarts}"))
-results.append(case("...with no grace period: the RMS is already a minute of frames",
-                    time.monotonic() - started < 8.0,
-                    f"took {time.monotonic() - started:.1f}s"))
-
-# 8c. The roughness check needs a window of frames, and can be turned off.
-guider = RoughGuider(rms_until_start=99)
-guider.status = lambda: {"rmsTotal": 564.5, "samples": 3}
-seq, rig, config = build({"guider": guider})
-config.update("recovery", {"guideGraceSeconds": 0.0, "cooldownSeconds": 0.0})
-seq._guiding_wanted = True
-seq._check_guiding()
-results.append(case("three rough frames after a dither are not yet a verdict",
-                    guider.starts == []))
-guider = RoughGuider(rms_until_start=99)
-seq, rig, config = build({"guider": guider})
-config.update("recovery", {"guideGraceSeconds": 0.0, "cooldownSeconds": 0.0,
-                           "guideRmsFaultArcsec": 0.0})
-seq._guiding_wanted = True
-seq._check_guiding()
-results.append(case("the roughness check switched off leaves rough guiding alone",
-                    guider.starts == []))
-
-
-# 8d. The guider fails to settle when the target starts. That used to be
-# "carrying on unguided" fifteen seconds into the night with recovery
-# switched off for good; now it is the same rescue as a lost star.
-class SettlingGuider(Guider):
-    def __init__(self, fail_starts):
-        super().__init__()
-        self.state = "Stopped"
-        self.fail_starts = fail_starts
-        self.settle_error = None
-
-    def start_guiding(self, **kw):
-        self.starts.append(kw)
-        self.state = "Guiding"
-        self.settle_error = ("timed-out waiting for guider to settle"
-                             if len(self.starts) <= self.fail_starts else None)
-
-
-guider = SettlingGuider(fail_starts=1)
-seq, rig, config = build({"guider": guider})
-config.update("guiding", {"startWithSequence": True, "settleTimeoutSeconds": 3.0})
-config.update("recovery", {"guideGraceSeconds": 0.0, "guideRestartAttempts": 3,
-                           "recalibrateAfterAttempts": 2, "cooldownSeconds": 0.0})
-seq._start_guiding()
-results.append(case("a guider that fails to settle at the start is restarted rather than abandoned",
-                    len(guider.starts) == 2 and seq._guiding_wanted
-                    and seq._recoveries[-1]["ok"],
-                    f"starts={len(guider.starts)}, wanted={seq._guiding_wanted}"))
-
-guider = SettlingGuider(fail_starts=99)
-seq, rig, config = build({"guider": guider})
-config.update("guiding", {"startWithSequence": True, "settleTimeoutSeconds": 3.0})
-config.update("recovery", {"guideGraceSeconds": 0.0, "guideRestartAttempts": 2,
-                           "cooldownSeconds": 0.0, "maxPerTarget": 0})
-seq._start_guiding()
-results.append(case("...and one that never settles leaves the night running unguided after its tries",
-                    len(guider.starts) == 3 and not seq._guiding_wanted,
-                    f"starts={len(guider.starts)}, wanted={seq._guiding_wanted}"))
-
-guider = SettlingGuider(fail_starts=99)
-seq, rig, config = build({"guider": guider})
-config.update("guiding", {"startWithSequence": True, "settleTimeoutSeconds": 3.0})
-config.update("recovery", {"guidingRecovery": False})
-seq._start_guiding()
-results.append(case("...with guiding recovery off it is told once and left alone",
-                    len(guider.starts) == 1 and not seq._guiding_wanted))
-
-
-# 8e. A star dropped for a frame while settling is not a failure. PHD2 says
-# LostLock on one low-SNR frame and is guiding on the next; giving up on the
-# first one is how a night went unguided fifteen seconds in.
-class FlickeringGuider(Guider):
-    def __init__(self):
-        super().__init__()
-        self.settle_error = None
-        self._t0 = time.monotonic()
-
-    @property
-    def state(self):
-        return "LostLock" if time.monotonic() - self._t0 < 1.5 else "Guiding"
-
-    @state.setter
-    def state(self, value):
-        pass
-
-
-guider = FlickeringGuider()
-seq, rig, config = build({"guider": guider})
-results.append(case("a star lost for a frame during the settle is waited out",
-                    seq._wait_for_guiding(5.0) is True))
-
-
-class SettleThenFailGuider(FlickeringGuider):
-    @property
-    def settling(self):
-        return time.monotonic() - self._t0 < 1.5
-
-    @settling.setter
-    def settling(self, value):
-        pass
-
-    @property
-    def settle_error(self):
-        return None if self.settling else "timed-out waiting for guider to settle"
-
-    @settle_error.setter
-    def settle_error(self, value):
-        pass
-
-
-guider = SettleThenFailGuider()
-seq, rig, config = build({"guider": guider})
-started = time.monotonic()
-results.append(case("PHD2's own verdict that the settle failed ends the wait at once",
-                    seq._wait_for_guiding(30.0) is False
-                    and time.monotonic() - started < 5.0))
-
 
 # 9. Recovery switched off entirely does nothing at all.
 guider = Guider()
@@ -510,6 +411,49 @@ seq._make_safe(park=False, stop_tracking=True)
 results.append(case("stopping tracking at the end does not park",
                     not mount.parked and mount.tracking is False))
 
+
+# 13b. Rough guiding: still "guiding", but every sub trailed. Past the limit
+# for the set number of frames in a row the star is dropped and a fresh one
+# picked; one rough frame is only noted; a second fresh star is not asked
+# for until the spacing has passed.
+guider = Guider()
+guider.rms = 5.2
+seq, rig, config = build({"guider": guider})
+config.update("recovery", {"roughGuidingArcsec": 3.0, "roughGuidingFrames": 2,
+                           "roughGuidingRetryMinutes": 10.0,
+                           "guideRestartAttempts": 2, "cooldownSeconds": 0.0})
+config.update("guiding", {"settleTimeoutSeconds": 2.0})
+seq._guiding_wanted = True
+guider.recover_after = 1
+seq._check_guiding()
+results.append(case("one rough frame is noted, not acted on",
+                    guider.starts == [] and seq._rough_runs == 1))
+seq._check_guiding()
+results.append(case("two rough frames running: guiding restarts on a fresh star",
+                    len(guider.starts) == 1 and guider.starts[0].get("fresh_star") is True
+                    and guider.guiding and seq._recoveries[-1]["ok"],
+                    f"starts={guider.starts}"))
+seq._check_guiding(); seq._check_guiding()
+results.append(case("...and not again inside the spacing",
+                    len(guider.starts) == 1, f"starts={len(guider.starts)}"))
+seq._rough_last -= 601.0
+seq._check_guiding(); seq._check_guiding()
+results.append(case("...but again once the spacing has passed",
+                    len(guider.starts) == 2, f"starts={len(guider.starts)}"))
+guider = Guider()
+guider.rms = 5.2
+guider.samples = 4
+seq, rig, config = build({"guider": guider})
+config.update("recovery", {"roughGuidingArcsec": 3.0, "roughGuidingFrames": 1})
+seq._guiding_wanted = True
+seq._check_guiding()
+results.append(case("too few guide steps to judge: no restart",
+                    guider.starts == []))
+config.update("recovery", {"roughGuidingArcsec": 0})
+guider.samples = 40
+seq._check_guiding()
+results.append(case("0 arcsec turns the rough-guiding restart off",
+                    guider.starts == [] and not seq._guide_lost_in_slot))
 
 # 14. Going to a panel with a plate solver present, and no rotator. The
 # solve is asked to hold the framing angle only when a rotator is turning;
@@ -669,6 +613,160 @@ results.append(case("a solver reporting the other half-turn is read as the same 
 laid, restarted = angle_case(88.0, COLLAB)       # 268 - 180: the same footprint
 results.append(case("...and exactly half a turn away is no turn at all",
                     laid == [] and not restarted, f"laid={laid}"))
+
+# 2026-10-19 20:47: OnStep refused the slew to the next panel with "Already in
+# motion" 38 ms after PHD2's last guide pulse, and that one refusal parked
+# the mount and ended the night.  A refused slew is now asked for again.
+print("-- a slew refused while a guide pulse is still being worked off --")
+
+
+class Mount:
+    def __init__(self, refusals=0, pulse_for=0.0):
+        self.connected = True
+        self.refusals = refusals
+        self.slews = []
+        self.pulse_until = time.monotonic() + pulse_for
+        self.slewing = False
+        self.tracking = True
+
+    @property
+    def pulse_guiding(self):
+        return time.monotonic() < self.pulse_until
+
+    def slew_to(self, ra, dec):
+        self.slews.append((ra, dec, time.monotonic()))
+        if len(self.slews) <= self.refusals:
+            raise DeviceError("SlewToCoordinatesAsync: SlewError: Already in motion")
+
+
+mount = Mount(refusals=2)
+seq, rig, config = build({"mount": mount})
+seq.SLEW_RETRY_SECONDS = 0.05
+config.update("sequencer", {"slewRetrySeconds": 5.0})
+started = time.monotonic()
+seq._slew(mount, 20.5, 37.0, "panel 6")
+results.append(case("a slew refused twice is asked for until the mount takes it",
+                    len(mount.slews) == 3 and mount.slews[-1][:2] == (20.5, 37.0),
+                    f"slews={len(mount.slews)}"))
+
+mount = Mount(refusals=0, pulse_for=0.4)
+seq, rig, config = build({"mount": mount})
+seq.SLEW_RETRY_SECONDS = 0.05
+seq._slew(mount, 1.0, 2.0, "x")
+results.append(case("a guide pulse the driver reports is waited out before the slew",
+                    len(mount.slews) == 1 and mount.slews[0][2] >= mount.pulse_until,
+                    f"slews={len(mount.slews)}"))
+
+mount = Mount(refusals=99)
+seq, rig, config = build({"mount": mount})
+seq.SLEW_RETRY_SECONDS = 0.05
+config.update("sequencer", {"slewRetrySeconds": 0.3})
+try:
+    seq._slew(mount, 1.0, 2.0, "x")
+    refused = ""
+except DeviceError as exc:
+    refused = str(exc)
+results.append(case("a mount that never takes the slew is given up on, with the count",
+                    "refused to slew to x" in refused and len(mount.slews) > 1,
+                    refused))
+
+# 2026-10-19 20:14:51: PHD2 still said Stopped one second after `guide`, so
+# the panel was shot "unguided" while PHD2 went on to guide it.
+print("-- PHD2 reporting Stopped for a moment after guide --")
+guider = Guider()
+guider.state = "Stopped"
+seq, rig, config = build({"guider": guider})
+
+
+def start_late():
+    time.sleep(1.5)
+    guider.state = "Guiding"
+
+
+threading.Thread(target=start_late, daemon=True).start()
+results.append(case("a guider that takes a moment to report is waited for",
+                    seq._wait_for_guiding(6.0) is True, f"state={guider.state}"))
+
+guider = Guider()
+guider.state = "LostLock"
+seq, rig, config = build({"guider": guider})
+results.append(case("...but a lost lock is still an answer straight away",
+                    seq._wait_for_guiding(6.0) is False))
+
+# 2026-10-19 20:38: three cameras reconnected cleanly after a USB dropout and
+# shot the rest of the night at +18 C, their coolers off since the reopen.
+print("-- the cooler after a reconnect --")
+from astrocontrol import rigs as rigs_module                       # noqa: E402
+
+
+class ColdCamera:
+    connected = True
+    can_cool = True
+
+    def __init__(self):
+        self.gain = None
+        self.offset = None
+        self.setpoint = None
+        self.cooler = False
+        self.calls = []
+
+    def set_settings(self, gain=None, offset=None):
+        self.gain, self.offset = gain, offset
+        self.calls.append(("settings", gain, offset))
+
+    def set_setpoint(self, value):
+        self.setpoint = value
+        self.calls.append(("setpoint", value))
+
+    def set_cooler(self, on):
+        self.cooler = on
+        self.calls.append(("cooler", on))
+
+
+camera = ColdCamera()
+config = Config(Path(tempfile.mkdtemp()) / "settings.json")
+config.update("camera", {"gain": 100, "offset": 50})
+stand_in = types.SimpleNamespace(manager=Manager({"camera": camera}), config=config,
+                                 cooler_wanted=None)
+rigs_module.Rig.note_cooler(stand_in, on=True, setpoint=-5.0)
+done = rigs_module.Rig.restore_camera(stand_in)
+results.append(case("a camera back from a reconnect is cooled to what was last asked",
+                    camera.cooler is True and camera.setpoint == -5.0
+                    and camera.gain == 100 and camera.offset == 50,
+                    f"calls={camera.calls}"))
+rigs_module.Rig.note_cooler(stand_in, on=False)
+camera = ColdCamera()
+stand_in.manager = Manager({"camera": camera})
+rigs_module.Rig.restore_camera(stand_in)
+results.append(case("...and left warm after the warm-down asked for that",
+                    camera.cooler is False and camera.setpoint == -5.0,
+                    f"calls={camera.calls}"))
+camera = ColdCamera()
+stand_in.manager = Manager({"camera": camera})
+stand_in.cooler_wanted = None
+rigs_module.Rig.restore_camera(stand_in)
+results.append(case("...and the cooler is not touched when nobody ever asked",
+                    not any(c[0] in ("cooler", "setpoint") for c in camera.calls)
+                    and camera.gain == 100, f"calls={camera.calls}"))
+
+
+class RigsWithRestore(Rigs):
+    def reconnect_camera(self, rig, stop=None, progress=None):
+        self.reconnects += 1
+        # The sequence says how to notice a Stop and where to report waits.
+        assert callable(stop) and callable(progress)
+        LOG.append(("info", "restored"))
+        return {"connected": ["camera"], "failed": []}
+
+
+seq, rig, config = build({}, fail_times=2)
+seq.rigs = RigsWithRestore(rig)
+config.update("recovery", {"frameRetryAttempts": 3, "frameRetrySeconds": 0.0,
+                           "reconnectDevices": True})
+outcome = seq._expose_slot([rig], {rig.id: {"exposure": 60.0, "filter": "L"}})
+results.append(case("the sequence's own reconnect goes through the restoring path",
+                    not outcome["errors"] and seq.rigs.reconnects == 1
+                    and ("info", "restored") in LOG, f"errors={outcome['errors']}"))
 
 print()
 print(f"{sum(results)}/{len(results)} passed")

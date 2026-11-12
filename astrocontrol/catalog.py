@@ -258,9 +258,13 @@ _OTYPE = re.compile(r"^%C\.0\s+(.+)$", re.MULTILINE)
 _cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 _cache_lock = threading.Lock()
 _CACHE_SECONDS = 3600.0
+#: After Sesame cannot be reached, how long lookups skip it (answer "not
+#: found" at once) instead of each waiting out the timeout (2026-11-03).
+_DOWN_SECONDS = 120.0
+_down_until = 0.0
 
 
-def resolve(name: str, timeout: float = 8.0) -> dict[str, Any] | None:
+def resolve(name: str, timeout: float = 6.0) -> dict[str, Any] | None:
     """Look a name up at CDS Sesame.  Returns None when it is not known.
 
     Results are cached for an hour: object coordinates do not move, and the
@@ -276,6 +280,10 @@ def resolve(name: str, timeout: float = 8.0) -> dict[str, Any] | None:
         hit = _cache.get(key)
         if hit is not None and now - hit[0] < _CACHE_SECONDS:
             return hit[1]
+
+    global _down_until
+    if now < _down_until:
+        return None                        # unreachable a moment ago; not cached
 
     result: dict[str, Any] | None = None
     try:
@@ -298,7 +306,10 @@ def resolve(name: str, timeout: float = 8.0) -> dict[str, Any] | None:
                 "source": "sesame",
             }
     except Exception:                      # noqa: BLE001 - offline is a normal state here
-        result = None
+        # Unreachable is not "unknown": do not remember it for an hour, just
+        # stop asking for a couple of minutes.
+        _down_until = time.monotonic() + _DOWN_SECONDS
+        return None
 
     with _cache_lock:
         _cache[key] = (now, result)

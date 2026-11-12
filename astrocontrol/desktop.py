@@ -10,7 +10,6 @@ dependency and nothing else.
 from __future__ import annotations
 
 import logging
-import os
 import socket
 import threading
 import time
@@ -28,6 +27,73 @@ def free_port(host: str = "127.0.0.1") -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind((host, 0))
         return int(sock.getsockname()[1])
+
+
+def _port_file() -> Path:
+    from .config import data_root
+    return data_root() / "server.port"
+
+
+def remembered_port(host: str = "127.0.0.1") -> int:
+    """The port the last run listened on, if it is still free; else a new one.
+
+    A port picked fresh on every start is a port nobody can keep: a tab
+    opened from the Open in browser menu, or a bookmark of it, was dead at
+    the next restart, and the first thing it said was "Failed to fetch" with
+    nothing in the log to explain it. So the port is written down and asked
+    for again, and only when something else has taken it does the OS pick
+    another - in which case the browser tab is wrong again, and the log line
+    that says which port is listening is the way to find it.
+    """
+    bind = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+    try:
+        wanted = int(_port_file().read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        wanted = 0
+    if 1024 <= wanted <= 65535:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind((bind, wanted))
+                return wanted
+            except OSError:
+                pass
+    return free_port(bind)
+
+
+def lan_bind(host: str, port: int) -> tuple[str, int]:
+    """Where to listen: the LAN when Settings > server.lanAccess is on (0.2.52).
+
+    Only when nothing explicit was asked for: a host or port given on the
+    command line wins. With LAN access on, the fixed `lanPort` is used when it
+    is free, so the fleet dashboard's fleet.json can name it once.
+    """
+    try:
+        from .config import Config
+        settings = Config().section("server")
+    except Exception:                              # noqa: BLE001 - a bare home
+        return host, port
+    if not settings.get("lanAccess") or host not in ("127.0.0.1", "localhost"):
+        return host, port
+    wanted = port or int(settings.get("lanPort") or 0)
+    if wanted:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("0.0.0.0", wanted))
+                return "0.0.0.0", wanted
+            except OSError:
+                pass
+    return "0.0.0.0", port
+
+
+def remember_port(port: int) -> None:
+    """Write the port down for the next start. A home that cannot be written
+    to just means a fresh port next time, which is what happened before."""
+    try:
+        path = _port_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(int(port)), encoding="utf-8")
+    except OSError:
+        pass
 
 
 class ServerThread:
@@ -205,8 +271,13 @@ def run(host: str = "127.0.0.1", port: int = 0, debug: bool = False) -> None:
             "Or run the interface in a browser instead:  python run.py --browser"
         ) from exc
 
-    server = ServerThread(host, port or free_port(host if host != "0.0.0.0" else "127.0.0.1"))
+    host, port = lan_bind(host, port)
+    if host == "0.0.0.0":
+        log.info("LAN access is on: listening on every interface (fleet token required "
+                 "for anything but this PC)")
+    server = ServerThread(host, port or remembered_port(host))
     server.start()
+    remember_port(server.port)
     log.info("server listening on %s", server.url)
 
     bridge = Bridge()
@@ -265,18 +336,6 @@ def run(host: str = "127.0.0.1", port: int = 0, debug: bool = False) -> None:
     finally:
         server.stop()
         log.info("server stopped")
-        # And go. The interpreter would otherwise wait for every thread that
-        # is not a daemon - the device apartment threads, a watcher mid-poll -
-        # and a window closed at bedtime left a process behind, every night:
-        # a dozen of them were found on one PC, each still polling the
-        # collaboration server as this telescope, one still holding the flat
-        # panel's serial port so the next launch could not open it, and
-        # between them hours of processor time. The devices have been
-        # disconnected and the stacks saved by the server's own shutdown
-        # above; nothing left is worth waiting for.
-        log.info("exiting")
-        logging.shutdown()
-        os._exit(0)
 
 
 WEBVIEW2_URL = "https://developer.microsoft.com/microsoft-edge/webview2/"

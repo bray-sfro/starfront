@@ -172,8 +172,10 @@ class StackPipeline:
         if not night or night == self.night:
             return
         with self._lock:
-            for key in list(self._stacks):
-                self._let_go(key)
+            self.save_all()
+            self._stacks.clear()
+            self._saved.clear()
+            self._used.clear()
             self._current = ""
             self.night = night
             self.root = self.base / night
@@ -187,14 +189,9 @@ class StackPipeline:
         import shutil
         key = f"{project}/{filter_name}"
         with self._lock:
-            # Released before the folder goes: a stack on disk is mapped
-            # files, and a mapped file cannot be deleted.
-            found = self._stacks.pop(key, None)
+            self._stacks.pop(key, None)
             self._saved.pop(key, None)
             self._used.pop(key, None)
-            if found is not None:
-                with contextlib.suppress(Exception):
-                    found.close()
             if self._current == key:
                 self._current = ""
             folder = livestack.stack_root(self.root, project, filter_name)
@@ -260,20 +257,12 @@ class StackPipeline:
             while len(self._stacks) > MAX_OPEN:
                 oldest = min((name for name in self._stacks if name != key),
                              key=lambda name: self._used.get(name, 0.0))
-                self._let_go(oldest)
+                with contextlib.suppress(OSError):
+                    self._stacks[oldest].save()
+                self._stacks.pop(oldest, None)
+                self._saved.pop(oldest, None)
+                self._used.pop(oldest, None)
             return stack
-
-    def _let_go(self, key: str) -> None:
-        """Save a stack, release it, and forget it. Under the lock."""
-        found = self._stacks.pop(key, None)
-        self._saved.pop(key, None)
-        self._used.pop(key, None)
-        if found is None:
-            return
-        with contextlib.suppress(OSError):
-            found.save()
-        with contextlib.suppress(Exception):
-            found.close()
 
     def stack(self, project: str, filter_name: str) -> LiveStack | None:
         """A stack to look at: the open one, or tonight's from disk, or None."""

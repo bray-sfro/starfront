@@ -257,8 +257,7 @@ class PairingCheck:
         errors: dict[str, str] = {}
 
         def job(rig: Any) -> None:
-            was_saving = rig.capture.save_enabled
-            rig.capture.save_enabled = False
+            rig.capture.suspend_saving()
             try:
                 record = rig.capture.capture_blocking(self._exposure_for(rig, exposure))
                 frame = rig.capture.frame(record.id)
@@ -266,7 +265,7 @@ class PairingCheck:
             except Exception as exc:                 # noqa: BLE001 - reported per camera
                 errors[rig.id] = str(exc)
             finally:
-                rig.capture.save_enabled = was_saving
+                rig.capture.resume_saving()
 
         threads = [threading.Thread(target=job, args=(rig,), daemon=True,
                                     name=f"check-{rig.id}") for rig in cameras]

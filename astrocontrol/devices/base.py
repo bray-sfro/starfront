@@ -22,6 +22,15 @@ class DeviceError(RuntimeError):
     """Raised for any driver-level failure; surfaced to the UI as an error toast."""
 
 
+class CameraLostError(DeviceError):
+    """The camera says it is connected but nobody is answering (0.2.52e).
+
+    Raised instead of calling into a driver that has lost its camera - the
+    call that, on ZWO's ASCOM driver, puts up a modal "Exposure Duration
+    between 0 and 0s" box and never returns.
+    """
+
+
 # Device kinds understood by the application.
 #: `piercam` is an ordinary camera in a different job: it watches the telescope
 #: rather than the sky, so it shares every backend's camera class and differs
@@ -90,6 +99,14 @@ class Camera(Device):
     def start_exposure(self, seconds: float, light: bool = True) -> None:
         raise NotImplementedError
 
+    def probe(self) -> str | None:
+        """Why the camera is not really there, or None when it answers.
+
+        Cheap - a few property reads - and only ever a read. A backend that
+        cannot tell says None (0.2.52e).
+        """
+        return None
+
     def abort_exposure(self) -> None:
         raise NotImplementedError
 
@@ -123,6 +140,17 @@ class Camera(Device):
     @property
     def cooler_power(self) -> float | None:
         return None
+
+    def read_settings(self) -> dict[str, int | None]:
+        """Gain and offset as the driver has them now (0.2.53 gain fix).
+
+        Not the values last written: a camera that was reconnected comes back
+        at its driver's defaults, and EAGLE's twin FSQ shot 36 subs at gain 0
+        / offset 0 on 2026-11-04 while the program still believed what it had
+        been told at dusk.  Only reads; None for a value that cannot be read.
+        Updates `gain` / `offset` so the FITS header says what the camera did.
+        """
+        return {"gain": int(self.gain), "offset": int(self.offset)}
 
     def set_settings(self, binning: int | None = None, gain: int | None = None,
                      offset: int | None = None) -> None:
@@ -180,6 +208,16 @@ class Mount(Device):
 
     @property
     def at_home(self) -> bool:
+        return False
+
+    @property
+    def pulse_guiding(self) -> bool:
+        """Whether a guide pulse is still being worked off.
+
+        OnStep refuses a slew (and a park) while one is: "Already in
+        motion".  A driver that cannot say answers False, and the slew code
+        then falls back to a moment's grace after guiding stops.
+        """
         return False
 
     @property
@@ -527,6 +565,16 @@ class SwitchBank(Device):
         boolean, writable}."""
         return []
 
+    def describe_channels(self) -> list[dict[str, Any]]:
+        """The channels without their values: names and ranges only.
+
+        Cheap where `channels` is not — a driver reads every value live, and
+        matching an outlet to a telescope by name should not cost a round of
+        driver calls on every status tick.
+        """
+        return [{key: value for key, value in channel.items() if key != "value"}
+                for channel in self.channels]
+
     def set_value(self, index: int, value: float) -> None:
         raise NotImplementedError
 
@@ -556,16 +604,6 @@ class Guider(Device):
     @property
     def settling(self) -> bool:
         return False
-
-    @property
-    def settle_error(self) -> str | None:
-        """Why the last settle after `start_guiding` failed, or None.
-
-        None also while a settle is still running and before any has been
-        asked for: the sequencer reads it only once `settling` has gone
-        False, and a guider that cannot say simply never reports one.
-        """
-        return None
 
     def start_guiding(self, settle_pixels: float = 1.5, settle_time: float = 8.0,
                       settle_timeout: float = 60.0, recalibrate: bool = False) -> None:

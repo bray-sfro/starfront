@@ -882,10 +882,26 @@ class ZwoCamera(Camera):
                 self.binning = int(binning)
             if gain is not None:
                 self._set_control(_GAIN, int(gain))
-                self.gain = self._get_control(_GAIN) or int(gain)
+                # The read-back, even when it is 0 (it used to fall back to
+                # the value asked for, which hid a gain the camera refused).
+                read = self._get_control(_GAIN)
+                self.gain = int(gain) if read is None else read
             if offset is not None:
                 self._set_control(_OFFSET, int(offset))
-                self.offset = self._get_control(_OFFSET) or int(offset)
+                read = self._get_control(_OFFSET)
+                self.offset = int(offset) if read is None else read
+
+    def read_settings(self) -> dict[str, int | None]:
+        """Gain and offset as the SDK has them now (0.2.53); reads only."""
+        self._require()
+        with self._lock:
+            gain = self._get_control(_GAIN)
+            offset = self._get_control(_OFFSET)
+        if gain is not None:
+            self.gain = gain
+        if offset is not None:
+            self.offset = offset
+        return {"gain": gain, "offset": offset}
 
     # -- exposing ---------------------------------------------------------
     def start_exposure(self, seconds: float, light: bool = True) -> None:

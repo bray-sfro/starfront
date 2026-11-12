@@ -47,6 +47,18 @@ def data_root() -> Path:
 # Every key the UI may write, with the value used when the file has nothing to
 # say.  Unknown keys are dropped on save so a typo cannot quietly persist.
 DEFAULTS: dict[str, dict[str, Any]] = {
+    # Reaching this PC from the fleet dashboard (0.2.52). Off: Starfront
+    # listens on 127.0.0.1 only, as always. On: it listens on the LAN at
+    # `lanPort`, and every request that does not come from this PC itself must
+    # carry `X-Fleet-Token: <fleetToken>` or is refused. Localhost is
+    # unchanged either way. A blank token is filled with a random one the
+    # first time LAN access is switched on.
+    "server": {
+        "lanAccess": False,
+        "lanPort": 8765,
+        "fleetToken": "",
+        "nodeName": "",            # how the fleet shows this PC; blank = hostname
+    },
     "site": {
         # There is nothing sensible to guess: the mount usually knows, and the
         # planetarium asks for the coordinates when it does not.
@@ -54,13 +66,16 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "longitude": None,         # degrees east of Greenwich, negative west
         "elevation": 0.0,          # metres
         "useMount": True,          # prefer what the mount driver reports
-        # The sky's Bortle class, 1 (darkest) to 9, as the operator rates
-        # it; None until they do. Sent with the collaboration profile, so a
-        # project that asks for a dark sky can tell.
-        "bortle": None,
+        # OBSERVAT in every frame (0.2.53a).
+        "observatory": "Starfront Observatories",
     },
     "optics": {
         "focalLength": None,       # millimetres, for the field-of-view rectangle
+        # What TELESCOP says (0.2.53a), e.g. "FSQ106" or "Twin FSQ". Per
+        # telescope. Blank = the telescope's name in Starfront, unless that is
+        # the generic "Telescope N", in which case this PC's name (fleet
+        # nodeName, else the hostname), with "-N" when it carries several.
+        "telescopeName": "",
         # The camera angle: the position angle of the sensor's up axis, 0 being
         # north up. Everything that has to know what shape of sky the sensor
         # covers depends on it — mosaic panels, survey footprints, and the
@@ -106,7 +121,21 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "offset": None,
         "setpoint": -10.0,
         "coolAtStart": True,
+        # One switch for the whole mount: every camera that can cool is cooled
+        # when a sequence starts, whatever each telescope's own box says.
+        # Shared, never per telescope.
+        "coolAllAtStart": True,
+        # Warm the camera when the night is over (dawn, a loop putting the
+        # night to bed, a failure closed out, Shut down). Off: never warmed
+        # by the program at all.
         "warmAtEnd": True,
+        # 0.2.52d: a run stopped by hand, or one that ends before the night
+        # does (plan ran out, nothing up yet), keeps the cooler at its
+        # setpoint. On brings back the old warm-up after every end.
+        "warmOnStop": False,
+        # ...and a camera left cold that way warms at dawn (an hour after a
+        # daylight stop) unless a sequence starts first.
+        "warmAtDawnIfCold": True,
         "coolToleranceC": 1.0,
         "coolTimeoutMinutes": 20.0,
         # Whether the sequence stands still while the sensor comes down to
@@ -124,6 +153,23 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # Warming is ramped rather than switched off: a fast temperature change
         # risks condensation on the sensor window.
         "warmRateCPerMinute": 3.0,
+        # The outlets that fed this camera in 0.2.46, before the Power page
+        # existed. Still honoured when nothing is assigned there, so a file
+        # from that version goes on working; new assignments go in
+        # `power.outlets`. A telescope never inherits another's outlets, so
+        # this is read per telescope, never shared.
+        "powerChannels": [],
+    },
+    # The power box: which piece of gear each outlet feeds, by the outlet's
+    # own name as the box reports it. One box serves the whole mount, so this
+    # is shared. A value is a device key: "<telescope id>:<kind>" for the
+    # gear on one optical train ("main:camera", "e027b7ba:focuser") and the
+    # bare kind for the things there is one of ("mount", "guider", "dome").
+    # These are what a power cycle switches, and what the Observatory panel
+    # labels each outlet with. An outlet nobody has assigned that carries a
+    # telescope's own name ("rasa1") is taken as that telescope's camera.
+    "power": {
+        "outlets": {},
     },
     # Weather, cloud, rain — whatever the observatory's safety monitor
     # aggregates into one answer. This is the only setting group in the program
@@ -151,6 +197,44 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "unreachableIsUnsafe": True,
         # Refuse to start a sequence at all while it reads unsafe.
         "blockStart": True,
+        # A safety monitor read straight off an Alpaca server (0.2.53a), e.g.
+        # the Starfront roof API: source "alpaca", scheme "https", host
+        # "alpaca-api.tx.starfront.space", port 443 (0 = scheme default), and
+        # the building's SafetyMonitor device number. Blank source = off, and
+        # nothing changes for a rig that does not set it. When set it fails
+        # closed: an error, timeout, TLS failure, non-200, bad JSON, an answer
+        # older than staleSeconds, or a PC clock more than maxClockSkewSeconds
+        # off the server's all read UNSAFE, whatever unreachableIsUnsafe says.
+        "source": "",
+        "alpacaScheme": "http",
+        "alpacaHost": "",
+        "alpacaPort": 0,
+        "alpacaBasePath": "",
+        "alpacaDevice": 0,
+        # Also check the building's own report time and open/closed in the
+        # Starfront roof report (GET /api/v1/roof/state). Turn off for an
+        # Alpaca server that does not have that endpoint.
+        "alpacaCheckRoofState": True,
+        "alpacaTimeoutSeconds": 5.0,
+        "alpacaPollSeconds": 30.0,
+        "staleSeconds": 180.0,
+        "maxClockSkewSeconds": 120.0,
+        # Roof-status glitches (0.2.53a). With the network source, an unsafe
+        # that the server does not confirm (an error, stale data, clock skew,
+        # issafe=false with roof/state open) must last debounceSeconds before
+        # the shutdown - the larger of this and graceSeconds, not the sum. A
+        # confirmed one (issafe=false and roof/state closed, or an explicit
+        # closing/closed roof state) acts on the confirmReads-th read in a row.
+        "debounceSeconds": 75.0,
+        "confirmReads": 2,
+        # After a weather shutdown of a running sequence, start it again once
+        # it has read safe continuously for resumeAfterSeconds - doubled after
+        # each restart that night - at most autoRestartMaxPerNight times, and
+        # not past dawn, the sequence's end, or with less than one sub left.
+        # Any user action on the telescope cancels it.
+        "autoRestart": True,
+        "autoRestartMaxPerNight": 3,
+        "autoRestartCoolTimeoutMinutes": 20.0,
     },
     # The camera that watches the telescope rather than the sky. It has to cope
     # with afternoon sun through to a pitch-dark dome on the same night with
@@ -268,11 +352,9 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # A frame with no matching master dark or flat still goes in, raw, and
         # the Image tab says so. Off, such frames are left out of the stack.
         "stackUncalibrated": True,
-        # The long side of the canvas, in pixels. Zero is the camera's own
-        # resolution. A stack over sixteen megapixels lives on disk as
-        # memory-mapped files, thirty bytes a pixel (2.6 GB for a sixty-
-        # megapixel camera), and the rest of the program is not squeezed.
-        "maxPixels": 0,
+        # The long side of the canvas. Five accumulators are kept per pixel, so
+        # 3000 is about 180 MB a filter; 4096 is twice that.
+        "maxPixels": 3000,
     },
     "calibration": {
         # Where the master frames live. Blank means a folder beside the data,
@@ -456,10 +538,29 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # A German equatorial has to flip; a fork mount reports no side of pier
         # and is left alone regardless of this setting.
         "meridianFlipEnabled": True,
-        "flipPauseMinutes": 5.0,            # stop imaging this long before it
-        "flipAfterMinutes": 2.0,            # and flip this long after it
+        # How long the mount can track past the meridian before its own limit
+        # stops it, in minutes: the mount's limit less a margin. Imaging runs
+        # until `flipPauseMinutes` before that, so the last frame can go
+        # through transit and the flip follows the moment it ends. 0 is a
+        # mount that cannot pass the meridian at all - imaging stops a frame
+        # short of transit and the wait is a frame long.
+        "flipLimitMinutes": 0.0,
+        "flipPauseMinutes": 5.0,            # stop imaging this long before the limit
+        "flipAfterMinutes": 2.0,            # and flip this long after transit
+        # A flip slew that leaves the mount on the same side of the pier is
+        # tried again this often: OnStep only flips a goto once the target is
+        # past its own meridian limit, which two minutes rarely is.
+        "flipRetryMinutes": 5.0,
         "flipSolve": True,                  # re-centre by plate solve after it
+        # How far the rotator turns at a meridian flip to keep the same sky
+        # angle: 180 for a plain rotator (the camera turns over with the
+        # tube); 0 for one whose driver already allows for the side of pier.
+        # The re-centring solve corrects whatever is left either way.
+        "rotatorFlipDegrees": 180.0,
         "settleSeconds": 10.0,              # after every slew
+        # How long a refused slew ("Already in motion" while the last guide
+        # pulse is worked off) keeps being asked for before the run gives up.
+        "slewRetrySeconds": 60.0,
         # What to do with the mount when the plan runs out. Parking is the safe
         # answer for a rig nobody is standing next to, which is nearly every
         # rig this runs: two telescopes on their first collaboration night
@@ -494,6 +595,22 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # abort that never finishes is an abort that never parked.
         "coverTimeoutSeconds": 120.0,
         "roofTimeoutSeconds": 300.0,
+        # 0.2.53b - the roof at the start of a target. Open it (lead telescope
+        # only) before the first home/slew/focus/light of every target if it
+        # is not open; acts only when a dome/roof with a shutter is connected.
+        "openRoofAtStart": True,
+        # Refuse to open with no safety monitor (Equipment or network source).
+        # Off: open anyway, with a warning that nothing closes it for weather.
+        "requireSafetyToOpen": False,
+        # How long an OpenShutter is given to read open. Longer, or a failure,
+        # is the site's technician lock: latched, never retried, no lights.
+        "roofOpenTimeoutSeconds": 180.0,
+        # Hold every light while a connected roof does not read open.
+        "pauseLightsUnlessRoofOpen": True,
+        # Shut a roof this run opened at the end of the run (after the park).
+        "closeRoofAtEnd": True,
+        # Let the 0.2.53a auto-restart open the roof (off: it opens nothing).
+        "reopenRoofOnAutoRestart": False,
         "parkTimeoutSeconds": 300.0,
         # How long Abort waits for the run to notice before parking anyway. It
         # has to cover the slowest thing the sequencer can be inside — a guider
@@ -521,17 +638,20 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         "guidingRecovery": True,
         "guideGraceSeconds": 25.0,
         "guideRestartAttempts": 3,
-        # Re-select a star and restart guiding; after this many failures the
-        # attempt includes a fresh calibration, which is slow but is the only
-        # thing that fixes a mount that has been moved by hand.
+        # Guiding that is still "guiding" but trailing every sub is as lost as
+        # a lost star. Past this RMS for this many frames in a row the star is
+        # dropped and a fresh one picked; 0 arcsec turns it off. Spaced out,
+        # because a night of bad seeing is not fixed by a better star.
+        "roughGuidingArcsec": 3.0,
+        "roughGuidingFrames": 2,
+        "roughGuidingRetryMinutes": 10.0,
+        # Rough guiding on a star PHD2 is holding well is restarted on a fresh
+        # star first; this many rough restarts in, the restart includes a
+        # fresh calibration, which is slow but is the only thing that fixes
+        # a mount that has been moved by hand. 0 never recalibrates. A lost
+        # star never does: PHD2 cannot calibrate on a star it cannot see, and
+        # the calibration it writes anyway replaces the good one for good.
         "recalibrateAfterAttempts": 2,
-        # Guiding that is running but this rough, in arcseconds RMS over the
-        # last fifty frames, is treated as lost: the star is bad or the
-        # calibration is (a pier side the driver never reports, a mount moved
-        # by hand), and PHD2 will chase it to the edge of the frame while
-        # saying "Guiding". It is restarted on a fresh star and, if that is
-        # not it, a fresh calibration. 0 switches the check off.
-        "guideRmsFaultArcsec": 5.0,
         # A sub exposed while the guider had no lock is very likely trailed, and
         # is always flagged on the sub chart. Moving it out of the way as well
         # is off by default because it may be perfectly usable — that is a
@@ -548,9 +668,36 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # A single failed download is not a reason to end the night; a camera
         # that has fallen off the USB bus is, and the difference is whether it
         # comes back when asked again.
+        # 0.2.52e: how often an idle telescope's camera is asked whether it
+        # is still there (a few cheap reads), and reconnected if it is not.
+        # 0 turns the idle look off; the check before every exposure stays.
+        "cameraWatchSeconds": 60.0,
         "frameRetryAttempts": 3,
         "frameRetrySeconds": 20.0,
         "reconnectDevices": True,
+        # The same disconnect-and-reconnect for a frame taken by hand on the
+        # Image tab (Capture, Loop) and for a focus or centring frame: the
+        # camera is brought back on its remembered driver and the frame is
+        # tried once more before the failure is reported.
+        "reconnectManualCaptures": True,
+        # A camera that has not said its exposure is done this long after it
+        # should have is treated as having failed, which is what lets the
+        # reconnect happen instead of a download that waits for ever.
+        "hungSeconds": 120.0,
+        # A camera that has left the USB bus does not come back for a
+        # reconnect: the driver cannot open what the PC can no longer see.
+        # Cutting its outlets on the power box and restoring them is the one
+        # thing that does fix it, and on 2026-10-19 it was the only thing that
+        # would have saved the night. Only outlets mapped to that camera are
+        # touched (Equipment > Camera > Power), and only after the plain
+        # reconnect has had its go: this many reconnects of the same camera
+        # inside a quarter of an hour, or one that fails outright.
+        "powerCycleCameras": True,
+        "powerCycleAfterReconnects": 1,
+        # Off long enough for the body to lose its charge, then long enough
+        # back on for the PC to enumerate it and the driver to see it.
+        "powerCycleOffSeconds": 10.0,
+        "powerCycleBootSeconds": 25.0,
         # -- giving up ------------------------------------------------------
         # Recoveries that keep happening are a rig problem, not a weather one.
         "maxPerTarget": 8,
@@ -558,6 +705,53 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # What happens when recovery has run out of ideas: carry on with the
         # next target, or stop the night and make the mount safe.
         "onGiveUp": "next",        # next|stop|park
+        # -- one telescope at a time (0.2.51) --------------------------------
+        # A camera that is still failing after the frame retries is taken out
+        # of the slot and brought back in the background - reconnect, then
+        # the power box - while the other telescopes go on imaging. Attempts
+        # are spaced by a backoff that doubles up to the cap; past the last
+        # one the telescope sits out the rest of the target.
+        "rigRecoveryAttempts": 6,
+        "rigRecoveryBackoffSeconds": 20.0,
+        "rigRecoveryBackoffMaxSeconds": 300.0,
+        # Every step a recovery takes (abort, reconnect, power cycle, the
+        # check that the camera answers) has to finish inside this.
+        "recoveryStepSeconds": 180.0,
+        # A camera download (or any driver call that hands over a frame) that
+        # has not returned in this long is treated as hung - 2026-10-14 02:24
+        # was a download that never came back, and nothing timed it out.
+        "downloadTimeoutSeconds": 120.0,
+        # Slack on top of exposure + hungSeconds + downloadTimeoutSeconds
+        # before a telescope's frame is given up on and its thread abandoned.
+        "slotGraceSeconds": 60.0,
+        # No progress at all from the sequence thread for this long (a status
+        # update, a frame, a slew finishing) and the watchdog steps in: the
+        # thread stacks go to the log folder, the captures are aborted, and
+        # if that does not free it the night is closed out.
+        "watchdogMinutes": 15.0,
+        # A cooler that has not brought the sensor down by half a degree in
+        # this long is asked again, and then given up on - instead of the
+        # whole coolTimeoutMinutes with every telescope waiting.
+        "coolStallSeconds": 300.0,
+        # Guiding that could not be restarted is tried again this long later,
+        # doubling each time, instead of never again that night.
+        "guideRetryMinutes": 10.0,
+        # A mount that has dropped off is reconnected this many times before
+        # the run gives up on it.
+        "mountReconnectAttempts": 3,
+        # Each frame is written to sequence-progress.json; a program that is
+        # killed or a PC that restarts picks the same night up where it was,
+        # after this long (so the drivers can come up first), waiting up to
+        # resumeWaitMinutes for the cameras to connect.
+        "resumeAfterRestart": True,
+        "resumeDelaySeconds": 60.0,
+        "resumeWaitMinutes": 10.0,
+        # What a run that cannot be rescued (every camera failed, the thread
+        # stuck in a driver) does to the mount on its way out: park,
+        # stopTracking, or none. Unlike parkAtEnd this is a failure close-out.
+        "closeOutOnFailure": "park",
+        # A run still going this long after dawn is closed out by the watchdog.
+        "dawnCloseOutMinutes": 15.0,
     },
     "guiding": {
         # PHD2 is a separate program, so connecting to it means making sure it
@@ -697,6 +891,19 @@ DEFAULTS: dict[str, dict[str, Any]] = {
         # should stay off for most people: an assignment that silently rewrote
         # what a mount did tonight would be the software going rogue.
         "autoAccept": False,
+        # Sending this PC's collaboration lights, and the masters that
+        # calibrate them, to the server (astrocontrol/autoupload.py). On by
+        # default (2026-11-04): each light is queued the moment it is saved
+        # and sent by a thread of its own; the Collab tab switch turns it off.
+        # The collaboration must be taking uploads on the server as well.
+        # Local files are never changed or deleted.
+        "autoUpload": True,
+        # Only these rigs (by name); empty means every rig on this PC.
+        "autoUploadRigs": [],
+        # The most it may use of the uplink, in megabits a second (0 = no cap).
+        "autoUploadMbit": 0.0,
+        # Only between dawn and dusk at this site, never while imaging.
+        "autoUploadDaytimeOnly": False,
     },
     # Telling somebody who is not in the room. A night that dies at one in the
     # morning is a night lost entirely unless something says so.

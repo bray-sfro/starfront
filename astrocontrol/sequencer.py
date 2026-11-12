@@ -47,6 +47,8 @@ from typing import Any
 
 from . import allsky, astro, capture, filters, plans, schedule
 from .devices.base import DeviceError
+from .recovery import (FAILED as RIG_FAILED, OK as RIG_OK, RECOVERING as RIG_RECOVERING,
+                       ProgressJournal, RigRecovery, backoff, call_with_timeout)
 from .imaging import stars
 
 # States the UI shows. "waiting" means the next target is not up yet.
@@ -137,11 +139,6 @@ class Sequencer:
         # The warnings board, for the things only the run can see happen: a
         # flip that did not flip, a solver that keeps failing. Optional.
         self.warnings: Any = None
-        # A collaboration's rules by project id, and the image scale in
-        # arcseconds per pixel, from the collaboration client. Set by whoever
-        # builds both; without them every sub is credited as before.
-        self.collab_rules: Any = None
-        self.collab_scale: Any = None
         self._solve_failures = 0
         # Told when the first plate solve on a collaboration target measures
         # the camera at an angle other than the one its panels were laid at.
@@ -154,11 +151,24 @@ class Sequencer:
         #: (rig id, asked filter, fitted filter) already warned about, so a
         #: drawer telescope following another's allocation says so once.
         self._said_fitted: set[tuple[str, str, str]] = set()
+        #: True from the moment a person presses Stop until the next start.
+        #: Stop means "leave the rig where it is"; park-at-end is for a night
+        #: that ran out on its own, and used to fire after a Stop as well.
+        self._stopped_by_hand = False
 
         self._thread: threading.Thread | None = None
         # The warm-down outlives the run that started it, so it gets its own.
         self._warm_thread: threading.Thread | None = None
         self._warm_stop = threading.Event()
+        # A run that was stopped by hand, or ran out before the night did,
+        # leaves the cameras cold (0.2.52d). They warm at dawn instead, unless
+        # a new sequence starts first: a thread that waits, and its stop flag.
+        self._warm_later_thread: threading.Thread | None = None
+        self._warm_later_stop = threading.Event()
+        self._warm_later_at: float | None = None
+        #: Set when the run ended because the night itself was over (dawn,
+        #: less the margin), which is the one ordinary end that warms at once.
+        self._night_over = False
         self._abort = threading.Event()
         self._paused = threading.Event()
         self._skip = threading.Event()
@@ -200,11 +210,10 @@ class Sequencer:
         self._guiding_wanted = False
         self._guide_lost_since: float | None = None
         self._guide_lost_in_slot = False
-        # Restarts for rough guiding since it was last seen guiding well. A
-        # restart "succeeds" the moment PHD2 is guiding again, long before
-        # there are enough frames to know whether it is any better, so the
-        # decision to recalibrate has to be remembered across slots rather
-        # than made inside one attempt loop.
+        # Rough-guiding bookkeeping: frames in a row over the limit, and when
+        # a fresh star was last picked for it.
+        self._rough_runs = 0
+        self._rough_last = 0.0
         self._rough_restarts = 0
         self._recentre_request: str | None = None
         self._entry_id: str | None = None
@@ -241,6 +250,46 @@ class Sequencer:
         self._rig_state: dict[str, dict[str, Any]] = {}
         self._checking = threading.Lock()
 
+        # -- 0.2.51: recovery that does not end the night ------------------
+        # One record per telescope: ok, recovering (attempt n of m, why,
+        # what it is doing), or failed for the rest of the target.
+        self._rig_recovery: dict[str, RigRecovery] = {}
+        # Bumped on every start. A sequence thread that was given up on by
+        # the watchdog finds its number out of date at its next `_check` and
+        # leaves, instead of waking up inside the next night's run.
+        self._generation = 0
+        self._abandoned = False
+        # The watchdog: when the sequence thread last showed signs of life,
+        # and the latest a step it is waiting on is allowed to take.
+        self._beat_at = time.monotonic()
+        self._expect_by: float | None = None
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog: dict[str, Any] = {"state": "idle"}
+        # Set by whatever decided the night cannot go on, so the way out
+        # closes the observatory (closeOutOnFailure) and says why.
+        self._close_out: str | None = None
+        # Guiding that could not be restarted is tried again later.
+        self._guide_retry_at: float | None = None
+        self._guide_retries = 0
+        # The roof at the start of a target (0.2.53b). A failed or timed-out
+        # open is the site's technician lock (Bray, Hakos): latched here, and
+        # nothing more is sent to the roof until a person starts a new run.
+        self._roof_locked: str | None = None
+        # Whether this run sent the OpenShutter - so the end of the run knows
+        # the roof it is leaving open is one it opened.
+        self._roof_opened_by_run = False
+        # Frames shot so far tonight by entry, panel, telescope and filter,
+        # written to disk after each one so a restart resumes there.
+        try:
+            from .config import data_root
+            journal_path = data_root() / "sequence-progress.json"
+        except Exception:                          # noqa: BLE001 - a bare build
+            journal_path = Path("sequence-progress.json")
+        self.journal = ProgressJournal(journal_path)
+        self._progress: dict[str, int] = {}
+        self._finished_entries: set[str] = set()
+        self._resume: dict[str, Any] | None = None
+
     # -- the telescopes ----------------------------------------------------
     @property
     def master(self):
@@ -266,7 +315,10 @@ class Sequencer:
     # -- state -------------------------------------------------------------
     @property
     def running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        # A thread the watchdog has given up on may still be alive inside a
+        # driver call, but the run is over: never "running but dead".
+        return (self._thread is not None and self._thread.is_alive()
+                and not self._abandoned)
 
     @property
     def paused(self) -> bool:
@@ -292,6 +344,12 @@ class Sequencer:
         thread = self._warm_thread
         return thread is not None and thread.is_alive()
 
+    @property
+    def warm_pending(self) -> bool:
+        """Whether cameras left cold by the last run are waiting for dawn to warm."""
+        thread = self._warm_later_thread
+        return thread is not None and thread.is_alive()
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -309,6 +367,8 @@ class Sequencer:
                 # Warming runs on after the sequence has ended, so it is
                 # reported separately rather than holding the run open.
                 "warming": self.warming,
+                # When cameras left cold by a Stop are due to warm (0.2.52d).
+                "warmAt": self._warm_later_at if self.warm_pending else None,
                 # What the UI should gate on, rather than `running`: a paused or
                 # stopping sequence leaves the cameras free.
                 "imaging": self.owns_the_cameras,
@@ -318,7 +378,12 @@ class Sequencer:
                 "error": self._error,
                 # What went wrong and what is being done about it.
                 "recovery": dict(self._recovery) if self._recovery else None,
-                "recoveries": list(self._recoveries),
+                # Per telescope (0.2.51): ok / recovering / failed, attempt
+                # n of m, why, and what the recovery is doing right now.
+                "rigRecovery": {rig_id: rec.as_dict()
+                                for rig_id, rec in self._rig_recovery.items()},
+                "watchdog": dict(self._watchdog),
+                "resumed": bool(self._resume),
                 "rescues": self._rescues,
                 "entryId": self._entry_id,
                 "panel": self._panel,
@@ -334,8 +399,10 @@ class Sequencer:
                 "frames": list(self._frames_log),
                 "referenceHfr": self._reference_hfr.get(self.master.id),
                 "referenceHfrByRig": dict(self._reference_hfr),
-                "telescopes": {rig_id: dict(state)
-                               for rig_id, state in self._rig_state.items()},
+                "telescopes": {rig_id: (
+                    {**state, "recovery": self._rig_recovery[rig_id].as_dict()}
+                    if rig_id in self._rig_recovery else dict(state))
+                    for rig_id, state in self._rig_state.items()},
                 # The master's own progress, kept at the top level so a
                 # single-telescope setup reads exactly as it always did.
                 "filter": self._rig_state.get(self.master.id, {}).get("filter", ""),
@@ -352,6 +419,17 @@ class Sequencer:
                 self._state_since = time.time()
             self._state = state
             self._message = message
+        self._beat()
+
+    def _alive(self) -> bool:
+        """For a long job's abort poll: it is still polling, so it is alive."""
+        self._beat_at = time.monotonic()
+        return False
+
+    def _beat(self) -> None:
+        """The sequence thread is alive and getting somewhere."""
+        if getattr(threading.current_thread(), "sf_generation", None) == self._generation:
+            self._beat_at = time.monotonic()
 
     def _say(self, message: str, level: str = "info") -> None:
         self.manager.log(message, level)
@@ -391,6 +469,19 @@ class Sequencer:
         with contextlib.suppress(Exception):
             self.warnings.raise_(key, level, title, detail, fix, sticky=True)
 
+    def _unwarn(self, key: str) -> None:
+        """Take a run warning down: the thing it was about has come right.
+
+        A sticky warning is cleared by name or not at all - the watchdog cannot
+        see a focus run or a plate solve for itself - and until these were
+        cleared on success a bad patch of sky at midnight was still "failing"
+        on the board the next afternoon.
+        """
+        if self.warnings is None:
+            return
+        with contextlib.suppress(Exception):
+            self.warnings.clear(key)
+
     def _set_rig(self, rig, **values: Any) -> None:
         with self._lock:
             state = self._rig_state.setdefault(
@@ -399,9 +490,12 @@ class Sequencer:
             state["name"] = rig.name
             state["role"] = rig.role
             state.update(values)
+        # A focus sweep reporting its points, a cooler its temperature: the
+        # run is getting somewhere (the watchdog).
+        self._beat()
 
     # -- control -----------------------------------------------------------
-    def start(self, loop: bool = False) -> None:
+    def start(self, loop: bool = False, resume: dict[str, Any] | None = None) -> None:
         """Run the plan tonight; with `loop`, every night until told to stop.
 
         On loop the night is bracketed by the whole of what an unattended
@@ -448,6 +542,7 @@ class Sequencer:
         # A warm-down from the previous run would be raising the setpoint while
         # this one tries to lower it.
         self._stop_warming()
+        self._night_over = False
         # Last night's event warnings belong to last night.
         if self.warnings is not None:
             with contextlib.suppress(Exception):
@@ -457,6 +552,7 @@ class Sequencer:
         self._abort.clear()
         self._paused.clear()
         self._skip.clear()
+        self._stopped_by_hand = False
         # A new night may have new drawers; the fitted-filter warning is
         # worth hearing once more.
         self._said_fitted.clear()
@@ -465,8 +561,263 @@ class Sequencer:
             self._loop_next = None
             self._nights = 0
         self._reset_night()
+        if resume:
+            self._seed_resume(resume)
+        else:
+            # A person starting a new run is the only thing that lifts the
+            # technician-lock latch (0.2.53b); an auto-restart never does.
+            self._roof_locked = None
+            self._roof_opened_by_run = False
+        with self._lock:
+            self._generation += 1
+            self._abandoned = False
+            self._close_out = None
+            self._expect_by = None
+            self._beat_at = time.monotonic()
+        self._journal_write()
         self._thread = threading.Thread(target=self._run, daemon=True, name="sequencer")
+        self._thread.sf_generation = self._generation       # type: ignore[attr-defined]
         self._thread.start()
+        self._start_watchdog()
+
+    # -- the watchdog (0.2.51) ------------------------------------------------
+    #
+    # 2026-10-14 02:24: three exposures started and then nothing, for twelve
+    # and a half hours, until somebody restarted the program in the afternoon.
+    # The sequence thread was inside a driver call that never returned and
+    # nothing was watching it.  The watchdog is a thread of its own that knows
+    # when the run last showed signs of life and how long the step it is in
+    # may take.  Past that it saves every thread's stack, aborts the captures
+    # (which frees most hangs), and if the run is still stuck one period
+    # later it gives the thread up and closes the night out itself.  It does
+    # the same for a run still going past dawn.
+
+    def _start_watchdog(self) -> None:
+        generation = self._generation
+        thread = threading.Thread(target=self._watch, args=(generation,), daemon=True,
+                                  name="sequencer-watchdog")
+        self._watchdog_thread = thread
+        thread.start()
+
+    def _watch(self, generation: int) -> None:
+        stage = 0
+        stage_at = 0.0
+        reason = ""
+        while generation == self._generation:
+            time.sleep(0.5)
+            thread = self._thread
+            if thread is None or not thread.is_alive() or self._abandoned:
+                break
+            settings = self._recovery_settings()
+            limit = float(settings.get("watchdogMinutes") or 0.0) * 60.0
+            if limit <= 0 or not settings.get("enabled", True):
+                with self._lock:
+                    self._watchdog = {"state": "off"}
+                continue
+            now = time.monotonic()
+            with self._lock:
+                beat = self._beat_at
+                expect = self._expect_by
+            quiet = now - beat
+            due = max(beat + limit, expect or 0.0)
+            late_dawn = None
+            with contextlib.suppress(Exception):
+                dawn = self._dawn_at or None
+                after = float(settings.get("dawnCloseOutMinutes") or 0.0) * 60.0
+                if dawn and not self._loop and self._settings().get("stopAtDawn", True) \
+                        and time.time() > dawn + after:
+                    late_dawn = f"still running {(time.time() - dawn) / 60.0:.0f} min after dawn"
+            with self._lock:
+                self._watchdog = {"state": "stalled" if stage else "watching",
+                                  "quietSeconds": round(quiet, 1),
+                                  "limitSeconds": limit,
+                                  "expectBy": None if expect is None
+                                  else time.time() + (expect - now),
+                                  "stage": stage, "reason": reason}
+            stalled = now > due or late_dawn is not None
+            if not stalled:
+                if stage:
+                    stage = 0
+                    reason = ""
+                    self.manager.log("Watchdog: the sequence is moving again", "success")
+                continue
+            if stage == 0:
+                stage, stage_at = 1, now
+                reason = late_dawn or f"no progress for {quiet / 60.0:.1f} min"
+                self.manager.log(f"Watchdog: {reason} — saving the thread stacks and "
+                                 "aborting the captures", "error")
+                self._dump_stacks(reason)
+                with self._lock:
+                    self._recovery = {"kind": "watchdog", "reason": reason,
+                                      "attempt": 1, "attempts": 2, "since": time.time()}
+                if late_dawn:
+                    self._abort.set()
+                for rig in self.rigs.all:
+                    with contextlib.suppress(Exception):
+                        call_with_timeout(rig.capture.abort, 15.0, "aborting a capture")
+                    with contextlib.suppress(Exception):
+                        rig.capture.release_stuck()
+                continue
+            # Stage 1 did not free it: give the thread up and close out here.
+            if now - stage_at > min(limit, 300.0):
+                self._abandon(reason)
+                break
+
+    def _dump_stacks(self, reason: str) -> None:
+        """Every thread's stack, for the morning: where the run was stuck."""
+        import sys as _sys
+        import traceback as _tb
+        with contextlib.suppress(Exception):
+            from .config import data_root
+            folder = data_root() / "logs"
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / time.strftime("sequence-stacks-%Y%m%d-%H%M%S.txt")
+            names = {t.ident: t.name for t in threading.enumerate()}
+            lines = [f"Watchdog: {reason}", ""]
+            for ident, frame in _sys._current_frames().items():
+                lines.append(f"--- thread {names.get(ident, ident)}")
+                lines.extend(line.rstrip("\n") for line in _tb.format_stack(frame))
+                lines.append("")
+            path.write_text("\n".join(lines), encoding="utf-8")
+            self.manager.log(f"Watchdog: thread stacks saved to {path}", "warn")
+
+    def _abandon(self, reason: str) -> None:
+        """The run is stuck for good: close the night out from here."""
+        message = f"the sequence stopped responding ({reason})"
+        with self._lock:
+            self._abandoned = True
+            self._error = message
+            self._close_out = message
+            self._recovery = {"kind": "watchdog", "reason": f"{reason}; closing out",
+                              "attempt": 2, "attempts": 2, "since": time.time()}
+        self._abort.set()
+        self.manager.log(f"Watchdog: {message} — closing the night out", "error")
+        self._tell("failure", "The sequence stopped responding",
+                   f"{reason}. Closing the observatory out.\n\n{self._summary()}")
+        action = str(self._recovery_settings().get("closeOutOnFailure") or "park")
+        with contextlib.suppress(Exception):
+            call_with_timeout(self._stop_guiding, 30.0, "stopping guiding")
+        mount = self.manager.get("mount")
+        if mount is not None and action != "none":
+            try:
+                if action == "park":
+                    call_with_timeout(self._park_and_check, 600.0, "parking the mount")
+                else:
+                    call_with_timeout(lambda: mount.set_tracking(False), 30.0,
+                                      "stopping tracking")
+            except Exception as exc:              # noqa: BLE001 - reported
+                self.manager.log(f"Watchdog: could not make the mount safe: {exc}", "error")
+                with contextlib.suppress(Exception):
+                    call_with_timeout(lambda: mount.set_tracking(False), 30.0,
+                                      "stopping tracking")
+                self._tell("failure", "The mount may not be safe",
+                           f"{exc}. The telescope may still be pointing at the sky.")
+        with self._lock:
+            self._entry_id = None
+            self._rig_state = {}
+            self._recovery = {"kind": "watchdog", "reason": message,
+                              "attempt": 2, "attempts": 2, "since": time.time()}
+        self._set(IDLE, "error")
+        self._journal_close("failed")
+        with contextlib.suppress(Exception):
+            self._start_warming()
+
+    # -- the progress journal (0.2.51) ----------------------------------------
+    #
+    # FSQ106, September and October: eleven runs ended with the program killed
+    # or the PC off, and every one of them started again from frame one of the
+    # first target - or, mostly, not at all.  The run now writes what it has
+    # shot after every frame, and a program that comes back up the same night
+    # picks up at the frame it was on.
+
+    @staticmethod
+    def _progress_key(entry_id: str, panel_index: int, rig_id: str, filter_name: str) -> str:
+        return f"{entry_id}:{int(panel_index)}:{rig_id}:{filter_name}"
+
+    def _journal_write(self, active: bool = True) -> None:
+        with contextlib.suppress(Exception):
+            entries = [e.get("id") for e in (self.plan.raw().get("entries") or [])]
+            with self._lock:
+                data = {
+                    "version": 1, "active": active, "loop": self._loop,
+                    "night": self._night_now(), "started": self._started,
+                    "entryId": self._entry_id, "panelIndex": self._panel_index,
+                    "progress": dict(self._progress),
+                    "finished": sorted(self._finished_entries),
+                    "plan": entries,
+                }
+            self.journal.write(data)
+
+    def _journal_close(self, reason: str) -> None:
+        with contextlib.suppress(Exception):
+            self._journal_write(active=False)
+            self.journal.close(reason)
+
+    def resumable(self) -> dict[str, Any] | None:
+        """The run a restart should pick up again, or None.
+
+        Only a run that was still going when the program went away - not one
+        that finished, failed or was stopped by hand - and only on the same
+        night, with the same plan still loaded.
+        """
+        settings = self._recovery_settings()
+        if not settings.get("enabled", True) or not settings.get("resumeAfterRestart", True):
+            return None
+        data = self.journal.load()
+        if not data or not data.get("active"):
+            return None
+        if time.time() - float(data.get("updated") or 0) > 16 * 3600:
+            return None
+        night = self._night_now()
+        if not night or data.get("night") != night:
+            return None
+        entries = [e.get("id") for e in (self.plan.raw().get("entries") or [])]
+        if not entries or not set(entries) & set(data.get("plan") or []):
+            return None
+        return data
+
+    def _seed_resume(self, data: dict[str, Any]) -> None:
+        progress = {str(k): int(v) for k, v in (data.get("progress") or {}).items()
+                    if int(v or 0) > 0}
+        with self._lock:
+            self._resume = dict(data)
+            self._progress = dict(progress)
+            self._finished_entries = set(data.get("finished") or [])
+            for key, count in progress.items():
+                parts = key.split(":", 3)
+                if len(parts) != 4:
+                    continue
+                done_key = f"{parts[0]}:{parts[2]}:{parts[3]}"
+                self._done[done_key] = self._done.get(done_key, 0) + count
+        shot = sum(progress.values())
+        self._say(f"Resuming tonight's run after a restart: {shot} frame(s) already "
+                  f"shot, {len(self._finished_entries)} target(s) finished", "warn")
+
+    def _without_done(self, queue: list[dict[str, Any]], entry_id: str,
+                      panel_index: int, rig_id: str) -> list[dict[str, Any]]:
+        """A telescope's queue for a panel less the frames already shot tonight."""
+        if not self._progress:
+            return queue
+        left = {}
+        for item in queue:
+            name = str(item.get("filter") or "")
+            if name not in left:
+                left[name] = self._progress.get(
+                    self._progress_key(entry_id, panel_index, rig_id, name), 0)
+        out = []
+        for item in queue:
+            name = str(item.get("filter") or "")
+            if left.get(name, 0) > 0:
+                left[name] -= 1
+                continue
+            out.append(item)
+        return out
+
+    def _credit(self, entry_id: str, panel_index: int, rig_id: str, filter_name: str) -> None:
+        key = self._progress_key(entry_id, panel_index, rig_id, filter_name)
+        with self._lock:
+            self._progress[key] = self._progress.get(key, 0) + 1
+        self._journal_write()
 
     def _reset_night(self) -> None:
         """Forget the previous night: counters, references, what was homed."""
@@ -486,6 +837,12 @@ class Sequencer:
             self._since_solve = {}
             self._filter_offset = {}
             self._rig_state = {}
+            self._rig_recovery = {}
+            self._progress = {}
+            self._finished_entries = set()
+            self._resume = None
+            self._guide_retry_at = None
+            self._guide_retries = 0
             self._recovery = None
             self._recoveries = []
             self._rescues = 0
@@ -493,12 +850,15 @@ class Sequencer:
             self._guiding_wanted = False
             self._guide_lost_since = None
             self._guide_lost_in_slot = False
+            self._rough_runs = 0
+            self._rough_last = 0.0
             self._rough_restarts = 0
             self._recentre_request = None
             self._cooling_wanted = set()
             self._homed = False
             self._weather_hold = False
             self._dawn_at = None
+            self._night_over = False
 
     def pause(self) -> None:
         self._paused.set()
@@ -513,7 +873,12 @@ class Sequencer:
         self._say("Skipping to the next target", "warn")
 
     def stop(self) -> None:
+        self._stopped_by_hand = True
         self._abort.set()
+        # Stopped by a person (or the program closed by one) is not a run to
+        # pick up after a restart; written now, not when the thread gets there.
+        if self.running:
+            self._journal_close("stopped")
         self._paused.clear()
         for rig in self.rigs.all:
             with contextlib.suppress(Exception):
@@ -542,9 +907,179 @@ class Sequencer:
             self._say(f"The sky is {reason}: holding the run until it clears",
                       "error")
             return
+        # What was running, taken before the shutdown closes the journal, so
+        # the auto-restart (0.2.53a) can pick it up at the same frame.
+        hook = getattr(self, "on_weather_shutdown", None)
+        if hook is not None:
+            with contextlib.suppress(Exception):
+                hook(self.weather_snapshot())
         self._weather_hold = True
         self._say(f"The sky is {reason}: shutting down", "error")
         self.shut_down()
+
+    # -- auto-restart after a weather shutdown (0.2.53a) -------------------
+    def weather_snapshot(self) -> dict[str, Any] | None:
+        """The run a weather shutdown is interrupting, as the journal has it."""
+        if not self.running:
+            return None
+        entries = [e.get("id") for e in (self.plan.raw().get("entries") or [])]
+        with self._lock:
+            return {
+                "version": 1, "active": True, "loop": self._loop,
+                "night": self._night_now(), "started": self._started,
+                "entryId": self._entry_id, "panelIndex": self._panel_index,
+                "progress": dict(self._progress),
+                "finished": sorted(self._finished_entries),
+                "plan": entries, "takenAt": time.time(),
+            }
+
+    def _restart_entry(self, snapshot: dict[str, Any]):
+        """(entry, target, panel) the interrupted run was on, or Nones."""
+        entries = list(self.plan.raw().get("entries") or [])
+        done = set(snapshot.get("finished") or [])
+        entry = next((e for e in entries if e.get("id") == snapshot.get("entryId")), None)
+        if entry is None:
+            entry = next((e for e in entries if e.get("id") not in done
+                          and not plans.is_calibration(e)), None)
+        if entry is None or plans.is_calibration(entry):
+            return entry, None, None
+        target = next((t for t in self.targets.listing()
+                       if t.get("id") == entry.get("targetId")), None)
+        if target is None or target.get("type") == "allsky" or target.get("ra") is None:
+            return entry, target, None
+        index = int(snapshot.get("panelIndex") or 0)
+        panel = next((p for p in (target.get("panels") or [])
+                      if int(p.get("index", 0) or 0) == index), None)
+        if panel is None:
+            panel = {"index": 0, "ra": target["ra"], "dec": target["dec"]}
+        return entry, target, panel
+
+    def weather_deadlines(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+        """Tonight's key, dawn (less the margin), the sequence's end, one sub."""
+        self._dawn_at = None
+        dawn = None
+        with contextlib.suppress(Exception):
+            dawn = self._dawn()
+        if dawn:
+            dawn -= float(self._settings().get("dawnMarginMinutes") or 0.0) * 60.0
+        entries = list(self.plan.raw().get("entries") or [])
+        done = set(snapshot.get("finished") or [])
+        left = [e for e in entries if e.get("id") not in done]
+        ends = [e.get("endAt") for e in left]
+        end = (max(float(x) for x in ends)
+               if ends and all(ends) and not snapshot.get("loop") else None)
+        entry, _, _ = self._restart_entry(snapshot)
+        subs = [float(f.get("exposure") or 0) for f in ((entry or {}).get("filters") or [])
+                if int(f.get("count") or 0) > 0 and float(f.get("exposure") or 0) > 0]
+        if not subs:
+            subs = [float(f.get("exposure") or 0) for e in left
+                    for f in (e.get("filters") or []) if float(f.get("exposure") or 0) > 0]
+        return {"night": self._night_now(), "dawn": dawn, "end": end,
+                "sub": min(subs) if subs else 60.0}
+
+    def restart_begin(self) -> None:
+        if self.running:
+            raise DeviceError("a sequence is already running")
+        self._abort.clear()
+        self._paused.clear()
+        self._skip.clear()
+        # The shutdown's warm-down is still ramping the setpoint up.
+        self._stop_warming()
+
+    def restart_abort(self) -> None:
+        self._abort.set()
+
+    def restart_recool(self, timeout: float) -> list[str]:
+        """Cool every imaging camera to its setpoint; the names still warm at the timeout."""
+        wanted = []
+        every = bool(self.config.get("camera", "coolAllAtStart", True))
+        for rig in self.rigs.imaging():
+            settings = rig.config.section("camera")
+            camera = rig.manager.get("camera")
+            if camera is None or not camera.connected or not camera.can_cool:
+                continue
+            if not (every or settings.get("coolAtStart", True)):
+                continue
+            setpoint = float(settings.get("setpoint", -10.0))
+            camera.set_setpoint(setpoint)
+            camera.set_cooler(True)
+            if hasattr(rig, "note_cooler"):
+                rig.note_cooler(on=True, setpoint=setpoint)
+            wanted.append((rig, camera, setpoint,
+                           float(settings.get("coolToleranceC") or 1.0)))
+        if wanted:
+            self._say("Auto-restart: recooling " + ", ".join(r.name for r, *_ in wanted))
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            late = [rig.name for rig, camera, setpoint, tol in wanted
+                    if camera.temperature is None or abs(camera.temperature - setpoint) > tol]
+            if not late or time.monotonic() >= deadline:
+                return late
+            self._set("cooling", "auto-restart: recooling")
+            self._sleep(min(2.0, max(0.05, deadline - time.monotonic())))
+
+    def restart_unpark(self) -> None:
+        dome = self.manager.get("dome")
+        if dome is not None and dome.connected and getattr(dome, "can_shutter", False) \
+                and self._roof_state(dome) != "open":
+            # 0.2.53b: the auto-restart still opens nothing by default (as in
+            # 0.2.53a). With 'reopenRoofOnAutoRestart' on (and 'Open roof at
+            # sequence start') it opens the way a target does - the safety
+            # monitor is asked again first - and never against a latched lock.
+            if not (self._roof_open_wanted()
+                    and self._settings().get("reopenRoofOnAutoRestart", False)) \
+                    or self._roof_locked:
+                raise DeviceError(f"the roof/shutter is {self._roof_state(dome)}; it is not "
+                                  "reopened automatically"
+                                  + (f" ({self._roof_locked})" if self._roof_locked else ""))
+            if not self._ensure_roof_open("the auto-restart"):
+                raise DeviceError("the night ran out before the roof could be opened")
+        mount = self._mount_ready()
+        self._release_mount(mount)
+        if getattr(mount, "at_park", False):
+            raise DeviceError("the mount is still parked after the unpark")
+
+    def restart_centre(self, snapshot: dict[str, Any]) -> str:
+        entry, target, panel = self._restart_entry(snapshot)
+        if panel is None:
+            return "nothing to centre on (the run carries on with what it has)"
+        label = f"{(entry or {}).get('name') or 'the target'}"
+        ra, dec = astro.normalise_ra_hours(panel["ra"]), float(panel["dec"])
+        self._set("slewing", f"auto-restart: slewing to {label}")
+        mount = self._slew(self._mount_ready(), ra, dec, label)
+        self._wait_for_mount(mount)
+        if self.solver.executable() is None:
+            return f"slewed to {label} (no plate solver set up, so not solved)"
+        self._set("centring", f"auto-restart: plate solving {label}")
+        try:
+            self.solver.start("center", None, ra, dec, None)
+            self._wait_for_solver()
+        except DeviceError as exc:
+            raise DeviceError(f"plate solving {label} failed: {exc}") from exc
+        return f"centred on {label}"
+
+    def restart_focus(self) -> str:
+        rigs = [rig for rig in self._focusable() if not self._focus_muted(rig)]
+        due = {rig.name: rig.focuser.due(False) for rig in rigs}
+        due = {name: why for name, why in due.items() if why}
+        if not due:
+            return ""
+        self._maybe_focus()
+        return "; ".join(f"{name}: {why}" for name, why in due.items())
+
+    def restart_resume(self, snapshot: dict[str, Any]) -> None:
+        self.start(loop=bool(snapshot.get("loop")), resume=snapshot)
+
+    def restart_park(self) -> None:
+        self._abort.set()
+        with contextlib.suppress(Exception):
+            self._stop_guiding()
+        try:
+            self._park_and_check()
+        finally:
+            with contextlib.suppress(Exception):
+                self._start_warming()
+            self._set(IDLE, "auto-restart failed: parked")
 
     def weather_safe(self) -> None:
         """Safe again, and settled long enough to be believed."""
@@ -561,6 +1096,10 @@ class Sequencer:
     # -- helpers -----------------------------------------------------------
     def _check(self) -> None:
         """Raise if stopping; block while paused."""
+        self._beat()
+        mine = getattr(threading.current_thread(), "sf_generation", None)
+        if mine is not None and mine != self._generation:
+            raise _Stopped()
         if self._abort.is_set():
             raise _Stopped()
         while self._paused.is_set() and not self._abort.is_set():
@@ -588,30 +1127,58 @@ class Sequencer:
         return float(site["latitude"]), float(site["longitude"])
 
     @staticmethod
-    def _parallel(jobs: list[tuple[Any, Any]], name: str) -> dict[str, Any]:
+    def _parallel(jobs: list[tuple[Any, Any]], name: str,
+                  timeout: float | None = None) -> dict[str, Any]:
         """Run one job per telescope at the same time and collect the outcomes.
 
         A thread each rather than a pool: there are at most a handful of
         telescopes, and each job spends its life blocked on a driver.
+
+        With a `timeout`, a telescope whose job has not come back by then is
+        reported as hung (in `errors` and in `hung`) and its thread is left
+        behind: one wedged driver must not hold every other telescope - and
+        the night - with it, which is what an unbounded join did.
         """
         results: dict[str, Any] = {}
         errors: dict[str, str] = {}
-        threads: list[threading.Thread] = []
+        threads: list[tuple[Any, threading.Thread]] = []
+        lock = threading.Lock()
+        late: set[str] = set()
 
         def worker(rig, job) -> None:
             try:
-                results[rig.id] = job()
+                value = job()
+                with lock:
+                    if rig.id not in late:
+                        results[rig.id] = value
             except Exception as exc:              # noqa: BLE001 - reported per rig
-                errors[rig.id] = str(exc)
+                with lock:
+                    if rig.id not in late:
+                        errors[rig.id] = str(exc)
 
+        generation = getattr(threading.current_thread(), "sf_generation", None)
         for rig, job in jobs:
             thread = threading.Thread(target=worker, args=(rig, job), daemon=True,
                                       name=f"{name}-{rig.id}")
+            # A job of the run's counts as the run being alive (watchdog).
+            thread.sf_generation = generation          # type: ignore[attr-defined]
             thread.start()
-            threads.append(thread)
-        for thread in threads:
-            thread.join()
-        return {"results": results, "errors": errors}
+            threads.append((rig, thread))
+        deadline = None if not timeout else time.monotonic() + float(timeout)
+        hung: list[str] = []
+        for rig, thread in threads:
+            if deadline is None:
+                thread.join()
+            else:
+                thread.join(max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                with lock:
+                    late.add(rig.id)
+                    errors[rig.id] = (f"no answer from the driver in {float(timeout):.0f}s "
+                                      f"({name} hung)")
+                    results.pop(rig.id, None)
+                hung.append(rig.id)
+        return {"results": results, "errors": errors, "hung": hung}
 
     # -- the cameras -------------------------------------------------------
     def _prepare_cameras(self) -> None:
@@ -653,11 +1220,19 @@ class Sequencer:
                                 offset=int(offset) if offset is not None else None)
             self._say(f"{label}: gain {camera.gain}, offset {camera.offset}")
 
-        if not settings.get("coolAtStart", True) or not camera.can_cool:
+        # One switch for the whole mount outranks each telescope's own box: a
+        # follower imported with cooling off (rasa2 on 2026-10-08 spent the
+        # night at +18 C beside two at -5 C) is the thing it exists to catch.
+        every = bool(self.config.get("camera", "coolAllAtStart", True))
+        if not camera.can_cool or not (every or settings.get("coolAtStart", True)):
             return
         setpoint = float(settings.get("setpoint", -10.0))
         camera.set_setpoint(setpoint)
         camera.set_cooler(True)
+        # Remembered on the telescope, so a camera brought back after a
+        # failed frame is cooled again rather than left at ambient.
+        if hasattr(rig, "note_cooler"):
+            rig.note_cooler(on=True, setpoint=setpoint)
         self._say(f"{label}: cooling the camera to {setpoint:g} C")
         with self._lock:
             self._cooling_wanted.add(rig.id)
@@ -682,48 +1257,41 @@ class Sequencer:
         tolerance = float(settings.get("coolToleranceC") or 1.0)
         timeout = float(settings.get("coolTimeoutMinutes") or 20.0) * 60.0
         label = rig.name
-        # What the run was showing before the wait, to put back after it. The
-        # wait is announced as "cooling", and with nothing putting the stage
-        # back the banner and the activity line read "cooling -4.0 C" through
-        # a ten-minute exposure that had plainly started.
-        with self._lock:
-            before = (self._state, self._message)
-            before_rig = str(self._rig_state.get(rig.id, {}).get("state") or "")
 
         deadline = time.monotonic() + timeout
         announced = False
-        stale_since: float | None = None
-        reconnected = False
+        # A cooler that is not getting anywhere (2026-10-14 20:45: a camera
+        # reconnected mid-focus came back at 28.7 C and stayed there) is asked
+        # once more, and then given up on - instead of the full timeout with
+        # every telescope waiting on it.
+        stall = float(self._recovery_settings().get("coolStallSeconds") or 0.0)
+        best: float | None = None
+        best_at = time.monotonic()
+        nudged = False
+        poll = 5.0 if not stall else max(0.2, min(5.0, stall / 4.0))
         while True:
             self._check()
-            # A driver that has stopped reading - every number zero at once,
-            # which is a dropped USB link - would otherwise be waited on for
-            # the whole twenty minutes. It is given a minute, then the camera
-            # is reconnected, which is what brings the driver back, and its
-            # settings are put back with it. Once; after that the night goes
-            # on at whatever temperature the sensor really is.
-            if getattr(camera, "reading_stale", False):
-                stale_since = stale_since or time.monotonic()
-                if not reconnected and time.monotonic() - stale_since > 60.0:
-                    self._say(f"{label}: the camera's temperature reading has stopped "
-                              "(the driver answers zeros); reconnecting the camera", "warn")
-                    self._reconnect_cameras([rig])
-                    reconnected = True
-                    camera = rig.manager.get("camera")
-                    if camera is None or not camera.connected:
-                        break
-                    stale_since = None
-                    continue
-                if reconnected:
-                    self._say(f"{label}: the camera still gives no temperature after "
-                              "reconnecting; starting anyway - check its USB link", "warn")
-                    break
-            else:
-                stale_since = None
             now = camera.temperature
             if now is not None and abs(now - setpoint) <= tolerance:
                 self._say(f"{label}: camera at {now:.1f} C", "success")
                 break
+            if now is not None and (best is None or now < best - 0.5):
+                best, best_at = now, time.monotonic()
+            if stall and time.monotonic() - best_at > stall:
+                if not nudged:
+                    nudged = True
+                    best_at = time.monotonic()
+                    self._say(f"{label}: the camera is not cooling ({now} C); "
+                              "switching the cooler on again", "warn")
+                    with contextlib.suppress(Exception):
+                        camera.set_setpoint(setpoint)
+                    with contextlib.suppress(Exception):
+                        camera.set_cooler(True)
+                else:
+                    self._say(f"{label}: the cooler is not bringing the camera down "
+                              f"({now} C, wanted {setpoint:g} C); starting anyway "
+                              "rather than holding the night", "warn")
+                    break
             if time.monotonic() > deadline:
                 self._say(f"{label}: camera reached "
                           f"{now if now is None else round(now, 1)} C, not "
@@ -735,15 +1303,12 @@ class Sequencer:
                 announced = True
             self._set_rig(rig, state=f"cooling {now:.1f} C" if now is not None
                           else "cooling")
-            time.sleep(5.0)
-        if announced:
-            self._set(*before)
-            self._set_rig(rig, state=before_rig)
+            time.sleep(poll)
         with self._lock:
             self._cooling_wanted.discard(rig.id)
 
-    def _warm_cameras(self) -> None:
-        rigs = [rig for rig in self.rigs.all
+    def _warm_cameras(self, only: list[Any] | None = None) -> None:
+        rigs = [rig for rig in (self.rigs.all if only is None else only)
                 if (camera := rig.manager.get("camera")) is not None and camera.connected]
         self._parallel([(rig, lambda rig=rig: self._warm_camera(rig))
                         for rig in rigs], "warm")
@@ -763,6 +1328,9 @@ class Sequencer:
             return
 
         rate = float(settings.get("warmRateCPerMinute") or 3.0)
+        # Whatever happens to the camera from here on, nobody wants it cold.
+        if hasattr(rig, "note_cooler"):
+            rig.note_cooler(on=False)
         start = camera.temperature
         if start is None:
             camera.set_cooler(False)
@@ -815,6 +1383,11 @@ class Sequencer:
                     self._nights += 1
                 self._put_to_bed()
         finally:
+            # Given up on by the watchdog, which has closed the night out
+            # already; a run started since then is not this thread's to tidy.
+            if self._abandoned or getattr(threading.current_thread(), "sf_generation",
+                                          self._generation) != self._generation:
+                return
             with self._lock:
                 self._entry_id = None
                 self._panel = self._panels = self._slot = self._slots = 0
@@ -843,23 +1416,43 @@ class Sequencer:
             # it. Parking is deliberately opt-in: a surprise slew in the dark is
             # worse than a mount left tracking, unless there is a roof that has
             # to close over it — which is what the setting is for.
-            #
-            # And only when the plan ran out on its own. The setting says "when
-            # the plan runs out", and the Stop button promises the mount is
-            # left tracking where it is; Abort & park is the one that parks.
-            # The weather shutdown and a give-up set to park do their own
-            # parking before they raise the flag, so they lose nothing here.
             settings = self._settings()
-            stopped = self._abort.is_set()
-            if not stopped and (settings.get("parkAtEnd")
-                                or settings.get("stopTrackingAtEnd")):
+            close_out = self._close_out
+            failure_action = str(self._recovery_settings().get("closeOutOnFailure")
+                                 or "park")
+            if close_out and not self._stopped_by_hand and failure_action != "none":
+                # Unrecoverable, or the night ran out while recovering: the
+                # observatory is made safe whatever parkAtEnd says.
+                self._say(f"Closing the night out: {close_out}", "error")
+                with contextlib.suppress(Exception):
+                    self._make_safe(
+                        park=failure_action == "park" or bool(settings.get("parkAtEnd")),
+                        stop_tracking=failure_action == "stopTracking"
+                        or bool(settings.get("stopTrackingAtEnd")))
+            elif self._stopped_by_hand:
+                # Stop, pressed by a person, means exactly what the button
+                # says: the run ends and the rig is left where it is, still
+                # tracking. Park-at-end is for a night that ran out on its
+                # own; it used to fire here after a Stop too, and the mount
+                # went to park under somebody who wanted to carry on by hand.
+                if settings.get("parkAtEnd") or settings.get("stopTrackingAtEnd"):
+                    self._say("Stopped by hand: the mount is left where it is, "
+                              "tracking (park at end applies to a night that ends on its own)")
+            elif settings.get("parkAtEnd") or settings.get("stopTrackingAtEnd"):
                 with contextlib.suppress(Exception):
                     self._make_safe(park=bool(settings.get("parkAtEnd")),
                                     stop_tracking=bool(settings.get("stopTrackingAtEnd")))
-            elif stopped and settings.get("parkAtEnd"):
-                self._say("Stopped: the mount is left tracking where it is "
-                          "(Park at end applies when the plan runs out; "
-                          "Abort & park parks now)")
+            # 0.2.53b: a roof this run opened is shut again at the end of a run
+            # that ended on its own or failed (after the park), never after a
+            # Stop by hand - Stop leaves the rig exactly where it is.
+            if not self._stopped_by_hand:
+                try:
+                    self._close_roof_after_run()
+                except Exception as exc:          # noqa: BLE001 - reported
+                    self._say(f"Could not close the roof at the end of the run: {exc}",
+                              "error")
+                    self._tell("failure", "The roof did not close at the end of the run",
+                               f"{exc}. " + self._summary())
 
             # A copy of the log where the data is, so a night run at a remote
             # site can be read into afterwards without getting onto that machine.
@@ -872,7 +1465,14 @@ class Sequencer:
             # thread was still alive and everything gated on it stayed gated.
             # It is safety work, not sequence work, so it outlives the run.
             self._set(IDLE, self._message)
-            self._start_warming()
+            self._warm_after_run(close_out=bool(
+                close_out and not self._stopped_by_hand and failure_action != "none"))
+            # An orderly end - finished, failed, stopped - is not resumed after
+            # a restart; only a program that went away mid-run is.
+            if not self._abandoned and getattr(threading.current_thread(),
+                                               "sf_generation", None) == self._generation:
+                self._journal_close("stopped" if self._stopped_by_hand
+                                    else ("failed" if self._error else "finished"))
 
     def _night(self) -> None:
         """One night of the plan, from the coolers coming on to the plan running out.
@@ -916,6 +1516,10 @@ class Sequencer:
         except Exception as exc:                # noqa: BLE001 - shown to the operator
             with self._lock:
                 self._error = str(exc)
+                # A run that failed is closed out (closeOutOnFailure), not
+                # left with the mount tracking into the pier.
+                if not self._close_out:
+                    self._close_out = f"the sequence failed: {exc}"
             self._set(IDLE, "error")
             self._say(f"Sequence failed: {exc}", "error")
             self._tell("failure", f"Sequence failed: {exc}", self._summary())
@@ -992,6 +1596,7 @@ class Sequencer:
                        "The observatory is parked and waiting for dusk.")
         # Woken the instant Stop is pressed, rather than at the next tick.
         while time.time() < start_at:
+            self._beat()                       # waiting on purpose (watchdog)
             if self._abort.wait(min(5.0, max(0.1, start_at - time.time()))):
                 return False
         while not self._sky_safe():
@@ -1135,11 +1740,16 @@ class Sequencer:
         for entry in stored["entries"]:
             if self._abort.is_set():
                 break
+            # Picked up after a restart: what was finished stays finished.
+            if entry.get("id") in self._finished_entries:
+                self._say(f"{entry['name']}: already finished tonight")
+                continue
             self._begin_entry(entry)
 
             if plans.is_calibration(entry):
                 try:
                     self._run_calibration(entry)
+                    self._finished(entry)
                 except _Skipped:
                     self._say(f"Skipped {entry['name']}", "warn")
                 continue
@@ -1191,6 +1801,26 @@ class Sequencer:
                     self._say(f"Skipped {entry['name']}", "warn")
                 break
 
+    def _finished(self, entry: dict[str, Any]) -> None:
+        with self._lock:
+            self._finished_entries.add(str(entry.get("id")))
+        self._journal_write()
+
+    def _panel_left(self, entry: dict[str, Any], panel: dict[str, Any]) -> int:
+        """Frames this panel still needs tonight, on every telescope."""
+        rigs = self.rigs.imaging()
+        master_id = self.master.id
+        filter_order = str(plans.options_for(entry).get("filterOrder") or "grouped")
+        fitted = plans.fitted_filters(rigs)
+        index = int(panel.get("index", 0) or 0)
+        left = 0
+        for rig in rigs:
+            with contextlib.suppress(Exception):
+                queue = _flatten(plans.allocation_for(entry, rig.id, master_id, fitted),
+                                 filter_order)
+                left += len(self._without_done(queue, entry["id"], index, rig.id))
+        return left
+
     def _entry_summary(self, entry: dict[str, Any],
                        target: dict[str, Any] | None) -> str:
         """A target in a line, for a message: panels and what is planned."""
@@ -1216,6 +1846,14 @@ class Sequencer:
             # NGC 7000.
             self._target_rescues = 0
             self._recentre_request = None
+            # ...and a telescope that ran out of attempts on the last target
+            # gets one more full set on this one.
+            for rec in self._rig_recovery.values():
+                if rec.state == RIG_FAILED:
+                    rec.state = RIG_OK
+                    rec.attempt = 0
+                    rec.reason = ""
+        self._journal_write()
 
     def _why_not_now(self, entry: dict[str, Any],
                      target: dict[str, Any] | None) -> str:
@@ -1378,6 +2016,7 @@ class Sequencer:
         if dawn and (self._settings().get("stopAtDawn", True) or self._loop):
             margin = float(self._settings().get("dawnMarginMinutes") or 0.0) * 60.0
             if now + need >= dawn - margin:
+                self._night_over = True
                 return "the night is over"
         return None
 
@@ -1431,7 +2070,8 @@ class Sequencer:
         self._say(f"Calibration task: {entry['name']}")
         self.calibrator.run(
             recipe, entry.get("rigId") or None,
-            should_abort=lambda: (self._abort.is_set() or self._skip.is_set()
+            should_abort=lambda: (self._alive() or self._abort.is_set()
+                                  or self._skip.is_set()
                                   or bool(end_at and time.time() >= end_at)),
             report=lambda text: self._set("calibrating", f"{entry['name']}: {text}"))
         if self._skip.is_set():
@@ -1459,6 +2099,8 @@ class Sequencer:
             return
 
         self._wait_for_start(entry)
+        if not self._ensure_roof_open(entry.get("name") or "the all-sky survey", entry):
+            return
         settings = {**self.config.section("allsky"), **(parameters.get("plan") or {})}
         overheads = {
             "perFrame": float(self.config.get("schedule", "perFrameSeconds", 15.0)),
@@ -1666,6 +2308,8 @@ class Sequencer:
 
             self._parallel([(rig, lambda rig=rig: self._await_cooling(rig))
                             for rig in rigs], "cool")
+            # 0.2.53b: never a light under a roof that does not read open.
+            self._roof_gate_lights()
             outcome = self._parallel(
                 [(rig, lambda rig=rig: rig.capture.capture_blocking(
                     exposure, frame_type="light")) for rig in rigs], "expose")
@@ -1716,6 +2360,11 @@ class Sequencer:
         latitude, longitude = site
 
         self._wait_for_start(entry)
+        # 0.2.53b: the roof opened before anything moves or exposes - at the
+        # start of the sequence (its first target) and before every target
+        # after it, if it is not open by then.
+        if not self._ensure_roof_open(entry.get("name") or "the target", entry):
+            return
         end_at = entry.get("endAt")
         panels = target.get("panels") or []
         if panels and target.get("type") == "survey":
@@ -1763,10 +2412,15 @@ class Sequencer:
             for rig in self._focusable():
                 self._refocus_reason[rig.id] = f"{entry['name']}: focus on start"
 
+        resumed = any(key.startswith(f"{entry['id']}:") for key in self._progress)
         for position, panel in enumerate(queue, start=1):
             self._check()
             if self._skip.is_set():
                 raise _Skipped()
+            # After a restart, a panel that already has everything is not
+            # slewed to again.
+            if resumed and not self._panel_left(entry, panel):
+                continue
             # Before the slew, and allowing for what a slew, a centre and a
             # focus sweep are about to cost. Starting all that with four minutes
             # left is how the night runs past its end.
@@ -1790,8 +2444,11 @@ class Sequencer:
             # remains one folder.
             stamp = target.get("collab") or {}
             for rig in self.rigs.imaging():
-                rig.capture.set_output(target=entry["name"], object_name=object_name,
-                                       panel=panel_tag)
+                # save=True, always: a sequence's lights are the point of the
+                # night, and whatever the Image tab or an interrupted focus
+                # sweep left saving set to is not a reason to drop them.
+                rig.capture.set_output(save=True, target=entry["name"],
+                                       object_name=object_name, panel=panel_tag)
                 # What only the planner knows, for the header of every frame:
                 # which target and panel, the panel's own framing, and the
                 # collaboration it is shot for.
@@ -1823,7 +2480,12 @@ class Sequencer:
                     self._say(f"{reason} — stopping before the focus run", "warn")
                 return
             # Focus first, then guide: a focus run would only have to pause the
-            # guider it had just settled.
+            # guider it had just settled. And through the filter the first
+            # frame will use: a sweep through whatever the wheel was left on
+            # was followed by a filter change, and a filter change is a
+            # reason to sweep again - two runs, nine minutes, before the
+            # first sub of the night.
+            self._select_first_filters(entry)
             self._maybe_focus(panel=panel, label=label, entry=entry)
             self._start_guiding()
             if not self._shoot(entry, panel, label, end_at):
@@ -1838,6 +2500,7 @@ class Sequencer:
                     self.coverage.record_many([panel])
 
         self._say(f"{entry['name']}: the whole allocation is shot", "success")
+        self._finished(entry)
 
     #: How far the camera may measure from the angle a fixed-angle mosaic was
     #: laid at before the mosaic is laid again. The same figure the program
@@ -2018,7 +2681,7 @@ class Sequencer:
         self._set("slewing", f"slewing to {label}")
         self._say(f"Slewing to {label}")
         started = time.monotonic()
-        mount = self.manager.require("mount")
+        mount = self._mount_ready()
         self._ensure_tracking(mount)
 
         rotator = self.manager.get("rotator")
@@ -2034,7 +2697,8 @@ class Sequencer:
             self._say(f"Rotator left where it is ({float(rotator.position):.1f}°): "
                       "this collaboration is shot at the camera's own angle")
 
-        mount.slew_to(astro.normalise_ra_hours(panel["ra"]), float(panel["dec"]))
+        mount = self._slew(mount, astro.normalise_ra_hours(panel["ra"]),
+                           float(panel["dec"]), label)
         self._wait_for_mount(mount)
 
         if rotating:
@@ -2057,6 +2721,7 @@ class Sequencer:
                                   rotation if rotating else None)
                 self._wait_for_solver()
                 self._solve_failures = 0
+                self._unwarn("solver.failing")
             except DeviceError as exc:
                 # A failed centre is not a reason to abandon the night; the frame
                 # is still usable, just not perfectly framed.
@@ -2072,6 +2737,107 @@ class Sequencer:
         # Slew, settle and centre together: what one panel costs before a single
         # frame of it is taken, which on a mosaic is paid once per panel.
         self._record_overhead("slew", time.monotonic() - started)
+
+    #: How long between tries when the mount refuses a slew.
+    SLEW_RETRY_SECONDS = 3.0
+
+    def _mount_ready(self):
+        """The mount, reconnected first if it has dropped off (0.2.51).
+
+        FSQ106 2026-10-20 23:22 ended "Sequence failed: Mount is not
+        connected". A mount that has gone is reconnected on its remembered
+        driver a few times, with a backoff, before the run gives up on it.
+        """
+        mount = self.manager.get("mount")
+        if mount is not None and mount.connected:
+            return mount
+        settings = self._recovery_settings()
+        attempts = int(settings.get("mountReconnectAttempts") or 0) \
+            if settings.get("enabled", True) and settings.get("reconnectDevices", True) else 0
+        base = float(settings.get("rigRecoveryBackoffSeconds") or 20.0)
+        cap = float(settings.get("rigRecoveryBackoffMaxSeconds") or 300.0)
+        step = float(settings.get("recoveryStepSeconds") or 180.0)
+        for attempt in range(1, attempts + 1):
+            self._recovering("mount", "the mount is not connected; reconnecting it "
+                             f"(attempt {attempt} of {attempts})", attempt)
+            with contextlib.suppress(Exception):
+                self.manager.disconnect("mount")
+            try:
+                outcome = call_with_timeout(
+                    lambda: self.rigs.connect_remembered(self.master, ("mount",)),
+                    step, "the mount reconnect")
+                failed = (outcome or {}).get("failed") or []
+            except Exception as exc:              # noqa: BLE001 - counted
+                failed = [str(exc)]
+            mount = self.manager.get("mount")
+            if mount is not None and mount.connected:
+                self._recovered("mount", "The mount is back", True)
+                return mount
+            self._say("Mount reconnect failed: " + ("; ".join(failed) or "no answer"),
+                      "warn")
+            if attempt < attempts:
+                self._sleep(backoff(attempt, base, cap))
+        if attempts:
+            self._recovered("mount", "The mount did not come back", False)
+        return self.manager.require("mount")
+
+    def _slew(self, mount, ra_hours: float, dec_deg: float, label: str):
+        """Ask for a slew until the mount takes it; reconnect it if it will not.
+
+        Returns the mount the slew went to, which is a fresh one after a
+        reconnect.
+        """
+        try:
+            self._slew_once(mount, ra_hours, dec_deg, label)
+            return mount
+        except DeviceError as exc:
+            if not (self._recovery_on("reconnectDevices")
+                    and int(self._recovery_settings().get("mountReconnectAttempts") or 0)):
+                raise
+            self._check()
+            self._say(f"{exc}; reconnecting the mount and trying once more", "warn")
+            with contextlib.suppress(Exception):
+                self.manager.disconnect("mount")
+            mount = self._mount_ready()
+            self._ensure_tracking(mount)
+            self._slew_once(mount, ra_hours, dec_deg, label)
+            return mount
+
+    def _slew_once(self, mount, ra_hours: float, dec_deg: float, label: str) -> None:
+        """Ask for a slew until the mount takes it.
+
+        OnStep answers a slew sent in the first second or two after guiding
+        stops with "SlewError: Already in motion": the last guide pulse is
+        still being worked off.  On 2026-10-19 PHD2's pulse went out 38 ms
+        before the slew to panel 6, and that one refusal was taken as fatal -
+        the mount was parked and the night ended at 20:47.  So: wait for the
+        pulse to clear where the driver can report it, a moment's grace where
+        it cannot, and retry every refusal for a while before giving up, the
+        way `_park_and_check` already does for Park.
+        """
+        # A guide pulse the driver can report is waited out; one it cannot
+        # report gets a beat of grace, which is what the retries are for.
+        settle_until = time.monotonic() + 10.0
+        while getattr(mount, "pulse_guiding", False) and time.monotonic() < settle_until:
+            time.sleep(0.2)
+        time.sleep(0.5)
+        timeout = float(self._settings().get("slewRetrySeconds") or 60.0)
+        deadline = time.monotonic() + timeout
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                mount.slew_to(ra_hours, dec_deg)
+                return
+            except Exception as exc:              # noqa: BLE001 - the driver's word
+                self._check()
+                if time.monotonic() + self.SLEW_RETRY_SECONDS >= deadline:
+                    raise DeviceError(
+                        f"the mount refused to slew to {label} {attempts} time(s) in "
+                        f"{timeout:.0f}s — last answer: {exc}") from exc
+                if attempts == 1 or attempts % 5 == 0:
+                    self._say(f"Slew refused ({exc}); trying again", "warn")
+                time.sleep(self.SLEW_RETRY_SECONDS)
 
     def _wait_for_mount(self, mount, timeout: float = 600.0) -> None:
         time.sleep(1.0)
@@ -2226,7 +2992,7 @@ class Sequencer:
             # finish read as a button that did nothing.
             outcome = self._parallel(
                 [(rig, lambda rig=rig: rig.focuser.run(
-                    should_abort=lambda: (self._abort.is_set()
+                    should_abort=lambda: (self._alive() or self._abort.is_set()
                                           or self._skip.is_set()),
                     report=lambda text, rig=rig: self._set_rig(
                         rig, state=f"focus: {text}")))
@@ -2245,17 +3011,7 @@ class Sequencer:
                 self._hfr_over_limit.pop(rig.id, None)
                 self._focus_failures.pop(rig.id, None)
                 self._focus_blocked_until.pop(rig.id, None)
-                # The result, in the log. A failure was always said; a
-                # success lived only on the screen, so a night read back
-                # from its log had a sweep of thirteen frames and no answer.
-                with contextlib.suppress(Exception):
-                    last = (rig.focuser.status() or {}).get("last") or {}
-                    if last.get("bestPosition") is not None:
-                        self._say(
-                            f"{rig.name}: focused at {last['bestPosition']}"
-                            + (f", HFD {last['bestHfd']:.2f}" if last.get("bestHfd") else "")
-                            + (f" (was {last['startHfd']:.2f} at {last.get('startPosition')})"
-                               if last.get("startHfd") else ""), "success")
+                self._unwarn(f"focus.failed.{rig.id}")
                 # Focus now stands where this filter wants it, so that is the
                 # offset the next filter change measures its move from.
                 self._filter_offset[rig.id] = self._offset_for(
@@ -2330,6 +3086,30 @@ class Sequencer:
         hour_angle = ((lst - ra_hours + 12.0) % 24.0) - 12.0
         return -hour_angle          # positive means the meridian is still ahead
 
+    @staticmethod
+    def _flip_minutes(settings: dict[str, Any], key: str, default: float) -> float:
+        """A flip timing setting in minutes; a blank is the default, a 0 is 0."""
+        value = settings.get(key)
+        try:
+            return max(0.0, float(default if value is None or value == "" else value))
+        except (TypeError, ValueError):
+            return default
+
+    def _flip_room(self, ahead: float, settings: dict[str, Any]) -> float:
+        """Hours of imaging left before the mount has to stop for the flip.
+
+        The mount can track *flip limit* minutes past the meridian before its
+        own limit stops it, and imaging has to be over *pause* minutes before
+        that. With the limit at 0 - a mount that cannot pass the meridian, or
+        one nobody has set a limit for - imaging stops before transit, which
+        with ten-minute subs can mean a quarter of an hour of clear sky spent
+        waiting at every flip. A mount that can track a few minutes past is
+        let run the last frame through transit and flipped the moment it ends.
+        """
+        pause = self._flip_minutes(settings, "flipPauseMinutes", 5.0) / 60.0
+        limit = self._flip_minutes(settings, "flipLimitMinutes", 0.0) / 60.0
+        return ahead + limit - pause
+
     def _flip_due(self, panel: dict[str, Any], next_frame_seconds: float) -> bool:
         settings = self._settings()
         if not settings.get("meridianFlipEnabled", True):
@@ -2345,21 +3125,56 @@ class Sequencer:
         ahead = self._hours_to_meridian(panel["ra"])
         if ahead is None:
             return False
-        pause = float(settings.get("flipPauseMinutes") or 5.0) / 60.0
+        limit = self._flip_minutes(settings, "flipLimitMinutes", 0.0) / 60.0
         # Flip if this frame would still be running when the mount must stop.
-        return ahead - (next_frame_seconds / 3600.0) < pause and ahead > -1.0
+        # A panel already an hour or more past where the mount would have
+        # stopped was slewed to on the other side and is not flipped again.
+        return (self._flip_room(ahead, settings) < next_frame_seconds / 3600.0
+                and ahead > -(1.0 + limit))
 
-    def _flip(self, panel: dict[str, Any], label: str) -> None:
+    #: How many times a flip slew that left the mount on the same side of the
+    #: pier is tried again, and how long between tries.  OnStep (and others)
+    #: keep tracking past the meridian for as long as their own limit allows
+    #: and only flip on a goto once the target is beyond it - two minutes past,
+    #: which is the default flip wait, is not beyond it.  2026-10-19 20:23: the
+    #: flip slew on panel 16 came back on the west side and the run carried on
+    #: towards the limit with a warning and nothing else.
+    FLIP_RETRIES = 4
+
+    def _flip(self, panel: dict[str, Any], label: str, attempt: int = 1) -> bool:
+        """Flip the mount for a panel crossing the meridian.
+
+        True when the mount changed side (or cannot say), False when the slew
+        left it where it was and the caller should try again later.
+        """
         settings = self._settings()
-        mount = self.manager.require("mount")
+        mount = self._mount_ready()
         before = mount.side_of_pier
 
-        wait_minutes = float(settings.get("flipAfterMinutes") or 2.0)
+        after = self._flip_minutes(settings, "flipAfterMinutes", 2.0)
+        limit = self._flip_minutes(settings, "flipLimitMinutes", 0.0)
+        if limit > 0:
+            # Never later than the mount's own limit allows: imaging ran up to
+            # the pause before it, and the mount stops tracking there.
+            after = min(after, max(0.0, limit - self._flip_minutes(
+                settings, "flipPauseMinutes", 5.0)))
         ahead = self._hours_to_meridian(panel["ra"]) or 0.0
-        delay = max(0.0, (ahead * 60.0 + wait_minutes) * 60.0)
-        self._set("flipping", f"waiting {delay / 60:.1f} min for the meridian")
-        self._say(f"Meridian flip for {label}: waiting {delay / 60:.1f} minutes", "warn")
-        self._sleep(delay)
+        delay = max(0.0, (ahead * 60.0 + after) * 60.0)
+        if delay >= 30.0:
+            self._set("flipping", f"waiting {delay / 60:.1f} min for the meridian")
+            self._say(f"Meridian flip for {label}: waiting {delay / 60:.1f} minutes"
+                      + ("" if limit > 0 else " — the mount is set to track 0 min past "
+                         "the meridian (Settings › Mount); give it the minutes its own "
+                         "limit allows and the last frame runs through transit instead"),
+                      "warn")
+            self._sleep(delay)
+        elif delay > 0:
+            self._set("flipping", "flipping at the meridian")
+            self._say(f"Meridian flip for {label}")
+            self._sleep(delay)
+        elif attempt > 1:
+            self._say(f"Meridian flip for {label}: trying again "
+                      f"({-ahead * 60:.0f} min past the meridian)", "warn")
 
         guider = self.manager.get("guider")
         guiding = guider is not None and guider.connected and guider.guiding
@@ -2368,36 +3183,62 @@ class Sequencer:
             with contextlib.suppress(Exception):
                 guider.stop_guiding()
 
+        # Where the rotator stands before the flip: the angle the centring
+        # solve corrected it to, which is the panel's angle plus this rig's
+        # mechanical-to-sky offset - not the panel's angle itself.
+        rotator = self.manager.get("rotator")
+        rotation = panel.get("rotation")
+        rotator_before = None
+        if rotation is not None and rotator is not None and rotator.connected:
+            with contextlib.suppress(Exception):
+                rotator_before = float(rotator.position)
+
         self._set("flipping", "flipping")
-        mount.slew_to(astro.normalise_ra_hours(panel["ra"]), float(panel["dec"]))
+        mount = self._slew(mount, astro.normalise_ra_hours(panel["ra"]),
+                           float(panel["dec"]), f"{label} (flip)")
         self._wait_for_mount(mount)
 
         after = mount.side_of_pier
-        if before is not None and after == before:
+        unflipped = before is not None and after == before
+        if unflipped:
+            retry_minutes = float(settings.get("flipRetryMinutes") or 5.0)
+            again = attempt < self.FLIP_RETRIES
             self._say(f"The mount did not change side of pier ({after}); "
-                      "it may not have flipped", "warn")
+                      "it may not have flipped"
+                      + (f" — trying again in {retry_minutes:g} min" if again
+                         else " — giving up on the flip for this panel"), "warn")
             self._warn("mount.flip", "warning", "The meridian flip may not have happened",
                        f"After the flip slew the mount still reports the {after} side "
                        f"of the pier on {label}.",
-                       "Watch the mount: if it is really past the meridian on the wrong "
-                       "side it will hit its limit. Check the driver's flip settings.")
+                       "The mount is probably still inside its own past-meridian limit "
+                       "and will flip on a later try. If it never does, check the "
+                       "driver's flip settings before it runs into its limit.")
         else:
             self._say(f"Flipped from {before} to {after}", "success")
         self._tell("activity", f"Meridian flip on {label}",
                    (f"The mount did not change side of pier ({after})"
-                    if before is not None and after == before
-                    else f"Flipped from {before} to {after}")
+                    if unflipped else f"Flipped from {before} to {after}")
                    + "; re-centring and restarting guiding.")
         with self._lock:
             self._flips += 1
 
-        rotator = self.manager.get("rotator")
-        rotation = panel.get("rotation")
-        if rotation is not None and rotator is not None and rotator.connected:
-            # The rotator works in sky position angle, so re-commanding the same
-            # angle puts the framing back where it was despite the flip.
-            self._set("flipping", "restoring the camera angle")
-            rotator.move_absolute(float(rotation))
+        rotating = rotation is not None and rotator is not None and rotator.connected
+        if rotating and rotator_before is not None and not unflipped:
+            # 2026-11-04, EAGLE (NiteCrawler on a CEM GEM): the flip used to
+            # re-command the panel's own angle (270.09), throwing away the
+            # +47 deg the centring solve had found (it stood at 223.05), and
+            # re-centred without an angle - every sub after the flip came out
+            # at PA 137 instead of 270. The sky angle does not change on a flip;
+            # the camera turns over with the tube, so the rotator goes to its
+            # corrected position plus `rotatorFlipDegrees` (180 on a plain
+            # rotator; 0 for one whose driver compensates for the side of
+            # pier), and the solve below checks and corrects what is left.
+            turn = float(settings.get("rotatorFlipDegrees", 180.0) or 0.0)
+            goal = (rotator_before + turn) % 360.0
+            self._set("flipping", "turning the camera for the new side of the pier")
+            self._say(f"Rotator: {rotator_before:.1f}° -> {goal:.1f}° for the flip "
+                      f"(keeps {float(rotation):.1f}° on the sky)")
+            rotator.move_absolute(goal)
             deadline = time.monotonic() + 300
             while rotator.moving:
                 self._check()
@@ -2408,8 +3249,11 @@ class Sequencer:
         if settings.get("flipSolve", True) and self.solver.executable() is not None:
             self._set("flipping", "re-centring after the flip")
             try:
+                # With the panel's angle, so the solve measures the frame's
+                # position angle and turns the rotator onto it if it is out.
                 self.solver.start("center", None, astro.normalise_ra_hours(panel["ra"]),
-                                  float(panel["dec"]))
+                                  float(panel["dec"]),
+                                  float(rotation) if rotating else None)
                 self._wait_for_solver()
             except DeviceError as exc:
                 self._say(f"Could not re-centre after the flip: {exc}", "warn")
@@ -2421,6 +3265,7 @@ class Sequencer:
 
         # Focus shifts across a flip on most rigs — on all of them.
         self._maybe_focus()
+        return not unflipped
 
     # -- watching the run --------------------------------------------------
     def _record_frame(self, rig, record: Any, panel: dict[str, Any],
@@ -2519,15 +3364,8 @@ class Sequencer:
                 telescope=rig.name)
         # And to the panel it landed on. A mosaic's panels are different sky,
         # and a collaboration counts depth per point of sky - so this is what
-        # gets reported, panel by panel, rather than the target's total. A sub
-        # the project's star-size rule would refuse is not credited at all:
-        # the server judges a night by its mean, and a night of good subs with
-        # a trailed hour in it used to pass or fail as a whole.
-        refused = None if guide_lost else self._over_star_limit(entry, entry_row["hfr"])
-        if refused:
-            entry_row["refused"] = refused
-            self._say(f"{rig.name}: {refused}", "warn")
-        if not guide_lost and not refused:
+        # gets reported, panel by panel, rather than the target's total.
+        if not guide_lost:
             with contextlib.suppress(Exception):
                 self.targets.add_panel_integration(
                     entry["targetId"], rig.capture.night_name(),
@@ -2537,31 +3375,6 @@ class Sequencer:
         with self._lock:
             self._frames_log.append(entry_row)
             del self._frames_log[:-FRAME_HISTORY]
-
-    def _over_star_limit(self, entry: dict[str, Any], hfr_px: float | None) -> str | None:
-        """Why a sub fails its collaboration's star-size rule, or None.
-
-        None as well when there is no rule, no measurement, no scale or no
-        collaboration: a sub is only ever refused on a rule the project set.
-        """
-        if hfr_px is None or self.collab_rules is None or self.collab_scale is None:
-            return None
-        try:
-            target = self.targets.get(entry.get("targetId") or "") or {}
-            project = (target.get("collab") or {}).get("project")
-            if not project:
-                return None
-            limit = (self.collab_rules(project) or {}).get("maxHfr")
-            scale = self.collab_scale()
-            if not limit or not scale:
-                return None
-            arcsec = float(hfr_px) * float(scale)
-            if arcsec <= float(limit):
-                return None
-            return (f'not credited to the collaboration — stars {arcsec:.2f}" '
-                    f'against the project\'s {float(limit):g}" limit')
-        except Exception:                        # noqa: BLE001 - never stop a run for this
-            return None
 
     def _guide_rms(self) -> float | None:
         """Total guide RMS in arcseconds right now, or None when not guiding."""
@@ -2681,28 +3494,16 @@ class Sequencer:
 
         # Wait for it to settle, so the first frame is not taken mid-slew.
         if self._wait_for_guiding(float(settings.get("settleTimeoutSeconds") or 180.0)):
+            if not self._calibration_sound(guider):
+                return
+            # Only now is guiding something worth watching and recovering: a
+            # guider that never started is not one that has lost its star.
             self._guiding_wanted = True
             self._guide_lost_since = None
             self._say("Guiding", "success")
             return
-
-        # It did not settle: the star went, or it never held still.  This used
-        # to be the end of guiding for the target — "carrying on unguided"
-        # fifteen seconds into the night, with the whole recovery machinery
-        # switched off because guiding had "never started".  A guider that
-        # dropped its star during the first settle is exactly a guider that
-        # has lost its star, and gets the same rescue: a fresh star, then a
-        # fresh calibration, and only after all of that an unguided night.
-        fault = self._guiding_fault() or (
-            f"the guider did not settle — {guider.settle_error}"
-            if getattr(guider, "settle_error", None)
-            else f"the guider is {guider.state} rather than settled")
-        if not self._recovery_on("guidingRecovery"):
-            self._say(f"{fault}; carrying on unguided", "warn")
-            return
-        self._guiding_wanted = True
-        self._guide_lost_since = None
-        self._restart_guiding(fault, rough=False)
+        self._say(f"The guider is {guider.state} rather than guiding; carrying "
+                  "on unguided", "warn")
 
     def _dither(self, entry: dict[str, Any] | None = None) -> None:
         """Nudge the guider between slots so hot pixels do not stack up.
@@ -3037,6 +3838,7 @@ class Sequencer:
         # some set AtPark a beat after the motion stops. Watching only Slewing
         # meant a mount that had parked perfectly well was reported as failing,
         # which is its own kind of bad: an abort that cries wolf gets ignored.
+        deadline = time.monotonic() + timeout
         # How long to keep asking after the mount has stopped moving. A driver
         # that parks instantly answers on the first pass and never reaches this.
         settle = min(5.0, timeout)
@@ -3062,6 +3864,239 @@ class Sequencer:
             time.sleep(0.25)
         raise DeviceError("the mount does not report being parked")
 
+    # -- the roof opened at the start of a target (0.2.53b) ----------------
+    #
+    # Hakos, 2026-11-04: a sequence started at 21:50 and imaged a closed roof
+    # all night - ASCOM.HakosRoof.Dome was connected but nothing ever sent it
+    # OpenShutter, because the sequencer only ever closed a roof. Bray: "you
+    # should make it so that the roof opens when a sequence starts".
+    #
+    # Only the lead telescope (the master, which owns the mount) drives the
+    # roof: a follower's manager is never asked for its dome, and every
+    # telescope waits on the one roof state read from the lead's.
+    #
+    # An open that fails, or does not read open in time, is the site's
+    # technician lock (Bray's standing rule for Hakos): latched, counted as
+    # closed, never retried, no close-back, no lights, an alert and a warning
+    # that stays up, and the run stopped the ordinary way (park, warm).
+
+    ROOF_POLL_SECONDS = 2.0
+    #: Consecutive "error" reads during an open before it counts as failed;
+    #: one bad read over COM is a glitch, not the driver's "Error".
+    ROOF_ERROR_READS = 3
+
+    def _roof_settings(self) -> dict[str, Any]:
+        s = self._settings()
+        return {
+            "open": bool(s.get("openRoofAtStart", True)),
+            "requireSafety": bool(s.get("requireSafetyToOpen", False)),
+            "timeout": max(10.0, float(s.get("roofOpenTimeoutSeconds") or 180.0)),
+            "gate": bool(s.get("pauseLightsUnlessRoofOpen", True)),
+            "closeAtEnd": bool(s.get("closeRoofAtEnd", True)),
+        }
+
+    def _roof_open_wanted(self) -> bool:
+        return self._roof_settings()["open"]
+
+    def _lead_dome(self):
+        """The lead telescope's roof, if it has one that can be opened."""
+        try:
+            dome = self.master.manager.get("dome")
+        except Exception:                         # noqa: BLE001 - no master yet
+            return None
+        if dome is None or not getattr(dome, "connected", False) \
+                or not getattr(dome, "can_shutter", False):
+            return None
+        return dome
+
+    @staticmethod
+    def _roof_state(dome) -> str:
+        """open, closed, opening, closing, error - a read that fails is error."""
+        try:
+            return str(dome.shutter_state or "error").lower()
+        except Exception:                         # noqa: BLE001 - a fault is not open
+            return "error"
+
+    def _safety_watching(self) -> bool:
+        watcher = getattr(self, "safety", None)
+        if watcher is None:
+            return False
+        if not self.config.section("safety").get("enabled", True):
+            return False
+        with contextlib.suppress(Exception):
+            return bool(watcher.watching)
+        return False
+
+    def _safety_says_safe(self) -> bool:
+        watcher = getattr(self, "safety", None)
+        try:
+            return watcher.read() is True
+        except Exception:                         # noqa: BLE001 - a fault is unsafe
+            return False
+
+    def _roof_alert(self, subject: str, body: str) -> None:
+        self._tell("safety", subject, body)
+
+    def _roof_lock(self, dome, why: str) -> None:
+        """Latch the technician lock and stop the run. Raises."""
+        name = getattr(dome, "name", "the roof")
+        self._roof_locked = why
+        title = "The roof did not open - treated as LOCKED"
+        detail = (f"{name}: {why}. Per the site rule a failed or timed-out open is "
+                  "the technician's lock: the roof counts as closed, nothing more "
+                  "is sent to it (no retry, no close), and no lights are taken.")
+        fix = ("Check with the site. If the roof really is open, close it from the "
+               "roof's own control. Start the sequence again by hand once it is "
+               "unlocked - an auto-restart never opens against a lock.")
+        self._warn("roof.locked", "critical", title, detail, fix)
+        self._say(f"{title}: {why}", "error")
+        self._roof_alert(title, f"{detail}\n\n{fix}\n\n{self._summary()}")
+        raise DeviceError(f"the roof did not open ({why}) - treated as the "
+                          "technician's lock; the sequence is stopped")
+
+    def _ensure_roof_open(self, label: str, entry: dict[str, Any] | None = None) -> bool:
+        """Open the lead's roof before `label` moves or exposes anything.
+
+        True to go on (open, or nothing to open, or the setting is off).
+        False when the night ran out while waiting for a safe sky. Raises
+        (stopping the run) on a failed or timed-out open, a latched lock,
+        or 'Require safety monitor to open' with no monitor.
+        """
+        settings = self._roof_settings()
+        if not settings["open"]:
+            return True                             # old behaviour: never opened
+        dome = self._lead_dome()
+        if dome is None:
+            return True
+        if self._roof_state(dome) == "open":
+            return True
+        if self._roof_locked:
+            raise DeviceError(f"the roof is treated as locked ({self._roof_locked}); "
+                              "nothing more is sent to it tonight")
+
+        # The safety monitor first: an unsafe sky is waited out, never opened into.
+        if self._safety_watching():
+            self._unwarn("roof.nosafety")
+            told = False
+            while not self._safety_says_safe():
+                if not told:
+                    self._say(f"The roof stays shut before {label}: the safety "
+                              "monitor says it is not safe - waiting", "warn")
+                    told = True
+                self._set("waiting", "roof shut: waiting for the safety monitor")
+                reason = self._past_deadline(entry, (entry or {}).get("endAt"))
+                if reason:
+                    self._say(f"{reason} - the roof was never opened for {label}", "warn")
+                    return False
+                self._sleep(10.0)
+                if self._roof_state(dome) == "open":
+                    return True
+        elif settings["requireSafety"]:
+            title = "The roof was not opened: no safety monitor"
+            detail = ("'Require safety monitor to open' is on and no safety monitor "
+                      "is connected or configured, so the roof stays shut.")
+            self._warn("roof.nosafety", "critical", title, detail,
+                       "Connect the safety monitor, or turn the requirement off "
+                       "under Equipment → Sequencer.")
+            self._roof_alert(title, detail)
+            raise DeviceError("the roof was not opened: 'Require safety monitor to "
+                              "open' is on and there is no safety monitor")
+        else:
+            title = "Roof opened with no safety monitor - nothing will close it for weather"
+            detail = (f"{getattr(dome, 'name', 'The roof')} is being opened for {label} "
+                      "with no safety monitor connected or configured. Starfront "
+                      "closes it at the end of the run, but nothing will close it "
+                      "if the weather turns.")
+            self._warn("roof.nosafety", "warning", title, detail,
+                       "Connect a safety monitor (Equipment → Safety), or watch the sky.")
+            self._roof_alert(title, detail)
+            self._say(title, "warn")
+
+        timeout = settings["timeout"]
+        self._set("homing", "opening the roof")
+        self._say(f"Opening the roof ({getattr(dome, 'name', 'dome')}) before {label}", "warn")
+        try:
+            dome.open_shutter()
+        except Exception as exc:                  # noqa: BLE001 - a refused open
+            self._roof_lock(dome, f"OpenShutter failed: {exc}")
+        self._roof_opened_by_run = True
+        deadline = time.monotonic() + timeout
+        errors = 0
+        state = self._roof_state(dome)
+        while True:
+            if state == "open":
+                break
+            errors = errors + 1 if state == "error" else 0
+            if errors >= self.ROOF_ERROR_READS:
+                self._roof_lock(dome, "the roof reported an error while opening")
+            if time.monotonic() >= deadline:
+                # "opening" is never proof of progress: HakosRoof 6.2 reads a
+                # closing roof and every text it does not know as opening.
+                self._roof_lock(dome, f"not open after {timeout:.0f} s (it reads {state})")
+            self._sleep(self.ROOF_POLL_SECONDS)
+            state = self._roof_state(dome)
+        self._say("Roof open", "success")
+        self._unwarn("roof.closed")
+        return True
+
+    def _roof_gate_lights(self) -> None:
+        """Hold the next light until the lead's roof reads open.
+
+        Closed, closing, opening, error: none of them is open. The run is held
+        (re-checked every few seconds), alerted once it has stayed shut for a
+        minute, and carries on by itself once it reads open. Nothing is sent to
+        the roof from here: a roof shut part way through the night was shut by
+        somebody or something, and is not opened against. Calibration frames
+        never come through here.
+        """
+        if not self._roof_settings()["gate"]:
+            return
+        dome = self._lead_dome()
+        if dome is None:
+            return
+        state = self._roof_state(dome)
+        if state == "open":
+            return
+        started = time.monotonic()
+        alerted = False
+        self._say(f"Holding the lights: the roof reads {state}", "warn")
+        while state != "open":
+            self._set("waiting", f"lights held: the roof reads {state}")
+            if not alerted and time.monotonic() - started >= 60.0:
+                alerted = True
+                title = "Lights held: the roof is not open"
+                detail = (f"{getattr(dome, 'name', 'The roof')} has read {state} for a "
+                          "minute. No light is taken until it reads open"
+                          + (f" (treated as locked: {self._roof_locked})"
+                             if self._roof_locked else "") + ".")
+                self._warn("roof.closed", "critical", title, detail,
+                           "Open the roof, or stop the sequence.")
+                self._roof_alert(title, detail)
+            reason = self._past_deadline(None, None)
+            if reason:
+                self._say(f"{reason} while the lights were held for the roof", "warn")
+                raise _Skipped()
+            self._sleep(5.0)
+            state = self._roof_state(dome)
+        self._unwarn("roof.closed")
+        self._say("The roof reads open again: carrying on", "success")
+
+    def _close_roof_after_run(self) -> None:
+        """Shut the roof this run opened, once the mount is parked (0.2.53b)."""
+        if not (self._roof_opened_by_run and self._roof_settings()["closeAtEnd"]):
+            return
+        mount = self.manager.get("mount")
+        if mount is not None and getattr(mount, "connected", False) \
+                and not getattr(mount, "at_park", False):
+            self._say("The roof this run opened is left open: the mount is not "
+                      "parked", "error")
+            self._tell("failure", "The roof was left open",
+                       "The mount did not report parked, so the roof was not closed "
+                       "over it. " + self._summary())
+            return
+        self._close_roof()
+        self._roof_opened_by_run = False
+
     def _close_roof(self, timeout: float | None = None) -> None:
         """Shut the dome or roll-off, and stop it following the mount.
 
@@ -3085,6 +4120,13 @@ class Sequencer:
             return
         if dome.shutter_state == "closed":
             return
+        if self._roof_locked and self._roof_state(dome) != "open":
+            # 0.2.53b: the technician's lock counts as closed and is never
+            # fought - no close-back is sent. A roof that reads open is closed
+            # as before: the lock is evidently not on.
+            self._say(f"Roof treated as locked and closed ({self._roof_locked}): "
+                      "nothing sent to it", "warn")
+            return
 
         self._set("parking", "closing the roof")
         dome.close_shutter()
@@ -3095,6 +4137,7 @@ class Sequencer:
         if dome.shutter_state != "closed":
             raise DeviceError(f"the roof is {dome.shutter_state}")
         self._say("Roof closed", "success")
+        self._unwarn("roof.nosafety")
         if getattr(dome, "can_park", False) and not dome.at_park:
             with contextlib.suppress(Exception):
                 dome.park()
@@ -3134,6 +4177,7 @@ class Sequencer:
 
     def _stop_warming(self) -> None:
         """Cut a warm-down short, for a new sequence that is about to cool anyway."""
+        self._cancel_warm_later()
         if not self.warming:
             return
         self._warm_stop.set()
@@ -3179,7 +4223,7 @@ class Sequencer:
         finished with the cameras - a calibration run from the Calibrate tab."""
         self._start_warming()
 
-    def _start_warming(self) -> None:
+    def _start_warming(self, only: list[Any] | None = None) -> None:
         """Ramp the coolers off on a thread of their own.
 
         Detached on purpose. Warming is several minutes of sleeping that has
@@ -3189,15 +4233,152 @@ class Sequencer:
         if self.warming:
             return
         self._warm_stop.clear()
-        rigs = [rig for rig in self.rigs.all
+        rigs = [rig for rig in (self.rigs.all if only is None else only)
                 if (camera := rig.manager.get("camera")) is not None
                 and camera.connected and camera.can_cool
                 and rig.config.section("camera").get("warmAtEnd", True)]
         if not rigs:
             return
         self._warm_thread = threading.Thread(
-            target=self._warm_cameras, daemon=True, name="warm-down")
+            target=lambda: self._warm_cameras(rigs), daemon=True, name="warm-down")
         self._warm_thread.start()
+
+    # -- warming after a run (0.2.52d) ---------------------------------------
+    #
+    # 2026-11-04 00:16: "when i stop a sequence i dont need the camera to warm
+    # up". Every end of a run used to ramp the coolers off - a Stop pressed to
+    # change one setting, and a run that ended in its first second because the
+    # target was still under its altitude floor, both cost a ten-minute warm
+    # and another cool-down. Now only the end of the night warms at once.
+
+    #: How close to dawn (on top of the dawn margin) a plan that runs out
+    #: counts as having run to the end of the night.
+    END_OF_NIGHT_SLACK_SECONDS = 30 * 60
+
+    def _warm_decision(self, close_out: bool) -> tuple[bool, str]:
+        """Whether this run's end warms the cameras now, and why (for the log)."""
+        if close_out:
+            return True, "the night is being closed out"
+        if self._stopped_by_hand:
+            return False, "stopped by hand"
+        if self._error:
+            return False, "the run failed"
+        if self._night_over:
+            return True, "the night is over"
+        with self._lock:
+            frames = sum(self._done.values())
+        dawn = None
+        with contextlib.suppress(Exception):
+            dawn = self._dawn()
+        if dawn:
+            margin = float(self._settings().get("dawnMarginMinutes") or 0.0) * 60.0
+            if time.time() >= dawn - margin - self.END_OF_NIGHT_SLACK_SECONDS:
+                return True, "the night is over"
+        if not frames:
+            return False, "nothing was shot"
+        if not dawn:
+            # No site, so no dawn to tell the end of the night by: a plan
+            # that was shot through to its end is the end, as it always was.
+            return True, "the plan is finished"
+        return False, "the plan ran out before the end of the night"
+
+    def _warm_after_run(self, close_out: bool = False) -> None:
+        """Warm the cameras at the end of a run - or, after a Stop, keep them cold.
+
+        * warmAtEnd off (per telescope): never warmed by a run's end at all.
+        * The night over (dawn), a loop's night put to bed, a failure being
+          closed out, Shut down: warmed now, as before.
+        * Stopped by hand, failed without a close-out, or ended before the
+          night did (the plan ran out, nothing was up): the cooler stays on at
+          its setpoint. warmOnStop brings the old warm-at-once back; otherwise,
+          with warmAtDawnIfCold (on by default), the camera is warmed at dawn
+          if no sequence has started by then, so it is not left cold all day.
+        """
+        if self.warming:
+            return                       # a loop's put-to-bed is warming them already
+        now, why = self._warm_decision(close_out)
+        rigs = [rig for rig in self.rigs.all
+                if (camera := rig.manager.get("camera")) is not None
+                and camera.connected and getattr(camera, "can_cool", False)
+                and rig.config.section("camera").get("warmAtEnd", True)]
+        if not rigs:
+            return
+        at_once = [rig for rig in rigs if now
+                   or rig.config.section("camera").get("warmOnStop", False)]
+        if at_once:
+            self._start_warming(at_once)
+        # Only a cooler that is on is being kept cold; one already off (a
+        # loop's night put to bed, then Stop) is left alone and not booked.
+        cold = [rig for rig in rigs if rig not in at_once
+                and _cooler_on(rig.manager.get("camera"))]
+        if not cold:
+            return
+        dawn = None
+        with contextlib.suppress(Exception):
+            dawn = self._next_dawn()
+        later = [rig for rig in cold
+                 if rig.config.section("camera").get("warmAtDawnIfCold", True)]
+        for rig in cold:
+            camera = rig.manager.get("camera")
+            reading = None
+            with contextlib.suppress(Exception):
+                reading = camera.temperature
+            where = f" at {reading:.1f} C" if isinstance(reading, (int, float)) else ""
+            when = (f"; it warms at {_clock(dawn)} unless a sequence starts first"
+                    if dawn and rig in later else "")
+            self._say(f"{rig.name}: the camera stays cooled{where} ({why}){when}")
+        if dawn and later:
+            self._warm_later(later, dawn)
+
+    #: A run stopped in daylight - after dawn, or before dusk - has no dawn
+    #: coming to wait for; its cameras warm this long after it ended instead.
+    WARM_LATER_DAYTIME_SECONDS = 60 * 60
+
+    def _next_dawn(self) -> float | None:
+        """When cameras a stopped run left cold should warm.
+
+        The end of the night it was stopped in; or, stopped in daylight, an
+        hour from now. None without a site, when there is nothing to go by.
+        """
+        site = self._site()
+        if site is None:
+            return None
+        now = time.time()
+        night = schedule.night(site[0], site[1])
+        dusk = (night.get("duskAstronomical") or night.get("duskNautical")
+                or night.get("sunset"))
+        dawn = (night.get("dawnAstronomical") or night.get("windowEnd")
+                or night.get("sunrise"))
+        if dusk and dawn and float(dusk) <= now < float(dawn):
+            return float(dawn)
+        return now + self.WARM_LATER_DAYTIME_SECONDS
+
+    def _warm_later(self, rigs: list[Any], at: float) -> None:
+        """Warm these cameras at `at`, unless a sequence starts before then."""
+        self._cancel_warm_later()
+        self._warm_later_stop.clear()
+        self._warm_later_at = float(at)
+
+        def wait_then_warm() -> None:
+            if self._warm_later_stop.wait(max(0.0, at - time.time())):
+                return
+            # A run going by then owns the cameras and warms them itself.
+            if self.running:
+                return
+            self._say("Dawn: warming the camera(s) a stopped run left cold")
+            self._start_warming(rigs)
+
+        self._warm_later_thread = threading.Thread(
+            target=wait_then_warm, daemon=True, name="warm-at-dawn")
+        self._warm_later_thread.start()
+
+    def _cancel_warm_later(self) -> None:
+        self._warm_later_stop.set()
+        thread = self._warm_later_thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5.0)
+        self._warm_later_thread = None
+        self._warm_later_at = None
 
     def _make_safe(self, park: bool = False, stop_tracking: bool = False) -> None:
         """Put the mount somewhere it can be left.
@@ -3223,6 +4404,11 @@ class Sequencer:
         except Exception as exc:                  # noqa: BLE001 - reported, not fatal
             self._say(f"Could not make the mount safe: {exc}", "error")
             if park:
+                # Not parked is bad; tracking on into the pier is worse
+                # (2026-10-08 06:02, 10-13 06:07: park refused, left tracking).
+                with contextlib.suppress(Exception):
+                    mount.set_tracking(False)
+                    self._say("Parking failed, so tracking is stopped instead", "warn")
                 # Somebody not in the room needs to hear this one.
                 self._tell("failure", "The mount did not park at the end of the sequence",
                            f"{exc}. The telescope may still be pointing at the sky.")
@@ -3246,50 +4432,103 @@ class Sequencer:
             return f"the guider is {state.lower()} rather than guiding"
         return None                     # calibrating, or something else in hand
 
-    #: Guide frames the RMS must be measured over before it is judged.  A
-    #: window this short is still a minute of guiding, and a window shorter
-    #: than it is the first few frames after a restart or a dither, which
-    #: are the settle, not the guiding.
-    ROUGH_MIN_SAMPLES = 20
+    def _guiding_healthy(self) -> bool:
+        return self._guiding_fault() is None
 
-    def _guiding_quality(self) -> tuple[str, str | None]:
-        """How guiding that *is* running is going: ("rough", why), ("fine",
-        None), or ("unknown", None) while there are too few frames to say.
+    def _guiding_rough(self) -> str | None:
+        """Guiding that is running but trailing every sub, or None.
 
-        PHD2 holding a star is not the same as PHD2 guiding: with a stale or
-        reversed calibration — a pier side the driver never reports, a mount
-        nudged by hand — every correction pushes the star further out, and
-        PHD2 keeps chasing it at hundreds of arcseconds RMS while reporting
-        "Guiding" all the way.  Those subs are trailed exactly as a lost
-        star's would be, so rough is a fault, not a notice.
+        A guider at 5" RMS is still "guiding" by every state it reports, and
+        the ten subs before anyone looks are all trailed.  Past the limit for
+        the set number of frames in a row this says so, and the caller drops
+        the star for a fresh one; between times it is only noted, and a fresh
+        star is not asked for again until the spacing has passed.
         """
-        guider = self.manager.get("guider")
-        if guider is None or not guider.connected:
-            return "unknown", None
-        if not guider.guiding or guider.settling:
-            return "unknown", None
-        limit = float(self._recovery_settings().get("guideRmsFaultArcsec") or 0)
+        settings = self._recovery_settings()
+        limit = float(settings.get("roughGuidingArcsec") or 0)
         if limit <= 0:
-            return "unknown", None
+            return None
+        guider = self.manager.get("guider")
+        if guider is None or not guider.connected or not guider.guiding:
+            return None
+        try:
+            status = guider.status()
+            rms = status.get("rmsTotal")
+            samples = int(status.get("samples") or 0)
+        except Exception:                        # noqa: BLE001 - informational only
+            return None
+        # Ten guide steps is the least that makes an RMS worth acting on; a
+        # guider straight off a dither has a window of two.
+        if rms is None or samples < 10 or float(rms) <= limit:
+            self._rough_runs = 0
+            return None
+        self._rough_runs += 1
+        needed = max(1, int(settings.get("roughGuidingFrames") or 1))
+        if self._rough_runs < needed:
+            self._say(f'Guiding is rough: {float(rms):.1f}" RMS against {limit:g}" '
+                      f"({self._rough_runs} of {needed} frames before a fresh star)",
+                      "warn")
+            return None
+        spacing = float(settings.get("roughGuidingRetryMinutes") or 0) * 60.0
+        if self._rough_last and time.monotonic() - self._rough_last < spacing:
+            return None                 # a fresh star was tried not long ago
+        self._rough_runs = 0
+        self._rough_last = time.monotonic()
+        return f'guiding is rough — {float(rms):.1f}" RMS against a limit of {limit:g}"'
+
+    #: PHD2's RA and Dec axes should make a right angle. A calibration further
+    #: off than this was made on a star PHD2 could not really see, and guiding
+    #: on it pushes the star the wrong way with every correction - PHD2 chases
+    #: it to the edge of the frame saying "Guiding" all the way. A real mount
+    #: on a real star comes out within a few degrees.
+    CALIBRATION_ORTHO_LIMIT_DEG = 10.0
+
+    #: The star PHD2 must be seeing before a calibration is asked for. Below
+    #: this it is a smudge through cloud, and the calibration will be too.
+    RECALIBRATE_MIN_SNR = 10.0
+
+    def _star_well_seen(self, guider) -> bool:
+        """Is PHD2 holding a star bright enough to calibrate on?"""
         try:
             status = guider.status()
         except Exception:                        # noqa: BLE001 - informational only
-            return "unknown", None
-        rms = status.get("rmsTotal")
-        samples = int(status.get("samples") or 0)
-        if rms is None or samples < self.ROUGH_MIN_SAMPLES:
-            return "unknown", None
-        if float(rms) <= limit:
-            return "fine", None
-        return "rough", (f"guiding is rough — {float(rms):.1f}\" RMS over the last "
-                         f"{samples} frames against a limit of {limit:g}\"; the "
-                         f"star or the calibration is bad")
+            return False
+        snr = status.get("snr")
+        return (bool(status.get("guiding")) and not status.get("starLost")
+                and snr is not None and float(snr) >= self.RECALIBRATE_MIN_SNR)
 
-    def _guiding_rough(self) -> str | None:
-        return self._guiding_quality()[1]
+    def _calibration_sound(self, guider) -> bool:
+        """Is the calibration PHD2 has just started guiding on worth guiding on?
 
-    def _guiding_healthy(self) -> bool:
-        return self._guiding_fault() is None and self._guiding_rough() is None
+        False means guiding has been stopped and the night goes on unguided,
+        with a warning that says what to do: a bad calibration makes trailed
+        subs that an unguided mount would not, so refusing is the kinder
+        choice. A guider that cannot be asked, or that has no calibration to
+        report, is given the benefit of the doubt.
+        """
+        read = getattr(guider, "calibration_data", None)
+        if read is None:
+            return True
+        try:
+            data = read()
+        except Exception:                        # noqa: BLE001 - an older PHD2
+            return True
+        error = (data or {}).get("orthoError")
+        if error is None or float(error) <= self.CALIBRATION_ORTHO_LIMIT_DEG:
+            self._unwarn("guider.calibration")
+            return True
+        detail = (f"PHD2's RA and Dec axes are {float(error):.0f}° off a right angle "
+                  f"(RA {data['xAngle']:.1f}°, Dec {data['yAngle']:.1f}°)")
+        self._say(f"Not guiding on this calibration: {detail}. Every correction "
+                  "would push the star the wrong way. Carrying on unguided.", "error")
+        self._warn("guider.calibration", "critical", "PHD2's calibration is bad",
+                   detail + ".",
+                   "Calibrate PHD2 by hand on a bright star under clear sky, near the "
+                   "meridian and the celestial equator, then start guiding again.")
+        with contextlib.suppress(Exception):
+            guider.stop_guiding()
+        self._guiding_wanted = False
+        return False
 
     def _check_guiding(self) -> None:
         """Between slots: is the guider still doing its job, and if not, fix it.
@@ -3298,28 +4537,27 @@ class Sequencer:
         does — stopping, re-selecting a star, calibrating — would ruin the sub in
         flight anyway.
         """
+        if not self._guiding_wanted and self._guide_retry_at is not None \
+                and time.monotonic() >= self._guide_retry_at:
+            self._retry_guiding()
         if not self._guiding_wanted or not self._recovery_on("guidingRecovery"):
             return
         fault = self._guiding_fault()
         rough = False
         if fault is None:
-            quality, fault = self._guiding_quality()
-            rough = fault is not None
-            if quality == "fine":
-                # A full window of good guiding: whatever was wrong is fixed,
-                # and the next rough patch starts again from a fresh star.
-                self._rough_restarts = 0
-        if fault is None:
             self._guide_lost_since = None
-            return
-        self._guide_lost_in_slot = True
+            fault = self._guiding_rough()
+            if fault is None:
+                return
+            rough = True
+        else:
+            self._guide_lost_in_slot = True
 
         settings = self._recovery_settings()
         # PHD2 usually finds the star again by itself within an exposure or two.
         # A cloud is over before a re-acquisition would have finished, so the
         # grace period is not politeness — it is the faster of the two options.
-        # Rough guiding gets no grace: the RMS is already a window of frames
-        # long, and nothing about a bad calibration comes right by waiting.
+        # Rough guiding gets no grace: it has already had its frames' worth.
         grace = 0.0 if rough else float(settings.get("guideGraceSeconds") or 0)
         if self._guide_lost_since is None:
             self._guide_lost_since = time.monotonic()
@@ -3336,110 +4574,140 @@ class Sequencer:
                     return
                 time.sleep(1.0)
 
-        self._restart_guiding(fault, rough)
-
-    def _restart_guiding(self, fault: str, rough: bool) -> None:
-        """Stop the guider, give it a fresh star and start it again, a bounded
-        number of times; the later tries recalibrate.  Out of tries, the night
-        carries on unguided and `_guiding_wanted` goes False so nothing keeps
-        asking.
-        """
-        settings = self._recovery_settings()
         attempts = int(settings.get("guideRestartAttempts") or 0)
         recalibrate_after = int(settings.get("recalibrateAfterAttempts") or 0)
         guiding = self.config.section("guiding")
         guider = self.manager.get("guider")
         if guider is None or not guider.connected:
             return
-        # A fresh calibration is slow and is the only thing that fixes a
-        # mount that has been nudged by hand, so it is what the later
-        # attempts do rather than what every attempt does.  Rough guiding on
-        # a held star is nearly always the calibration, and a restart for it
-        # looks successful the moment PHD2 is guiding again — the verdict
-        # takes another window of frames — so the count that matters there
-        # is restarts across slots: one for a fresh star, then the fix.
+
+        # A fresh calibration is slow and is the only thing that fixes a mount
+        # that has been nudged by hand - but it is also the one thing that
+        # cannot be done through cloud. A lost star means PHD2 cannot see the
+        # star, and a calibration made on a star it cannot see is not a bad
+        # try, it is a bad calibration: PHD2 writes it over the good one and
+        # every night after guides on it. So a lost star is only ever given a
+        # fresh star. Rough guiding on a star PHD2 is holding well is the real
+        # signature of a bad calibration, and that is the only thing that
+        # recalibrates. A restart for rough guiding looks successful the moment
+        # PHD2 is guiding again - the verdict takes another window of frames -
+        # so the count that matters is rough restarts across slots: a fresh
+        # star first, and only when that was not it, the calibration.
         if rough:
             self._rough_restarts += 1
-        recalibrate_rough = bool(recalibrate_after) and rough and self._rough_restarts > 1
+        recalibrate = (bool(recalibrate_after) and rough
+                       and self._rough_restarts >= recalibrate_after)
+        if recalibrate and not self._star_well_seen(guider):
+            self._say("Guiding is rough but the guide star is too faint to "
+                      "calibrate on; restarting on a fresh star instead", "warn")
+            recalibrate = False
 
         for attempt in range(1, attempts + 1):
             if self._budget_spent():
                 self._give_up("The guider keeps losing its star")
-            recalibrate = recalibrate_rough or (
-                bool(recalibrate_after) and attempt > recalibrate_after)
             self._recovering(
                 "guiding",
                 f"{fault}; restarting guiding"
+                + (" on a fresh star" if rough else "")
                 + (" with a fresh calibration" if recalibrate else "")
                 + f" (attempt {attempt} of {attempts})", attempt)
             with contextlib.suppress(Exception):
                 guider.stop_guiding()
             self._sleep(2.0)
             try:
+                kwargs: dict[str, Any] = {}
+                if rough:
+                    # The same faint star again is the same rough guiding
+                    # again: drop it and let PHD2 pick afresh.
+                    kwargs["fresh_star"] = True
                 guider.start_guiding(
                     settle_pixels=float(guiding.get("settlePixels") or 1.5),
                     settle_time=float(guiding.get("settleTime") or 8.0),
                     settle_timeout=float(guiding.get("settleTimeout") or 60.0),
-                    recalibrate=recalibrate)
+                    recalibrate=recalibrate, **kwargs)
             except DeviceError as exc:
                 self._say(f"Could not start guiding: {exc}", "warn")
                 self._cooldown()
                 continue
             if self._wait_for_guiding(
                     float(guiding.get("settleTimeoutSeconds") or 180.0)):
-                self._recovered("guiding", "Guiding again", True)
+                if not self._calibration_sound(guider):
+                    self._recovered("guiding", "Guiding is off for the night: PHD2's "
+                                    "calibration cannot be guided on", False)
+                    self._guide_lost_since = None
+                    return
+                self._recovered("guiding", "Guiding again on a fresh star" if rough
+                                else "Guiding again", True)
                 self._guide_lost_since = None
                 return
             self._cooldown()
 
         # Out of attempts, but an unguided sub of a bright target is still a
         # sub: the night carries on and the log says loudly why it is worse.
+        self._guide_lost_since = None
+        self._guiding_wanted = False
+        # ...for now. 2026-10-14 01:52: a cloud took the star, three restarts
+        # inside it failed, and the rest of the night went unguided under a
+        # clear sky. Tried again later, spaced out further each time.
+        minutes = float(settings.get("guideRetryMinutes") or 0.0)
+        later = ""
+        if minutes > 0:
+            wait = minutes * 60.0 * (2 ** min(self._guide_retries, 3))
+            self._guide_retry_at = time.monotonic() + wait
+            later = f"; trying again in {wait / 60.0:.0f} min"
         self._recovered(
             "guiding",
             "Could not get the guider going again; carrying on unguided — "
-            "these frames will not be as tight", False)
-        self._guide_lost_since = None
-        self._guiding_wanted = False
+            f"these frames will not be as tight{later}", False)
+
+    def _retry_guiding(self) -> None:
+        """Guiding that was given up on earlier in the night, tried again."""
+        self._guide_retry_at = None
+        self._guide_retries += 1
+        guider = self.manager.get("guider")
+        if guider is None or not guider.connected:
+            return
+        self._recovering("guiding", "trying the guider again "
+                         f"(retry {self._guide_retries} since it was given up on)",
+                         self._guide_retries)
+        with contextlib.suppress(Exception):
+            guider.stop_guiding()
+        self._start_guiding()
+        if self._guiding_wanted:
+            self._guide_retries = 0
+            self._recovered("guiding", "Guiding again", True)
+            return
+        minutes = float(self._recovery_settings().get("guideRetryMinutes") or 0.0)
+        if minutes > 0:
+            wait = minutes * 60.0 * (2 ** min(self._guide_retries, 3))
+            self._guide_retry_at = time.monotonic() + wait
+        self._recovered("guiding", "The guider still will not guide; carrying on "
+                        "unguided", False)
 
     def _wait_for_guiding(self, timeout: float) -> bool:
-        """Wait for the guider to settle onto a star.  True if it did.
-
-        A star dropped for a frame or two while settling is not a failure —
-        PHD2 reports LostLock on a single low-SNR frame and is guiding again
-        on the next, and giving up on the first one is how a night went
-        unguided fifteen seconds in.  What ends the wait early is PHD2
-        stopping altogether, its own verdict that the settle failed, or a
-        star that stays lost for longer than a few frames could explain.
-        """
+        """Wait for the guider to settle onto a star.  True if it did."""
         deadline = time.monotonic() + timeout
+        # PHD2 still says Stopped for a few seconds after `guide` is accepted:
+        # it has a guide exposure to take before it reports anything else.
+        # Read one second in, that was "the guider is Stopped rather than
+        # guiding; carrying on unguided" (2026-10-19 20:14:51) and a panel shot
+        # unguided while PHD2 was in fact guiding. So Stopped only counts once
+        # it has had long enough to be a real stop.
+        grace = time.monotonic() + 20.0
         time.sleep(1.0)
         guider = self.manager.get("guider")
-        lost_since: float | None = None
         while time.monotonic() < deadline:
             self._check()
             if guider is None or not guider.connected:
                 return False
-            state = guider.state
-            if state == "Stopped":
+            if guider.guiding and not guider.settling:
+                return True
+            if guider.state == "LostLock":
                 return False
-            if state == "LostLock":
-                lost_since = lost_since or time.monotonic()
-                if time.monotonic() - lost_since > self.LOST_LOCK_PATIENCE:
-                    return False
-            else:
-                lost_since = None
-            if not guider.settling:
-                if getattr(guider, "settle_error", None):
-                    return False
-                if guider.guiding:
-                    return True
+            if guider.state == "Stopped" and time.monotonic() > grace:
+                return False
             time.sleep(0.5)
         return False
-
-    #: Seconds a star may stay lost during a settle before the settle is
-    #: called off: a cloud over the guide field or a star that was never
-    #: really there, either way not something the next frame will mend.
-    LOST_LOCK_PATIENCE = 15.0
 
     # -- the pointing ------------------------------------------------------
     def _check_recentre(self, panel: dict[str, Any], label: str) -> None:
@@ -3504,28 +4772,58 @@ class Sequencer:
         # a re-centre — can take minutes, and an abort arriving during any of
         # them must not be followed by one more frame.
         self._check()
+        # 0.2.53b: never a light under a roof that does not read open.
+        self._roof_gate_lights()
 
         # The first light frame is where the sensor temperature finally matters.
         # By now the mount has homed, slewed, centred and focused, so this is
         # usually already satisfied and returns at once.
+        cool_limit = 60.0 + max(
+            [float(rig.config.section("camera").get("coolTimeoutMinutes") or 20.0) * 60.0
+             for rig in active] or [0.0])
+        self._expect(cool_limit)
         self._parallel([(rig, lambda rig=rig: self._await_cooling(rig))
-                        for rig in active], "cool")
+                        for rig in active], "cool", timeout=cool_limit)
 
         self._check()
-        outcome = self._parallel([(rig, job(rig)) for rig in active], "expose")
+        limit = self._frame_timeout(max(float(frames[rig.id]["exposure"]) for rig in active))
+        self._expect(limit + 5.0)
+        outcome = self._parallel([(rig, job(rig)) for rig in active], "expose",
+                                 timeout=limit)
+        self._expect(None)
+        self._free_hung(active, outcome)
         if not outcome["errors"] or not self._recovery_on("enabled"):
             return outcome
 
         settings = self._recovery_settings()
         retries = int(settings.get("frameRetryAttempts") or 0)
         wait = float(settings.get("frameRetrySeconds") or 0)
+        # When the other telescopes' frames landed, the one that failed gets a
+        # single quick retry here; anything more happens in the background
+        # (`_bench`) so the others are not kept waiting on it.
+        if len(active) > 1 and len(outcome["errors"]) < len(active):
+            retries = min(retries, 1)
+        # A camera that hung is not asked again in this slot: it has already
+        # cost a whole frame timeout, and its recovery starts with a reconnect.
+        hung = set(outcome.get("hung") or [])
+        # So is one just back from a background recovery: it has had its
+        # quick retries already, and failing again sends it straight back.
+        hung |= {rig.id for rig in active
+                 if (rec := self._rig_recovery.get(rig.id)) is not None and rec.attempt > 0}
+        # And one the camera check has already reconnected three times and
+        # called gone (0.2.52e): asking it again here only delays the others.
+        hung |= {rig_id for rig_id, message in outcome["errors"].items()
+                 if "power-cycle or replug it at the scope" in str(message)}
 
         for attempt in range(1, retries + 1):
             if not outcome["errors"]:
                 break
             if self._budget_spent():
                 self._give_up("The cameras keep failing")
-            failed = [rig for rig in active if rig.id in outcome["errors"]]
+            failed = [rig for rig in active
+                      if rig.id in outcome["errors"] and rig.id not in hung]
+            if not failed:
+                break
             first = outcome["errors"][failed[0].id]
             self._recovering(
                 "camera",
@@ -3535,9 +4833,17 @@ class Sequencer:
             self._sleep(wait)
             if settings.get("reconnectDevices", True) and attempt > 1:
                 self._reconnect_cameras(failed)
-            retry = self._parallel([(rig, job(rig)) for rig in failed], "re-expose")
+            self._expect(limit + 5.0)
+            retry = self._parallel([(rig, job(rig)) for rig in failed], "re-expose",
+                                   timeout=limit)
+            self._expect(None)
+            self._free_hung(failed, retry)
+            hung |= set(retry.get("hung") or [])
             outcome["results"].update(retry["results"])
-            outcome["errors"] = retry["errors"]
+            outcome["errors"] = {**{rig_id: message for rig_id, message
+                                    in outcome["errors"].items()
+                                    if rig_id in hung and rig_id not in retry["results"]},
+                                 **retry["errors"]}
             if not outcome["errors"]:
                 self._recovered("camera", "The camera answered again", True)
                 return outcome
@@ -3545,6 +4851,341 @@ class Sequencer:
         if retries:
             self._recovered("camera", "The camera did not answer again", False)
         return outcome
+
+    # -- one telescope's recovery (0.2.51) ------------------------------------
+    #
+    # Detect (a frame that failed or hung) -> safe state (abort the exposure,
+    # free the capture) -> reconnect, with the power box on a repeat ->
+    # verify (the camera answers) -> rejoin at the frame it missed, refocused
+    # if it was away long enough.  On its own thread, with a backoff between
+    # attempts and a deadline on every step, so the telescopes that are fine
+    # are never kept waiting on the one that is not.
+
+    def _rec(self, rig) -> RigRecovery:
+        with self._lock:
+            rec = self._rig_recovery.get(rig.id)
+            if rec is None:
+                rec = self._rig_recovery[rig.id] = RigRecovery(rig.id, rig.name)
+            return rec
+
+    def _rig_usable(self, rig) -> bool:
+        rec = self._rig_recovery.get(rig.id)
+        if rec is not None and rec.state != RIG_OK:
+            return False
+        camera = rig.manager.get("camera")
+        if camera is None or not camera.connected:
+            # Dropped without a failed frame to say so: recover it.
+            self._bench(rig, "the camera is not connected")
+            return False
+        return True
+
+    def _rig_recovering(self, rig) -> bool:
+        rec = self._rig_recovery.get(rig.id)
+        return rec is not None and rec.state == RIG_RECOVERING
+
+    def _expect(self, seconds: float | None) -> None:
+        """Tell the watchdog how long the step about to block may take."""
+        with self._lock:
+            self._expect_by = None if seconds is None else time.monotonic() + float(seconds)
+        self._beat()
+
+    def _frame_timeout(self, exposure: float) -> float:
+        """The longest one frame may take before its telescope is given up on.
+
+        The exposure, the camera's own hang allowance, the download deadline
+        - twice, because a failed frame gets a reconnect and one more try
+        inside the capture - and some slack.
+        """
+        settings = self._recovery_settings()
+        hung = max(30.0, float(settings.get("hungSeconds") or 120.0))
+        download = float(settings.get("downloadTimeoutSeconds") or 120.0)
+        grace = float(settings.get("slotGraceSeconds") or 60.0)
+        return 2.0 * (float(exposure) + hung + download) + grace
+
+    def _free_hung(self, rigs: list[Any], outcome: dict[str, Any]) -> None:
+        """A capture thread stuck in a driver: abort it and free the camera."""
+        for rig_id in outcome.get("hung") or []:
+            rig = next((r for r in rigs if r.id == rig_id), None)
+            if rig is None:
+                continue
+            self._say(f"{rig.name}: the camera has stopped answering (hung in the "
+                      "driver); giving up on that frame", "error")
+            with contextlib.suppress(Exception):
+                call_with_timeout(rig.capture.abort, 15.0, "aborting the exposure")
+            with contextlib.suppress(Exception):
+                rig.capture.release_stuck()
+
+    def _bench(self, rig, reason: str) -> None:
+        """Take a telescope out of the slots and start recovering it."""
+        settings = self._recovery_settings()
+        rec = self._rec(rig)
+        if rec.state != RIG_OK:
+            return
+        attempts = int(settings.get("rigRecoveryAttempts") or 0)
+        with self._lock:
+            rec.name = rig.name
+            rec.reason = str(reason)
+            rec.attempts = attempts
+            rec.failures += 1
+            rec.since = time.time()
+            if rec.down_since is None:
+                rec.down_since = time.time()
+            if not settings.get("enabled", True) or attempts <= 0 \
+                    or rec.attempt >= attempts:
+                rec.state = RIG_FAILED
+                rec.step = ""
+            else:
+                rec.state = RIG_RECOVERING
+                rec.step = "starting"
+        rec.note(f"failed: {reason}", False)
+        self._set_rig(rig, state=rec.state)
+        if rec.state == RIG_FAILED:
+            self._say(f"{rig.name}: out of recovery attempts — {reason}; it sits out "
+                      "the rest of this target", "error")
+            self._tell("recovery", f"Could not recover {rig.name}", reason)
+            self._recovery_banner()
+            return
+        self._say(f"{rig.name}: recovering in the background, the other telescopes "
+                  f"carry on — {reason}", "warn")
+        self._tell("recovery", f"{rig.name} is recovering", reason)
+        thread = threading.Thread(target=self._recover_rig,
+                                  args=(rig, rec, self._generation),
+                                  daemon=True, name=f"recover-{rig.id}")
+        rec.thread = thread
+        thread.start()
+        self._recovery_banner()
+
+    def _recovery_banner(self) -> None:
+        """The run's recovery banner: every telescope that is not ok."""
+        with self._lock:
+            troubled = [rec for rec in self._rig_recovery.values() if rec.state != RIG_OK]
+            if not troubled:
+                if self._recovery and self._recovery.get("kind") == "telescope":
+                    self._recovery = None
+                return
+            first = troubled[0]
+            self._recovery = {
+                "kind": "telescope",
+                "reason": "; ".join(f"{rec.name}: {rec.label()}" for rec in troubled),
+                "attempt": first.attempt, "attempts": first.attempts,
+                "since": first.since,
+                "rigs": [rec.as_dict() for rec in troubled],
+            }
+
+    def _recover_rig(self, rig, rec: RigRecovery, generation: int) -> None:
+        settings = self._recovery_settings()
+        base = float(settings.get("rigRecoveryBackoffSeconds") or 20.0)
+        cap = float(settings.get("rigRecoveryBackoffMaxSeconds") or 300.0)
+        step = float(settings.get("recoveryStepSeconds") or 180.0)
+
+        def gone() -> bool:
+            return self._abort.is_set() or generation != self._generation
+
+        def doing(text: str) -> None:
+            with self._lock:
+                rec.step = text
+            self._recovery_banner()
+
+        try:
+            while rec.attempt < rec.attempts:
+                with self._lock:
+                    rec.attempt += 1
+                    delay = backoff(rec.attempt, base, cap)
+                    rec.next_at = time.time() + delay
+                doing(f"waiting {delay:g}s before attempt {rec.attempt} of {rec.attempts}")
+                until = time.monotonic() + delay
+                while time.monotonic() < until:
+                    if gone():
+                        return
+                    time.sleep(min(0.25, max(0.0, until - time.monotonic())))
+                with self._lock:
+                    rec.next_at = None
+
+                # Safe state: nothing half-exposed, nothing holding the camera.
+                doing("aborting the exposure")
+                with contextlib.suppress(Exception):
+                    call_with_timeout(rig.capture.abort, min(step, 30.0),
+                                      "aborting the exposure")
+                with contextlib.suppress(Exception):
+                    rig.capture.release_stuck()
+                if gone():
+                    return
+
+                # Reconnect: the remembered driver, the power box on a repeat.
+                doing("reconnecting the camera")
+                failed: list[str] = []
+                with contextlib.suppress(Exception):
+                    call_with_timeout(lambda: rig.manager.disconnect("camera"),
+                                      min(step, 30.0), "disconnecting the camera")
+                try:
+                    reconnect = getattr(self.rigs, "reconnect_camera", None)
+                    if reconnect is not None:
+                        outcome = call_with_timeout(
+                            lambda: reconnect(rig, stop=gone, progress=doing),
+                            step, "the camera reconnect")
+                    else:
+                        outcome = call_with_timeout(
+                            lambda: self.rigs.connect_remembered(rig, ("camera",)),
+                            step, "the camera reconnect")
+                    failed = list((outcome or {}).get("failed") or [])
+                except Exception as exc:          # noqa: BLE001 - counted as a failure
+                    failed = [str(exc)]
+                if gone():
+                    return
+
+                # Verify: connected and answering.
+                doing("checking the camera answers")
+                camera = rig.manager.get("camera")
+                ok = camera is not None and camera.connected
+                if ok:
+                    try:
+                        call_with_timeout(lambda: getattr(camera, "temperature", None),
+                                          min(step, 30.0), "reading the camera")
+                    except Exception as exc:      # noqa: BLE001 - counted as a failure
+                        ok = False
+                        failed.append(str(exc))
+                if ok:
+                    # Connected is not answering (0.2.52e): a driver that has
+                    # lost its camera reconnects "fine" and reads 0 to 0 s.
+                    probe = getattr(camera, "probe", None)
+                    if probe is not None:
+                        try:
+                            bad = call_with_timeout(probe, min(step, 60.0),
+                                                    "checking the camera")
+                        except Exception as exc:  # noqa: BLE001 - counted as a failure
+                            bad = str(exc)
+                        if bad:
+                            ok = False
+                            failed.append(f"it reconnected but {bad}")
+                if ok:
+                    self._rig_back(rig, rec)
+                    return
+                with self._lock:
+                    rec.reason = "; ".join(failed) or "the camera did not come back"
+                rec.note(f"attempt {rec.attempt}: {rec.reason}", False)
+                self._say(f"{rig.name}: recovery attempt {rec.attempt} of {rec.attempts} "
+                          f"failed — {rec.reason}", "warn")
+
+            with self._lock:
+                rec.state = RIG_FAILED
+                rec.step = ""
+            self._set_rig(rig, state=RIG_FAILED)
+            self._say(f"{rig.name}: out of recovery attempts ({rec.attempts}); it sits "
+                      "out the rest of this target", "error")
+            self._tell("recovery", f"Could not recover {rig.name}", rec.reason)
+        finally:
+            self._recovery_banner()
+
+    def _rig_back(self, rig, rec: RigRecovery) -> None:
+        away = time.time() - (rec.down_since or time.time())
+        with self._lock:
+            rec.state = RIG_OK
+            rec.step = "rejoining"
+            rec.rejoined = True
+            rec.recoveries += 1
+        rec.note("camera back", True)
+        self._set_rig(rig, state="")
+        self._say(f"{rig.name}: the camera is back (attempt {rec.attempt} of "
+                  f"{rec.attempts}); it rejoins at the frame it missed", "success")
+        self._tell("recovery", f"Recovered {rig.name}", f"after {away:.0f}s")
+        # Away long enough for the focus to have moved with the temperature.
+        if away > 600.0:
+            focuser = rig.manager.get("focuser")
+            if focuser is not None and focuser.connected:
+                self._refocus_reason[rig.id] = "back after a camera recovery"
+
+    def _rig_ok(self, rig) -> None:
+        """A frame landed: this telescope's recovery count starts again."""
+        rec = self._rig_recovery.get(rig.id)
+        if rec is None or (rec.attempt == 0 and rec.down_since is None):
+            return
+        with self._lock:
+            rec.attempt = 0
+            rec.down_since = None
+            rec.reason = ""
+            rec.step = ""
+            rec.rejoined = False
+
+    def _wait_for_rigs(self, pending: list[Any], entry: dict[str, Any],
+                       end_at: float | None, label: str) -> bool:
+        """No telescope can shoot: wait for one to come back, or for the end.
+
+        False when the night (or the target) ran out first - the run then
+        ends and is closed out like any other end of night.
+        """
+        while True:
+            self._check()
+            if self._skip.is_set():
+                raise _Skipped()
+            if any(self._rig_recovery.get(r.id) is None
+                   or self._rig_recovery[r.id].state != RIG_RECOVERING for r in pending):
+                return True
+            reason = self._past_deadline(entry, end_at)
+            if reason:
+                with self._lock:
+                    self._close_out = f"{reason} while recovering " + ", ".join(
+                        r.name for r in pending)
+                self._say(f"{label}: {reason} — still recovering "
+                          + ", ".join(r.name for r in pending), "error")
+                return False
+            self._set("recovering", "; ".join(
+                f"{r.name}: {self._rec(r).label()}"
+                + (f" ({self._rec(r).step})" if self._rec(r).step else "")
+                for r in pending))
+            time.sleep(0.5)
+
+    def _reverify(self, active: list[Any], panel: dict[str, Any], label: str) -> None:
+        """Before a recovered telescope shoots again: is the rig as it was?"""
+        back = [rig for rig in active
+                if (rec := self._rig_recovery.get(rig.id)) is not None and rec.rejoined]
+        if not back:
+            return
+        for rig in back:
+            self._rig_recovery[rig.id].rejoined = False
+            # Gain, offset and the cooler came back with the reconnect
+            # (`restore_camera`); the filter is selected by the slot.
+        # The mount may have been left alone for minutes: still tracking, on
+        # target? A master that was away is also the camera that solves.
+        if any(rig.id == self.master.id for rig in back):
+            self._check_tracking(panel, label, force_recentre=True)
+
+    def _check_tracking(self, panel: dict[str, Any], label: str,
+                        force_recentre: bool = False) -> None:
+        """Between frames: a mount that stopped tracking is put right.
+
+        2026-10-20 21:5x: the mount stopped tracking and the night carried on
+        shooting trails for an hour. Tracking is switched back on and the
+        target centred again, since it will have drifted.
+        """
+        mount = self.manager.get("mount")
+        if mount is None or not getattr(mount, "connected", False):
+            return
+        try:
+            tracking = call_with_timeout(lambda: mount.tracking, 30.0, "reading the mount")
+            parked = call_with_timeout(lambda: getattr(mount, "at_park", False), 30.0,
+                                       "reading the mount")
+        except Exception as exc:                  # noqa: BLE001 - said, not raised
+            self._say(f"Could not read the mount: {exc}", "warn")
+            return
+        if parked:
+            return
+        if tracking and not force_recentre:
+            return
+        if not tracking:
+            self._recovering("mount", "the mount has stopped tracking; switching "
+                                      "tracking back on and centring again")
+            try:
+                call_with_timeout(lambda: mount.set_tracking(True), 30.0,
+                                  "switching tracking on")
+            except Exception as exc:              # noqa: BLE001 - reported
+                self._recovered("mount", f"Could not switch tracking back on: {exc}",
+                                False)
+                return
+        if self.solver is not None and self.solver.executable() is not None:
+            with contextlib.suppress(Exception):
+                self._goto(panel, label)
+        if not tracking:
+            self._recovered("mount", "Tracking again", True)
 
     def _reconnect_cameras(self, rigs: list[Any]) -> None:
         """Take a camera down and bring it back up on its remembered driver.
@@ -3558,27 +5199,53 @@ class Sequencer:
             with contextlib.suppress(Exception):
                 rig.manager.disconnect("camera")
             try:
-                outcome = self.rigs.connect_remembered(rig, ("camera",))
+                # Back with its gain, offset and cooler as they were: a
+                # reopened body comes up warm with the driver's defaults.
+                # The set may power-cycle the camera's outlets on the way,
+                # so it is told how to notice a Stop and where to say what
+                # it is waiting for.
+                reconnect = getattr(self.rigs, "reconnect_camera", None)
+                outcome = (reconnect(rig, stop=self._abort.is_set,
+                                     progress=lambda text: self._set("recovering", text))
+                           if reconnect is not None
+                           else self.rigs.connect_remembered(rig, ("camera",)))
                 if outcome["failed"]:
                     self._say(f"{rig.name}: " + "; ".join(outcome["failed"]), "warn")
                 elif outcome["connected"]:
                     self._say(f"{rig.name}: the camera is back", "success")
-                    # A fresh connection is a driver at its defaults. ZWO's
-                    # comes back with the cooler off and the gain wherever it
-                    # was last set from somewhere else, and a night that
-                    # carried on from here warmed the sensor from -4 C to
-                    # -2 C under a "cooling" label before anybody noticed.
-                    try:
-                        self._prepare_camera(rig)
-                    except Exception as exc:      # noqa: BLE001 - reported, not fatal
-                        self._say(f"{rig.name}: could not put the camera's "
-                                  f"settings back after reconnecting — {exc}",
-                                  "warn")
             except Exception as exc:              # noqa: BLE001 - reported, not fatal
                 self._say(f"{rig.name}: could not reconnect the camera — {exc}",
                           "warn")
 
     # -- imaging -----------------------------------------------------------
+    def _select_first_filters(self, entry: dict[str, Any]) -> None:
+        """Put every telescope's wheel on the filter its first frame will use.
+
+        Done before the start-of-target focus run so the sweep is through
+        the imaging filter, and the slot's own selection afterwards finds
+        the wheel already there and triggers nothing. A wheel that will not
+        move says so and the slot selection tries again.
+        """
+        rigs = self.rigs.imaging()
+        master_id = self.master.id
+        options = plans.options_for(entry)
+        filter_order = str(options.get("filterOrder") or "grouped")
+        fitted = plans.fitted_filters(rigs)
+        for rig in rigs:
+            try:
+                queue = _flatten(
+                    plans.allocation_for(entry, rig.id, master_id, fitted), filter_order)
+            except Exception:                    # noqa: BLE001 - the slot loop will say
+                continue
+            name = str((queue[0] if queue else {}).get("filter") or "")
+            if not name:
+                continue
+            try:
+                self._select_filter(rig, name)
+            except DeviceError as exc:
+                self._say(f"{rig.name}: could not select {name} before the focus "
+                          f"run — {exc}", "warn")
+
     def _select_filter(self, rig, name: str) -> bool:
         """Put a telescope's wheel on the named filter.  True if it moved."""
         # In the one spelling, whatever asked: the wheel's names already are.
@@ -3652,7 +5319,15 @@ class Sequencer:
             return False
         try:
             self._set_rig(rig, state=f"filter offset {delta:+d}")
-            focuser.move_relative(delta)
+            health = getattr(rig, "focus_health", None)
+            if health is not None:
+                # A focuser that has stopped answering is reconnected and the
+                # move made once more (0.2.52d).
+                health.call(lambda f: f.move_relative(delta),
+                            f"the {name} focus offset", self._abort.is_set)
+                focuser = rig.manager.get("focuser") or focuser
+            else:
+                focuser.move_relative(delta)
             deadline = time.monotonic() + 120
             while focuser.moving and time.monotonic() < deadline:
                 self._check()
@@ -3728,14 +5403,24 @@ class Sequencer:
         """Work through one panel, one slot at a time, on every telescope.
 
         False when it stopped early — out of night, or the field has set.
+
+        Each telescope keeps its own place in its queue (0.2.51). A telescope
+        whose camera fails is taken out of the slot and recovered in the
+        background while the others carry on; it rejoins at the frame it
+        missed. Only when no telescope can shoot does the run wait - in a
+        "recovering" state the status names - and only when every one has
+        run out of attempts does the night end, closed out safely.
         """
-        rigs = self.rigs.imaging()
+        imaging = self.rigs.imaging()
+        rigs = imaging + [rig for rig in self.rigs.all
+                          if rig not in imaging and self._rig_recovering(rig)]
         if not rigs:
             raise DeviceError("no camera is connected")
         master_id = self.master.id
         overheads = float(self.config.get("schedule", "perFrameSeconds", 15.0))
         options = plans.options_for(entry)
         filter_order = str(options.get("filterOrder") or "grouped")
+        panel_index = int(panel.get("index", 0) or 0)
 
         # The labels are already set by `_run_entry`, before the slew.
         queues: dict[str, list[dict[str, Any]]] = {}
@@ -3743,9 +5428,12 @@ class Sequencer:
         # through that filter, and its queue has to say so.
         fitted = plans.fitted_filters(rigs)
         for rig in rigs:
-            queues[rig.id] = _flatten(
+            full = _flatten(
                 plans.allocation_for(entry, rig.id, master_id, fitted), filter_order)
-            self._set_rig(rig, frame=0, frames=len(queues[rig.id]), filter="")
+            # After a restart: less what this panel already has tonight.
+            queues[rig.id] = self._without_done(full, entry["id"], panel_index, rig.id)
+            self._set_rig(rig, frame=len(full) - len(queues[rig.id]),
+                          frames=len(full), filter="")
 
         slots = max((len(queue) for queue in queues.values()), default=0)
         with self._lock:
@@ -3753,6 +5441,9 @@ class Sequencer:
         if not slots:
             return True
         dealt = self._deal_key(entry, rigs, master_id)
+        position = {rig.id: 0 for rig in rigs}
+        offset = {rig.id: int(self._rig_state.get(rig.id, {}).get("frame", 0) or 0)
+                  for rig in rigs}
 
         # A panel slewed to after it crossed the meridian is already on the
         # side the driver chose for it, and "flipping" it would be a second
@@ -3760,12 +5451,14 @@ class Sequencer:
         # change side - once per panel, on every panel of a mosaic shot late.
         ahead = self._hours_to_meridian(panel["ra"])
         flipped = ahead is not None and ahead < 0.0
-        for slot in range(slots):
+        # A flip slew that left the mount on the same side is tried again a
+        # few minutes later, a few times, while the flip is still due.
+        flip_attempts = 0
+        flip_retry_at = 0.0
+        while True:
             self._check()
             if self._skip.is_set():
                 raise _Skipped()
-            with self._lock:
-                self._slot = slot + 1
             # Between frames, the plan is read again: a collaboration entry
             # can be dealt afresh by the server while the run is on it - the
             # join dealt it blind to the Moon, the first poll with the Moon
@@ -3774,16 +5467,41 @@ class Sequencer:
             if self._deal_changed(entry, rigs, master_id, dealt):
                 raise _Redealt()
 
-            # Whoever still has a frame at this slot takes part; a telescope
-            # that ran out of allocation simply sits the rest of the panel out.
-            active = [rig for rig in rigs if slot < len(queues[rig.id])]
-            if not active:
+            # Whoever still has a frame left and a camera that is not being
+            # recovered takes part; a telescope that ran out of allocation
+            # simply sits the rest of the panel out.
+            left = [rig for rig in rigs if position[rig.id] < len(queues[rig.id])]
+            if not left:
                 break
-            frames = {rig.id: queues[rig.id][slot] for rig in active}
+            active = [rig for rig in left if self._rig_usable(rig)]
+            if not active:
+                pending = [rig for rig in left if self._rig_recovering(rig)]
+                if not pending:
+                    names = ", ".join(f"{rig.name} ({self._rec(rig).reason})"
+                                      for rig in left)
+                    message = (f"every telescope with frames left on {label} has "
+                               f"run out of recovery attempts: {names}")
+                    if len(left) == len(rigs):
+                        with self._lock:
+                            self._close_out = message
+                        raise DeviceError(message)
+                    # The others have finished this panel; the run goes on
+                    # without the one that failed.
+                    self._say(message, "error")
+                    break
+                if not self._wait_for_rigs(pending, entry, end_at, label):
+                    return False
+                continue
+            with self._lock:
+                self._slot = max(position[rig.id] for rig in active) + 1
+            frames = {rig.id: queues[rig.id][position[rig.id]] for rig in active}
+            # A telescope back from a recovery is checked before it shoots.
+            self._reverify(active, panel, label)
 
             changed = self._parallel(
                 [(rig, lambda rig=rig: self._select_filter(rig, frames[rig.id]["filter"]))
-                 for rig in active], "filter")
+                 for rig in active], "filter",
+                timeout=float(self._recovery_settings().get("recoveryStepSeconds") or 180.0))
             for rig_id, message in changed["errors"].items():
                 self._say(f"{self._name(rig_id)}: could not select a filter — "
                           f"{message}", "warn")
@@ -3793,6 +5511,7 @@ class Sequencer:
             # slew or a guider restart during an exposure is a ruined sub.
             self._check_recentre(panel, label)
             self._check_guiding()
+            self._check_tracking(panel, label)
 
             longest = max(frame["exposure"] for frame in frames.values())
             # The clock, the dawn and the horizon, before every frame. `end_at`
@@ -3805,14 +5524,21 @@ class Sequencer:
             if self._too_low(panel, longest, label, entry):
                 return False
 
-            if not flipped and self._flip_due(panel, longest + overheads):
-                self._flip(panel, label)
-                flipped = True
+            if (not flipped and time.monotonic() >= flip_retry_at
+                    and self._flip_due(panel, longest + overheads)):
+                flip_attempts += 1
+                flipped = self._flip(panel, label, flip_attempts)
+                if not flipped:
+                    if flip_attempts >= self.FLIP_RETRIES:
+                        flipped = True
+                    else:
+                        minutes = float(self._settings().get("flipRetryMinutes") or 5.0)
+                        flip_retry_at = time.monotonic() + minutes * 60.0
 
             for rig in active:
-                self._set_rig(rig, frame=slot + 1, filter=frames[rig.id]["filter"],
-                              state="exposing")
-            self._set("imaging", f"{label}: slot {slot + 1}/{slots} — " + ", ".join(
+                self._set_rig(rig, frame=offset[rig.id] + position[rig.id] + 1,
+                              filter=frames[rig.id]["filter"], state="exposing")
+            self._set("imaging", f"{label}: slot {self._slot}/{slots} — " + ", ".join(
                 f"{rig.name} {frames[rig.id]['filter']} "
                 f"{frames[rig.id]['exposure']:g}s" for rig in active))
 
@@ -3822,25 +5548,30 @@ class Sequencer:
             if self._guiding_wanted and not self._guiding_healthy():
                 self._guide_lost_in_slot = True
 
-            # A slave camera dropping out at two in the morning must not end the
-            # night for the rest of the rig; the master failing does.
+            # Any camera - the master's included - that is still failing after
+            # the quick retries is recovered on its own, in the background. The
+            # mount, the guider and the solver are not the master camera, and
+            # one camera off the USB bus used to end the night for all three
+            # telescopes (2026-10-12 21:05, 10-14 20:42, 10-20 00:16 and 00:35).
             for rig in active:
                 self._set_rig(rig, state="")
                 message = outcome["errors"].get(rig.id)
                 if message is None:
                     continue
-                if rig.id == master_id:
-                    raise DeviceError(message)
                 self._say(f"{rig.name}: frame failed — {message}", "warn")
+                self._bench(rig, message)
 
             for rig in active:
                 record = outcome["results"].get(rig.id)
                 if record is None:
                     continue
+                position[rig.id] += 1
+                self._rig_ok(rig)
                 filter_name = frames[rig.id]["filter"]
                 key = f"{entry['id']}:{rig.id}:{filter_name}"
                 with self._lock:
                     self._done[key] = self._done.get(key, 0) + 1
+                self._credit(entry["id"], panel_index, rig.id, filter_name)
 
                 # Measured first, then credited: the night's report wants the
                 # star size and the guiding this frame was taken under, and
@@ -3848,7 +5579,7 @@ class Sequencer:
                 self._record_frame(rig, record, panel, entry, filter_name,
                                    guide_lost=self._guide_lost_in_slot)
 
-            if slot + 1 < slots:
+            if any(position[rig.id] < len(queues[rig.id]) for rig in rigs):
                 self._dither(entry)
 
         return True
@@ -3875,6 +5606,17 @@ class _Redealt(Exception):
     OIII while the telescope went on shooting the Ha it had started with.
     The run reads the plan again and starts the entry over on what it says.
     """
+
+
+def _cooler_on(camera: Any) -> bool:
+    """Whether a camera's cooler is on; True when it cannot say. A camera
+    already warm (a loop that put the night to bed, then Stop) has nothing
+    to keep cold and nothing to warm."""
+    try:
+        value = camera.cooler_on
+    except Exception:                               # noqa: BLE001
+        return True
+    return True if value is None else bool(value)
 
 
 def _clock(timestamp: float) -> str:

@@ -104,6 +104,16 @@ body > .activity, body > .seq-banner, body > .recovery-bar, body > .warnings-bar
 }
 .link-state.online { color: var(--good); border-color: #2c5d43; }
 .link-state.offline { color: var(--bad); border-color: #5d2c2c; }
+.link-state.stale { color: var(--warn); border-color: #5d4f2c; }
+/* 0.2.50: the page says when what it shows is not current. */
+.link-banner {
+  position: fixed; top: 0; left: 50%; transform: translateX(-50%); z-index: 1000;
+  background: #5d2c2c; color: #fff; font-size: 12px; padding: 4px 14px;
+  border-radius: 0 0 6px 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+}
+.link-banner[hidden] { display: none; }
+.pill.stale { opacity: 0.6; border-style: dashed; }
+.pill.stale .dot { background: var(--warn); }
 
 /* ---------------------------------------------------------------- layout */
 .layout {
@@ -203,6 +213,22 @@ input[type="checkbox"] { accent-color: var(--accent); }
 }
 .btn:hover:not(:disabled) { background: #1e2430; border-color: #333d4f; }
 .btn:disabled { opacity: 0.38; cursor: not-allowed; }
+/* A press that has been taken and is being acted on: not greyed out like a
+   button that cannot be pressed, but held, with a spinner, until the answer. */
+.btn.busy, .btn.busy:disabled { opacity: 0.85; cursor: progress; }
+.btn.busy::after {
+  content: ''; display: inline-block; margin-left: 7px; width: 9px; height: 9px;
+  border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+  animation: btn-spin 0.7s linear infinite;
+}
+@keyframes btn-spin { to { transform: rotate(360deg); } }
+.toast.busy { border-color: #365f96; }
+.toast.busy::before {
+  content: ''; display: inline-block; margin-right: 8px; width: 9px; height: 9px; vertical-align: -1px;
+  border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%;
+  animation: btn-spin 0.7s linear infinite;
+}
+.image-row.gone { opacity: 0.45; }
 .btn.small { padding: 4px 9px; font-size: 11.5px; }
 .btn.primary { background: var(--accent-dim); border-color: var(--accent-edge); color: var(--accent-text); }
 .btn.primary:hover:not(:disabled) { background: var(--accent-edge); }
@@ -377,6 +403,12 @@ table.survey-fields tr:hover td { background: var(--panel-2); }
   cursor: pointer;
 }
 .recovery-bar:hover { background: rgba(232, 176, 84, 0.2); }
+/* One telescope's own recovery, on its Observatory card (0.2.51). */
+.rig-card.recovering { box-shadow: inset 0 0 0 1px rgba(232, 176, 84, 0.7); }
+.rig-card.failed { box-shadow: inset 0 0 0 1px rgba(230, 90, 90, 0.8); }
+.rig-recovery { font-size: 11px; margin-top: 4px; color: #e8b054; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.rig-card.failed .rig-recovery { color: #e65a5a; }
 .recovery-mark { color: var(--warn); animation: activity-spin 1.8s linear infinite; }
 @keyframes activity-spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) {
@@ -556,6 +588,8 @@ table.survey-fields tr:hover td { background: var(--panel-2); }
 .rig-tab.active.master::before { color: inherit; }
 /* A telescope with no allocation of its own is following the master's. */
 .rig-tab.mirrored:not(.active) { border-style: dashed; }
+/* The way back for a follower that was given its own allocation. */
+.rig-follow { margin-left: auto; padding: 5px 9px; font-size: 11px; }
 .grow { flex: 1 1 auto; min-width: 0; }
 
 /* The observatory at a glance: one card per telescope, every slot with its
@@ -753,6 +787,7 @@ table.survey-fields tr:hover td { background: var(--panel-2); }
   border: 1px solid var(--line); border-radius: 100px; color: var(--muted);
 }
 
+/* The per-telescope strip under the main view. */
 /* Every telescope side by side. The tiles share the main view's space and
    the main canvas is hidden while they are up. */
 .multi-view {
@@ -791,7 +826,6 @@ table.survey-fields tr:hover td { background: var(--panel-2); }
 #btnAllScopes.active { background: var(--accent-dim); border-color: var(--accent-edge); color: var(--accent-text); }
 #allScopesZoom { width: auto; margin-top: 0; padding: 3px 6px; font-size: 11.5px; }
 
-/* The per-telescope strip under the main view. */
 .rig-views {
   display: flex; gap: 8px; flex-wrap: wrap;
   margin: 8px 0 0;
@@ -832,13 +866,6 @@ table.survey-fields tr:hover td { background: var(--panel-2); }
   border: 1px solid var(--line);
   border-radius: var(--radius);
   color: var(--muted);
-}
-/* What the live stack holds, beside the cursor readout. Amber while frames
-   are going in raw, because that is the one thing worth noticing tonight. */
-.stack-info:empty { display: none; }
-.stack-info.raw { color: var(--warn); }
-.viewer-toolbar select.small {
-  padding: 3px 6px; font-size: 11.5px; max-width: 220px;
 }
 
 /* ---------------------------------------------------------------- analysis */
@@ -1747,6 +1774,31 @@ table.survey-fields tr:hover td { background: var(--panel-2); }
 }
 .switch-row .btn { min-width: 54px; }
 .switch-row input { width: 76px; }
+/* The box's own meters: volts in, amps drawn, its temperature. */
+.switch-readings { margin: 2px 0 8px; }
+
+.switch-row .switch-feeds { color: var(--muted); font-size: 11px; margin-left: 6px; }
+
+/* The Power page: one row per port on the box, and what it feeds. */
+.outlet-table { margin: 4px 0 6px; }
+.outlet-row {
+  display: grid; grid-template-columns: minmax(110px, 1fr) minmax(170px, 1.4fr) minmax(0, 1fr);
+  gap: 4px 10px; align-items: center; padding: 3px 0;
+  border-bottom: 1px solid var(--line); font-size: 12px;
+}
+.outlet-row:last-child { border-bottom: 0; }
+.outlet-row select { width: 100%; }
+.outlet-row .outlet-group { color: var(--muted); font-size: 11px; margin-left: 5px; }
+.outlet-row .outlet-hint { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* ...and one row per device, with the outlets a cycle would switch. */
+.power-gear { margin: 4px 0 6px; }
+.gear-row {
+  display: grid; grid-template-columns: minmax(120px, 1fr) minmax(0, 2fr) auto;
+  gap: 4px 10px; align-items: center; padding: 3px 0;
+  border-bottom: 1px solid var(--line); font-size: 12px;
+}
+.gear-row:last-child { border-bottom: 0; }
+.gear-row .gear-outlets { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* The pier camera's live view. The box keeps its height whatever the camera's
    aspect turns out to be, so the panel below it does not jump about every time
@@ -2256,74 +2308,6 @@ label.inline.compact input[type="range"] { width: 150px; margin-top: 0; }
 .depth-grid .meter { min-width: 60px; }
 .meter.met .meter-fill { background: var(--good); }
 
-/* The night as it is happening, above the list: a live strip with the
-   people on the sky and the frames landing, scrolling past. */
-.col-live {
-  margin: 4px 0 10px; padding: 10px 12px;
-  border: 1px solid #2c5d43; border-radius: 6px;
-  background: linear-gradient(120deg, #11201a 0%, var(--panel) 65%);
-  box-shadow: inset 0 0 40px rgba(126, 231, 165, 0.05);
-}
-.col-live.busy { border-color: var(--accent-edge); box-shadow: inset 0 0 40px rgba(126, 231, 165, 0.08), 0 0 18px rgba(126, 231, 165, 0.08); }
-.col-live-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.col-live-head > b { color: var(--accent); letter-spacing: 1.2px; text-transform: uppercase; font-size: 11px; }
-.col-live-count { color: var(--text); font-size: 12.5px; }
-.col-live-count .shooting-count { color: var(--accent); }
-.live-dot {
-  width: 9px; height: 9px; border-radius: 50%; background: var(--accent);
-  animation: livepulse 2s ease-out infinite;
-}
-@keyframes livepulse {
-  0% { box-shadow: 0 0 0 0 rgba(126, 231, 165, 0.7); }
-  70% { box-shadow: 0 0 0 9px rgba(126, 231, 165, 0); }
-  100% { box-shadow: 0 0 0 0 rgba(126, 231, 165, 0); }
-}
-/* People as a row of overlapping faces; a ringed one is shooting now. */
-.col-faces { display: flex; flex-wrap: wrap; align-items: center; margin: 8px 0 2px; padding-left: 2px; }
-.col-face {
-  width: 30px; height: 30px; border-radius: 50%; flex: none;
-  border: 2px solid var(--panel); margin-right: -8px; object-fit: cover;
-  background: var(--panel-2); box-sizing: border-box;
-}
-.col-face.blank {
-  display: inline-flex; align-items: center; justify-content: center;
-  color: var(--muted); font-weight: 600; font-size: 12px;
-}
-.col-face.shooting { border-color: var(--accent); animation: shootring 2.4s ease-out infinite; position: relative; z-index: 1; }
-@keyframes shootring {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(126, 231, 165, 0.55); }
-  50% { box-shadow: 0 0 0 5px rgba(126, 231, 165, 0); }
-}
-/* The frames landing, scrolling past; paused under the pointer. */
-.col-ticker {
-  overflow: hidden; white-space: nowrap; margin-top: 8px;
-  font-size: 12px; color: var(--muted);
-  -webkit-mask-image: linear-gradient(90deg, transparent, #000 4%, #000 96%, transparent);
-  mask-image: linear-gradient(90deg, transparent, #000 4%, #000 96%, transparent);
-}
-.col-ticker-track { display: inline-block; animation: ticker 60s linear infinite; }
-.col-ticker:hover .col-ticker-track { animation-play-state: paused; }
-.col-ticker-item { display: inline-block; margin-right: 34px; }
-.col-ticker-item b { color: var(--text); font-weight: 600; }
-.col-ticker-item::after { content: '✦'; color: var(--accent-dim); margin-left: 34px; }
-@keyframes ticker { to { transform: translateX(-50%); } }
-/* Who is on a collaboration right now, on its card. */
-.col-now { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; font-size: 12px; color: var(--muted); }
-.col-now .col-faces { margin: 0 8px 0 0; }
-.col-now b { color: var(--accent); font-weight: 600; }
-.col-chip.today { color: var(--text); }
-.col-chip.needs { color: var(--accent-text); border-color: var(--accent-edge); background: var(--accent-dim); }
-.col-open.live { border-color: var(--accent-edge); box-shadow: 0 0 0 1px rgba(126, 231, 165, 0.12), 0 0 18px rgba(126, 231, 165, 0.08); }
-.col-open.live .col-sky { box-shadow: 0 0 14px rgba(126, 231, 165, 0.18); border-color: var(--accent-edge); }
-.btn.glow { animation: btnglow 2.6s ease-in-out infinite; }
-@keyframes btnglow {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(126, 231, 165, 0); }
-  50% { box-shadow: 0 0 14px 2px rgba(126, 231, 165, 0.35); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .live-dot, .col-face.shooting, .col-ticker-track, .btn.glow { animation: none; }
-}
-
 /* Who is about: the count in the toolbar and the line on each card. */
 .col-online { color: var(--good); margin-left: 6px; }
 .col-online:empty { display: none; }
@@ -2351,31 +2335,6 @@ label.inline.compact input[type="range"] { width: 150px; margin-top: 0; }
 .col-open.joined { border-color: #2c5d43; }
 .col-open p.small { margin: 4px 0; }
 .col-open .depth-grid { margin-top: 6px; }
-.col-open .col-hint { margin-top: 6px; opacity: 0.6; }
-.col-open.open { background: var(--panel-2); }
-/* Who has contributed: the opened part of a card. */
-.col-detail { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
-/* The field's depth map on an opened card: the Plan tab's own, in the card's width. */
-.col-depth { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
-.col-depth .plan-framing { margin: 0; }
-.col-depth .plan-framing h4 { margin-top: 0; }
-.col-detail-head { margin-bottom: 6px; }
-.col-person { display: flex; align-items: center; gap: 10px; padding: 4px 0; }
-.col-person-body { flex: 1; min-width: 0; }
-.col-person-hours { flex: none; color: var(--text); }
-.col-avatar {
-  width: 32px; height: 32px; border-radius: 50%; flex: none; object-fit: cover;
-  background: var(--panel); border: 1px solid var(--line);
-}
-.col-avatar.blank {
-  display: inline-flex; align-items: center; justify-content: center;
-  color: var(--muted); font-weight: 600; font-size: 13px;
-}
-.col-chips { display: flex; flex-wrap: wrap; gap: 4px; margin: 2px 0; }
-.col-chip {
-  font-size: 11px; padding: 1px 7px; border-radius: 100px;
-  border: 1px solid var(--line); color: var(--muted); font-family: var(--mono);
-}
 
 /* A chunk's framing, on the closed box rather than behind a double-click. */
 .plan-framing.framing-inline { margin-top: 10px; }
@@ -2383,10 +2342,6 @@ label.inline.compact input[type="range"] { width: 150px; margin-top: 0; }
 .depth-filters { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 6px; }
 .depth-filters .btn.active { background: var(--accent-dim); border-color: var(--accent-edge); color: var(--accent-text); }
 .depth-canvas { cursor: crosshair; }
-/* Whose field of view is which on the depth map: a swatch and a line each. */
-.depth-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 6px 0 2px; }
-.depth-key { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
-.depth-key i { display: inline-block; width: 14px; height: 9px; border-radius: 2px; }
 .plan-framing.framing-inline h4 { margin-top: 0; }
 /* Bandpass beside each filter slot. Narrow, because most filters have none. */
 .slot-nm-input { width: 58px; margin: 0; font-size: 11px; padding: 3px 5px; }
@@ -2399,18 +2354,6 @@ label.inline.compact input[type="range"] { width: 150px; margin-top: 0; }
 }
 .col-open .btn { flex-shrink: 0; }
 .col-offered { border-color: var(--accent-dim); margin-top: 10px; }
-/* Starting one: the form's fold line is a proper button, the one thing a
-   coordinator comes to the tab to press. */
-.col-start-fold { margin: 6px 0 10px; }
-.col-start-fold > summary {
-  display: inline-flex; align-items: center;
-  padding: 6px 14px; border-radius: 5px;
-  background: var(--accent-dim); border: 1px solid var(--accent-edge); color: var(--accent-text);
-  font-size: 12.5px; font-weight: 600; letter-spacing: 0; text-transform: none;
-}
-.col-start-fold > summary::before, .col-start-fold[open] > summary::before { content: none; }
-.col-start-fold > summary:hover { background: var(--accent-edge); color: var(--accent-text); }
-.col-start-fold[open] > summary { margin-bottom: 8px; }
 .collab-page > .fold { margin-top: 0; }
 
 /* Joining: one box, one button. Green once it is done. */

@@ -23,7 +23,10 @@ ROOT = Path(SPECPATH).resolve().parent
 ICON = str(ROOT / "packaging" / "build" / "starfront.ico")
 
 datas = [(str(ROOT / "astrocontrol" / "web"), "astrocontrol/web"),
-         (str(ROOT / "README.md"), ".")]
+         (str(ROOT / "README.md"), "."),
+         # CA roots for https Alpaca (0.2.53a): Python on Windows only sees the
+         # roots already in the Windows store, so the build carries its own.
+         (str(ROOT / "astrocontrol" / "devices" / "cacert.pem"), "astrocontrol/devices")]
 binaries = []
 hiddenimports = [
     "astrocontrol.main",
@@ -35,7 +38,7 @@ hiddenimports += collect_submodules("astrocontrol")
 
 # Libraries that find their own parts at run time and need them all present.
 for package in ("webview", "uvicorn", "pydantic", "pydantic_core", "starlette",
-                "fastapi", "anyio", "clr_loader", "pythonnet"):
+                "fastapi", "anyio", "clr_loader", "pythonnet", "certifi"):
     try:
         d, b, h = collect_all(package)
     except Exception:                              # noqa: BLE001 - optional ones

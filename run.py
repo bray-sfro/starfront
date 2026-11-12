@@ -28,7 +28,18 @@ def main() -> None:
     parser.add_argument("--reload", action="store_true", help="auto-reload during development")
     parser.add_argument("--debug", action="store_true",
                         help="developer tools in the application window")
+    parser.add_argument("--fleet", action="store_true",
+                        help="run the fleet dashboard (all your Starfront PCs) instead")
+    parser.add_argument("--fleet-config", default="",
+                        help="fleet.json to use (default: <data folder>/fleet.json)")
     args = parser.parse_args()
+
+    if args.fleet:
+        from astrocontrol.fleet.__main__ import serve
+        serve(config_path=args.fleet_config or None,
+              host=None if args.host == "127.0.0.1" else args.host,
+              port=args.port or None, browser=True)
+        return
 
     # Before anything else: a crash that leaves no trace cannot be fixed, and
     # the window has no console behind it to leave one on.
@@ -37,6 +48,15 @@ def main() -> None:
     print(f"Logging to {path}")
 
     if args.browser or args.server or args.reload:
+        import os
+        from astrocontrol import desktop as _desktop
+        explicit_host = args.host != "127.0.0.1"
+        args.host, lan_port = _desktop.lan_bind(args.host, args.port)
+        args.port = args.port or lan_port
+        if explicit_host:
+            # The old tablet switch: an explicit --host with LAN access off
+            # keeps the open behaviour for this run (see main._lan_allowed).
+            os.environ["STARFRONT_OPEN_LAN"] = "1"
         port = args.port or 8765
         url = f"http://{'127.0.0.1' if args.host == '0.0.0.0' else args.host}:{port}/"
         print(f"Starfront -> {url}")

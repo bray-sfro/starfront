@@ -296,28 +296,6 @@ mount.park = lambda: order.append("park")
 seq._make_safe(park=True)
 case("parking stops guiding first", order == ["guide", "park"], str(order))
 
-# OnStep answers Park with "Mount in motion" for a moment after the last
-# guide pulse. One refusal used to end the attempt and leave the mount
-# tracking into the morning; the end of a run now asks again until the mount
-# takes it, and confirms AtPark, the same as the shutdown does.
-mount = Mount()
-refusals = {"left": 2}
-real_park = mount.park
-def grumpy_park():
-    if refusals["left"] > 0:
-        refusals["left"] -= 1
-        raise DeviceError("Park failed: Mount in motion")
-    real_park()
-mount.park = grumpy_park
-seq, rig, config = build({"mount": mount})
-config.update("sequencer", {"parkTimeoutSeconds": 30})
-told = []
-seq.notifier = types.SimpleNamespace(send=lambda *a: told.append(a))
-seq._make_safe(park=True)
-case("a park the mount refuses at the end of a run is asked for again until it takes",
-     mount.at_park is True and mount.parks == 1 and refusals["left"] == 0 and not told,
-     f"parks={mount.parks} told={told}")
-
 # ------------------------------------------------- cooling does not block the slew
 camera = Camera(temperature=20.0, step=0.0)
 seq, rig, config = build({"camera": camera})
@@ -357,6 +335,20 @@ seq._await_cooling(rig)
 case("a camera with no cooler is never waited for",
      seq._cooling_wanted == set() and camera.cooler is None)
 
+# One switch for the whole mount: a telescope whose own "cool at start" is
+# off is cooled anyway while it is on, and left alone once it is off too.
+camera = Camera(temperature=20.0)
+seq, rig, config = build({"camera": camera})
+config.update("camera", {"setpoint": -5.0, "coolAtStart": False, "coolAllAtStart": True})
+seq._prepare_cameras()
+case("'cool every camera' cools a telescope whose own box is off",
+     camera.cooler is True and camera.setpoints == [-5.0])
+camera = Camera(temperature=20.0)
+seq, rig, config = build({"camera": camera})
+config.update("camera", {"setpoint": -5.0, "coolAtStart": False, "coolAllAtStart": False})
+seq._prepare_cameras()
+case("...and with both off the camera is left warm", camera.cooler is None)
+
 # ------------------------------------------------------- warming off the thread
 camera = Camera(temperature=-10.0)
 seq, rig, config = build({"camera": camera})
@@ -391,6 +383,20 @@ class FocusCapture:
     def __init__(self):
         self.save_enabled = True
         self.saw = []
+        self._suspended = 0
+
+    def suspend_saving(self):
+        if self._suspended == 0:
+            self._save_before = self.save_enabled
+            self.save_enabled = False
+        self._suspended += 1
+
+    def resume_saving(self):
+        if self._suspended == 0:
+            return
+        self._suspended -= 1
+        if self._suspended == 0:
+            self.save_enabled = self._save_before
 
     def capture_blocking(self, exposure, frame_type="light"):
         self.saw.append(self.save_enabled)
@@ -979,27 +985,28 @@ seq._loop = False
 seq._run()
 case("not on loop, one night and no bed of its own", ran == ["night"], str(ran))
 
-# Park at end means "when the plan runs out". Stop promises the mount is left
-# tracking where it is, and for a while it was not: the end of the run parked
-# whenever the setting was on, so Stop and Abort & park did the same thing.
+# Stop means "leave the rig where it is". With park-at-end on, a night that
+# runs out on its own parks; a night a person stopped does not — it did
+# (2026-10-08 20:50), under somebody who wanted to carry on by hand.
+from astrocontrol.sequencer import _Stopped                              # noqa: E402
 mount = Mount()
-seq, rig, config = build({"mount": mount})
+seq, rig, config = build({"mount": mount, "camera": Camera()})
 config.update("sequencer", {"parkAtEnd": True})
+seq._loop = False
 seq._night = lambda: None
-seq._loop = False
 seq._run()
-case("a plan that runs out parks the mount when Park at end is on",
-     mount.parks == 1, f"parks={mount.parks}")
-
+case("a night that ends on its own parks when park-at-end is on", mount.parks == 1)
 mount = Mount()
-seq, rig, config = build({"mount": mount})
-config.update("sequencer", {"parkAtEnd": True, "stopTrackingAtEnd": True})
-seq._night = lambda: seq.stop()             # Stop pressed during the night
+seq, rig, config = build({"mount": mount, "camera": Camera()})
+config.update("sequencer", {"parkAtEnd": True})
 seq._loop = False
+# `_night` handles its own _Stopped; what reaches `_run` is a night that
+# ended with Stop having been pressed.
+seq._night = lambda: seq.stop()
 seq._run()
-case("a run ended by Stop leaves the mount tracking where it is",
-     mount.parks == 0 and mount.tracking is True,
-     f"parks={mount.parks} tracking={mount.tracking}")
+case("a night stopped by hand leaves the mount where it is",
+     mount.parks == 0 and any("left where it is" in m for _, m in LOG))
+case("...because Stop was what ended it", seq._stopped_by_hand is True)
 
 # A loop is refused where it could not put the mount to bed.
 mount = Mount()

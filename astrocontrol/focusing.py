@@ -66,6 +66,9 @@ class FocusRun:
     attempts: int = 1
     fits: dict[str, Any] = field(default_factory=dict)
     method: str = ""
+    #: False when another attempt cannot help: focus is past the end of the
+    #: travel, and a second sweep from the same place walks into the same end.
+    retry: bool = True
 
     def payload(self) -> dict[str, Any]:
         return {
@@ -110,6 +113,9 @@ class AutoFocuser:
         # Where a finished run's timing is recorded, so the planner can cost a
         # sweep it has never seen. Set by the rig that owns this focuser.
         self.overheads: Any = None
+        # The rig's FocuserHealth (0.2.52d): a focuser that has stopped
+        # answering is reconnected and the sweep tried once more.
+        self.health: Any = None
 
     # -- state -------------------------------------------------------------
     @property
@@ -165,6 +171,37 @@ class AutoFocuser:
     # -- the run -----------------------------------------------------------
     def run(self, should_abort: Callable[[], bool] | None = None,
             report: Callable[[str], None] | None = None) -> FocusRun:
+        """A focus sweep - reconnecting a focuser that is not answering first.
+
+        Before it starts, a focuser reading the driver's placeholders (0 steps
+        at -273 C) is reconnected. A sweep that fails because a move failed
+        the same way is tried once more after a reconnect. Only the focuser
+        is reconnected, never while it is moving; see `focushealth`.
+        """
+        from .focushealth import bogus_reading, is_dead_error
+        health = self.health
+        say = report or (lambda message: None)
+        if health is not None and self.manager.get("focuser") is not None:
+            if bogus_reading(self.manager.get("focuser")) is not None:
+                say("The focuser is not answering; reconnecting it")
+                health.check("before autofocus", should_abort)
+        try:
+            return self._run_once(should_abort, report)
+        except Exception as exc:
+            focuser = self.manager.get("focuser")
+            if health is None or "aborted" in str(exc) \
+                    or not (is_dead_error(exc) or bogus_reading(focuser)):
+                raise
+            say(f"The focuser stopped answering ({exc}); reconnecting it")
+            if not health.heal(f"autofocus: {exc}", should_abort):
+                raise DeviceError(
+                    f"the focuser is not responding ({exc}). Reconnecting it did "
+                    "not help - power-cycle or replug it at the scope") from exc
+            say("Focuser reconnected; running the focus sweep once more")
+            return self._run_once(should_abort, report)
+
+    def _run_once(self, should_abort: Callable[[], bool] | None = None,
+                  report: Callable[[str], None] | None = None) -> FocusRun:
         focuser = self.manager.require("focuser")
         self.manager.require("camera")
         if not focuser.is_absolute:
@@ -196,6 +233,10 @@ class AutoFocuser:
                           or bool(should_abort and should_abort()))
         say = report or (lambda message: None)
         start_position = focuser.position
+        # Every measured point of every attempt, for choosing where to leave
+        # the focuser if none of them succeeds.
+        self._tried: list[FocusPoint] = []
+        self._start_hfds: list[float] = []
 
         self._running = True
         # A focus frame is a measurement, not data. Left saved it lands in the
@@ -204,8 +245,8 @@ class AutoFocuser:
         # puts a hundred of them a night among the frames that matter. They
         # still reach the viewer; they just never reach the disk. The same
         # reasoning, and the same mechanism, as a centring frame.
-        was_saving = self.capture.save_enabled
-        self.capture.save_enabled = False
+        # Counted, not remembered: see CaptureService.suspend_saving.
+        self.capture.suspend_saving()
         try:
             last_error = ""
             for attempt in range(1, attempts + 1):
@@ -251,17 +292,33 @@ class AutoFocuser:
                     return run
 
                 last_error = run.detail
+                self._tried.extend(p for p in run.points if p.hfd)
                 with self._lock:
                     self._last = run
+                if not run.retry:
+                    say(f"Autofocus stopped: {last_error}. Not retrying - another "
+                        "sweep would end at the same place")
+                    break
                 if attempt < attempts:
                     say(f"Autofocus attempt {attempt} was no good ({last_error}); "
                         f"going back to {start_position} and trying again")
                     self._move(focuser, start_position, overshoot, from_below=True)
 
-            self._move(focuser, start_position, overshoot, from_below=True)
+            # Every attempt failed. Going back to the start is right when the
+            # start was the best place seen - but when the sweep measured
+            # somewhere clearly sharper (EAGLE: HFD 3.3 at 307 against 9.2 at
+            # the 1807 it started from), going back guarantees a night of soft
+            # subs. Leave it at the sharpest point actually measured instead.
+            parked = self._best_measured(start_position)
+            self._move(focuser, parked, overshoot, from_below=True)
+            if parked != start_position:
+                say(f"Autofocus failed; left the focuser at {parked}, the "
+                    f"sharpest point the sweep measured, not back at {start_position}")
+                last_error += (f"; left at {parked}, the sharpest point measured, "
+                               f"instead of {start_position}")
             raise DeviceError(f"autofocus did not find a minimum: {last_error}")
         finally:
-            self.capture.save_enabled = was_saving
+            self.capture.resume_saving()
             self._running = False
             self._abort.clear()
             with self._lock:
@@ -325,12 +382,25 @@ class AutoFocuser:
         # The stars where we are now: what the result is judged against.
         starting = sample(start_position)
         run.start_hfd = starting.hfd if starting else None
+        if run.start_hfd:
+            self._start_hfds.append(run.start_hfd)
 
         # Out by `offset x step`, then walk back inwards.
         for index in range(offset_steps, -1, -1):
             sample(start_position + index * step)
 
         # Keep going until both arms of the V have enough points to fit.
+        #
+        # A side the focuser physically cannot extend any further is "pinned":
+        # it is measured right at the end of the travel, and then one point
+        # beyond the lowest is enough for that side, because the curve has
+        # visibly turned round between the end and the bottom. Insisting on
+        # `offset_steps` points there made focus impossible anywhere within
+        # `offset_steps x step` of either end - on EAGLE (375-step sweep, focus
+        # near 300 of 94580) every run walked down to 307, found the next point
+        # would be -68, and gave up with the bottom of the V already measured.
+        pinned = {"low": False, "high": False}
+        fillers = 0
         while True:
             self._check()
             usable = [(p.position, p.hfd) for p in run.points if p.hfd]
@@ -343,9 +413,22 @@ class AutoFocuser:
             lowest = positions[values.index(min(values))]
             left = sum(1 for p in positions if p < lowest)
             right = sum(1 for p in positions if p > lowest)
+            need_left = 1 if pinned["low"] else offset_steps
+            need_right = 1 if pinned["high"] else offset_steps
 
-            if left >= offset_steps and right >= offset_steps:
-                break
+            if left >= need_left and right >= need_right:
+                # A pinned side with a single point is a thin arm to fit; put
+                # one more between the end and the bottom when there is room.
+                filler = self._filler(pinned, positions, lowest, left, right,
+                                      focuser, measured)
+                if filler is None or fillers >= 2 or taken >= maximum_samples:
+                    break
+                fillers += 1
+                with self._lock:
+                    self._message = f"filling in at {filler}"
+                say(f"Adding a point at {filler}, between the end of travel and {lowest}")
+                sample(filler)
+                continue
             if taken >= maximum_samples:
                 run.detail = (f"gave up after {taken} points without bracketing "
                               "a minimum")
@@ -355,11 +438,11 @@ class AutoFocuser:
                               "stars — too light, too cloudy, or the cover is on")
                 return False
 
-            if left < offset_steps:
-                target = min(positions) - step
+            if left < need_left:
+                side, target = "low", min(positions) - step
                 say(f"More points needed below {lowest}")
             else:
-                target = max(positions) + step
+                side, target = "high", max(positions) + step
                 say(f"More points needed above {lowest}")
 
             # The target is worked out from the points that *measured*, so a
@@ -373,9 +456,35 @@ class AutoFocuser:
                 return False
 
             if target < 0 or (focuser.max_step and target > focuser.max_step):
-                run.detail = ("the focuser reached the end of its travel before "
-                              "the curve turned round")
-                return False
+                edge = 0 if side == "low" else int(focuser.max_step)
+                at_edge = measured.get(edge)
+                if at_edge is None:
+                    # One step would leave the travel, but the end itself has
+                    # not been looked at yet: measure there before deciding.
+                    with self._lock:
+                        self._message = f"measuring at the end of travel ({edge})"
+                    say(f"The next point would be past the end of travel; "
+                        f"measuring at {edge}")
+                    if sample(edge) is None:
+                        run.detail = "the focuser reached the end of its travel"
+                        return False
+                    continue
+                if at_edge.hfd is None or lowest == edge:
+                    best = min(usable, key=lambda item: item[1])
+                    run.detail = (
+                        f"best focus is past the {'low' if side == 'low' else 'high'} "
+                        f"end of the focuser's travel: stars were still getting "
+                        f"smaller at {edge} (HFD {best[1]:.2f} at {best[0]}). Move "
+                        "the camera or drawtube, or re-zero the focuser, so focus "
+                        "sits nearer the middle of its range")
+                    run.retry = False
+                    return False
+                # The end was measured and is worse than the bottom: the curve
+                # has turned round inside the travel. That side is done.
+                pinned[side] = True
+                say(f"Focus is close to the {side} end of travel; fitting with "
+                    f"what fits between it and {lowest}")
+                continue
             with self._lock:
                 self._message = f"extending the sweep to {target}"
             if sample(target) is None:
@@ -436,6 +545,22 @@ class AutoFocuser:
         return True
 
     # -- helpers -----------------------------------------------------------
+    def _best_measured(self, start_position: int) -> int:
+        """Where to leave the focuser after a run that found no minimum.
+
+        The sharpest point measured, but only when it beats the starting stars
+        by the same margin a successful run is held to; otherwise the start.
+        """
+        points = [p for p in getattr(self, "_tried", []) if p.hfd and p.stars]
+        starts = getattr(self, "_start_hfds", [])
+        if not points or not starts:
+            return start_position
+        best = min(points, key=lambda p: p.hfd)
+        limit = float(self.settings().get("focusMaxHfrRatio") or 1.15)
+        if best.hfd * limit < min(starts):
+            return int(best.position)
+        return start_position
+
     def _check(self) -> None:
         if self._stopping():
             raise _Stopped()
@@ -465,8 +590,35 @@ class AutoFocuser:
         """
         position = int(position)
         if focuser.position <= position:
-            self._settle(focuser, position + max(1, overshoot))
+            above = position + max(1, overshoot)
+            # Never ask for a place past the end of the travel: the driver
+            # refuses it outright, so a point near the top would fail rather
+            # than merely be approached with a little less overshoot.
+            if focuser.max_step:
+                above = min(above, int(focuser.max_step))
+            if above > position:
+                self._settle(focuser, above)
         self._settle(focuser, position)
+
+    @staticmethod
+    def _filler(pinned: dict[str, bool], positions: list[int], lowest: int,
+                left: int, right: int, focuser, measured: dict) -> int | None:
+        """A point between a pinned end of travel and the bottom of the curve.
+
+        Only for a side that is pinned and has a single point on it, and only
+        when there is room for a point that has not been measured already.
+        """
+        if pinned["low"] and left < 2:
+            nearest = max(p for p in positions if p < lowest)
+            middle = (nearest + lowest) // 2
+            if nearest < middle < lowest and middle not in measured:
+                return middle
+        if pinned["high"] and right < 2 and focuser.max_step:
+            nearest = min(p for p in positions if p > lowest)
+            middle = (nearest + lowest + 1) // 2
+            if lowest < middle < nearest and middle not in measured:
+                return middle
+        return None
 
     @staticmethod
     def _settle(focuser, position: int, timeout: float = 180.0) -> None:
