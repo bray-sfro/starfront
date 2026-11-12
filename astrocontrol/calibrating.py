@@ -35,7 +35,7 @@ from typing import Any
 
 import numpy as np
 
-from . import astro, calibration, roofguard
+from . import astro, calibration, coverprep, roofguard
 from .capture import clean_target
 from .config import Config, data_root, effective_site
 from .devices.base import DeviceError
@@ -938,6 +938,22 @@ class CalibrationRunner:
             })
         return results
 
+    def _open_cover_for_sky(self, rig, label: str) -> None:
+        """Open and verify the cover for sky flats. Never for a panel flat."""
+        if coverprep.guard_blocks_open():
+            raise DeviceError(coverprep.guard_blocks_open()
+                              or "the cover stays closed")
+        panel = rig.manager.get("flatpanel")
+        if panel is None or not getattr(panel, "connected", False):
+            return
+
+        def log(message: str, level: str = "info") -> None:
+            self._say(f"{rig.name}: {message}", level)
+
+        coverprep.ensure_open(
+            panel, timeout=coverprep.timeout_seconds(self.config),
+            log=log, command=coverprep.auto_cover(self.config))
+
     def _begin_sky(self, rig, spec: dict[str, Any]) -> None:
         """Get one telescope ready to look at the twilight sky."""
         camera = rig.manager.require("camera")
@@ -947,8 +963,9 @@ class CalibrationRunner:
             self._select_filter(rig, spec["filter"], lambda: None)
 
         # The sky is the light source, so the panel must be out and the cover
-        # open — the same thing a light frame needs, and the same code does it.
-        rig.capture.open_light_path()
+        # open before the first sky-flat frame. Re-read CoverState; do not
+        # trust a has_cover latch from connect. A failure holds the run.
+        self._open_cover_for_sky(rig, "sky flats")
 
         night = rig.capture.night_name()
         # calib-layout: <root>/RASA1/Flats/<night>/sky.  exact=True stops the
@@ -968,6 +985,10 @@ class CalibrationRunner:
                 st["waiting"] or f"sky flat {len(st['paths']) + 1}/{wanted} "
                                  f"at {exposure:.2f}s")
         record = rig.capture.capture_blocking(exposure, frame_type="flat")
+        camera = rig.manager.get("camera")
+        coverprep.judge_sky_frame(
+            getattr(record, "stats", None),
+            getattr(camera, "offset", None) if camera is not None else None)
         # Signal, not signal plus the camera's offset: at the exposures a fast
         # telescope wants in a bright sky the two are comparable.
         level = max(0.0, float(record.stats.get("median") or 0.0)
@@ -1108,18 +1129,27 @@ class CalibrationRunner:
                 "taken unless it is closed, and the roof is not opened for them")
 
     def _require_cover_closed(self, rig, check) -> None:
-        """Where a cover exists it has to read closed. No cover is fine."""
+        """Where a cover exists it has to read closed. No cover is fine.
+
+        Unknown is not "no cover". A failed read is not "no cover". Both hold
+        the darks rather than shooting through a lid that might be open.
+        """
         panel = rig.manager.get("flatpanel")
-        if panel is None or not getattr(panel, "connected", False) \
-                or not getattr(panel, "has_cover", False):
+        if panel is None or not getattr(panel, "connected", False):
             return
-        if panel.cover_state == "closed":
+        state = coverprep.read_state(panel)
+        if state == "notpresent":
             return
-        self._wait_for_cover(panel, "closed", check, timeout=30.0)
-        if panel.cover_state != "closed":
+        if state == "closed":
+            return
+        if state in ("open", "moving", "unknown", "error"):
+            with contextlib.suppress(Exception):
+                panel.close_cover()
+            self._wait_for_cover(panel, "closed", check, timeout=30.0)
+        if coverprep.read_state(panel) != "closed":
             raise DeviceError(
-                f"{rig.name}: the cover reads {panel.cover_state}; darks, bias "
-                "and panel flats need it closed")
+                f"{rig.name}: the cover reads {coverprep.read_state(panel)}; "
+                "darks, bias and panel flats need it closed")
 
     def _set_on_rig(self, rig, spec: dict[str, Any],
                     flat_exposures: dict[tuple[str, str], float],
@@ -1373,7 +1403,12 @@ class CalibrationRunner:
                       "of whatever the telescope is pointed at", "warn")
             return
 
-        if panel.has_cover and panel.cover_state != "closed":
+        state = coverprep.read_state(panel)
+        if state == "unread":
+            raise DeviceError(
+                f"{rig.name}: the cover could not be read; panel flats need it "
+                "closed, and it was not opened")
+        if state not in ("closed", "notpresent"):
             self._say(f"{rig.name}: closing the cover for the flats")
             panel.close_cover()
             self._wait_for_cover(panel, "closed", check)
@@ -1418,9 +1453,14 @@ class CalibrationRunner:
             return
         with contextlib.suppress(Exception):
             panel.turn_off()
-        if panel.has_cover and panel.cover_state != "closed":
+        state = coverprep.read_state(panel)
+        if state not in ("closed", "notpresent", "unread"):
             panel.close_cover()
             self._wait_for_cover(panel, "closed", check)
+        elif state == "unread":
+            raise DeviceError(
+                f"{rig.name}: the cover could not be read; darks and bias need "
+                "it closed")
         time.sleep(1.0)
 
     def _park_light(self, rig) -> None:

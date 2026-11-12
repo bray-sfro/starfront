@@ -390,7 +390,9 @@ table.survey-fields tr:hover td { background: var(--panel-2); }
 .roof-badge.moving { color: var(--blue); border-color: var(--blue); }
 .roof-badge.open { color: var(--good); border-color: var(--good); }
 .roof-badge.closed { color: var(--muted); }
-.roof-badge.locked, .roof-badge.error { color: var(--warn); border-color: var(--warn); }
+.roof-badge.locked, .roof-badge.error, .roof-badge.unknown { color: var(--warn); border-color: var(--warn); }
+.roof-badge.notpresent { color: var(--muted); }
+.cover-buttons { display: inline-flex; gap: 4px; align-items: center; }
 /* Working on something that takes a moment. */
 .activity.busy { background: linear-gradient(90deg, rgba(91, 141, 217, 0.16), transparent 55%); }
 .activity.busy .activity-icon { color: var(--blue); animation: activity-pulse 1.6s infinite; }

@@ -21,6 +21,12 @@ builds. Not installed anywhere.
 - Multiscope build: the 0.2.53b-r2 per-camera collab agents and filter
   identification, on top of all of the above.
 
+## 0.2.53i
+
+- Flat panel cover and calibrator light in the top bar, next to the roof badge: Open, Closed, Moving, Unknown, Error, Not present, plus light on/off and brightness. The status request reads a cache. It does not call the cover driver, so a hung CoverState cannot stall `/api/status`.
+- Open cover, Close cover, Light on (full brightness) and Light off in the top bar, with a confirmation. Open is refused (HTTP 409) during darks, bias and panel flats, and while an exposure, slew or autofocus is running.
+- Sequence start re-reads CoverState and opens the cover before the first slew, centring frame, autofocus frame, sky flat or light. Unknown on a connected CoverCalibrator is opened; a `has_cover` flag latched at connect is not trusted. The run is held if the cover does not report Open in time, or if the first sky frame still looks like a bias (the Twin FSQ's ~503 ADU lid). A camera or cover reconnect re-checks before the next sky frame. Darks, bias, panel flats and autocal keep the cover closed and never open the roof.
+
 ## 0.2.53h
 
 - Auto-upload backfill uses the same capture root as capture. A blank `capture.rootDirectory` is `data_root()/captures`, not "scan nothing".

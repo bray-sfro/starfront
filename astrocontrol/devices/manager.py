@@ -202,6 +202,10 @@ class DeviceManager:
             self._backends[kind] = backend
             if kind == "filterwheel":
                 self.apply_filter_names()
+            if kind in ("flatpanel", "camera"):
+                # A reconnect invalidates the cover reading. The next sky
+                # frame re-reads the driver instead of trusting the old Open.
+                self._drop_cover_cache()
             self.log(f"{KIND_LABELS[kind]} connected: {device.name}", "success")
             return device
 
@@ -256,9 +260,18 @@ class DeviceManager:
             except Exception as exc:
                 self.log(f"{KIND_LABELS[kind]} disconnect error: {exc}", "warn")
             finally:
+                if kind in ("flatpanel", "camera"):
+                    self._drop_cover_cache()
                 self._devices[kind] = None
                 self._backends.pop(kind, None)
                 self.log(f"{KIND_LABELS[kind]} disconnected")
+
+    def _drop_cover_cache(self) -> None:
+        try:
+            from .. import coverstatus
+        except Exception:                             # noqa: BLE001 - status is optional
+            return
+        coverstatus.drop(self._devices.get("flatpanel"))
 
     def disconnect_all(self) -> None:
         for kind in KINDS:

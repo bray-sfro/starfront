@@ -31,6 +31,8 @@ from . import filters
 from . import identify
 from . import ninaimport
 from . import mountclock
+from . import coverprep
+from . import coverstatus
 from . import roofguard
 from . import roofstatus
 from . import warnings
@@ -1407,6 +1409,11 @@ def _snapshot() -> dict[str, Any]:
             errors[name] = f"{type(exc).__name__}: {exc}"
             return {} if fallback is None else fallback
 
+    # Cover and light are probed on their own thread. This does not wait,
+    # and it does not call the driver on the request thread.
+    with contextlib.suppress(Exception):
+        for rig in rigs.all:
+            coverstatus.kick(rig.manager.get("flatpanel"))
     payload = part("core", _snapshot_core)
     for name, read in (("sequence", lambda: {**sequencer.status(),
                                              "shutdown": dict(shutdown_task)}),
@@ -1432,6 +1439,15 @@ def _snapshot() -> dict[str, Any]:
     payload["roof"] = roofstatus.observe(
         (payload.get("devices") or {}).get("dome") or {},
         str(seq.get("roofLocked") or ""), payload["serverTime"])
+    # Cover badge, from the cache the probe filled. Not a driver call.
+    payload["cover"] = coverstatus.observe((payload.get("devices") or {}).get("flatpanel"))
+    blocked = coverprep.guard_blocks_open()
+    payload["cover"]["openBlocked"] = blocked or ""
+    for entry in payload.get("rigs") or []:
+        if isinstance(entry, dict):
+            entry["cover"] = coverstatus.observe(
+                (entry.get("devices") or {}).get("flatpanel"))
+            entry["cover"]["openBlocked"] = blocked or ""
     payload["seq"] = next(_snapshot_seq)
     if errors:
         payload["sectionErrors"] = errors
@@ -1945,11 +1961,49 @@ def set_flat_light(body: FlatPanelRequest, rig: str | None = None) -> dict[str, 
     return {"ok": True}
 
 
+def _cover_open_blocked(target) -> str | None:
+    """Why Open Cover must be refused.
+
+    Opening during a dark, bias or panel-flat run is refused because the
+    cover has to stay shut for those frames. Opening during an exposure, a
+    slew or autofocus is also refused: nothing in the sequence shows that
+    moving the lid then is safe, and the sequence itself opens the cover
+    before those stages start. Close and the light are still allowed.
+    """
+    why = coverprep.guard_blocks_open()
+    if why:
+        return why
+    capture = getattr(target, "capture", None)
+    if capture is not None and (
+            str(getattr(capture, "_state", "") or "") == "exposing"
+            or getattr(capture, "busy", False)):
+        return "an exposure is running; the cover was not opened"
+    mount = None
+    with contextlib.suppress(Exception):
+        mount = target.manager.get("mount")
+    if mount is not None and getattr(mount, "connected", True) \
+            and getattr(mount, "slewing", False):
+        return "the mount is slewing; the cover was not opened"
+    focuser = getattr(target, "focuser", None)
+    if focuser is not None and getattr(focuser, "running", False):
+        return "autofocus is running; the cover was not opened"
+    if sequencer.running and str(getattr(sequencer, "_state", "") or "") in (
+            "slewing", "centring", "focusing", "exposing", "imaging"):
+        return (f"the sequence is {sequencer._state}; the cover was not opened")
+    return None
+
+
 @app.post("/api/flatpanel/cover")
 def set_cover(body: TrackingRequest, rig: str | None = None) -> dict[str, Any]:
     target = _rig(rig)
     panel = _guard(target.manager.require, "flatpanel")
-    _guard(panel.open_cover if body.on else panel.close_cover)
+    if body.on:
+        why = _cover_open_blocked(target)
+        if why:
+            raise HTTPException(status_code=409, detail=why)
+        _guard(panel.open_cover)
+    else:
+        _guard(panel.close_cover)
     target.manager.log(f"Cover {'opening' if body.on else 'closing'}")
     return {"ok": True}
 
