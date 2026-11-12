@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.0.32
+
+- **Your collaboration lights go to the server as they are saved, on by default.** Every light the *Starfront collaboration* container takes is handed to an upload queue the moment N.I.N.A. saves it (its image-saved event) and sent in the background to collab.starfront.space, where the coordinator stacks it. Nothing waits on it: the queue is a thread of its own, an upload cut off carries on where it stopped, and a collaboration that is not taking files is left alone for an hour. Your files are only read, never moved, changed or deleted. Switch it off under Options > Plugins > Starfront > *Upload my collaboration lights*.
+- Each collaboration light carries a PROJID header with the collaboration's id, so the server files it without guessing from the pointing.
+- *Collect the lights on the server* starts ticked on a new collaboration.
+
 ## 1.0.0.31
 
 - *Collect the lights on the server* in the start-a-collaboration form, and on Edit. A collaboration with it on takes everyone's lights, flats, darks and bias through the files page at collab.starfront.space/files, sorted by collaboration and person, for the coordinator to stack. A card on such a collaboration says so and has an *Open the files page* button.
