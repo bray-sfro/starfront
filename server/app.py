@@ -46,7 +46,10 @@ from server import auth                                          # noqa: E402
 from server.files import COOKIE, COOKIE_SECONDS, Files           # noqa: E402
 from server.agentuploads import AgentUploads  # noqa: E402
 from server.ratelimit import Limiter, client_address           # noqa: E402
+from server.billing import Billing                               # noqa: E402
+from server import billing as billing_module, support as support_module  # noqa: E402
 from server.jobs import Jobs                                     # noqa: E402
+from server.support import Support                               # noqa: E402
 from server.personal import Personal                             # noqa: E402
 from server.site import Site                                     # noqa: E402
 from server.releases import Releases                             # noqa: E402
@@ -2489,10 +2492,26 @@ releases = Releases(app, store, RELEASES_DIR, files.who, owns_project)
 personal = Personal(app, store, files, agent_uploads.agent, files.who, DISCORD.owners,
                     releases=releases, jobs=jobs)
 agent_uploads.personal = personal
+jobs.personal = personal
+
+# Paid plans, as the shop tells them: what entitlement() reads once
+# STARFRONT_BILLING=1. Its secrets are in the environment or billing.env
+# beside the database. See server/billing.py.
+support_module.load_env_file(DATA, billing_module.ENV_FILE)
+billing = Billing(app, store, files.who, DATA)
+personal.billing = billing
+if ROLE != "uploads":
+    billing.run_nightly()
 
 # The website around the files page: the front door (/), every collaboration
 # as cards (/collabs), and one person's own targets (/me). See server/site.py.
 site = Site(app, store, files, releases, personal, _figures, online_seconds=ONLINE_SECONDS)
+
+# Get help: a person's question becomes a help desk ticket with their plan,
+# project and telescopes attached. Off unless STARFRONT_SUPPORT=1 and
+# zendesk.env beside the database is filled in. See server/support.py.
+support_module.load_env_file(DATA)
+support = Support(app, store, files.who, personal, site, jobs)
 
 
 

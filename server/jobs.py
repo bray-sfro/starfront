@@ -124,6 +124,9 @@ class Jobs:
         self.token_file, self.latest, self.clock = token_file, latest or (lambda pid: ""), clock
         self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._lock = threading.Lock()
+        #: Personal projects (server/personal.py), set by app.py: stacking
+        #: one's own target is part of a plan.
+        self.personal: Any = None
         self._routes(app)
 
     def _job_token_ok(self, request: Request) -> bool:
@@ -228,6 +231,11 @@ class Jobs:
             who = self._owner(request, project)
             if who is None:
                 raise HTTPException(status_code=403, detail="only the collaboration's owner starts a stack")
+            if project.get("scope") == "personal" and self.personal is not None \
+                    and str(project.get("owner_id") or "") == str(who.get("id")):
+                allowed = self.personal.entitlement(who)
+                if not allowed["personal"]:
+                    raise HTTPException(status_code=402, detail=allowed["why"])
             with self._lock:
                 view = self.stack_view(project_id)
                 if view["busy"]:

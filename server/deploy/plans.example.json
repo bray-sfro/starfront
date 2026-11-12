@@ -1,0 +1,16 @@
+{
+  "_about": "Copy to plans.json beside the database (/var/lib/starfront/plans.json) and edit. Nothing here is secret. Names, prices and sizes below are the Nov 2026 proposal, not a decision. 'variants', 'skus' and 'products' say which shop items are this plan (any one match is enough); 'variant' is the one the Subscribe button opens.",
+  "graceDays": 7,
+  "periodDays": 31,
+  "keepDays": 90,
+  "subscribeUrl": "https://starfront.space/products/auto-processing?variant={variant}&sf={link}",
+  "manageUrl": "https://starfront.space/apps/subscriptions",
+  "plans": [
+    {"key": "hobbyist", "name": "Hobbyist", "price": "$9 a month", "storageGB": 100,
+     "skus": ["SF-AUTO-100"], "variants": [], "variant": "REPLACE_WITH_VARIANT_ID"},
+    {"key": "standard", "name": "Standard", "price": "$19 a month", "storageGB": 300,
+     "skus": ["SF-AUTO-300"], "variants": [], "variant": "REPLACE_WITH_VARIANT_ID"},
+    {"key": "observatory", "name": "Observatory", "price": "$59 a month", "storageGB": 1000,
+     "skus": ["SF-AUTO-1000"], "variants": [], "variant": "REPLACE_WITH_VARIANT_ID"}
+  ]
+}

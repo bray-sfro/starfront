@@ -189,3 +189,12 @@ def test_working_on_needs_the_rig_to_be_on_it_not_just_a_task(tmp_path):
     assert work["California Dreaming"]["active"]
     page = client.get("/telescopes").text
     assert "'Joined'" in page and "nothing sent since" in page
+
+
+def test_pages_carry_the_help_form_and_the_plan_controls(tmp_path):
+    client, _ = build(tmp_path)
+    me = client.get("/me").text
+    for part in ('id="sfHelpDlg"', 'id="sfFoot" hidden', 'id="plans"', 'id="linkForm"', "Manage plan",
+                 "/api/v1/me/billing/link", "/api/v1/support"):
+        assert part in me, part
+    assert 'id="sfHelpDlg"' in client.get("/telescopes").text
