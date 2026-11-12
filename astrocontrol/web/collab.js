@@ -123,7 +123,74 @@
     line.hidden = !up.enabled && !(up.counts && Object.keys(up.counts).length);
     line.textContent = up.line || '';
     const refused = (up.refused || []).map((r) => `${r.file}: ${r.why}`);
-    line.title = [up.lastError ? `Last error: ${up.lastError}` : '', ...refused].filter(Boolean).join('\n');
+    const held = (up.held || []).map((r) => `${r.file}: held — ${r.why}`);
+    line.title = [up.lastError ? `Last error: ${up.lastError}` : '', ...held, ...refused].filter(Boolean).join('\n');
+  }
+
+  /** The chart label: the scope's display name when one is chosen, else the rig. */
+  function scopeLabel(status) {
+    const block = status.scopes || {};
+    if (!block || block.enabled === false || !block.telescopes) {
+      return status.telescope || 'this telescope';
+    }
+    const named = block.telescopes
+      .filter((rig) => rig.displayName)
+      .map((rig) => (block.telescopes.length > 1 ? `${rig.name}: ${rig.displayName}` : rig.displayName));
+    if (named.length) return named.join(', ');
+    if (block.displayName) return block.displayName;
+    return status.telescope || 'this telescope';
+  }
+
+  /** One dropdown per equipment telescope. Options are the server's scopes. */
+  function drawScopes() {
+    const block = ((col.state || {}).scopes) || {};
+    const box = $('colScopes');
+    const rows = $('colScopeRows');
+    const flag = $('colRegisteredScopes');
+    if (flag && block.enabled !== undefined && flag.checked !== !!block.enabled) {
+      flag.checked = !!block.enabled;
+    }
+    const off = block.enabled === false;
+    const note = $('colScopeNote');
+    const fallback = $('colScopeFallback');
+    const register = $('colScopeRegisterLine');
+    if (note) note.hidden = off;
+    if (fallback) fallback.hidden = !off;
+    if (register) register.hidden = off;
+    if (rows) rows.hidden = off;
+    if (!rows || off) {
+      if (rows) rows.innerHTML = '';
+      return;
+    }
+    const choices = block.choices || [];
+    const telescopes = block.telescopes || [];
+    // Bound scopes are already first. The label is displayName; the value is the id.
+    rows.innerHTML = telescopes.map((rig) => {
+      const options = ['<option value="">Let the server use this telescope\'s bind</option>']
+        .concat(choices.map((choice) => {
+          const selected = choice.id === rig.scopeId ? ' selected' : '';
+          const mark = choice.bound ? '' : ' (not bound here)';
+          return `<option value="${esc(choice.id)}"${selected}>${esc(choice.displayName)}${mark}</option>`;
+        })).join('');
+      const missing = rig.scopeId && !choices.some((choice) => choice.id === rig.scopeId)
+        ? '<span class="small muted">The saved scope is not on the server\'s list. It is kept, and not replaced with a name.</span>'
+        : '';
+      return `<label>${esc(rig.name)}<select data-col-scope="${esc(rig.id)}">${options}</select>${missing}</label>`;
+    }).join('') || '<p class="small muted">No telescope in this setup yet.</p>';
+    rows.querySelectorAll('[data-col-scope]').forEach((select) => {
+      select.addEventListener('change', async () => {
+        try {
+          col.state = await app.api('/api/collab/scope', 'POST', {
+            rig: select.dataset.colScope,
+            scopeId: select.value,
+          });
+          drawServer();
+        } catch (error) {
+          app.toast(error.message, 'error');
+          await load(true);
+        }
+      });
+    });
   }
 
   /** Who this program is on the server, and the buttons that follow from it. */
@@ -138,7 +205,7 @@
     const box = $('colJoinBox');
     if (!name || !inBtn || !outBtn) return;
 
-    const scope = status.telescope || 'this telescope';
+    const scope = scopeLabel(status);
     const every = Math.round(status.pollMinutes || 10);
     const enrolled = status.enrolled
       ? `${scope} is enrolled and checks in every ${every} minutes.`
@@ -174,6 +241,7 @@
           + 'under Advanced.';
     }
     if (box) box.classList.toggle('joined', !!(person.admin || person.signedIn));
+    drawScopes();
 
     // Starting one needs a person who may.
     const start = $('colStartFold');
@@ -891,6 +959,19 @@
         app.toast(share ? 'The others can see where this telescope points'
           : 'This telescope no longer shares its position', 'info');
       } catch (error) { app.toast(error.message, 'error'); }
+    });
+
+    on('colRegisteredScopes', 'change', async () => {
+      const on = $('colRegisteredScopes').checked;
+      try {
+        await app.api('/api/settings/collab', 'POST', { registeredScopes: on });
+        app.toast(on
+          ? 'Uploads will name the scope chosen for each telescope'
+          : 'Registered scopes are off; uploads use the previous path', 'info');
+        await load(true);
+      } catch (error) {
+        app.toast(error.message, 'error');
+      }
     });
 
     on('colAutoUpload', 'change', async () => {

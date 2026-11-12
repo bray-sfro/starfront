@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.55
+
+Not released. Registered scopes for collab.starfront.space, client only.
+
+- The Collab tab lists the server's scopes in a dropdown (bound ones first, labelled with `displayName`). There is no box to type a telescope name. The choice is stored per equipment telescope as the scope id, so a rename on the server changes the label only.
+- Auto-upload sends that `scopeId` with the frame. On a multiscope RASA each drawer (RASA-L, RASA-A, RASA-R) sends its own. A 409 for a scope that is not bound, or a camera the server cannot place, holds that file with the server's reason. It is not dropped and it does not pause the other files. A 400 for an unknown scope and a 403 for somebody else's scope are held the same way.
+- `collab.registeredScopes` defaults on. Off is the previous path: no scope id is sent, and the server's telescope-name fallback still applies. Registering or binding a scope is done on the server; this program only links there and never makes up an id.
+- Presence may still send the equipment profile's name so the chart can show it. That name is not how a file is filed.
+
 ## 0.2.54 (consolidated, 2026-11-11)
 
 One tree for every change made since 0.2.53b, in single-scope and multiscope

@@ -75,6 +75,10 @@ class Refused(Exception):
     """The server will not take this file, for a reason it gave."""
 
 
+class Hold(Exception):
+    """This file stays queued with a clear status. The others keep going."""
+
+
 class Pause(Exception):
     """The server asked for a wait before anything else is sent."""
 
@@ -497,6 +501,27 @@ class AutoUploader:
         return any(i["path"] == path and i["project"] == project and i["kind"] == kind
                    for i in self.items)
 
+    def release_held(self, rig: str = "") -> int:
+        """Queue held files again after the scope for them has changed.
+
+        A blank ``rig`` releases every held file. The file was never removed
+        from the queue; this only lets the worker try it with the new id.
+        """
+        n = 0
+        with self._lock:
+            for item in self.items:
+                if item.get("state") != "held":
+                    continue
+                if rig and str(item.get("rig") or "") not in ("", rig):
+                    continue
+                item.update(state="queued", error="", status="", nextTry=0.0)
+                n += 1
+            if n:
+                self._save()
+        if n:
+            self._wake.set()
+        return n
+
     def add(self, path: str | Path, project: str, kind: str = "light", task: str = "",
             rig: str = "", night: str = "", filter_name: str = "",
             identity: dict[str, Any] | None = None) -> bool:
@@ -701,6 +726,13 @@ class AutoUploader:
             self._mark(item, state="refused", error=str(exc), doneAt=self.clock())
             self._say(f"Auto-upload: {path.name} not sent - {exc}", "warn")
             self._log_queue()
+        except Hold as exc:
+            # A scope the server will not file this frame under. The file
+            # stays in the queue with the reason. The other cameras' files
+            # are not paused and this one is not thrown away.
+            self._mark(item, state="held", error=str(exc), status=str(exc))
+            self._say(f"Auto-upload: {path.name} held — {exc}", "warn")
+            self._log_queue()
         except Pause as exc:
             until = self.clock() + exc.seconds
             with self._lock:
@@ -723,10 +755,45 @@ class AutoUploader:
         finally:
             self.current = None
 
+    def _scope_for_item(self, item: dict[str, Any], path: Path) -> str:
+        """The scope id for this file, or blank when the server should resolve the bind."""
+        from . import scopes
+        if not scopes.registered_scopes_enabled(self.config):
+            return ""
+        assignments = []
+        for rig in self._rig_rows():
+            assignments.append({
+                "id": str(rig.get("id") or ""),
+                "name": str(rig.get("name") or ""),
+                "scopeId": str(rig.get("scopeId") or ""),
+            })
+        known: list[dict[str, Any]] = []
+        client = self.client
+        if client is not None:
+            getter = getattr(client, "known_scopes", None)
+            if callable(getter):
+                try:
+                    known = list(getter() or [])
+                except Exception:                  # noqa: BLE001 - no list means "send the stored id"
+                    known = []
+        identity = dict(self._identity_for_send(item, path) or {})
+        if item.get("rig") and not identity.get("rig"):
+            identity["rig"] = item.get("rig")
+        return scopes.scope_id_for_frame(
+            assignments, identity, known or None,
+            enabled=True)
+
     def _upload(self, item: dict[str, Any], path: Path) -> None:
-        code, body, headers = self.http("POST", "/api/v1/agent/uploads", {
+        from . import scopes
+        body_json = {
             "project": item["project"], "name": path.name, "kind": item["kind"],
-            "bytes": item["bytes"], "sha256": item["sha256"], "task": item.get("task") or ""})
+            "bytes": item["bytes"], "sha256": item["sha256"], "task": item.get("task") or ""}
+        # scopeId selects among this agent's binds. The equipment-profile
+        # name is not sent: the server stores it and does not file by it.
+        body_json.update(scopes.upload_extra(
+            self._scope_for_item(item, path),
+            enabled=scopes.registered_scopes_enabled(self.config)))
+        code, body, headers = self.http("POST", "/api/v1/agent/uploads", body_json)
         self._obey(code, body, headers)
         if body.get("already"):
             self._mark(item, state="already", status=body.get("status") or "",
@@ -772,6 +839,10 @@ class AutoUploader:
     def _obey(self, code: int, body: dict[str, Any], headers: dict[str, str]) -> None:
         if 200 <= code < 300:
             return
+        from . import scopes
+        hold = scopes.scope_hold_message(code, body)
+        if hold:
+            raise Hold(hold)
         detail = str(body.get("detail") or f"HTTP {code}")
         retry_after = float(headers.get("retry-after") or 0) or None
         if code == 429:
@@ -898,6 +969,7 @@ class AutoUploader:
                 "camera": str(getattr(camera, "name", "") or "") if camera is not None else "",
                 "colour": bool(getattr(camera, "bayer_pattern", None)) if camera is not None else False,
                 "upload": getattr(getattr(rig, "capture", None), "upload_collab", None),
+                "scopeId": str(getattr(rig, "scope_id", "") or ""),
             })
         return rows
 
@@ -1039,8 +1111,10 @@ class AutoUploader:
             matched += 1
             project, task = found
             ident = identity_from_header(header)
+            matched_id = ""
             for rig in known:
                 if _same_rig(ident, rig):
+                    matched_id = str(rig.get("id") or "")
                     if rig.get("role"):
                         ident["role"] = rig["role"]
                     if rig.get("upload") is not None:
@@ -1049,12 +1123,14 @@ class AutoUploader:
                         ident["colour"] = True
                         if ident.get("role") != "master":
                             ident["role"] = ident.get("role") or "follower"
+                    if matched_id:
+                        ident["rig"] = matched_id
                     break
             if not allows_upload(ident, strict=True):
                 skip("follower", path.name)
                 continue
             if self.add(path, project, "light", task,
-                        rig=str(ident.get("name") or ""),
+                        rig=matched_id or str(ident.get("name") or ""),
                         filter_name=str(header.get("FILTER") or ""),
                         identity=ident):
                 queued.append(path.name)
@@ -1098,6 +1174,8 @@ class AutoUploader:
             queued = counts.get("queued", 0) + counts.get("waiting", 0) + counts.get("sending", 0)
             refused = [{"file": Path(i["path"]).name, "why": i.get("error") or ""}
                        for i in self.items if i["state"] == "refused"][-5:]
+            held = [{"file": Path(i["path"]).name, "why": i.get("error") or ""}
+                    for i in self.items if i.get("state") == "held"][-8:]
             active = {p: (u, w) for p, (u, w) in self.project_paused.items() if u > now}
         if not s["enabled"]:
             line = "Auto-upload is off"
@@ -1132,11 +1210,14 @@ class AutoUploader:
         line += f" · {sent} sent"
         if pending:
             line += f" · {pending} waiting for calibration on the server"
+        if counts.get("held"):
+            line += f" · {counts['held']} held"
         if counts.get("refused"):
             line += f" · {counts['refused']} refused"
         return {"enabled": s["enabled"], "rigs": s["rigs"], "mbit": s["mbit"],
                 "daytimeOnly": s["daytimeOnly"], "running": self.running,
                 "counts": counts, "pendingCalibration": pending, "line": line,
+                "held": held,
                 "pausedUntil": self.paused_until or None, "pausedWhy": self.paused_why,
                 "projectsPaused": {p: {"until": u, "why": w} for p, (u, w) in self.project_paused.items() if u > now},
                 "projectCounts": project_counts,

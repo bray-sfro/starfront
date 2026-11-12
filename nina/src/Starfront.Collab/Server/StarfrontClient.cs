@@ -121,6 +121,12 @@ namespace Starfront.Collab.Server {
 
         // -- a telescope: the three calls, and the browsing around them ------
 
+        /// <summary>The scopes this agent can see. An agent token is enough; binding is not.</summary>
+        public async Task<List<ScopeInfo>> ScopesAsync(string agentToken, CancellationToken token) {
+            var answer = await Call<JObject>(HttpMethod.Get, "/api/v1/scopes", null, agentToken, token).ConfigureAwait(false);
+            return ScopeDirectory.Read(answer);
+        }
+
         public Task<HelloAnswer> HelloAsync(string agentToken, JObject profile, JObject presence, CancellationToken token) {
             var body = new JObject { ["protocol"] = Protocol, ["profile"] = profile };
             if (presence != null) body["presence"] = presence;

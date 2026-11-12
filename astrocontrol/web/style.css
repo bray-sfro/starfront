@@ -2377,5 +2377,8 @@ label.inline.compact input[type="range"] { width: 150px; margin-top: 0; }
 .col-join { border-left: 3px solid var(--warn); }
 .col-join.joined { border-left-color: var(--good); }
 .col-join .btn.primary { white-space: nowrap; }
+.col-scope-rows { display: flex; flex-direction: column; gap: 8px; margin: 6px 0; }
+.col-scope-rows label { display: flex; flex-direction: column; align-items: stretch; gap: 2px; max-width: 420px; }
+.col-scope-rows select { margin-top: 0; }
 .collab-share { margin: 0 0 8px; }
 .collab-share b { color: var(--good); margin-right: 6px; }
