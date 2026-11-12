@@ -579,6 +579,25 @@ def _one_task_per_project(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return kept + list(newest.values())
 
 
+def _open_project_tasks(tasks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only the shares whose collaboration is still open.
+
+    Closing a project takes it off the browse list but used to leave every
+    accepted task in place, so GET /api/v1/agent/task and the dealer kept
+    handing out panels for work nobody is collecting. Those leftovers ate a
+    rig's nightly plan — four six-hour shares in one night, two of them on
+    dead collabs — and joining something new looked broken. A missing
+    project is treated the same way: it cannot be shot.
+    """
+    kept: list[dict[str, Any]] = []
+    for task in tasks:
+        project = store.project(str(task.get("project") or ""))
+        if project is None or project.get("status") != "open":
+            continue
+        kept.append(task)
+    return kept
+
+
 @app.get("/api/v1/agent/task")
 def current_task(agent: dict[str, Any] = Depends(agent_from),
                  night: str = Query(default="", max_length=16),
@@ -603,7 +622,7 @@ def current_task(agent: dict[str, Any] = Depends(agent_from),
     rig has to say.
     """
     store.seen(agent["id"])
-    tasks = _one_task_per_project(store.tasks_for(agent["id"]))
+    tasks = _open_project_tasks(_one_task_per_project(store.tasks_for(agent["id"])))
     if not tasks:
         return {"task": None, "tasks": [], "version": 0,
                 "protocol": collab.PROTOCOL}
@@ -622,7 +641,10 @@ def current_task(agent: dict[str, Any] = Depends(agent_from),
     for project_id in {task["project"] for task in tasks}:
         _redeal(project_id, {agent["id"]: night.strip()} if night.strip() else None,
                 moon=sky)
-    tasks = store.tasks_for(agent["id"])
+    tasks = _open_project_tasks(store.tasks_for(agent["id"]))
+    if not tasks:
+        return {"task": None, "tasks": [], "version": 0,
+                "protocol": collab.PROTOCOL}
     task = tasks[0]
     project = store.project(task["project"])
     return {
@@ -1471,7 +1493,7 @@ def _redeal(project_id: str, nights: dict[str, str] | None = None,
     left exactly alone, so an idle poll costs nothing.
     """
     project = _collab(project_id)
-    if project is None:
+    if project is None or project.get("status") != "open":
         return 0
     payload = project.get("payload") or {}
     wants = collab.Requirements.read(payload.get("requirements") or {})
