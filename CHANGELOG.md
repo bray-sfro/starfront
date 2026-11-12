@@ -10,9 +10,8 @@ builds. Not installed anywhere.
   open or closed; a close that does not change the reading warns; Alnitak cover
   prep before panel flats. Merged under 0.2.53g's roof guard: the guard still
   refuses an open first.
-- 0.2.53d (PR #6): a timed-out camera call quarantines that camera until the
-  call returns; no automatic outlet power-cycling on reconnect; three failed
-  reconnects stop.
+- Not in this build: 0.2.53d (PR #6, camera call quarantine). With it,
+  check_camera_health and check_gain_offset fail; it needs a fix first.
 - 0.2.53e/f (PR #7): centring never syncs the mount; it slews by the measured
   offset, rejects flipped or jumping solves, and fails the target when
   attempts run out.
